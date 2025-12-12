@@ -73,6 +73,19 @@ func main() -> int
 - **Sets**: literals `{1, 2, 3}`, methods `add`, `has`, `remove`, `len`
 - Iteration, comprehensions for all collection types
 
+### Module System
+```coex
+import math
+replace abs with math.abs
+
+func main() -> int
+    print(math.max(5, 10))   # Qualified call
+    print(abs(-42))          # Aliased call
+    return 0
+~
+```
+Standard library: `lib/math.coex` provides `abs`, `max`, `min`, `clamp`, `sign`
+
 ### Cellular Automata
 ```coex
 matrix Grid[100, 100]:
@@ -129,7 +142,7 @@ python3 coexc.py program.coex --emit-ast
 
 **Current: Alpha** - Core language features working, concurrency is stubbed.
 
-### Working (132 tests passing)
+### Working (145 tests passing)
 
 | Category | Features |
 |----------|----------|
@@ -146,6 +159,7 @@ python3 coexc.py program.coex --emit-ast
 | **Sets** | Literals, add/has/remove/len operations |
 | **Matrix/CA** | Creation, cell access, formulas (sequential) |
 | **Lambdas** | All function kinds, stored in variables |
+| **Modules** | Import, qualified calls, replace aliases |
 
 ### Known Limitations
 
@@ -153,7 +167,6 @@ python3 coexc.py program.coex --emit-ast
 |---------|--------|
 | `list.append()` | Bug in method dispatch |
 | Concurrency | All features run sequentially |
-| Imports | Parsed, no module loading |
 | `while` loops | Grammar exists, no codegen |
 
 ### Concurrency Roadmap
@@ -196,9 +209,9 @@ python3 -m pytest tests/test_types.py::TestEnums::test_enum_with_data -v
 Contributions welcome! Areas that need work:
 
 - **Concurrency runtime** - Task scheduler, channels
-- **Module system** - File imports and namespaces
 - **Error messages** - Better diagnostics with line numbers
 - **Optimization** - LLVM optimization passes
+- **Standard library** - Expand lib/ with more modules
 
 ## License
 
