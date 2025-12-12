@@ -12,10 +12,6 @@ from dataclasses import dataclass, field
 import struct
 import os
 
-binding.initialize()
-binding.initialize_native_target()
-binding.initialize_native_asmprinter()
-
 @dataclass
 class ModuleInfo:
     """Information about a loaded module"""
