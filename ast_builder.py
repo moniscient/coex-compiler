@@ -17,12 +17,16 @@ class ASTBuilder:
     def build(self, tree: CoexParser.ProgramContext) -> Program:
         """Build AST from parse tree root"""
         program = Program()
-        
+
         for child in tree.children:
             if isinstance(child, CoexParser.ImportDeclContext):
                 imp = self.visit_import_decl(child)
                 if imp:
                     program.imports.append(imp)
+            elif isinstance(child, CoexParser.ReplaceDeclContext):
+                rep = self.visit_replace_decl(child)
+                if rep:
+                    program.replaces.append(rep)
             elif isinstance(child, CoexParser.DeclarationContext):
                 decl = self.visit_declaration(child)
                 if isinstance(decl, FunctionDecl):
@@ -35,29 +39,27 @@ class ASTBuilder:
                     program.traits.append(decl)
                 elif isinstance(decl, MatrixDecl):
                     program.matrices.append(decl)
-        
+
         return program
-    
+
     # ========================================================================
-    # Imports
+    # Imports and Replace
     # ========================================================================
-    
+
     def visit_import_decl(self, ctx: CoexParser.ImportDeclContext) -> Optional[ImportDecl]:
-        """Visit an import declaration"""
-        if ctx.FROM():
-            # from "module" import "name" [as "alias"]
-            strings = ctx.stringLiteral()
-            module = self._get_string_value(strings[0])
-            name = self._get_string_value(strings[1])
-            alias = None
-            if len(strings) > 2:
-                alias = self._get_string_value(strings[2])
-            return ImportDecl(module=module, names=[name], alias=alias)
-        else:
-            # import "module"
-            module = self._get_string_value(ctx.stringLiteral(0))
-            return ImportDecl(module=module)
-    
+        """Visit an import declaration: import module_name"""
+        module = ctx.IDENTIFIER().getText()
+        return ImportDecl(module=module)
+
+    def visit_replace_decl(self, ctx: CoexParser.ReplaceDeclContext) -> Optional[ReplaceDecl]:
+        """Visit a replace declaration: replace shortname with module.function"""
+        shortname = ctx.IDENTIFIER().getText()
+        qualified = ctx.qualifiedName()
+        identifiers = qualified.IDENTIFIER()
+        module = identifiers[0].getText()
+        qualified_name = identifiers[1].getText()
+        return ReplaceDecl(shortname=shortname, module=module, qualified_name=qualified_name)
+
     def _get_string_value(self, ctx) -> str:
         """Extract string value from string literal"""
         text = ctx.getText()

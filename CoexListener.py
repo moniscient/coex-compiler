@@ -26,6 +26,24 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#replaceDecl.
+    def enterReplaceDecl(self, ctx:CoexParser.ReplaceDeclContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#replaceDecl.
+    def exitReplaceDecl(self, ctx:CoexParser.ReplaceDeclContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#qualifiedName.
+    def enterQualifiedName(self, ctx:CoexParser.QualifiedNameContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#qualifiedName.
+    def exitQualifiedName(self, ctx:CoexParser.QualifiedNameContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#declaration.
     def enterDeclaration(self, ctx:CoexParser.DeclarationContext):
         pass

@@ -635,10 +635,16 @@ class MatrixDecl:
 
 @dataclass
 class ImportDecl:
-    """Import declaration"""
-    module: str
-    names: List[str] = field(default_factory=list)  # Empty = import whole module
-    alias: Optional[str] = None
+    """Import declaration: import module_name"""
+    module: str  # e.g., "math"
+
+
+@dataclass
+class ReplaceDecl:
+    """Replace declaration: replace shortname with module.function"""
+    shortname: str       # e.g., "abs"
+    module: str          # e.g., "math"
+    qualified_name: str  # e.g., "abs" (the function name in the module)
 
 
 # ============================================================================
@@ -648,6 +654,7 @@ class ImportDecl:
 @dataclass
 class Program:
     imports: List[ImportDecl] = field(default_factory=list)
+    replaces: List['ReplaceDecl'] = field(default_factory=list)
     globals: List[GlobalVarDecl] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)

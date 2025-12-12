@@ -54,7 +54,7 @@ func main() -> int
 
 ## Feature Status (as of Dec 2024)
 
-### Fully Working (132 tests passing)
+### Fully Working (145 tests passing)
 - Arithmetic, comparisons, boolean logic
 - Variables, assignment, compound operators (`+=`, `-=`, etc.)
 - Control flow: `if`/`else`/`elif`, `for..in`, `loop`, `break`, `continue`
@@ -71,13 +71,27 @@ func main() -> int
 - Lambdas: `formula(_ x: int) => x * 2`
 - Ranges: `start..stop` in for loops
 - Ternary: `cond ? then ; else`
+- Module system: `import math`, `math.abs(-5)`, `replace abs with math.abs`
+
+### Module System
+```coex
+import math                        # Load lib/math.coex
+replace abs with math.abs          # Create local alias
+
+func main() -> int
+    print(math.max(5, 10))         # Qualified call
+    print(abs(-42))                # Aliased call
+    return 0
+~
+```
+
+Standard library: `lib/math.coex` provides `abs`, `max`, `min`, `clamp`, `sign`
 
 ### Known Issues
 | Issue | Description |
 |-------|-------------|
 | `list.append()` | Method dispatch type mismatch (expects `i8*`, gets `i64`) |
 | Concurrency | All concurrent features run sequentially (stubs) |
-| Imports | Parsed but no module loading |
 
 ## Codegen Patterns
 

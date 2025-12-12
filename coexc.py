@@ -117,7 +117,7 @@ def compile_coex(source_path: str, output_path: str = None,
     # Generate code
     print("Generating LLVM IR...")
     codegen = CodeGenerator()
-    ir = codegen.generate(program)
+    ir = codegen.generate(program, source_path=source_path)
     
     if emit_ir:
         print(ir)

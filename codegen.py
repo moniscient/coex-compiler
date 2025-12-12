@@ -8,7 +8,19 @@ Handles the full language, with concurrency primitives implemented sequentially.
 from llvmlite import ir, binding
 from ast_nodes import *
 from typing import Dict, Optional, Tuple, List as PyList
+from dataclasses import dataclass, field
 import struct
+import os
+
+
+@dataclass
+class ModuleInfo:
+    """Information about a loaded module"""
+    name: str
+    path: str
+    program: 'Program'
+    functions: Dict[str, str] = field(default_factory=dict)  # func_name -> mangled_name
+    types: Dict[str, str] = field(default_factory=dict)      # type_name -> mangled_name
 
 
 class CodeGenerator:
@@ -82,7 +94,13 @@ class CodeGenerator:
         # List and channel runtime support
         self.list_type = None
         self.channel_type = None
-        
+
+        # Module system support
+        self.loaded_modules: Dict[str, ModuleInfo] = {}  # module_name -> ModuleInfo
+        self.replace_aliases: Dict[str, Tuple[str, str]] = {}  # shortname -> (module, func_name)
+        self.module_search_paths: PyList[str] = []
+        self.current_module: Optional[str] = None  # Track which module we're compiling
+
         # Declare external functions
         self._declare_builtins()
     
@@ -2698,8 +2716,26 @@ class CodeGenerator:
     # Program Generation
     # ========================================================================
     
-    def generate(self, program: Program) -> str:
+    def generate(self, program: Program, source_path: str = None) -> str:
         """Generate LLVM IR for entire program"""
+        # Set up module search paths
+        self.module_search_paths = []
+        if source_path:
+            self.module_search_paths.append(os.path.dirname(os.path.abspath(source_path)))
+        # Add lib/ directory relative to compiler location
+        compiler_dir = os.path.dirname(os.path.abspath(__file__))
+        self.module_search_paths.append(os.path.join(compiler_dir, "lib"))
+
+        # Load imported modules first (they must be compiled before main program)
+        for imp in program.imports:
+            self._load_module(imp.module)
+
+        # Register replace aliases
+        for rep in program.replaces:
+            if rep.module not in self.loaded_modules:
+                raise RuntimeError(f"Module '{rep.module}' not imported for replace '{rep.shortname}'")
+            self.replace_aliases[rep.shortname] = (rep.module, rep.qualified_name)
+
         # Register all traits first (they define interfaces)
         for trait_decl in program.traits:
             self._register_trait(trait_decl)
@@ -2750,7 +2786,115 @@ class CodeGenerator:
             self._generate_matrix_methods(matrix_decl)
         
         return str(self.module)
-    
+
+    # ========================================================================
+    # Module Loading
+    # ========================================================================
+
+    def _find_module_file(self, module_name: str) -> Optional[str]:
+        """Find module file in search paths"""
+        filename = f"{module_name}.coex"
+
+        for path in self.module_search_paths:
+            full_path = os.path.join(path, filename)
+            if os.path.exists(full_path):
+                return full_path
+
+        return None
+
+    def _load_module(self, module_name: str) -> ModuleInfo:
+        """Load and compile a module, returning its info"""
+        # Check cache
+        if module_name in self.loaded_modules:
+            return self.loaded_modules[module_name]
+
+        # Find module file
+        module_path = self._find_module_file(module_name)
+        if not module_path:
+            searched = ", ".join(self.module_search_paths)
+            raise RuntimeError(f"Module not found: {module_name} (searched: {searched})")
+
+        # Parse module
+        from antlr4 import FileStream, CommonTokenStream
+        from CoexLexer import CoexLexer
+        from CoexParser import CoexParser
+        from ast_builder import ASTBuilder
+
+        input_stream = FileStream(module_path)
+        lexer = CoexLexer(input_stream)
+        token_stream = CommonTokenStream(lexer)
+        parser = CoexParser(token_stream)
+        tree = parser.program()
+
+        builder = ASTBuilder()
+        program = builder.build(tree)
+
+        # Create module info
+        module_info = ModuleInfo(
+            name=module_name,
+            path=module_path,
+            program=program,
+        )
+
+        # Generate code for module with name mangling
+        saved_module = self.current_module
+        self.current_module = module_name
+
+        self._generate_module_contents(program, module_info)
+
+        self.current_module = saved_module
+        self.loaded_modules[module_name] = module_info
+
+        return module_info
+
+    def _generate_module_contents(self, program: Program, module_info: ModuleInfo):
+        """Generate code for module contents with name mangling"""
+        prefix = f"__{module_info.name}__"
+
+        # Register traits from module
+        for trait_decl in program.traits:
+            self._register_trait(trait_decl)
+
+        # Register types with mangled names
+        for type_decl in program.types:
+            mangled = f"{prefix}{type_decl.name}"
+            # Store original name mapping
+            module_info.types[type_decl.name] = mangled
+            # Create a copy of the type decl with mangled name
+            mangled_type_decl = TypeDecl(
+                name=mangled,
+                type_params=type_decl.type_params,
+                fields=type_decl.fields,
+                methods=type_decl.methods,
+                variants=type_decl.variants
+            )
+            self._register_type(mangled_type_decl)
+
+        # Declare and generate functions with mangled names
+        for func in program.functions:
+            if func.name == "main":
+                continue  # Skip main in modules
+
+            mangled = f"{prefix}{func.name}"
+            module_info.functions[func.name] = mangled
+
+            # Create mangled function declaration
+            mangled_func = FunctionDecl(
+                kind=func.kind,
+                name=mangled,
+                type_params=func.type_params,
+                params=func.params,
+                return_type=func.return_type,
+                body=func.body
+            )
+
+            # Store for return type inference
+            self.func_decls[mangled] = mangled_func
+
+            # Declare and generate
+            self._declare_function(mangled_func)
+            self._generate_function(mangled_func)
+
     def _register_trait(self, trait_decl: 'TraitDecl'):
         """Register a trait definition"""
         self.traits[trait_decl.name] = trait_decl
@@ -4928,7 +5072,25 @@ class CodeGenerator:
                             self.builder.call(self.printf, [fmt_ptr, value])
                 
                 return ir.Constant(ir.IntType(64), 0)
-            
+
+            # Check for replace alias: abs -> math.abs
+            if name in self.replace_aliases:
+                module_name, qualified_name = self.replace_aliases[name]
+                module_info = self.loaded_modules[module_name]
+                if qualified_name in module_info.functions:
+                    mangled = module_info.functions[qualified_name]
+                    func = self.functions[mangled]
+                    args = []
+                    for i, arg in enumerate(expr.args):
+                        arg_val = self._generate_expression(arg)
+                        if i < len(func.args):
+                            expected = func.args[i].type
+                            arg_val = self._cast_value(arg_val, expected)
+                        args.append(arg_val)
+                    return self.builder.call(func, args)
+                else:
+                    raise RuntimeError(f"Function '{qualified_name}' not found in module '{module_name}'")
+
             # Look up function
             if name in self.functions:
                 func = self.functions[name]
@@ -4962,6 +5124,28 @@ class CodeGenerator:
                     return self.builder.call(func, args)
         
         elif isinstance(expr.callee, MemberExpr):
+            # Check for module-qualified call: module.function(args)
+            if isinstance(expr.callee.object, Identifier):
+                possible_module = expr.callee.object.name
+                func_name = expr.callee.member
+
+                # Check if this is a loaded module
+                if possible_module in self.loaded_modules:
+                    module_info = self.loaded_modules[possible_module]
+                    if func_name in module_info.functions:
+                        mangled = module_info.functions[func_name]
+                        func = self.functions[mangled]
+                        args = []
+                        for i, arg in enumerate(expr.args):
+                            arg_val = self._generate_expression(arg)
+                            if i < len(func.args):
+                                expected = func.args[i].type
+                                arg_val = self._cast_value(arg_val, expected)
+                            args.append(arg_val)
+                        return self.builder.call(func, args)
+                    else:
+                        raise RuntimeError(f"Function '{func_name}' not found in module '{possible_module}'")
+
             # Check for Type.new() pattern
             if isinstance(expr.callee.object, Identifier):
                 type_name = expr.callee.object.name

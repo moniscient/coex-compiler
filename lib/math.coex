@@ -1,0 +1,42 @@
+# Math module for Coex standard library
+
+formula abs(_ x: int) -> int
+    if x < 0
+        return -x
+    ~
+    return x
+~
+
+formula max(_ a: int, _ b: int) -> int
+    if a > b
+        return a
+    ~
+    return b
+~
+
+formula min(_ a: int, _ b: int) -> int
+    if a < b
+        return a
+    ~
+    return b
+~
+
+formula clamp(_ x: int, _ low: int, _ high: int) -> int
+    if x < low
+        return low
+    ~
+    if x > high
+        return high
+    ~
+    return x
+~
+
+formula sign(_ x: int) -> int
+    if x < 0
+        return -1
+    ~
+    if x > 0
+        return 1
+    ~
+    return 0
+~

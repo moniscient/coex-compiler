@@ -26,13 +26,22 @@ grammar Coex;
 // ----------------------------------------------------------------------------
 
 program
-    : NEWLINE* importDecl* (NEWLINE* declaration)* NEWLINE* EOF
+    : NEWLINE* ((importDecl | replaceDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
     ;
 
-// Module imports (Python style)
+// Module imports: import module_name
 importDecl
-    : IMPORT stringLiteral
-    | FROM stringLiteral IMPORT stringLiteral (AS stringLiteral)?
+    : IMPORT IDENTIFIER
+    ;
+
+// Local alias: replace shortname with module.function
+replaceDecl
+    : REPLACE IDENTIFIER WITH qualifiedName
+    ;
+
+// Qualified name for module.function references
+qualifiedName
+    : IDENTIFIER (DOT IDENTIFIER)+
     ;
 
 declaration
@@ -621,10 +630,10 @@ TRUE        : 'true' ;
 FALSE       : 'false' ;
 NIL         : 'nil' ;
 
-// Module system (Python style - lowercase keywords)
+// Module system
 IMPORT      : 'import' ;
-FROM        : 'from' ;
-AS          : 'as' ;
+REPLACE     : 'replace' ;
+WITH        : 'with' ;
 
 // Block terminators
 END         : 'end' ;

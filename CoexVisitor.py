@@ -19,6 +19,16 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#replaceDecl.
+    def visitReplaceDecl(self, ctx:CoexParser.ReplaceDeclContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#qualifiedName.
+    def visitQualifiedName(self, ctx:CoexParser.QualifiedNameContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#declaration.
     def visitDeclaration(self, ctx:CoexParser.DeclarationContext):
         return self.visitChildren(ctx)
