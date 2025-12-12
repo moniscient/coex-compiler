@@ -5330,6 +5330,15 @@ class CodeGenerator:
     
     def _generate_member(self, expr: MemberExpr) -> ir.Value:
         """Generate code for member access"""
+        # Check for enum variant access: EnumName.VariantName
+        if isinstance(expr.object, Identifier):
+            type_name = expr.object.name
+            if hasattr(self, 'enum_variants') and type_name in self.enum_variants:
+                variant_name = expr.member
+                if variant_name in self.enum_variants[type_name]:
+                    # This is an enum variant with no arguments (like Color.Green)
+                    return self._generate_enum_constructor(type_name, variant_name, [], {})
+        
         obj = self._generate_expression(expr.object)
         
         # Check if this is a tuple (literal struct type)
@@ -6780,11 +6789,12 @@ class CodeGenerator:
                 for s in stmt.then_body:
                     collect_from_stmt(s)
                 for clause in stmt.else_if_clauses:
-                    for s in clause.body:
+                    # clause is a tuple: (condition, body)
+                    for s in clause[1]:
                         collect_from_stmt(s)
                 if stmt.else_body:
-                    for s in stmt.else_body:
-                        collect_from_stmt(s)
+                        for s in stmt.else_body:
+                            collect_from_stmt(s)
             elif isinstance(stmt, ForStmt):
                 # Loop variable
                 if isinstance(stmt.pattern, str):
