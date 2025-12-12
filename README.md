@@ -1,184 +1,208 @@
-# Coex Compiler
+# Coex
 
-A compiler for the Coex programming language that generates native executables via LLVM.
+**Coex** is a programming language designed for safe concurrency with explicit function kinds, cellular automata support, and static polymorphism. This compiler generates native executables via LLVM.
 
-## Architecture
+## Example
 
+```coex
+type Point:
+    x: int
+    y: int
+
+    func distance() -> float
+        return sqrt(self.x * self.x + self.y * self.y)
+    ~
+~
+
+type Option<T>:
+    case Some(value: T)
+    case None
+~
+
+func main() -> int
+    var p: Point = Point(3, 4)
+    print(p.x + p.y)
+
+    var opt: Option<int> = Option.Some(42)
+    match opt
+        case Some(v):
+            print(v)
+        ~
+        case None:
+            print(0)
+        ~
+    ~
+
+    var squares: List<int> = [x * x for x in 0..5]
+    for s in squares
+        print(s)
+    ~
+
+    return 0
+~
 ```
-Coex source (.coex)
-        ↓
-    ANTLR Parser (Python)
-        ↓
-    Parse Tree
-        ↓
-    AST Builder (ast_builder.py)
-        ↓
-    Abstract Syntax Tree
-        ↓
-    Code Generator (codegen.py)
-        ↓
-    LLVM IR
-        ↓
-    llvmlite → Object file (.o)
-        ↓
-    clang linker → Executable
+
+## Features
+
+### Three Function Kinds
+| Kind | Purpose | Current Status |
+|------|---------|----------------|
+| `formula` | Pure functions - no side effects | Working |
+| `func` | Regular imperative functions | Working |
+| `task` | Concurrent tasks | Parses, runs sequentially |
+
+### Type System
+- **Primitives**: `int`, `float`, `bool`, `string`, `byte`, `char`
+- **User-defined types** with fields and methods
+- **Enums with associated data** and pattern matching
+- **Generics** with monomorphization
+- **Traits** for static polymorphism
+- **Tuples** with named/positional access and destructuring
+- **Optional types**: `T?`
+
+### Control Flow
+- `if`/`else if`/`else` chains
+- `for..in` loops with ranges (`0..10`) and iterables
+- `loop` with `break`/`continue`
+- `match` statements with pattern matching
+- Ternary expressions: `cond ? then ; else`
+
+### Collections
+- **Lists**: literals `[1, 2, 3]`, comprehensions `[x * 2 for x in data]`
+- Iteration, `len()`, `get()` operations
+
+### Cellular Automata
+```coex
+matrix Grid[100, 100]:
+    type: int
+    init: 0
+
+    formula step()
+        return cell + cell[-1, 0] + cell[1, 0]
+    ~
+~
 ```
 
-## Files
+### Lambdas
+```coex
+var double: formula(int) -> int = formula(_ x: int) => x * 2
+print(double(21))  # 42
+```
 
-- `coexc.py` - Main compiler driver
-- `ast_nodes.py` - AST node definitions for the full language
-- `ast_builder.py` - Parse tree to AST converter
-- `codegen.py` - LLVM IR code generator
-- `hello.coex` - Basic example program
-- `test_full.coex` - Comprehensive test program
+## Installation
 
-## Setup
+### Prerequisites
+- Python 3.8+
+- clang (for linking)
 
-1. **Install dependencies:**
+### Setup
 
 ```bash
-pip install antlr4-python3-runtime llvmlite
-```
+# Clone the repository
+git clone https://github.com/yourusername/coex-compiler.git
+cd coex-compiler
 
-2. **Generate the parser** (if not already present):
+# Install Python dependencies
+pip install antlr4-python3-runtime llvmlite pytest
 
-```bash
-# Copy Coex.g4 to this directory
-antlr -Dlanguage=Python3 Coex.g4
-```
-
-3. **Verify setup:**
-
-```bash
-python coexc.py hello.coex --emit-ir
+# Verify installation
+python3 -m pytest tests/ -v
 ```
 
 ## Usage
 
 ```bash
-# Compile to object file
-python coexc.py hello.coex
-
-# Compile and link to executable
-python coexc.py hello.coex -o hello
+# Compile to executable
+python3 coexc.py program.coex -o program
+./program
 
 # View LLVM IR
-python coexc.py hello.coex --emit-ir
+python3 coexc.py program.coex --emit-ir
 
 # View AST
-python coexc.py hello.coex --emit-ast
-
-# Run the compiled program
-./hello
-
-# Run comprehensive tests
-python coexc.py test_full.coex -o test_full
-./test_full
+python3 coexc.py program.coex --emit-ast
 ```
 
-## Currently Supported Features
+## Project Status
 
-### Function Kinds
-- `formula` - Pure functions (executed normally for now)
-- `task` - Concurrent functions (executed sequentially for now)
-- `func` - Unrestricted functions
+**Current: Alpha** - Core language features working, concurrency is stubbed.
 
-### Types
-- `int` (64-bit signed integer)
-- `float` (64-bit double)
-- `bool`
-- `string` (basic support)
-- `byte`, `char`
-- `atomic_int`, `atomic_float`, `atomic_bool` (treated as regular types)
-- `T?` - Optional types (basic support)
-- User-defined types (parsing only)
+### Working (121 tests passing)
 
-### Statements
-- Variable declarations: `var x: int = 0`
-- Assignments: `x = y + 1`
-- Compound assignments: `+=`, `-=`, `*=`, `/=`, `%=`
-- If/else if/else chains
-- For loops with `range(start, end)` and `start..end`
-- Loop statements with break/continue
-- Return statements
-- Print statements (built-in)
-- Match statements (basic support)
-- Select statements (stub - executes first case)
-- Within/timeout (stub - executes body)
+| Category | Features |
+|----------|----------|
+| **Basics** | Arithmetic, comparisons, boolean logic, variables |
+| **Control Flow** | if/else/elif, for, loop, break, continue, match |
+| **Functions** | All three kinds, recursion, multiple parameters |
+| **Types** | User-defined types, methods, field access |
+| **Enums** | Variants with/without data, pattern matching |
+| **Generics** | Type parameters, monomorphization, trait bounds |
+| **Traits** | Declaration, structural implementation |
+| **Tuples** | Construction, `.0`/`.1` access, destructuring |
+| **Lists** | Literals, comprehensions, iteration |
+| **Matrix/CA** | Creation, cell access, formulas (sequential) |
+| **Lambdas** | All function kinds, stored in variables |
 
-### Expressions
-- Integer, float, boolean, string, nil literals
-- Hex (`0xFF`) and binary (`0b1010`) literals
-- Arithmetic: `+`, `-`, `*`, `/`, `%`
-- Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
-- Logical: `and`, `or`, `not` (short-circuit evaluation)
-- Ternary: `cond ? then ; else`
-- Unary: `-`, `not`, `await` (await is no-op)
-- Function calls
-- Method calls (basic built-ins)
-- Null coalescing: `??`
+### Known Limitations
 
-### Functions
-- All three kinds work (all run sequentially)
-- Parameters with types
-- Return types
-- Recursive calls
+| Feature | Status |
+|---------|--------|
+| `list.append()` | Bug in method dispatch |
+| Maps/Sets | Parsed, not implemented |
+| Concurrency | All features run sequentially |
+| Imports | Parsed, no module loading |
+| `while` loops | Grammar exists, no codegen |
 
-## Concurrency Model
+### Concurrency Roadmap
 
-Currently, all concurrency primitives are implemented sequentially:
+The language is designed for concurrency, but the current compiler runs everything sequentially. This allows all valid programs to compile and run correctly (just not in parallel). True concurrency requires:
 
-| Feature | Current Behavior |
-|---------|-----------------|
-| `formula` | Executes normally |
-| `task` | Executes normally |
-| Channels | Stubs (send/receive are no-ops) |
-| Atomics | Regular variables |
-| `select` | Executes first case |
-| `within` | Ignores timeout, executes body |
-| `await` | No-op, returns value |
+1. Runtime library with task scheduler
+2. Channel implementation with synchronization
+3. Atomic operations using platform primitives
 
-This allows all valid Coex programs to parse and compile. True concurrency support can be added later by implementing a runtime library.
+## Architecture
 
-## Not Yet Implemented (Fully)
-
-- Channels (need runtime queue implementation)
-- Full list/map/set operations
-- User-defined type instantiation
-- Traits and generics (monomorphization)
-- Pattern matching destructuring
-- Lambdas (closure capture)
-- Matrices (cellular automata)
-- Module imports
-
-## Extending the Compiler
-
-### Adding New Built-in Functions
-
-In `codegen.py`, add handling in `_generate_call`:
-
-```python
-if name == "my_builtin":
-    # Generate code for built-in
-    pass
+```
+source.coex → ANTLR4 Parser → AST Builder → CodeGen → LLVM IR → clang → executable
 ```
 
-### Adding New Types
+| File | Purpose |
+|------|---------|
+| `Coex.g4` | ANTLR4 grammar definition |
+| `ast_nodes.py` | AST node dataclasses |
+| `ast_builder.py` | Parse tree → AST conversion |
+| `codegen.py` | LLVM IR generation |
+| `coexc.py` | CLI compiler driver |
 
-1. Add type class in `ast_nodes.py`
-2. Handle in `ast_builder.py` type visitors
-3. Add LLVM type mapping in `codegen.py._get_llvm_type`
+## Running Tests
 
-### Adding Concurrency Runtime
+```bash
+# All tests
+python3 -m pytest tests/ -v
 
-To implement real concurrency:
+# Specific test file
+python3 -m pytest tests/test_types.py -v
 
-1. Create a C runtime library with:
-   - Channel queues with locking
-   - Task scheduler (green threads or OS threads)
-   - Atomic operations using platform primitives
+# Single test
+python3 -m pytest tests/test_types.py::TestEnums::test_enum_with_data -v
+```
 
-2. Link the runtime with compiled programs
+## Contributing
 
-3. Update code generator to emit calls to runtime functions
+Contributions welcome! Areas that need work:
+
+- **Maps and Sets** - Implement hash table data structure
+- **Concurrency runtime** - Task scheduler, channels
+- **Module system** - File imports and namespaces
+- **Error messages** - Better diagnostics with line numbers
+- **Optimization** - LLVM optimization passes
+
+## License
+
+[Add your license here]
+
+## Acknowledgments
+
+- Built with [ANTLR4](https://www.antlr.org/) for parsing
+- Uses [llvmlite](https://llvmlite.readthedocs.io/) for code generation

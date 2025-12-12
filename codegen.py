@@ -41,6 +41,7 @@ class CodeGenerator:
         self.type_fields: Dict[str, PyList[Tuple[str, Type]]] = {}  # type_name -> [(field_name, coex_type)]
         self.type_methods: Dict[str, Dict[str, str]] = {}  # type_name -> {method_name -> mangled_func_name}
         self.type_decls: Dict[str, TypeDecl] = {}  # type_name -> TypeDecl AST node
+        self.enum_variants: Dict[str, Dict[str, tuple]] = {}  # enum_name -> {variant_name -> (tag, fields)}
         
         # Generic type and function templates (not yet monomorphized)
         self.generic_types: Dict[str, TypeDecl] = {}  # name -> TypeDecl with type_params
@@ -4963,7 +4964,13 @@ class CodeGenerator:
                 type_name = expr.callee.object.name
                 if type_name in self.type_registry and expr.callee.member == "new":
                     return self._generate_type_new(type_name, expr.args)
-            
+
+                # Check for EnumType.VariantName(args) pattern
+                if type_name in self.enum_variants:
+                    variant_name = expr.callee.member
+                    if variant_name in self.enum_variants[type_name]:
+                        return self._generate_enum_constructor(type_name, variant_name, expr.args, expr.named_args)
+
             # Static method call: Type.method()
             return self._generate_method_call(MethodCallExpr(
                 expr.callee.object, expr.callee.member, expr.args))

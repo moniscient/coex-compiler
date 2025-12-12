@@ -290,8 +290,7 @@ func main() -> int
     return 0
 ~
 ''', "5\n")
-    
-    @pytest.mark.xfail(reason="Compiler bug: _collect_local_variables doesn't handle else_if_clauses tuples")
+
     def test_fizzbuzz_count(self, expect_output):
         # Count how many numbers 1-15 are divisible by 3 or 5
         expect_output('''

@@ -94,8 +94,7 @@ func main() -> int
 
 class TestEnums:
     """Tests for enum types."""
-    
-    @pytest.mark.xfail(reason="Compiler bug: enum variable storage type mismatch (i64 vs struct pointer)")
+
     def test_simple_enum(self, expect_output):
         expect_output('''
 type Color:
@@ -120,8 +119,7 @@ func main() -> int
     return 0
 ~
 ''', "2\n")
-    
-    @pytest.mark.xfail(reason="Compiler bug: enum variable storage type mismatch (i64 vs struct pointer)")
+
     def test_enum_with_data(self, expect_output):
         expect_output('''
 type Option:
@@ -142,8 +140,7 @@ func main() -> int
     return 0
 ~
 ''', "42\n")
-    
-    @pytest.mark.xfail(reason="Compiler bug: enum variable storage type mismatch (i64 vs struct pointer)")
+
     def test_enum_none_case(self, expect_output):
         expect_output('''
 type Option:
