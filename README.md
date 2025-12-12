@@ -69,7 +69,9 @@ func main() -> int
 
 ### Collections
 - **Lists**: literals `[1, 2, 3]`, comprehensions `[x * 2 for x in data]`
-- Iteration, `len()`, `get()` operations
+- **Maps**: literals `{1: "one", 2: "two"}`, methods `get`, `set`, `has`, `remove`, `len`
+- **Sets**: literals `{1, 2, 3}`, methods `add`, `has`, `remove`, `len`
+- Iteration, comprehensions for all collection types
 
 ### Cellular Automata
 ```coex
@@ -127,7 +129,7 @@ python3 coexc.py program.coex --emit-ast
 
 **Current: Alpha** - Core language features working, concurrency is stubbed.
 
-### Working (121 tests passing)
+### Working (132 tests passing)
 
 | Category | Features |
 |----------|----------|
@@ -140,6 +142,8 @@ python3 coexc.py program.coex --emit-ast
 | **Traits** | Declaration, structural implementation |
 | **Tuples** | Construction, `.0`/`.1` access, destructuring |
 | **Lists** | Literals, comprehensions, iteration |
+| **Maps** | Literals, get/set/has/remove/len operations |
+| **Sets** | Literals, add/has/remove/len operations |
 | **Matrix/CA** | Creation, cell access, formulas (sequential) |
 | **Lambdas** | All function kinds, stored in variables |
 
@@ -148,7 +152,6 @@ python3 coexc.py program.coex --emit-ast
 | Feature | Status |
 |---------|--------|
 | `list.append()` | Bug in method dispatch |
-| Maps/Sets | Parsed, not implemented |
 | Concurrency | All features run sequentially |
 | Imports | Parsed, no module loading |
 | `while` loops | Grammar exists, no codegen |
@@ -192,7 +195,6 @@ python3 -m pytest tests/test_types.py::TestEnums::test_enum_with_data -v
 
 Contributions welcome! Areas that need work:
 
-- **Maps and Sets** - Implement hash table data structure
 - **Concurrency runtime** - Task scheduler, channels
 - **Module system** - File imports and namespaces
 - **Error messages** - Better diagnostics with line numbers
