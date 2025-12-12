@@ -10,6 +10,9 @@ python3 -m pytest tests/ -v --tb=short
 
 # Compile a file
 python3 coexc.py source.coex -o output
+
+# Regenerate parser from grammar (note: command is 'antlr' not 'antlr4' on this system)
+antlr -Dlanguage=Python3 -visitor Coex.g4
 ```
 
 ## Architecture
@@ -51,7 +54,7 @@ func main() -> int
 
 ## Feature Status (as of Dec 2024)
 
-### Fully Working (121 tests passing)
+### Fully Working (132 tests passing)
 - Arithmetic, comparisons, boolean logic
 - Variables, assignment, compound operators (`+=`, `-=`, etc.)
 - Control flow: `if`/`else`/`elif`, `for..in`, `loop`, `break`, `continue`
@@ -63,6 +66,8 @@ func main() -> int
 - Traits (structural implementation checking)
 - Matrix/CA (sequential execution, `cell` keyword)
 - List literals, `len()`, `get()`, iteration, comprehensions
+- Map literals: `{1: 10, 2: 20}`, methods: `get`, `set`, `has`, `remove`, `len`
+- Set literals: `{1, 2, 3}`, methods: `add`, `has`, `remove`, `len`
 - Lambdas: `formula(_ x: int) => x * 2`
 - Ranges: `start..stop` in for loops
 - Ternary: `cond ? then ; else`
@@ -71,8 +76,6 @@ func main() -> int
 | Issue | Description |
 |-------|-------------|
 | `list.append()` | Method dispatch type mismatch (expects `i8*`, gets `i64`) |
-| Map literals | `_generate_map()` returns null (stub implementation) |
-| Set operations | Not implemented |
 | Concurrency | All concurrent features run sequentially (stubs) |
 | Imports | Parsed but no module loading |
 
@@ -135,6 +138,5 @@ statement: varDeclStmt | ifStmt | forStmt | loopStmt | matchStmt
 - `select` statement (channel multiplexing - stub)
 - `within`/`else` (temporal constraints - stub)
 - `await` (returns value immediately)
-- Map/Set comprehensions
 - Parallel matrix execution
 - True concurrency
