@@ -1,0 +1,16 @@
+# Factorial Example
+# Demonstrates: formula functions, recursion, conditionals
+
+formula factorial(n: int) -> int
+    if n <= 1
+        return 1
+    else
+        return n * factorial(n - 1)
+    ~
+~
+
+func main() -> int
+    print(factorial(5))
+    print(factorial(10))
+    return 0
+~

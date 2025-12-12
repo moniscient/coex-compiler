@@ -1,0 +1,7 @@
+# Hello World in Coex
+# The simplest possible Coex program
+
+func main() -> int
+    print(42)
+    return 0
+~

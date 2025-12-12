@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Compiled outputs
+*.o
+*.out
+*.exe
+
+# LLVM IR dumps (debugging artifacts)
+*.ll
+
+# Temporary files
+*.tmp
+*.temp
+
+# macOS
+.DS_Store
+
+# ANTLR generated files that can be regenerated
+# Uncomment these if you want to track only the grammar
+# CoexLexer.interp
+# CoexParser.interp
+# Coex.interp
+# Coex.tokens
+# CoexLexer.tokens

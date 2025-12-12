@@ -1,0 +1,55 @@
+# Coex Compiler CI Pipeline
+#
+# Runs on every push and pull request:
+# 1. Install dependencies
+# 2. Run all tests
+# 3. Verify example programs compile and run correctly
+
+name: Coex CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run tests
+      run: |
+        python -m pytest tests/ -v --tb=short
+    
+    - name: Test example programs
+      run: |
+        if [ -d "examples" ]; then
+          for f in examples/*.coex; do
+            if [ -f "$f" ]; then
+              echo "Compiling $f..."
+              python coexc.py "$f" -o "${f%.coex}"
+              if [ -f "${f%.coex}.expected" ]; then
+                echo "Checking output..."
+                "${f%.coex}" > /tmp/actual.txt
+                diff -u "${f%.coex}.expected" /tmp/actual.txt
+              else
+                echo "Running..."
+                "${f%.coex}"
+              fi
+            fi
+          done
+        fi

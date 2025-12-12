@@ -1,0 +1,18 @@
+# Fibonacci Example
+# Demonstrates: recursion, multiple function calls
+
+formula fib(n: int) -> int
+    if n <= 1
+        return n
+    else
+        return fib(n - 1) + fib(n - 2)
+    ~
+~
+
+func main() -> int
+    # Print first 10 Fibonacci numbers
+    for i in range(0, 10)
+        print(fib(i))
+    ~
+    return 0
+~
