@@ -104,6 +104,24 @@ var double: formula(int) -> int = formula(_ x: int) => x * 2
 print(double(21))  # 42
 ```
 
+### Inline LLVM IR
+Embed raw LLVM IR for low-level operations:
+```coex
+func main() -> int
+    var x: int = 3
+    var y: int = 4
+    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+        %r = add i64 %a, %b
+        ret i64 %r
+    """
+    print(result)  # 7
+    return 0
+~
+```
+- Binds Coex variables to LLVM registers: `x -> %a`
+- Specifies return register and type: `-> %r: i64`
+- Uses triple-quoted strings for the IR body
+
 ## Installation
 
 ### Prerequisites
@@ -142,7 +160,7 @@ python3 coexc.py program.coex --emit-ast
 
 **Current: Alpha** - Core language features working, concurrency is stubbed.
 
-### Working (145 tests passing)
+### Working (156 tests passing)
 
 | Category | Features |
 |----------|----------|
@@ -160,6 +178,7 @@ python3 coexc.py program.coex --emit-ast
 | **Matrix/CA** | Creation, cell access, formulas (sequential) |
 | **Lambdas** | All function kinds, stored in variables |
 | **Modules** | Import, qualified calls, replace aliases |
+| **Inline LLVM IR** | Variable bindings, return values, raw IR blocks |
 
 ### Known Limitations
 
