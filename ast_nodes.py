@@ -355,6 +355,30 @@ class ChannelReceiveExpr(Expr):
 
 
 @dataclass
+class LlvmBinding:
+    """Maps a Coex variable to an LLVM register"""
+    coex_name: str              # e.g., "x"
+    llvm_register: str          # e.g., "%a"
+    type_hint: Optional[str] = None  # e.g., "i64"
+
+
+@dataclass
+class LlvmIrExpr(Expr):
+    """Inline LLVM IR expression (returns a value)
+
+    Example:
+        var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 \"\"\"
+            %r = add i64 %a, %b
+            ret i64 %r
+        \"\"\"
+    """
+    bindings: List[LlvmBinding]
+    ir_body: str
+    return_register: str        # e.g., "%result"
+    return_type: str            # e.g., "i64"
+
+
+@dataclass
 class MatchExpr(Expr):
     """Match expression (returns value)"""
     subject: Expr
@@ -547,10 +571,24 @@ class ChannelSendStmt(Stmt):
     value: Expr
 
 
-@dataclass 
+@dataclass
 class PrintStmt(Stmt):
     """Built-in print for testing"""
     value: Expr
+
+
+@dataclass
+class LlvmIrStmt(Stmt):
+    """Inline LLVM IR statement (void, no return value)
+
+    Example:
+        llvm_ir \"\"\"
+            fence seq_cst
+            ret void
+        \"\"\"
+    """
+    bindings: List[LlvmBinding]
+    ir_body: str
 
 
 # ============================================================================

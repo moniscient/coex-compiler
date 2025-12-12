@@ -101,6 +101,10 @@ class CodeGenerator:
         self.module_search_paths: PyList[str] = []
         self.current_module: Optional[str] = None  # Track which module we're compiling
 
+        # Inline LLVM IR support
+        self._pending_inline_ir: PyList[Dict] = []  # Pending IR to inject during serialization
+        self._inline_ir_counter = 0  # Counter for unique stub function names
+
         # Declare external functions
         self._declare_builtins()
     
@@ -2785,7 +2789,7 @@ class CodeGenerator:
         for matrix_decl in program.matrices:
             self._generate_matrix_methods(matrix_decl)
         
-        return str(self.module)
+        return self.get_ir()
 
     # ========================================================================
     # Module Loading
@@ -3739,6 +3743,8 @@ class CodeGenerator:
             self._generate_select(stmt)
         elif isinstance(stmt, WithinStmt):
             self._generate_within(stmt)
+        elif isinstance(stmt, LlvmIrStmt):
+            self._generate_llvm_ir_block(stmt)
         elif isinstance(stmt, ExprStmt):
             self._generate_expression(stmt.expr)
     
@@ -4779,7 +4785,10 @@ class CodeGenerator:
         elif isinstance(expr, CellIndexExpr):
             # Matrix cell[dx, dy] - relative neighbor access
             return self._generate_cell_index_access(expr)
-        
+
+        elif isinstance(expr, LlvmIrExpr):
+            return self._generate_llvm_ir_block(expr)
+
         else:
             return ir.Constant(ir.IntType(64), 0)
     
@@ -7047,18 +7056,130 @@ class CodeGenerator:
         
         return var_names
 
+    # ========================================================================
+    # Inline LLVM IR Support
+    # ========================================================================
+
+    def _generate_llvm_ir_block(self, block) -> Optional[ir.Value]:
+        """Generate code for inline LLVM IR via stub function pattern
+
+        Creates a stub function declaration that will be replaced with the
+        actual IR body during module serialization.
+        """
+        from typing import Union
+        self._inline_ir_counter += 1
+        stub_name = f"__coex_llvm_ir_{self._inline_ir_counter}"
+
+        # Collect argument types/values from bindings
+        arg_types = []
+        arg_values = []
+        param_names = []
+
+        for binding in block.bindings:
+            if binding.coex_name not in self.locals:
+                raise RuntimeError(f"Unknown variable in llvm_ir binding: {binding.coex_name}")
+            var_ptr = self.locals[binding.coex_name]
+            var_val = self.builder.load(var_ptr)
+            arg_types.append(var_val.type)
+            arg_values.append(var_val)
+            param_names.append(binding.llvm_register.lstrip('%'))
+
+        # Determine return type
+        if isinstance(block, LlvmIrExpr):
+            ret_type = self._llvm_type_from_hint(block.return_type)
+        else:
+            ret_type = ir.VoidType()
+
+        # Create stub function declaration
+        func_type = ir.FunctionType(ret_type, arg_types)
+        stub_func = ir.Function(self.module, func_type, name=stub_name)
+
+        # Record for post-processing during serialization
+        self._pending_inline_ir.append({
+            'name': stub_name,
+            'param_names': param_names,
+            'param_types': [str(t) for t in arg_types],
+            'return_type': str(ret_type),
+            'ir_body': block.ir_body,
+        })
+
+        # Generate call to the stub function
+        if isinstance(ret_type, ir.VoidType):
+            self.builder.call(stub_func, arg_values)
+            return None
+        else:
+            return self.builder.call(stub_func, arg_values)
+
+    def _llvm_type_from_hint(self, hint: str) -> ir.Type:
+        """Convert LLVM type hint string to llvmlite type"""
+        type_map = {
+            'i1': ir.IntType(1),
+            'i8': ir.IntType(8),
+            'i16': ir.IntType(16),
+            'i32': ir.IntType(32),
+            'i64': ir.IntType(64),
+            'i128': ir.IntType(128),
+            'float': ir.FloatType(),
+            'double': ir.DoubleType(),
+            'ptr': ir.IntType(8).as_pointer(),
+            'void': ir.VoidType(),
+        }
+        return type_map.get(hint.lower(), ir.IntType(64))
+
+    def _inject_inline_ir(self, raw_ir: str) -> str:
+        """Replace stub declarations with full function definitions
+
+        This is called during module serialization to inject the user's
+        raw LLVM IR into the module.
+        """
+        import re
+
+        if not self._pending_inline_ir:
+            return raw_ir
+
+        result = raw_ir
+
+        for pending in self._pending_inline_ir:
+            name = pending['name']
+            param_names = pending['param_names']
+            param_types = pending['param_types']
+            ret_type = pending['return_type']
+            ir_body = pending['ir_body']
+
+            # Build function definition with named parameters
+            # llvmlite uses quotes around names, so we need to match that
+            params = ', '.join(f"{t} %{n}" for t, n in zip(param_types, param_names))
+            body_indented = '\n'.join('  ' + line for line in ir_body.split('\n') if line.strip())
+
+            func_def = f"""define {ret_type} @"{name}"({params}) {{
+entry:
+{body_indented}
+}}"""
+
+            # Find and replace the declaration with the definition
+            # llvmlite wraps names in quotes: declare i64 @"__coex_llvm_ir_1"(i64 %".1", i64 %".2")
+            decl_pattern = rf'declare\s+{re.escape(ret_type)}\s+@"{re.escape(name)}"\s*\([^)]*\)'
+            result = re.sub(decl_pattern, func_def, result)
+
+        return result
+
     def compile_to_object(self, output_path: str):
         """Compile module to object file"""
         llvm_ir = str(self.module)
-        mod = binding.parse_assembly(llvm_ir)
-        mod.verify()
-        
+        llvm_ir = self._inject_inline_ir(llvm_ir)  # Inject inline LLVM IR
+        try:
+            mod = binding.parse_assembly(llvm_ir)
+            mod.verify()
+        except Exception as e:
+            raise RuntimeError(f"LLVM IR error (possibly in inline IR): {e}")
+
         target = binding.Target.from_default_triple()
         target_machine = target.create_target_machine()
-        
+
         with open(output_path, "wb") as f:
             f.write(target_machine.emit_object(mod))
-    
+
     def get_ir(self) -> str:
         """Get LLVM IR as string"""
-        return str(self.module)
+        raw_ir = str(self.module)
+        return self._inject_inline_ir(raw_ir)

@@ -207,6 +207,7 @@ statement
     : varDeclStmt
     | tupleDestructureStmt
     | controlFlowStmt
+    | llvmIrStmt
     | simpleStmt
     ;
 
@@ -226,6 +227,27 @@ controlFlowStmt
 // Handles both assignment (x = 5) and expression statements (print())
 simpleStmt
     : expression (assignOp expression)?
+    ;
+
+// Inline LLVM IR statement/expression
+llvmIrStmt
+    : LLVM_IR llvmBindings? llvmReturn? TRIPLE_STRING
+    ;
+
+llvmBindings
+    : LPAREN llvmBinding (COMMA llvmBinding)* RPAREN
+    ;
+
+llvmBinding
+    : IDENTIFIER ARROW LLVM_REGISTER (COLON llvmTypeHint)?
+    ;
+
+llvmReturn
+    : ARROW LLVM_REGISTER COLON llvmTypeHint
+    ;
+
+llvmTypeHint
+    : IDENTIFIER
     ;
 
 varDeclStmt
@@ -445,6 +467,12 @@ primaryExpr
     | listLiteral
     | mapLiteral
     | lambdaExpr
+    | llvmIrExpr                                            // Inline LLVM IR expression
+    ;
+
+// Inline LLVM IR as expression (with return value)
+llvmIrExpr
+    : LLVM_IR llvmBindings? llvmReturn TRIPLE_STRING
     ;
 
 // Literals
@@ -635,6 +663,9 @@ IMPORT      : 'import' ;
 REPLACE     : 'replace' ;
 WITH        : 'with' ;
 
+// Inline LLVM IR
+LLVM_IR     : 'llvm_ir' ;
+
 // Block terminators
 END         : 'end' ;
 TILDE       : '~' ;
@@ -679,6 +710,11 @@ LARROW      : '<-' ;  // Channel receive operator (Go style)
 // Range and null coalescing
 DOTDOT      : '..' ;
 NULL_COALESCE : '??' ;
+
+// LLVM register (must come before PERCENT)
+LLVM_REGISTER
+    : '%' [a-zA-Z_] [a-zA-Z0-9_]*
+    ;
 
 // Single-character operators
 PLUS        : '+' ;
@@ -736,6 +772,12 @@ fragment DIGIT
 
 fragment HEX_DIGIT
     : [0-9a-fA-F]
+    ;
+
+// Triple-quoted strings (for multi-line content like inline LLVM IR)
+TRIPLE_STRING
+    : '"""' .*? '"""'
+    | '\'\'\'' .*? '\'\'\''
     ;
 
 // String literals (both single and double quotes are equivalent)

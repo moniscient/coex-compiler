@@ -425,16 +425,18 @@ class ASTBuilder:
     def visit_statement(self, ctx: CoexParser.StatementContext) -> Optional[Stmt]:
         """Visit a statement"""
         child = ctx.getChild(0)
-        
+
         if isinstance(child, CoexParser.VarDeclStmtContext):
             return self.visit_var_decl_stmt(child)
         elif hasattr(CoexParser, 'TupleDestructureStmtContext') and isinstance(child, CoexParser.TupleDestructureStmtContext):
             return self.visit_tuple_destructure_stmt(child)
         elif isinstance(child, CoexParser.ControlFlowStmtContext):
             return self.visit_control_flow_stmt(child)
+        elif hasattr(CoexParser, 'LlvmIrStmtContext') and isinstance(child, CoexParser.LlvmIrStmtContext):
+            return self.visit_llvm_ir_stmt(child)
         elif isinstance(child, CoexParser.SimpleStmtContext):
             return self.visit_simple_stmt(child)
-        
+
         return None
     
     def visit_tuple_destructure_stmt(self, ctx) -> TupleDestructureStmt:
@@ -444,7 +446,87 @@ class ASTBuilder:
         # Get the expression
         value = self.visit_expression(ctx.expression())
         return TupleDestructureStmt(names=names, value=value)
-    
+
+    def visit_llvm_ir_stmt(self, ctx) -> Stmt:
+        """Visit an inline LLVM IR statement
+
+        Syntax:
+            llvm_ir(x -> %a, y -> %b) -> %result: i64 \"\"\"
+                %result = add i64 %a, %b
+                ret i64 %result
+            \"\"\"
+
+        Returns LlvmIrExpr if there's a return specification, otherwise LlvmIrStmt.
+        """
+        # Parse bindings
+        bindings = []
+        if ctx.llvmBindings():
+            for binding_ctx in ctx.llvmBindings().llvmBinding():
+                coex_name = binding_ctx.IDENTIFIER().getText()
+                llvm_reg = binding_ctx.LLVM_REGISTER().getText()
+                type_hint = None
+                if binding_ctx.llvmTypeHint():
+                    type_hint = binding_ctx.llvmTypeHint().getText()
+                bindings.append(LlvmBinding(coex_name, llvm_reg, type_hint))
+
+        # Extract IR body from triple-quoted string
+        ir_body = ctx.TRIPLE_STRING().getText()
+        ir_body = self._clean_triple_string(ir_body)
+
+        # Check for return specification
+        if ctx.llvmReturn():
+            return_reg = ctx.llvmReturn().LLVM_REGISTER().getText()
+            return_type = ctx.llvmReturn().llvmTypeHint().getText()
+            return LlvmIrExpr(bindings, ir_body, return_reg, return_type)
+        else:
+            return LlvmIrStmt(bindings, ir_body)
+
+    def visit_llvm_ir_expr(self, ctx) -> LlvmIrExpr:
+        """Visit an inline LLVM IR expression (with return value)
+
+        This is used when llvm_ir appears as an expression, e.g.:
+            var result: int = llvm_ir(x -> %a) -> %r: i64 \"\"\"...\"\"\"
+        """
+        # Parse bindings
+        bindings = []
+        if ctx.llvmBindings():
+            for binding_ctx in ctx.llvmBindings().llvmBinding():
+                coex_name = binding_ctx.IDENTIFIER().getText()
+                llvm_reg = binding_ctx.LLVM_REGISTER().getText()
+                type_hint = None
+                if binding_ctx.llvmTypeHint():
+                    type_hint = binding_ctx.llvmTypeHint().getText()
+                bindings.append(LlvmBinding(coex_name, llvm_reg, type_hint))
+
+        # Extract IR body from triple-quoted string
+        ir_body = ctx.TRIPLE_STRING().getText()
+        ir_body = self._clean_triple_string(ir_body)
+
+        # llvmReturn is required for expression form
+        return_reg = ctx.llvmReturn().LLVM_REGISTER().getText()
+        return_type = ctx.llvmReturn().llvmTypeHint().getText()
+
+        return LlvmIrExpr(bindings, ir_body, return_reg, return_type)
+
+    def _clean_triple_string(self, raw: str) -> str:
+        """Remove triple quotes and normalize indentation"""
+        # Strip """ or '''
+        if raw.startswith('"""'):
+            content = raw[3:-3]
+        elif raw.startswith("'''"):
+            content = raw[3:-3]
+        else:
+            content = raw
+
+        # Remove common leading indentation
+        lines = content.split('\n')
+        non_empty = [line for line in lines if line.strip()]
+        if non_empty:
+            min_indent = min(len(line) - len(line.lstrip()) for line in non_empty)
+            lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
+
+        return '\n'.join(lines).strip()
+
     def visit_var_decl_stmt(self, ctx: CoexParser.VarDeclStmtContext) -> VarDecl:
         """Visit a variable declaration statement"""
         name = ctx.IDENTIFIER().getText()
@@ -885,7 +967,9 @@ class ASTBuilder:
             return self.visit_map_literal(ctx.mapLiteral())
         elif ctx.lambdaExpr():
             return self.visit_lambda_expr(ctx.lambdaExpr())
-        
+        elif hasattr(CoexParser, 'LlvmIrExprContext') and ctx.llvmIrExpr():
+            return self.visit_llvm_ir_expr(ctx.llvmIrExpr())
+
         return IntLiteral(0)  # fallback
     
     def visit_literal(self, ctx: CoexParser.LiteralContext) -> Expr:

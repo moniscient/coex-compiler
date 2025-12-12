@@ -350,6 +350,51 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#llvmIrStmt.
+    def enterLlvmIrStmt(self, ctx:CoexParser.LlvmIrStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmIrStmt.
+    def exitLlvmIrStmt(self, ctx:CoexParser.LlvmIrStmtContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#llvmBindings.
+    def enterLlvmBindings(self, ctx:CoexParser.LlvmBindingsContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmBindings.
+    def exitLlvmBindings(self, ctx:CoexParser.LlvmBindingsContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#llvmBinding.
+    def enterLlvmBinding(self, ctx:CoexParser.LlvmBindingContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmBinding.
+    def exitLlvmBinding(self, ctx:CoexParser.LlvmBindingContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#llvmReturn.
+    def enterLlvmReturn(self, ctx:CoexParser.LlvmReturnContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmReturn.
+    def exitLlvmReturn(self, ctx:CoexParser.LlvmReturnContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#llvmTypeHint.
+    def enterLlvmTypeHint(self, ctx:CoexParser.LlvmTypeHintContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmTypeHint.
+    def exitLlvmTypeHint(self, ctx:CoexParser.LlvmTypeHintContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#varDeclStmt.
     def enterVarDeclStmt(self, ctx:CoexParser.VarDeclStmtContext):
         pass
@@ -716,6 +761,15 @@ class CoexListener(ParseTreeListener):
 
     # Exit a parse tree produced by CoexParser#primaryExpr.
     def exitPrimaryExpr(self, ctx:CoexParser.PrimaryExprContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#llvmIrExpr.
+    def enterLlvmIrExpr(self, ctx:CoexParser.LlvmIrExprContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#llvmIrExpr.
+    def exitLlvmIrExpr(self, ctx:CoexParser.LlvmIrExprContext):
         pass
 
 

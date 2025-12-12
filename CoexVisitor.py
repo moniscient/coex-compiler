@@ -199,6 +199,31 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#llvmIrStmt.
+    def visitLlvmIrStmt(self, ctx:CoexParser.LlvmIrStmtContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#llvmBindings.
+    def visitLlvmBindings(self, ctx:CoexParser.LlvmBindingsContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#llvmBinding.
+    def visitLlvmBinding(self, ctx:CoexParser.LlvmBindingContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#llvmReturn.
+    def visitLlvmReturn(self, ctx:CoexParser.LlvmReturnContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#llvmTypeHint.
+    def visitLlvmTypeHint(self, ctx:CoexParser.LlvmTypeHintContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#varDeclStmt.
     def visitVarDeclStmt(self, ctx:CoexParser.VarDeclStmtContext):
         return self.visitChildren(ctx)
@@ -401,6 +426,11 @@ class CoexVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by CoexParser#primaryExpr.
     def visitPrimaryExpr(self, ctx:CoexParser.PrimaryExprContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#llvmIrExpr.
+    def visitLlvmIrExpr(self, ctx:CoexParser.LlvmIrExprContext):
         return self.visitChildren(ctx)
 
 
