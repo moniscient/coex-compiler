@@ -2619,12 +2619,12 @@ class CodeGenerator:
             return self.list_struct.as_pointer()
         
         elif isinstance(coex_type, MapType):
-            # Maps are opaque pointers for now
-            return ir.IntType(8).as_pointer()
-        
+            # Maps are pointers to Map struct
+            return self.map_struct.as_pointer()
+
         elif isinstance(coex_type, SetType):
-            # Sets are opaque pointers for now
-            return ir.IntType(8).as_pointer()
+            # Sets are pointers to Set struct
+            return self.set_struct.as_pointer()
         
         elif isinstance(coex_type, ChannelType):
             # Channels are pointers to Channel struct
@@ -4600,7 +4600,10 @@ class CodeGenerator:
         
         elif isinstance(expr, MapExpr):
             return self._generate_map(expr)
-        
+
+        elif isinstance(expr, SetExpr):
+            return self._generate_set(expr)
+
         elif isinstance(expr, ListComprehension):
             return self._generate_list_comprehension(expr)
         
@@ -5591,8 +5594,34 @@ class CodeGenerator:
         return list_ptr
     
     def _generate_map(self, expr: MapExpr) -> ir.Value:
-        """Generate code for map literal"""
-        return ir.Constant(ir.IntType(8).as_pointer(), None)
+        """Generate code for map literal: {key: value, ...}"""
+        # Create empty map
+        map_ptr = self.builder.call(self.map_new, [])
+
+        # Add each entry
+        for key_expr, value_expr in expr.entries:
+            key = self._generate_expression(key_expr)
+            value = self._generate_expression(value_expr)
+            # Cast to i64 for map storage
+            key_i64 = self._cast_value(key, ir.IntType(64))
+            value_i64 = self._cast_value(value, ir.IntType(64))
+            self.builder.call(self.map_set, [map_ptr, key_i64, value_i64])
+
+        return map_ptr
+
+    def _generate_set(self, expr: SetExpr) -> ir.Value:
+        """Generate code for set literal: {a, b, c}"""
+        # Create empty set
+        set_ptr = self.builder.call(self.set_new, [])
+
+        # Add each element
+        for elem_expr in expr.elements:
+            elem = self._generate_expression(elem_expr)
+            # Cast to i64 for set storage
+            elem_i64 = self._cast_value(elem, ir.IntType(64))
+            self.builder.call(self.set_add, [set_ptr, elem_i64])
+
+        return set_ptr
     
     def _generate_list_comprehension(self, expr: ListComprehension) -> ir.Value:
         """Generate code for list comprehension via desugaring.

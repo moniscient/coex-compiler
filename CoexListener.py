@@ -341,6 +341,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#tupleDestructureStmt.
+    def enterTupleDestructureStmt(self, ctx:CoexParser.TupleDestructureStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#tupleDestructureStmt.
+    def exitTupleDestructureStmt(self, ctx:CoexParser.TupleDestructureStmtContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#assignOp.
     def enterAssignOp(self, ctx:CoexParser.AssignOpContext):
         pass
@@ -383,6 +392,15 @@ class CoexListener(ParseTreeListener):
 
     # Exit a parse tree produced by CoexParser#elseClause.
     def exitElseClause(self, ctx:CoexParser.ElseClauseContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#bindingPattern.
+    def enterBindingPattern(self, ctx:CoexParser.BindingPatternContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#bindingPattern.
+    def exitBindingPattern(self, ctx:CoexParser.BindingPatternContext):
         pass
 
 
@@ -725,6 +743,24 @@ class CoexListener(ParseTreeListener):
 
     # Exit a parse tree produced by CoexParser#listLiteral.
     def exitListLiteral(self, ctx:CoexParser.ListLiteralContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#comprehensionClauses.
+    def enterComprehensionClauses(self, ctx:CoexParser.ComprehensionClausesContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#comprehensionClauses.
+    def exitComprehensionClauses(self, ctx:CoexParser.ComprehensionClausesContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#comprehensionClause.
+    def enterComprehensionClause(self, ctx:CoexParser.ComprehensionClauseContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#comprehensionClause.
+    def exitComprehensionClause(self, ctx:CoexParser.ComprehensionClauseContext):
         pass
 
 

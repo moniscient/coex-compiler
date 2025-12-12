@@ -927,12 +927,12 @@ class ASTBuilder:
         return ListExpr(elements)
     
     def visit_map_literal(self, ctx: CoexParser.MapLiteralContext):
-        """Visit a map literal, set comprehension, or map comprehension"""
-        # Check for comprehensions
+        """Visit a map literal, set literal, or comprehension"""
+        # Check for comprehensions first
         if ctx.comprehensionClauses():
             clauses = self.visit_comprehension_clauses(ctx.comprehensionClauses())
             expressions = ctx.expression()
-            
+
             if len(expressions) == 2:
                 # Map comprehension: {key: value for ...}
                 key = self.visit_expression(expressions[0])
@@ -942,15 +942,25 @@ class ASTBuilder:
                 # Set comprehension: {expr for ...}
                 body = self.visit_expression(expressions[0])
                 return SetComprehension(body, clauses)
-        
-        # Regular map literal
-        entries = []
+
+        # Map literal: {key: value, ...}
         if ctx.mapEntryList():
+            entries = []
             for entry in ctx.mapEntryList().mapEntry():
                 key = self.visit_expression(entry.expression(0))
                 value = self.visit_expression(entry.expression(1))
                 entries.append((key, value))
-        return MapExpr(entries)
+            return MapExpr(entries)
+
+        # Set literal: {a, b, c}
+        if ctx.expressionList():
+            elements = []
+            for expr in ctx.expressionList().expression():
+                elements.append(self.visit_expression(expr))
+            return SetExpr(elements)
+
+        # Empty braces: {} -> empty map
+        return MapExpr([])
     
     def visit_comprehension_clauses(self, ctx) -> PyList[ComprehensionClause]:
         """Visit comprehension clauses"""

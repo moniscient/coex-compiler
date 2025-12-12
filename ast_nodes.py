@@ -292,6 +292,12 @@ class MapExpr(Expr):
 
 
 @dataclass
+class SetExpr(Expr):
+    """Set literal: {a, b, c}"""
+    elements: List[Expr]
+
+
+@dataclass
 class TupleExpr(Expr):
     """Tuple literal: (a, b, c) or (name: a, other: b)"""
     elements: List[tuple]  # List of (name, expr) or (None, expr)

@@ -483,10 +483,12 @@ expressionList
     ;
 
 // Map/Set literals and comprehensions
-// Map: {key: value, ...} or {key: value for pattern in iterable if condition}
-// Set: {expr for pattern in iterable if condition}
+// Map: {} or {key: value, ...} or {key: value for pattern in iterable if condition}
+// Set: {a, b, ...} or {expr for pattern in iterable if condition}
 mapLiteral
-    : LBRACE mapEntryList? RBRACE                                    // Regular map
+    : LBRACE RBRACE                                                  // Empty map
+    | LBRACE mapEntryList RBRACE                                     // Map literal
+    | LBRACE expressionList RBRACE                                   // Set literal
     | LBRACE expression COLON expression comprehensionClauses RBRACE // Map comprehension
     | LBRACE expression comprehensionClauses RBRACE                  // Set comprehension
     ;

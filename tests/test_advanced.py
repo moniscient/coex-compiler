@@ -327,6 +327,138 @@ func main() -> int
 ''', "5\n")
 
 
+class TestMaps:
+    """Tests for map literals and operations."""
+
+    def test_empty_map(self, expect_output):
+        """Empty map creation."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {}
+    print(m.len())
+    return 0
+~
+''', "0\n")
+
+    def test_map_literal(self, expect_output):
+        """Map literal with entries."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10, 2: 20, 3: 30}
+    print(m.len())
+    return 0
+~
+''', "3\n")
+
+    def test_map_get(self, expect_output):
+        """Get value from map."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 100, 2: 200}
+    print(m.get(2))
+    return 0
+~
+''', "200\n")
+
+    def test_map_has(self, expect_output):
+        """Check if key exists in map."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {5: 50, 10: 100}
+    if m.has(5)
+        print(1)
+    ~
+    if not m.has(7)
+        print(2)
+    ~
+    return 0
+~
+''', "1\n2\n")
+
+    def test_map_set(self, expect_output):
+        """Set value in map."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10}
+    m.set(2, 20)
+    print(m.get(2))
+    return 0
+~
+''', "20\n")
+
+    def test_map_remove(self, expect_output):
+        """Remove key from map."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10, 2: 20}
+    m.remove(1)
+    print(m.len())
+    return 0
+~
+''', "1\n")
+
+
+class TestSets:
+    """Tests for set literals and operations."""
+
+    def test_set_literal(self, expect_output):
+        """Set literal with elements."""
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {1, 2, 3}
+    print(s.len())
+    return 0
+~
+''', "3\n")
+
+    def test_set_has(self, expect_output):
+        """Check if element exists in set."""
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {10, 20, 30}
+    if s.has(20)
+        print(1)
+    ~
+    if not s.has(25)
+        print(2)
+    ~
+    return 0
+~
+''', "1\n2\n")
+
+    def test_set_add(self, expect_output):
+        """Add element to set."""
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {1, 2}
+    s.add(3)
+    print(s.len())
+    return 0
+~
+''', "3\n")
+
+    def test_set_remove(self, expect_output):
+        """Remove element from set."""
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {1, 2, 3}
+    s.remove(2)
+    print(s.len())
+    return 0
+~
+''', "2\n")
+
+    def test_set_no_duplicates(self, expect_output):
+        """Set should not allow duplicates."""
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {1, 1, 2, 2, 3}
+    print(s.len())
+    return 0
+~
+''', "3\n")
+
+
 class TestLambdas:
     """Tests for lambda expressions."""
 
