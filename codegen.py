@@ -224,8 +224,9 @@ class CodeGenerator:
         list_new_ty = ir.FunctionType(list_ptr, [i64])
         self.list_new = ir.Function(self.module, list_new_ty, name="coex_list_new")
         
-        # list_append(list: List*, elem: i8*, elem_size: i64)
-        list_append_ty = ir.FunctionType(ir.VoidType(), [list_ptr, i8_ptr, i64])
+        # list_append(list: List*, elem: i8*, elem_size: i64) -> List*
+        # Returns a NEW list with the element appended (value semantics)
+        list_append_ty = ir.FunctionType(list_ptr, [list_ptr, i8_ptr, i64])
         self.list_append = ir.Function(self.module, list_append_ty, name="coex_list_append")
         
         # list_get(list: List*, index: i64) -> i8*
@@ -289,78 +290,82 @@ class CodeGenerator:
         builder.ret(list_ptr)
     
     def _implement_list_append(self):
-        """Implement list_append: add element to list, grow if needed"""
+        """Implement list_append: return a NEW list with element appended.
+
+        This implements value semantics - original list is unchanged.
+        New list has capacity = max(old_cap, old_len + 1).
+        """
         func = self.list_append
         func.args[0].name = "list"
         func.args[1].name = "elem"
         func.args[2].name = "elem_size"
-        
+
         entry = func.append_basic_block("entry")
-        check_grow = func.append_basic_block("check_grow")
-        do_grow = func.append_basic_block("do_grow")
-        do_append = func.append_basic_block("do_append")
-        
         builder = ir.IRBuilder(entry)
-        list_ptr = func.args[0]
+
+        old_list = func.args[0]
         elem_ptr = func.args[1]
         elem_size = func.args[2]
-        
-        # Load len and cap
-        len_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        length = builder.load(len_ptr)
-        
-        cap_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        cap = builder.load(cap_ptr)
-        
-        builder.branch(check_grow)
-        
-        # Check if we need to grow
-        builder.position_at_end(check_grow)
-        need_grow = builder.icmp_signed(">=", length, cap)
-        builder.cbranch(need_grow, do_grow, do_append)
-        
-        # Grow the array (double capacity)
-        builder.position_at_end(do_grow)
-        new_cap = builder.mul(cap, ir.Constant(ir.IntType(64), 2))
-        builder.store(new_cap, cap_ptr)
-        
-        # Allocate new data
-        new_size = builder.mul(new_cap, elem_size)
-        new_data = builder.call(self.malloc, [new_size])
-        
-        # Copy old data
-        data_field_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        old_data = builder.load(data_field_ptr)
-        old_size = builder.mul(length, elem_size)
-        builder.call(self.memcpy, [new_data, old_data, old_size])
-        
-        # Free old data and store new
-        builder.call(self.free, [old_data])
-        builder.store(new_data, data_field_ptr)
-        builder.branch(do_append)
-        
-        # Append element
-        builder.position_at_end(do_append)
-        # Reload data pointer (might have changed)
-        data_field_ptr2 = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        data = builder.load(data_field_ptr2)
-        
-        # Reload length (use phi or just reload)
-        len_ptr2 = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        current_len = builder.load(len_ptr2)
-        
-        # Calculate offset: len * elem_size
-        offset = builder.mul(current_len, elem_size)
-        dest = builder.gep(data, [offset])
-        
-        # Copy element
+
+        # Get old list's len and elem_size
+        old_len_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_len = builder.load(old_len_ptr)
+
+        # New length = old_len + 1
+        new_len = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
+
+        # Create new list with elem_size from old list
+        old_elem_size_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        old_elem_size = builder.load(old_elem_size_ptr)
+        new_list = builder.call(self.list_new, [old_elem_size])
+
+        # Set new list's len = old_len + 1
+        new_len_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(new_len, new_len_ptr)
+
+        # Ensure new list has enough capacity
+        # Get new list's current cap (starts at 8 from list_new)
+        new_cap_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        new_cap = builder.load(new_cap_ptr)
+
+        # If new_len > new_cap, we need to reallocate
+        need_grow = builder.icmp_signed(">", new_len, new_cap)
+        grow_block = func.append_basic_block("grow")
+        continue_block = func.append_basic_block("continue")
+        builder.cbranch(need_grow, grow_block, continue_block)
+
+        # Grow block: reallocate data buffer
+        builder.position_at_end(grow_block)
+        # New capacity = new_len (exact fit for appended list)
+        builder.store(new_len, new_cap_ptr)
+        new_data_size = builder.mul(new_len, old_elem_size)
+        new_data_ptr_field = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_new_data = builder.load(new_data_ptr_field)
+        builder.call(self.free, [old_new_data])
+        fresh_data = builder.call(self.malloc, [new_data_size])
+        builder.store(fresh_data, new_data_ptr_field)
+        builder.branch(continue_block)
+
+        # Continue block: copy old data and append new element
+        builder.position_at_end(continue_block)
+
+        # Get data pointers
+        old_data_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_data = builder.load(old_data_ptr)
+
+        new_data_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_data = builder.load(new_data_ptr)
+
+        # Copy old data to new list
+        copy_size = builder.mul(old_len, elem_size)
+        builder.call(self.memcpy, [new_data, old_data, copy_size])
+
+        # Append the new element at position old_len
+        offset = builder.mul(old_len, elem_size)
+        dest = builder.gep(new_data, [offset])
         builder.call(self.memcpy, [dest, elem_ptr, elem_size])
-        
-        # Increment length
-        new_len = builder.add(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_ptr2)
-        
-        builder.ret_void()
+
+        builder.ret(new_list)
     
     def _implement_list_get(self):
         """Implement list_get: return pointer to element at index"""
@@ -1952,7 +1957,11 @@ class CodeGenerator:
         src_cap = self.builder.load(src_cap_ptr)
 
         # Create new set
-        dst = self.builder.call(self.set_new, [])
+        initial_dst = self.builder.call(self.set_new, [])
+
+        # Allocate pointer to track dst across loop iterations (value semantics)
+        dst_ptr = self.builder.alloca(self.set_struct.as_pointer(), name="dst_set")
+        self.builder.store(initial_dst, dst_ptr)
 
         # Get source entries array
         src_entries_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2009,8 +2018,10 @@ class CodeGenerator:
         else:
             copied_i64 = self._cast_value(copied_elem, i64)
 
-        # Add to destination set
-        self.builder.call(self.set_add, [dst, copied_i64])
+        # Add to destination set (set_add returns NEW set with value semantics)
+        current_dst = self.builder.load(dst_ptr)
+        new_dst = self.builder.call(self.set_add, [current_dst, copied_i64])
+        self.builder.store(new_dst, dst_ptr)
         self.builder.branch(loop_next)
 
         # Loop next
@@ -2022,7 +2033,7 @@ class CodeGenerator:
 
         # Loop end
         self.builder.position_at_end(loop_end)
-        return dst
+        return self.builder.load(dst_ptr)
 
     def _generate_map_deep_copy(self, src: ir.Value, key_type: Type, value_type: Type) -> ir.Value:
         """Deep copy a map, recursively copying values if they are collections."""
@@ -2034,7 +2045,11 @@ class CodeGenerator:
         src_cap = self.builder.load(src_cap_ptr)
 
         # Create new map
-        dst = self.builder.call(self.map_new, [])
+        initial_dst = self.builder.call(self.map_new, [])
+
+        # Allocate pointer to track dst across loop iterations (value semantics)
+        dst_ptr = self.builder.alloca(self.map_struct.as_pointer(), name="dst_map")
+        self.builder.store(initial_dst, dst_ptr)
 
         # Get source entries array
         src_entries_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2093,8 +2108,10 @@ class CodeGenerator:
         else:
             copied_i64 = self._cast_value(copied_val, i64)
 
-        # Add to destination map
-        self.builder.call(self.map_set, [dst, key, copied_i64])
+        # Add to destination map (map_set returns NEW map with value semantics)
+        current_dst = self.builder.load(dst_ptr)
+        new_dst = self.builder.call(self.map_set, [current_dst, key, copied_i64])
+        self.builder.store(new_dst, dst_ptr)
         self.builder.branch(loop_next)
 
         # Loop next
@@ -2106,7 +2123,7 @@ class CodeGenerator:
 
         # Loop end
         self.builder.position_at_end(loop_end)
-        return dst
+        return self.builder.load(dst_ptr)
 
     def _generate_array_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
         """Deep copy an array, recursively copying elements if they are collections."""
@@ -2274,8 +2291,9 @@ class CodeGenerator:
         map_new_ty = ir.FunctionType(map_ptr, [])
         self.map_new = ir.Function(self.module, map_new_ty, name="coex_map_new")
         
-        # map_set(map: Map*, key: i64, value: i64)
-        map_set_ty = ir.FunctionType(ir.VoidType(), [map_ptr, i64, i64])
+        # map_set(map: Map*, key: i64, value: i64) -> Map*
+        # Returns a NEW map with the key-value pair set (value semantics)
+        map_set_ty = ir.FunctionType(map_ptr, [map_ptr, i64, i64])
         self.map_set = ir.Function(self.module, map_set_ty, name="coex_map_set")
         
         # map_get(map: Map*, key: i64) -> i64
@@ -2622,69 +2640,78 @@ class CodeGenerator:
         builder.ret_void()
     
     def _implement_map_set(self):
-        """Set key-value pair in map."""
+        """Return a NEW map with key-value pair set (value semantics).
+
+        This implements value semantics - original map is unchanged.
+        """
         func = self.map_set
-        func.args[0].name = "map"
+        func.args[0].name = "old_map"
         func.args[1].name = "key"
         func.args[2].name = "value"
-        
+
         entry = func.append_basic_block("entry")
         check_grow = func.append_basic_block("check_grow")
         do_grow = func.append_basic_block("do_grow")
         do_insert = func.append_basic_block("do_insert")
         new_entry = func.append_basic_block("new_entry")
         store_values = func.append_basic_block("store_values")
-        
+
         builder = ir.IRBuilder(entry)
-        
-        map_ptr = func.args[0]
+
+        old_map = func.args[0]
         key = func.args[1]
         value = func.args[2]
-        
+
+        # First, create a copy of the old map (value semantics)
+        new_map = builder.call(self.map_copy, [old_map])
+
         builder.branch(check_grow)
-        
+
+        # All operations below work on new_map, leaving old_map unchanged
         builder.position_at_end(check_grow)
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        len_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
-        cap_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        cap_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         cap = builder.load(cap_field)
-        
+
         len_times_4 = builder.mul(length, ir.Constant(ir.IntType(64), 4))
         cap_times_3 = builder.mul(cap, ir.Constant(ir.IntType(64), 3))
         need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
         builder.cbranch(need_grow, do_grow, do_insert)
-        
+
         builder.position_at_end(do_grow)
-        builder.call(self.map_grow, [map_ptr])
+        builder.call(self.map_grow, [new_map])
         builder.branch(do_insert)
-        
+
         builder.position_at_end(do_insert)
-        slot = builder.call(self.map_find_slot, [map_ptr, key])
-        
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        slot = builder.call(self.map_find_slot, [new_map, key])
+
+        entries_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         entries = builder.load(entries_field)
-        
+
         e_ptr = builder.gep(entries, [slot])
         state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         state = builder.load(state_ptr)
-        
+
         is_new = builder.icmp_unsigned("!=", state, ir.Constant(ir.IntType(8), 1))
         builder.cbranch(is_new, new_entry, store_values)
-        
+
         builder.position_at_end(new_entry)
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        current_len = builder.load(len_field)
+        len_field2 = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        current_len = builder.load(len_field2)
         new_len = builder.add(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field)
+        builder.store(new_len, len_field2)
         builder.branch(store_values)
-        
+
         builder.position_at_end(store_values)
         key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(key, key_ptr)
         value_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         builder.store(value, value_ptr)
         builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-        builder.ret_void()
+
+        # Return the new map (old_map is unchanged)
+        builder.ret(new_map)
     
     def _implement_map_get(self):
         """Get value for key (returns 0 if not found)."""
@@ -2987,8 +3014,9 @@ class CodeGenerator:
         set_new_ty = ir.FunctionType(set_ptr, [])
         self.set_new = ir.Function(self.module, set_new_ty, name="coex_set_new")
         
-        # set_add(set: Set*, key: i64)
-        set_add_ty = ir.FunctionType(ir.VoidType(), [set_ptr, i64])
+        # set_add(set: Set*, key: i64) -> Set*
+        # Returns a NEW set with the key added (value semantics)
+        set_add_ty = ir.FunctionType(set_ptr, [set_ptr, i64])
         self.set_add = ir.Function(self.module, set_add_ty, name="coex_set_add")
         
         # set_has(set: Set*, key: i64) -> bool
@@ -3282,15 +3310,33 @@ class CodeGenerator:
         is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
         builder.cbranch(is_occupied, insert_block, next_block)
         
-        # Insert occupied entry into new array
+        # Insert occupied entry into new array (directly, without calling set_add)
         builder = ir.IRBuilder(insert_block)
         idx = builder.load(idx_alloca)
         entry_ptr = builder.gep(old_entries, [idx], inbounds=True)
         key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         key = builder.load(key_ptr)
-        
-        # Call set_add to reinsert
-        builder.call(self.set_add, [set_ptr, key])
+
+        # Use set_find_slot to find the slot in the resized set
+        slot = builder.call(self.set_find_slot, [set_ptr, key])
+
+        # Get the new entry location
+        new_entries_reload = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        new_entries_ptr = builder.load(new_entries_reload)
+        new_entry_ptr = builder.gep(new_entries_ptr, [slot], inbounds=True)
+
+        # Store key and mark as occupied
+        new_key_ptr = builder.gep(new_entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(key, new_key_ptr)
+        new_state_ptr = builder.gep(new_entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(8), 1), new_state_ptr)
+
+        # Increment length
+        len_field_reload = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        cur_len = builder.load(len_field_reload)
+        new_len = builder.add(cur_len, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_len, len_field_reload)
+
         builder.branch(next_block)
         
         # Next iteration
@@ -3307,73 +3353,82 @@ class CodeGenerator:
         builder.ret_void()
     
     def _implement_set_add(self):
-        """Implement set_add: add key to set."""
+        """Return a NEW set with key added (value semantics).
+
+        This implements value semantics - original set is unchanged.
+        """
         func = self.set_add
-        func.args[0].name = "set"
+        func.args[0].name = "old_set"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        set_ptr = func.args[0]
+
+        old_set = func.args[0]
         key = func.args[1]
-        
+
+        # First, create a copy of the old set (value semantics)
+        new_set = builder.call(self.set_copy, [old_set])
+
+        # All operations below work on new_set, leaving old_set unchanged
+
         # Check if we need to grow (load factor > 0.75)
-        len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        len_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
-        
-        cap_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+
+        cap_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         cap = builder.load(cap_field)
-        
+
         # Check: len * 4 >= cap * 3 (equivalent to len/cap >= 0.75)
         len_times_4 = builder.mul(length, ir.Constant(ir.IntType(64), 4))
         cap_times_3 = builder.mul(cap, ir.Constant(ir.IntType(64), 3))
         need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
-        
+
         grow_block = func.append_basic_block("grow")
         insert_block = func.append_basic_block("insert")
-        
+
         builder.cbranch(need_grow, grow_block, insert_block)
-        
+
         # Grow the set
         builder = ir.IRBuilder(grow_block)
-        builder.call(self.set_grow, [set_ptr])
+        builder.call(self.set_grow, [new_set])
         builder.branch(insert_block)
-        
+
         # Find slot and insert
         builder = ir.IRBuilder(insert_block)
-        slot = builder.call(self.set_find_slot, [set_ptr, key])
-        
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        slot = builder.call(self.set_find_slot, [new_set, key])
+
+        entries_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         entries = builder.load(entries_field)
-        
+
         entry_ptr = builder.gep(entries, [slot], inbounds=True)
         state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         old_state = builder.load(state_ptr)
-        
+
         # Check if this is a new entry (state != 1)
         is_new = builder.icmp_signed("!=", old_state, ir.Constant(ir.IntType(8), 1))
-        
+
         inc_len_block = func.append_basic_block("inc_len")
         store_block = func.append_basic_block("store")
-        
+
         builder.cbranch(is_new, inc_len_block, store_block)
-        
+
         # Increment len for new entries
         builder = ir.IRBuilder(inc_len_block)
-        len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        length = builder.load(len_field)
-        new_len = builder.add(length, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field)
+        len_field2 = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        length2 = builder.load(len_field2)
+        new_len = builder.add(length2, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_len, len_field2)
         builder.branch(store_block)
-        
+
         # Store key and set state to occupied
         builder = ir.IRBuilder(store_block)
         key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(key, key_ptr)
         builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-        
-        builder.ret_void()
+
+        # Return the new set (old_set is unchanged)
+        builder.ret(new_set)
     
     def _implement_set_has(self):
         """Implement set_has: check if key is in set."""
@@ -7239,13 +7294,13 @@ class CodeGenerator:
             return ir.Constant(ir.IntType(64), 0)
         
         if method == "append":
-            # list.append(value) - call list_append
+            # list.append(value) - returns a NEW list with value appended (value semantics)
             if expr.args and isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
                 if hasattr(pointee, 'name') and pointee.name == "struct.List":
                     elem_val = self._generate_expression(expr.args[0])
                     elem_type = elem_val.type
-                    
+
                     # Calculate element size
                     if isinstance(elem_type, ir.IntType):
                         size = elem_type.width // 8
@@ -7261,16 +7316,16 @@ class CodeGenerator:
                         )
                     else:
                         size = 8
-                    
+
                     elem_size = ir.Constant(ir.IntType(64), size)
-                    
+
                     # Store element to temp and get pointer
                     temp = self.builder.alloca(elem_type, name="append_elem")
                     self.builder.store(elem_val, temp)
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
-                    
-                    self.builder.call(self.list_append, [obj, temp_ptr, elem_size])
-                    return ir.Constant(ir.IntType(64), 0)
+
+                    # Call list_append which returns a NEW list (value semantics)
+                    return self.builder.call(self.list_append, [obj, temp_ptr, elem_size])
 
                 # Check if this is an Array - Array.append returns a NEW array
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
@@ -7646,23 +7701,23 @@ class CodeGenerator:
         # Create new list
         list_ptr = self.builder.call(self.list_new, [elem_size])
         
-        # Append each element
+        # Append each element (list_append returns a new list with value semantics)
         for i, elem_expr in enumerate(expr.elements):
             if i == 0:
                 elem_val = first_elem
             else:
                 elem_val = self._generate_expression(elem_expr)
-            
+
             # Store element to a temporary location
             temp = self.builder.alloca(elem_type, name=f"list_elem_{i}")
             self.builder.store(elem_val, temp)
-            
+
             # Cast temp to i8*
             temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
-            
-            # Append
-            self.builder.call(self.list_append, [list_ptr, temp_ptr, elem_size])
-        
+
+            # Append - list_append returns a NEW list; update our reference
+            list_ptr = self.builder.call(self.list_append, [list_ptr, temp_ptr, elem_size])
+
         return list_ptr
     
     def _generate_map(self, expr: MapExpr) -> ir.Value:
@@ -7670,14 +7725,15 @@ class CodeGenerator:
         # Create empty map
         map_ptr = self.builder.call(self.map_new, [])
 
-        # Add each entry
+        # Add each entry (map_set returns a new map with value semantics)
         for key_expr, value_expr in expr.entries:
             key = self._generate_expression(key_expr)
             value = self._generate_expression(value_expr)
             # Cast to i64 for map storage
             key_i64 = self._cast_value(key, ir.IntType(64))
             value_i64 = self._cast_value(value, ir.IntType(64))
-            self.builder.call(self.map_set, [map_ptr, key_i64, value_i64])
+            # map_set returns a NEW map; update our reference
+            map_ptr = self.builder.call(self.map_set, [map_ptr, key_i64, value_i64])
 
         return map_ptr
 
@@ -7686,12 +7742,13 @@ class CodeGenerator:
         # Create empty set
         set_ptr = self.builder.call(self.set_new, [])
 
-        # Add each element
+        # Add each element (set_add returns a new set with value semantics)
         for elem_expr in expr.elements:
             elem = self._generate_expression(elem_expr)
             # Cast to i64 for set storage
             elem_i64 = self._cast_value(elem, ir.IntType(64))
-            self.builder.call(self.set_add, [set_ptr, elem_i64])
+            # set_add returns a NEW set; update our reference
+            set_ptr = self.builder.call(self.set_add, [set_ptr, elem_i64])
 
         return set_ptr
     
@@ -8016,27 +8073,33 @@ class CodeGenerator:
             
             result_list = self.builder.load(result_alloca)
             elem_size = ir.Constant(ir.IntType(64), 8)
-            self.builder.call(self.list_append, [result_list, temp_ptr, elem_size])
-            
+            # list_append returns a NEW list (value semantics); store it back
+            new_list = self.builder.call(self.list_append, [result_list, temp_ptr, elem_size])
+            self.builder.store(new_list, result_alloca)
+
         elif comp_type == "set":
             # Evaluate body expression and add to set
             key = self._generate_expression(body)
             key_i64 = self._cast_value(key, ir.IntType(64))
-            
+
             result_set = self.builder.load(result_alloca)
-            self.builder.call(self.set_add, [result_set, key_i64])
-            
+            # set_add returns a NEW set (value semantics); store it back
+            new_set = self.builder.call(self.set_add, [result_set, key_i64])
+            self.builder.store(new_set, result_alloca)
+
         elif comp_type == "map":
             # body is (key_expr, value_expr)
             key_expr, value_expr = body
             key = self._generate_expression(key_expr)
             value = self._generate_expression(value_expr)
-            
+
             key_i64 = self._cast_value(key, ir.IntType(64))
             value_i64 = self._cast_value(value, ir.IntType(64))
-            
+
             result_map = self.builder.load(result_alloca)
-            self.builder.call(self.map_set, [result_map, key_i64, value_i64])
+            # map_set returns a NEW map (value semantics); store it back
+            new_map = self.builder.call(self.map_set, [result_map, key_i64, value_i64])
+            self.builder.store(new_map, result_alloca)
     
     def _bind_pattern(self, pattern, value):
         """Bind pattern variables to a value."""

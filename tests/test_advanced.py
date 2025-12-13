@@ -277,11 +277,11 @@ func main() -> int
 ''', "20\n")
 
     def test_list_append(self, expect_output):
-        """Append to list."""
+        """Append to list (value semantics - returns new list)."""
         expect_output('''
 func main() -> int
     var lst: List<int> = [1, 2]
-    lst.append(3)
+    lst = lst.append(3)
     print(lst.len())
     return 0
 ~
@@ -375,11 +375,11 @@ func main() -> int
 ''', "1\n2\n")
 
     def test_map_set(self, expect_output):
-        """Set value in map."""
+        """Set value in map (value semantics - returns new map)."""
         expect_output('''
 func main() -> int
     var m: Map<int, int> = {1: 10}
-    m.set(2, 20)
+    m = m.set(2, 20)
     print(m.get(2))
     return 0
 ~
@@ -426,11 +426,11 @@ func main() -> int
 ''', "1\n2\n")
 
     def test_set_add(self, expect_output):
-        """Add element to set."""
+        """Add element to set (value semantics - returns new set)."""
         expect_output('''
 func main() -> int
     var s: Set<int> = {1, 2}
-    s.add(3)
+    s = s.add(3)
     print(s.len())
     return 0
 ~
@@ -456,6 +456,85 @@ func main() -> int
     return 0
 ~
 ''', "3\n")
+
+
+class TestCollectionValueSemantics:
+    """Tests for collection value semantics - mutation returns new collection."""
+
+    def test_list_append_original_unchanged(self, expect_output):
+        """List.append returns new list, original is unchanged."""
+        expect_output('''
+func main() -> int
+    var a: List<int> = [1, 2, 3]
+    var b: List<int> = a.append(4)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "3\n4\n")
+
+    def test_list_assignment_copies(self, expect_output):
+        """Assigning a list creates an independent copy."""
+        expect_output('''
+func main() -> int
+    var a: List<int> = [1, 2, 3]
+    var b: List<int> = a
+    b = b.append(4)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "3\n4\n")
+
+    def test_map_set_original_unchanged(self, expect_output):
+        """Map.set returns new map, original is unchanged."""
+        expect_output('''
+func main() -> int
+    var a: Map<int, int> = {1: 10}
+    var b: Map<int, int> = a.set(2, 20)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "1\n2\n")
+
+    def test_map_assignment_copies(self, expect_output):
+        """Assigning a map creates an independent copy."""
+        expect_output('''
+func main() -> int
+    var a: Map<int, int> = {1: 10}
+    var b: Map<int, int> = a
+    b = b.set(2, 20)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "1\n2\n")
+
+    def test_set_add_original_unchanged(self, expect_output):
+        """Set.add returns new set, original is unchanged."""
+        expect_output('''
+func main() -> int
+    var a: Set<int> = {1, 2}
+    var b: Set<int> = a.add(3)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "2\n3\n")
+
+    def test_set_assignment_copies(self, expect_output):
+        """Assigning a set creates an independent copy."""
+        expect_output('''
+func main() -> int
+    var a: Set<int> = {1, 2}
+    var b: Set<int> = a
+    b = b.add(3)
+    print(a.len())
+    print(b.len())
+    return 0
+~
+''', "2\n3\n")
 
 
 class TestLambdas:
