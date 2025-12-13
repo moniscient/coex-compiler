@@ -70,7 +70,7 @@ func main() -> int
 func main() -> int
     var items: List<int> = [1, 2, 3, 4, 5]
     gc()
-    print(len(items))
+    print(items.len())
     return 0
 ~
 ''', "5\n")
@@ -101,7 +101,7 @@ func make_list() -> List<int>
 func main() -> int
     var items: List<int> = make_list()
     gc()
-    print(len(items))
+    print(items.len())
     return 0
 ~
 ''', "3\n")
@@ -122,14 +122,13 @@ func main() -> int
 ~
 ''', "30\n")
 
-    @pytest.mark.xfail(reason="len(string) returns 0 - pre-existing bug unrelated to GC")
     def test_gc_with_string(self, expect_output):
         """Test gc() with string values"""
         expect_output('''
 func main() -> int
     var s: string = "hello"
     gc()
-    print(len(s))
+    print(s.len())
     return 0
 ~
 ''', "5\n")
@@ -183,7 +182,7 @@ func main() -> int
     if true
         gc()
     ~
-    print(len(items))
+    print(items.len())
     return 0
 ~
 ''', "3\n")
@@ -199,7 +198,7 @@ func trigger_gc() -> int
 func main() -> int
     var x: List<int> = [1, 2, 3]
     trigger_gc()
-    print(len(x))
+    print(x.len())
     return 0
 ~
 ''', "3\n")
@@ -213,7 +212,7 @@ class TestGCMemoryReclamation:
         expect_output('''
 func create_list() -> int
     var temp: List<int> = [1, 2, 3, 4, 5]
-    return len(temp)
+    return temp.len()
 ~
 
 func main() -> int

@@ -54,7 +54,7 @@ func main() -> int
 
 ## Feature Status (as of Dec 2024)
 
-### Fully Working (145 tests passing)
+### Fully Working (185 tests passing)
 - Arithmetic, comparisons, boolean logic
 - Variables, assignment, compound operators (`+=`, `-=`, etc.)
 - Control flow: `if`/`else`/`elif`, `for..in`, `loop`, `break`, `continue`
@@ -65,13 +65,16 @@ func main() -> int
 - Generics with monomorphization and trait bounds
 - Traits (structural implementation checking)
 - Matrix/CA (sequential execution, `cell` keyword)
-- List literals, `len()`, `get()`, iteration, comprehensions
-- Map literals: `{1: 10, 2: 20}`, methods: `get`, `set`, `has`, `remove`, `len`
-- Set literals: `{1, 2, 3}`, methods: `add`, `has`, `remove`, `len`
+- List: `[1, 2, 3]`, methods: `.len()`, `.get(i)`, `.append(x)`, iteration, comprehensions
+- String: `"hello"`, methods: `.len()` (returns UTF-8 codepoint count)
+- Map: `{1: 10, 2: 20}`, methods: `.get`, `.set`, `.has`, `.remove`, `.len()`
+- Set: `{1, 2, 3}`, methods: `.add`, `.has`, `.remove`, `.len()`
 - Lambdas: `formula(_ x: int) => x * 2`
 - Ranges: `start..stop` in for loops
 - Ternary: `cond ? then ; else`
 - Module system: `import math`, `math.abs(-5)`, `replace abs with math.abs`
+
+**Note:** Collection operations use method syntax (`.len()`, `.append()`) not free functions.
 
 ### Module System
 ```coex
@@ -90,7 +93,6 @@ Standard library: `lib/math.coex` provides `abs`, `max`, `min`, `clamp`, `sign`
 ### Known Issues
 | Issue | Description |
 |-------|-------------|
-| `list.append()` | Method dispatch type mismatch (expects `i8*`, gets `i64`) |
 | Concurrency | All concurrent features run sequentially (stubs) |
 
 ## Codegen Patterns

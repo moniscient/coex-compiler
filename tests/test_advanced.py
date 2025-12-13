@@ -276,7 +276,6 @@ func main() -> int
 ~
 ''', "20\n")
 
-    @pytest.mark.xfail(reason="Codegen bug: append method arg type mismatch (i8* vs i64)")
     def test_list_append(self, expect_output):
         """Append to list."""
         expect_output('''

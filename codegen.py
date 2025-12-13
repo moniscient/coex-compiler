@@ -384,7 +384,7 @@ class CodeGenerator:
         
         self.type_methods["List"] = {
             "get": "coex_list_get",
-            "append": "coex_list_append",
+            # "append" handled specially in _generate_method_call (needs alloca for element)
             "len": "coex_list_len",
         }
         
@@ -395,18 +395,20 @@ class CodeGenerator:
     
     def _create_string_type(self):
         """Create the String struct type and helper functions.
-        
+
         String layout (contiguous allocation, no null terminator):
-            Bytes 0-7:  i64 length (number of UTF-8 bytes)
-            Bytes 8+:   UTF-8 data (length bytes, no null terminator)
-        
+            Bytes 0-7:   i64 byte_len (number of UTF-8 bytes)
+            Bytes 8-15:  i64 char_count (number of UTF-8 codepoints)
+            Bytes 16+:   UTF-8 data (byte_len bytes, no null terminator)
+
         A String* points to the start of this block.
-        Total allocation size = 8 + length
+        Total allocation size = 16 + byte_len
         """
-        # The struct only contains the length field; data follows immediately after
+        # The struct contains byte_len and char_count; data follows immediately after
         self.string_struct = ir.global_context.get_identified_type("struct.String")
         self.string_struct.set_body(
-            ir.IntType(64),  # len (data follows at offset 8)
+            ir.IntType(64),  # byte_len (data follows at offset 16)
+            ir.IntType(64),  # char_count (number of UTF-8 codepoints)
         )
         
         string_ptr = self.string_struct.as_pointer()
@@ -420,8 +422,8 @@ class CodeGenerator:
         write_ty = ir.FunctionType(i64, [ir.IntType(32), i8_ptr, i64])
         self.write_syscall = ir.Function(self.module, write_ty, name="write")
         
-        # string_new(data: i8*, len: i64) -> String*
-        string_new_ty = ir.FunctionType(string_ptr, [i8_ptr, i64])
+        # string_new(data: i8*, byte_len: i64, char_count: i64) -> String*
+        string_new_ty = ir.FunctionType(string_ptr, [i8_ptr, i64, i64])
         self.string_new = ir.Function(self.module, string_new_ty, name="coex_string_new")
         
         # string_from_literal(data: i8*) -> String* (for null-terminated C strings from source)
@@ -476,106 +478,138 @@ class CodeGenerator:
         self._register_string_methods()
     
     def _implement_string_data(self):
-        """Get pointer to data portion (offset 8 from string pointer)"""
+        """Get pointer to data portion (offset 16 from string pointer)"""
         func = self.string_data
         func.args[0].name = "s"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
-        
-        # Cast to i8*, add 8 bytes offset to skip length field
+
+        # Cast to i8*, add 16 bytes offset to skip byte_len and char_count fields
         raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
-        
+        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+
         builder.ret(data_ptr)
     
     def _implement_string_new(self):
-        """Create String from data pointer and length.
-        
-        Allocates 8 + len bytes:
-          - Stores length at offset 0
-          - Copies data to offset 8
+        """Create String from data pointer, byte length, and char count.
+
+        Allocates 16 + byte_len bytes:
+          - Stores byte_len at offset 0
+          - Stores char_count at offset 8
+          - Copies data to offset 16
         """
         func = self.string_new
         func.args[0].name = "data"
-        func.args[1].name = "len"
-        
+        func.args[1].name = "byte_len"
+        func.args[2].name = "char_count"
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         data = func.args[0]
-        length = func.args[1]
-        
-        # Allocate 8 (length field) + len (data) bytes via GC
-        alloc_size = builder.add(ir.Constant(ir.IntType(64), 8), length)
+        byte_len = func.args[1]
+        char_count = func.args[2]
+
+        # Allocate 16 (byte_len + char_count fields) + byte_len (data) bytes via GC
+        alloc_size = builder.add(ir.Constant(ir.IntType(64), 16), byte_len)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
         raw_ptr = builder.call(self.gc.gc_alloc, [alloc_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
-        
-        # Store length at offset 0
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(length, len_ptr)
-        
-        # Copy data to offset 8
-        data_dest = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
-        builder.call(self.memcpy, [data_dest, data, length])
-        
+
+        # Store byte_len at offset 0
+        byte_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(byte_len, byte_len_ptr)
+
+        # Store char_count at offset 1 (byte 8)
+        char_count_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(char_count, char_count_ptr)
+
+        # Copy data to offset 16
+        data_dest = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+        builder.call(self.memcpy, [data_dest, data, byte_len])
+
         builder.ret(string_ptr)
     
     def _implement_string_from_literal(self):
         """Create String from null-terminated C string literal.
-        
-        Used for string literals in source code. Scans for length,
-        then calls string_new.
+
+        Used for string literals in source code. Scans for byte length
+        and UTF-8 codepoint count, then calls string_new.
+
+        UTF-8 codepoint counting: A byte starts a new codepoint if it's NOT
+        a continuation byte (10xxxxxx). So we count bytes where (byte & 0xC0) != 0x80.
         """
         func = self.string_from_literal
         func.args[0].name = "cstr"
-        
+
         entry = func.append_basic_block("entry")
         loop = func.append_basic_block("loop")
         loop_body = func.append_basic_block("loop_body")
+        inc_char = func.append_basic_block("inc_char")
+        after_char_check = func.append_basic_block("after_char_check")
         done = func.append_basic_block("done")
-        
+
         builder = ir.IRBuilder(entry)
         cstr = func.args[0]
-        
-        # Scan for null terminator to find length
-        len_ptr = builder.alloca(ir.IntType(64), name="len")
-        builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
+
+        # Allocate counters for byte_len and char_count
+        byte_len_ptr = builder.alloca(ir.IntType(64), name="byte_len")
+        char_count_ptr = builder.alloca(ir.IntType(64), name="char_count")
+        builder.store(ir.Constant(ir.IntType(64), 0), byte_len_ptr)
+        builder.store(ir.Constant(ir.IntType(64), 0), char_count_ptr)
         builder.branch(loop)
-        
+
         builder.position_at_end(loop)
-        current_len = builder.load(len_ptr)
-        char_ptr = builder.gep(cstr, [current_len])
+        current_byte_len = builder.load(byte_len_ptr)
+        char_ptr = builder.gep(cstr, [current_byte_len])
         char_val = builder.load(char_ptr)
         is_null = builder.icmp_unsigned("==", char_val, ir.Constant(ir.IntType(8), 0))
         builder.cbranch(is_null, done, loop_body)
-        
+
         builder.position_at_end(loop_body)
-        new_len = builder.add(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_ptr)
+        # Increment byte count
+        new_byte_len = builder.add(current_byte_len, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_byte_len, byte_len_ptr)
+
+        # Check if this byte starts a new codepoint: (byte & 0xC0) != 0x80
+        # A continuation byte has pattern 10xxxxxx (0x80-0xBF)
+        masked = builder.and_(char_val, ir.Constant(ir.IntType(8), 0xC0))
+        is_continuation = builder.icmp_unsigned("==", masked, ir.Constant(ir.IntType(8), 0x80))
+        builder.cbranch(is_continuation, after_char_check, inc_char)
+
+        builder.position_at_end(inc_char)
+        # Not a continuation byte, so this starts a new codepoint
+        current_char_count = builder.load(char_count_ptr)
+        new_char_count = builder.add(current_char_count, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_char_count, char_count_ptr)
+        builder.branch(after_char_check)
+
+        builder.position_at_end(after_char_check)
         builder.branch(loop)
-        
+
         builder.position_at_end(done)
-        final_len = builder.load(len_ptr)
-        # Create new string (without the null terminator)
-        result = builder.call(self.string_new, [cstr, final_len])
+        final_byte_len = builder.load(byte_len_ptr)
+        final_char_count = builder.load(char_count_ptr)
+        # Create new string with both byte_len and char_count
+        result = builder.call(self.string_new, [cstr, final_byte_len, final_char_count])
         builder.ret(result)
     
     def _implement_string_len(self):
-        """Return string length (first 8 bytes)"""
+        """Return string length (char_count at offset 1, i.e. bytes 8-15)"""
         func = self.string_len
         func.args[0].name = "s"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
-        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        length = builder.load(len_ptr)
-        builder.ret(length)
+        # Read char_count from offset 1 (second field)
+        char_count_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        char_count = builder.load(char_count_ptr)
+        builder.ret(char_count)
     
     def _implement_string_get(self):
         """Get byte at index with bounds checking.
@@ -606,9 +640,9 @@ class CodeGenerator:
         builder.cbranch(is_invalid, out_of_bounds, in_bounds)
         
         builder.position_at_end(in_bounds)
-        # Get data pointer (offset 8)
+        # Get data pointer (offset 16)
         raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
+        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
         
         # Get byte at index
         byte_ptr = builder.gep(data_ptr, [index])
@@ -621,46 +655,88 @@ class CodeGenerator:
         builder.ret(ir.Constant(ir.IntType(64), 0))
     
     def _implement_string_slice(self):
-        """Extract substring [start, end).
-        
+        """Extract substring [start, end) by byte indices.
+
         Clamps indices to valid range for safety.
+        Note: This slices by byte index. For proper UTF-8 handling, the slice
+        boundaries should align with codepoint boundaries.
         """
         func = self.string_slice
         func.args[0].name = "s"
         func.args[1].name = "start"
         func.args[2].name = "end"
-        
+
         entry = func.append_basic_block("entry")
+        count_loop = func.append_basic_block("count_loop")
+        count_body = func.append_basic_block("count_body")
+        inc_char = func.append_basic_block("inc_char")
+        after_inc = func.append_basic_block("after_inc")
+        count_done = func.append_basic_block("count_done")
+
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
         start = func.args[1]
         end = func.args[2]
-        
-        # Get length
-        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        length = builder.load(len_ptr)
-        
-        # Clamp start: max(0, min(start, length))
+
+        # Get byte_len
+        byte_len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        byte_len = builder.load(byte_len_ptr)
+
+        # Clamp start: max(0, min(start, byte_len))
         zero = ir.Constant(ir.IntType(64), 0)
         start_clamped = builder.select(builder.icmp_signed("<", start, zero), zero, start)
-        start_clamped = builder.select(builder.icmp_signed(">", start_clamped, length), length, start_clamped)
-        
-        # Clamp end: max(start, min(end, length))
+        start_clamped = builder.select(builder.icmp_signed(">", start_clamped, byte_len), byte_len, start_clamped)
+
+        # Clamp end: max(start, min(end, byte_len))
         end_clamped = builder.select(builder.icmp_signed("<", end, zero), zero, end)
-        end_clamped = builder.select(builder.icmp_signed(">", end_clamped, length), length, end_clamped)
+        end_clamped = builder.select(builder.icmp_signed(">", end_clamped, byte_len), byte_len, end_clamped)
         end_clamped = builder.select(builder.icmp_signed("<", end_clamped, start_clamped), start_clamped, end_clamped)
-        
-        # Calculate new length
-        new_len = builder.sub(end_clamped, start_clamped)
-        
-        # Get source data pointer
+
+        # Calculate new byte length
+        new_byte_len = builder.sub(end_clamped, start_clamped)
+
+        # Get source data pointer (offset 16)
         raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
+        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
         slice_start = builder.gep(data_ptr, [start_clamped])
-        
-        # Create new string
-        result = builder.call(self.string_new, [slice_start, new_len])
+
+        # Count codepoints in the slice (scan for non-continuation bytes)
+        idx_ptr = builder.alloca(ir.IntType(64), name="idx")
+        char_count_ptr = builder.alloca(ir.IntType(64), name="char_count")
+        builder.store(zero, idx_ptr)
+        builder.store(zero, char_count_ptr)
+        builder.branch(count_loop)
+
+        builder.position_at_end(count_loop)
+        idx = builder.load(idx_ptr)
+        done_counting = builder.icmp_signed(">=", idx, new_byte_len)
+        builder.cbranch(done_counting, count_done, count_body)
+
+        builder.position_at_end(count_body)
+        byte_ptr = builder.gep(slice_start, [idx])
+        byte_val = builder.load(byte_ptr)
+        # Check if this byte starts a codepoint: (byte & 0xC0) != 0x80
+        masked = builder.and_(byte_val, ir.Constant(ir.IntType(8), 0xC0))
+        is_continuation = builder.icmp_unsigned("==", masked, ir.Constant(ir.IntType(8), 0x80))
+        builder.cbranch(is_continuation, after_inc, inc_char)
+
+        builder.position_at_end(inc_char)
+        curr_count = builder.load(char_count_ptr)
+        new_count = builder.add(curr_count, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_count, char_count_ptr)
+        builder.branch(after_inc)
+
+        builder.position_at_end(after_inc)
+        new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(count_loop)
+
+        builder.position_at_end(count_done)
+        final_char_count = builder.load(char_count_ptr)
+
+        # Create new string with byte_len and char_count
+        result = builder.call(self.string_new, [slice_start, new_byte_len, final_char_count])
         builder.ret(result)
     
     def _implement_string_concat(self):
@@ -668,46 +744,59 @@ class CodeGenerator:
         func = self.string_concat
         func.args[0].name = "a"
         func.args[1].name = "b"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         a = func.args[0]
         b = func.args[1]
-        
-        # Get lengths
-        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_len = builder.load(a_len_ptr)
-        
-        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_len = builder.load(b_len_ptr)
-        
-        # Total length
-        total_len = builder.add(a_len, b_len)
-        
-        # Allocate new string: 8 + total_len
-        alloc_size = builder.add(ir.Constant(ir.IntType(64), 8), total_len)
-        raw_ptr = builder.call(self.malloc, [alloc_size])
+
+        # Get byte_len from both strings
+        a_byte_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_byte_len = builder.load(a_byte_len_ptr)
+
+        b_byte_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_byte_len = builder.load(b_byte_len_ptr)
+
+        # Get char_count from both strings
+        a_char_count_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        a_char_count = builder.load(a_char_count_ptr)
+
+        b_char_count_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        b_char_count = builder.load(b_char_count_ptr)
+
+        # Total byte length and char count
+        total_byte_len = builder.add(a_byte_len, b_byte_len)
+        total_char_count = builder.add(a_char_count, b_char_count)
+
+        # Allocate new string: 16 + total_byte_len via GC
+        alloc_size = builder.add(ir.Constant(ir.IntType(64), 16), total_byte_len)
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [alloc_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
-        
-        # Store length
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(total_len, len_ptr)
-        
-        # Get data destination (offset 8)
-        dest_data = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
-        
+
+        # Store byte_len at offset 0
+        byte_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(total_byte_len, byte_len_ptr)
+
+        # Store char_count at offset 1
+        char_count_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(total_char_count, char_count_ptr)
+
+        # Get data destination (offset 16)
+        dest_data = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+
         # Copy a's data
         a_raw = builder.bitcast(a, ir.IntType(8).as_pointer())
-        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 8)])
-        builder.call(self.memcpy, [dest_data, a_data, a_len])
-        
+        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 16)])
+        builder.call(self.memcpy, [dest_data, a_data, a_byte_len])
+
         # Copy b's data after a
-        b_dest = builder.gep(dest_data, [a_len])
+        b_dest = builder.gep(dest_data, [a_byte_len])
         b_raw = builder.bitcast(b, ir.IntType(8).as_pointer())
-        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 8)])
-        builder.call(self.memcpy, [b_dest, b_data, b_len])
-        
+        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 16)])
+        builder.call(self.memcpy, [b_dest, b_data, b_byte_len])
+
         builder.ret(string_ptr)
     
     def _implement_string_eq(self):
@@ -740,12 +829,12 @@ class CodeGenerator:
         builder.cbranch(len_eq, check_data, not_equal)
         
         builder.position_at_end(check_data)
-        # Get data pointers
+        # Get data pointers (offset 16)
         a_raw = builder.bitcast(a, ir.IntType(8).as_pointer())
-        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 8)])
-        
+        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 16)])
+
         b_raw = builder.bitcast(b, ir.IntType(8).as_pointer())
-        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 8)])
+        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 16)])
         
         # Compare bytes
         idx_ptr = builder.alloca(ir.IntType(64), name="idx")
@@ -801,12 +890,12 @@ class CodeGenerator:
         needle_len_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         needle_len = builder.load(needle_len_ptr)
         
-        # Get data pointers
+        # Get data pointers (offset 16)
         s_raw = builder.bitcast(s, ir.IntType(8).as_pointer())
-        s_data = builder.gep(s_raw, [ir.Constant(ir.IntType(64), 8)])
-        
+        s_data = builder.gep(s_raw, [ir.Constant(ir.IntType(64), 16)])
+
         needle_raw = builder.bitcast(needle, ir.IntType(8).as_pointer())
-        needle_data = builder.gep(needle_raw, [ir.Constant(ir.IntType(64), 8)])
+        needle_data = builder.gep(needle_raw, [ir.Constant(ir.IntType(64), 16)])
         
         # Empty needle always matches
         empty_needle = builder.icmp_signed("==", needle_len, ir.Constant(ir.IntType(64), 0))
@@ -882,9 +971,9 @@ class CodeGenerator:
         len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         length = builder.load(len_ptr)
         
-        # Get data pointer (offset 8)
+        # Get data pointer (offset 16)
         raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 8)])
+        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
         
         # write(1, data, length) - fd 1 is stdout
         stdout_fd = ir.Constant(ir.IntType(32), 1)
@@ -5055,18 +5144,9 @@ class CodeGenerator:
             if name == "range":
                 # range() returns iterator - handle in for loop
                 return ir.Constant(ir.IntType(64), 0)
-            
-            if name == "len":
-                # len(list) - call list_len
-                if expr.args:
-                    arg = self._generate_expression(expr.args[0])
-                    # Check if it's a list
-                    if isinstance(arg.type, ir.PointerType):
-                        pointee = arg.type.pointee
-                        if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                            return self.builder.call(self.list_len, [arg])
-                return ir.Constant(ir.IntType(64), 0)
-            
+
+            # Note: len() removed as builtin - use .len() method instead
+
             if name == "str":
                 # str(x) - for now just return the value
                 if expr.args:
