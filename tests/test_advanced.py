@@ -526,3 +526,106 @@ func main() -> int
     return 0
 ~
 ''', "6\n")
+
+
+class TestCollectionSize:
+    """Tests for .size() method on collections.
+
+    .size() returns the total memory footprint in bytes:
+    - List: 32 (header) + cap * elem_size
+    - String: 16 (header) + byte_len
+    - Map: 24 (header) + cap * 24 (MapEntry size)
+    - Set: 24 (header) + cap * 16 (SetEntry size)
+    """
+
+    def test_list_size_empty(self, expect_output):
+        """Empty list size (header + initial capacity * elem_size)."""
+        # List header: 32 bytes, initial cap=8, elem_size=8 for int
+        # Size = 32 + 8 * 8 = 96
+        expect_output('''
+func main() -> int
+    var lst: List<int> = []
+    print(lst.size())
+    return 0
+~
+''', "96\n")
+
+    def test_list_size_with_elements(self, expect_output):
+        """List size with some elements (still within initial capacity)."""
+        # Same as empty - cap doesn't change until it's exceeded
+        expect_output('''
+func main() -> int
+    var lst: List<int> = [1, 2, 3]
+    print(lst.size())
+    return 0
+~
+''', "96\n")
+
+    def test_string_size(self, expect_output):
+        """String size (header + byte length)."""
+        # String header: 16 bytes, "hello" = 5 bytes
+        # Size = 16 + 5 = 21
+        expect_output('''
+func main() -> int
+    var s: string = "hello"
+    print(s.size())
+    return 0
+~
+''', "21\n")
+
+    def test_string_size_empty(self, expect_output):
+        """Empty string size."""
+        # String header: 16 bytes, empty = 0 bytes
+        # Size = 16 + 0 = 16
+        expect_output('''
+func main() -> int
+    var s: string = ""
+    print(s.size())
+    return 0
+~
+''', "16\n")
+
+    def test_map_size_empty(self, expect_output):
+        """Empty map size (header + initial capacity * entry size)."""
+        # Map header: 24 bytes, initial cap=8, MapEntry=24 bytes
+        # Size = 24 + 8 * 24 = 216
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {}
+    print(m.size())
+    return 0
+~
+''', "216\n")
+
+    def test_map_size_with_elements(self, expect_output):
+        """Map size with some elements."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10, 2: 20}
+    print(m.size())
+    return 0
+~
+''', "216\n")
+
+    def test_set_size_empty(self, expect_output):
+        """Empty set size (header + initial capacity * entry size)."""
+        # Set header: 24 bytes, initial cap=8, SetEntry=16 bytes
+        # Size = 24 + 8 * 16 = 152
+        expect_output('''
+func main() -> int
+    var s: Set<int> = {1, 2, 3}
+    print(s.size())
+    return 0
+~
+''', "152\n")
+
+    def test_size_and_len_different(self, expect_output):
+        """Verify .size() and .len() return different values."""
+        expect_output('''
+func main() -> int
+    var lst: List<int> = [1, 2, 3]
+    print(lst.len())
+    print(lst.size())
+    return 0
+~
+''', "3\n96\n")

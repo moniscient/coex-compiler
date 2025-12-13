@@ -218,12 +218,17 @@ class CodeGenerator:
         # list_len(list: List*) -> i64
         list_len_ty = ir.FunctionType(i64, [list_ptr])
         self.list_len = ir.Function(self.module, list_len_ty, name="coex_list_len")
-        
+
+        # list_size(list: List*) -> i64 (total memory footprint in bytes)
+        list_size_ty = ir.FunctionType(i64, [list_ptr])
+        self.list_size = ir.Function(self.module, list_size_ty, name="coex_list_size")
+
         # Now implement these functions inline
         self._implement_list_new()
         self._implement_list_append()
         self._implement_list_get()
         self._implement_list_len()
+        self._implement_list_size()
         self._register_list_methods()
     
     def _implement_list_new(self):
@@ -376,23 +381,52 @@ class CodeGenerator:
         length = builder.load(len_ptr)
         
         builder.ret(length)
-    
+
+    def _implement_list_size(self):
+        """Implement list_size: return total memory footprint in bytes.
+
+        Size = 32 (header) + cap * elem_size (data array)
+        """
+        func = self.list_size
+        func.args[0].name = "list"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        list_ptr = func.args[0]
+
+        # Get cap field (field 1)
+        cap_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Get elem_size field (field 2)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        # Size = 32 (header) + cap * elem_size
+        data_size = builder.mul(cap, elem_size)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 32), data_size)
+
+        builder.ret(total_size)
+
     def _register_list_methods(self):
         """Register List as a type with methods."""
         self.type_registry["List"] = self.list_struct
         self.type_fields["List"] = []  # Internal structure, not user-accessible fields
-        
+
         self.type_methods["List"] = {
             "get": "coex_list_get",
             # "append" handled specially in _generate_method_call (needs alloca for element)
             "len": "coex_list_len",
+            "size": "coex_list_size",
         }
         
         self.functions["coex_list_new"] = self.list_new
         self.functions["coex_list_get"] = self.list_get
         self.functions["coex_list_append"] = self.list_append
         self.functions["coex_list_len"] = self.list_len
-    
+        self.functions["coex_list_size"] = self.list_size
+
     def _create_string_type(self):
         """Create the String struct type and helper functions.
 
@@ -461,19 +495,24 @@ class CodeGenerator:
         # string_data(s: String*) -> i8* (get pointer to data portion)
         string_data_ty = ir.FunctionType(i8_ptr, [string_ptr])
         self.string_data = ir.Function(self.module, string_data_ty, name="coex_string_data")
-        
+
+        # string_size(s: String*) -> i64 (total memory footprint in bytes)
+        string_size_ty = ir.FunctionType(i64, [string_ptr])
+        self.string_size = ir.Function(self.module, string_size_ty, name="coex_string_size")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
         self._implement_string_from_literal()
         self._implement_string_len()
+        self._implement_string_size()
         self._implement_string_get()
         self._implement_string_slice()
         self._implement_string_concat()
         self._implement_string_eq()
         self._implement_string_contains()
         self._implement_string_print()
-        
+
         # Register String type methods
         self._register_string_methods()
     
@@ -610,7 +649,27 @@ class CodeGenerator:
         char_count_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         char_count = builder.load(char_count_ptr)
         builder.ret(char_count)
-    
+
+    def _implement_string_size(self):
+        """Return string total memory footprint in bytes.
+
+        Size = 16 (header: byte_len + char_count) + byte_len (data)
+        """
+        func = self.string_size
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+        # Read byte_len from offset 0 (first field)
+        byte_len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        byte_len = builder.load(byte_len_ptr)
+
+        # Size = 16 (header) + byte_len
+        total_size = builder.add(ir.Constant(ir.IntType(64), 16), byte_len)
+        builder.ret(total_size)
+
     def _implement_string_get(self):
         """Get byte at index with bounds checking.
         
@@ -993,6 +1052,7 @@ class CodeGenerator:
         # Map method names to function names
         self.type_methods["String"] = {
             "len": "coex_string_len",
+            "size": "coex_string_size",
             "get": "coex_string_get",
             "slice": "coex_string_slice",
             "concat": "coex_string_concat",
@@ -1001,9 +1061,10 @@ class CodeGenerator:
             "print": "coex_string_print",
             "data": "coex_string_data",
         }
-        
+
         # Also store function references for direct access
         self.functions["coex_string_len"] = self.string_len
+        self.functions["coex_string_size"] = self.string_size
         self.functions["coex_string_get"] = self.string_get
         self.functions["coex_string_slice"] = self.string_slice
         self.functions["coex_string_concat"] = self.string_concat
@@ -1072,19 +1133,23 @@ class CodeGenerator:
         # map_len(map: Map*) -> i64
         map_len_ty = ir.FunctionType(i64, [map_ptr])
         self.map_len = ir.Function(self.module, map_len_ty, name="coex_map_len")
-        
+
+        # map_size(map: Map*) -> i64 (total memory footprint in bytes)
+        map_size_ty = ir.FunctionType(i64, [map_ptr])
+        self.map_size = ir.Function(self.module, map_size_ty, name="coex_map_size")
+
         # map_hash(key: i64) -> i64  (internal hash function)
         map_hash_ty = ir.FunctionType(i64, [i64])
         self.map_hash = ir.Function(self.module, map_hash_ty, name="coex_map_hash")
-        
+
         # map_grow(map: Map*)  (internal resize function)
         map_grow_ty = ir.FunctionType(ir.VoidType(), [map_ptr])
         self.map_grow = ir.Function(self.module, map_grow_ty, name="coex_map_grow")
-        
+
         # map_find_slot(map: Map*, key: i64) -> i64  (internal: find slot for key)
         map_find_slot_ty = ir.FunctionType(i64, [map_ptr, i64])
         self.map_find_slot = ir.Function(self.module, map_find_slot_ty, name="coex_map_find_slot")
-        
+
         # Implement all map functions
         self._implement_map_hash()
         self._implement_map_new()
@@ -1095,7 +1160,8 @@ class CodeGenerator:
         self._implement_map_has()
         self._implement_map_remove()
         self._implement_map_len()
-        
+        self._implement_map_size()
+
         # Register Map methods
         self._register_map_methods()
     
@@ -1586,15 +1652,39 @@ class CodeGenerator:
         """Return number of entries in map."""
         func = self.map_len
         func.args[0].name = "map"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         map_ptr = func.args[0]
         len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
         builder.ret(length)
-    
+
+    def _implement_map_size(self):
+        """Return total memory footprint of map in bytes.
+
+        Size = 24 (header) + cap * 24 (MapEntry array)
+        MapEntry is {i64 key, i64 value, i8 state} = 24 bytes with padding
+        """
+        func = self.map_size
+        func.args[0].name = "map"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+
+        # Get cap field (field 2)
+        cap_ptr = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Size = 24 (header) + cap * 24 (each MapEntry is 24 bytes)
+        entry_array_size = builder.mul(cap, ir.Constant(ir.IntType(64), 24))
+        total_size = builder.add(ir.Constant(ir.IntType(64), 24), entry_array_size)
+
+        builder.ret(total_size)
+
     def _register_map_methods(self):
         """Register Map as a type with methods."""
         self.type_registry["Map"] = self.map_struct
@@ -1606,14 +1696,16 @@ class CodeGenerator:
             "has": "coex_map_has",
             "remove": "coex_map_remove",
             "len": "coex_map_len",
+            "size": "coex_map_size",
         }
-        
+
         self.functions["coex_map_new"] = self.map_new
         self.functions["coex_map_get"] = self.map_get
         self.functions["coex_map_set"] = self.map_set
         self.functions["coex_map_has"] = self.map_has
         self.functions["coex_map_remove"] = self.map_remove
         self.functions["coex_map_len"] = self.map_len
+        self.functions["coex_map_size"] = self.map_size
 
     # ========================================================================
     # Set Type Implementation
@@ -1671,15 +1763,19 @@ class CodeGenerator:
         # set_len(set: Set*) -> i64
         set_len_ty = ir.FunctionType(i64, [set_ptr])
         self.set_len = ir.Function(self.module, set_len_ty, name="coex_set_len")
-        
+
+        # set_size(set: Set*) -> i64 (total memory footprint in bytes)
+        set_size_ty = ir.FunctionType(i64, [set_ptr])
+        self.set_size = ir.Function(self.module, set_size_ty, name="coex_set_size")
+
         # set_grow(set: Set*)  (internal resize function)
         set_grow_ty = ir.FunctionType(ir.VoidType(), [set_ptr])
         self.set_grow = ir.Function(self.module, set_grow_ty, name="coex_set_grow")
-        
+
         # set_find_slot(set: Set*, key: i64) -> i64  (internal: find slot for key)
         set_find_slot_ty = ir.FunctionType(i64, [set_ptr, i64])
         self.set_find_slot = ir.Function(self.module, set_find_slot_ty, name="coex_set_find_slot")
-        
+
         # Implement all set functions
         self._implement_set_new()
         self._implement_set_find_slot()
@@ -1688,6 +1784,7 @@ class CodeGenerator:
         self._implement_set_has()
         self._implement_set_remove()
         self._implement_set_len()
+        self._implement_set_size()
         self._register_set_methods()
     
     def _implement_set_new(self):
@@ -2133,34 +2230,60 @@ class CodeGenerator:
         """Implement set_len: return number of elements in set."""
         func = self.set_len
         func.args[0].name = "set"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         set_ptr = func.args[0]
-        
+
         len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
-        
+
         builder.ret(length)
-    
+
+    def _implement_set_size(self):
+        """Implement set_size: return total memory footprint in bytes.
+
+        Size = 24 (header) + cap * 16 (SetEntry array)
+        SetEntry is {i64 key, i8 state} = 16 bytes with padding
+        """
+        func = self.set_size
+        func.args[0].name = "set"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        set_ptr = func.args[0]
+
+        # Get cap field (field 2)
+        cap_ptr = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Size = 24 (header) + cap * 16 (each SetEntry is 16 bytes)
+        entry_array_size = builder.mul(cap, ir.Constant(ir.IntType(64), 16))
+        total_size = builder.add(ir.Constant(ir.IntType(64), 24), entry_array_size)
+
+        builder.ret(total_size)
+
     def _register_set_methods(self):
         """Register Set as a type with methods."""
         self.type_registry["Set"] = self.set_struct
         self.type_fields["Set"] = []  # Internal structure, not user-accessible fields
-        
+
         self.type_methods["Set"] = {
             "add": "coex_set_add",
             "has": "coex_set_has",
             "remove": "coex_set_remove",
             "len": "coex_set_len",
+            "size": "coex_set_size",
         }
-        
+
         self.functions["coex_set_new"] = self.set_new
         self.functions["coex_set_add"] = self.set_add
         self.functions["coex_set_has"] = self.set_has
         self.functions["coex_set_remove"] = self.set_remove
         self.functions["coex_set_len"] = self.set_len
+        self.functions["coex_set_size"] = self.set_size
 
     # ========================================================================
     # Atomic Reference Type Implementation
