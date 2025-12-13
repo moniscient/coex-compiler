@@ -249,7 +249,7 @@ func main() -> int
         expect_output('''
 type Counter:
     value: int
-    
+
     func get() -> int
         return self.value
     ~
@@ -261,3 +261,85 @@ func main() -> int
     return 0
 ~
 ''', "42\n")
+
+
+class TestUDTValueSemantics:
+    """Tests that user-defined types have proper value semantics."""
+
+    def test_udt_assignment_copies(self, expect_output):
+        """Assigning a UDT should create an independent copy."""
+        expect_output('''
+type Point:
+    x: int
+    y: int
+~
+
+func main() -> int
+    var a: Point = Point(1, 2)
+    var b: Point = a
+    b.x = 99
+    print(a.x)
+    print(b.x)
+    return 0
+~
+''', "1\n99\n")
+
+    def test_udt_with_list_field_copies(self, expect_output):
+        """UDT with list field should deep copy the list."""
+        expect_output('''
+type Container:
+    items: List<int>
+~
+
+func main() -> int
+    var a: Container = Container([1, 2, 3])
+    var b: Container = a
+    b.items = b.items.append(99)
+    print(a.items.len())
+    print(b.items.len())
+    return 0
+~
+''', "3\n4\n")
+
+    def test_udt_parameter_isolated(self, expect_output):
+        """UDT parameter modifications should not affect caller."""
+        expect_output('''
+type Point:
+    x: int
+    y: int
+~
+
+func modify_point(p: Point) -> int
+    p.x = 99
+    return p.x
+~
+
+func main() -> int
+    var original: Point = Point(1, 2)
+    var result: int = modify_point(original)
+    print(original.x)
+    print(result)
+    return 0
+~
+''', "1\n99\n")
+
+    def test_udt_with_list_parameter_isolated(self, expect_output):
+        """UDT with list field passed as parameter should be deep copied."""
+        expect_output('''
+type Container:
+    items: List<int>
+~
+
+func modify_container(c: Container) -> int
+    c.items = c.items.append(99)
+    return c.items.len()
+~
+
+func main() -> int
+    var original: Container = Container([1, 2, 3])
+    var new_len: int = modify_container(original)
+    print(original.items.len())
+    print(new_len)
+    return 0
+~
+''', "3\n4\n")

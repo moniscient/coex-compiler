@@ -5699,6 +5699,9 @@ class CodeGenerator:
 
         if coex_type and self._is_collection_coex_type(coex_type):
             value = self._generate_deep_copy(value, coex_type)
+        elif coex_type and isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
+            # User-defined types need deep copy to handle collection fields
+            value = self._generate_deep_copy(value, coex_type)
         elif isinstance(value.type, ir.PointerType):
             # Fallback to shallow copy for unknown collection types
             pointee = value.type.pointee
