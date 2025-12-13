@@ -98,6 +98,9 @@ class CodeGenerator:
 
         # Array element type tracking for proper destructuring
         self.array_element_types: Dict[str, ir.Type] = {}  # var_name -> element LLVM type
+
+        # Coex AST type tracking for deep copy and nested collections
+        self.var_coex_types: Dict[str, Type] = {}  # var_name -> Coex AST Type
         
         # List and channel runtime support
         self.list_type = None
@@ -237,12 +240,17 @@ class CodeGenerator:
         list_size_ty = ir.FunctionType(i64, [list_ptr])
         self.list_size = ir.Function(self.module, list_size_ty, name="coex_list_size")
 
+        # list_copy(list: List*) -> List* (deep copy for value semantics)
+        list_copy_ty = ir.FunctionType(list_ptr, [list_ptr])
+        self.list_copy = ir.Function(self.module, list_copy_ty, name="coex_list_copy")
+
         # Now implement these functions inline
         self._implement_list_new()
         self._implement_list_append()
         self._implement_list_get()
         self._implement_list_len()
         self._implement_list_size()
+        self._implement_list_copy()
         self._register_list_methods()
     
     def _implement_list_new(self):
@@ -423,6 +431,85 @@ class CodeGenerator:
 
         builder.ret(total_size)
 
+    def _implement_list_copy(self):
+        """Implement list_copy: create a deep copy of a list for value semantics.
+
+        This ensures that assignment `b = a` creates an independent copy,
+        so mutations to `b` do not affect `a`.
+        """
+        func = self.list_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        do_copy = func.append_basic_block("do_copy")
+        return_null = func.append_basic_block("return_null")
+
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        list_ptr_type = self.list_struct.as_pointer()
+
+        # Handle null input - return null
+        is_null = builder.icmp_unsigned("==", src, ir.Constant(list_ptr_type, None))
+        builder.cbranch(is_null, return_null, do_copy)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(list_ptr_type, None))
+
+        builder.position_at_end(do_copy)
+
+        # Load source fields
+        # len (field 0)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        # cap (field 1)
+        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_cap = builder.load(src_cap_ptr)
+
+        # elem_size (field 2)
+        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_elem_size = builder.load(src_elem_size_ptr)
+
+        # data pointer (field 3)
+        src_data_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_data = builder.load(src_data_ptr)
+
+        # Allocate new List struct (32 bytes) via GC
+        list_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_LIST)
+        raw_ptr = builder.call(self.gc.gc_alloc, [list_size, type_id])
+        dst = builder.bitcast(raw_ptr, list_ptr_type)
+
+        # Copy header fields to destination
+        # len
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_len, dst_len_ptr)
+
+        # cap
+        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(src_cap, dst_cap_ptr)
+
+        # elem_size
+        dst_elem_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_elem_size, dst_elem_size_ptr)
+
+        # Allocate new data array: cap * elem_size
+        data_size = builder.mul(src_cap, src_elem_size)
+        new_data = builder.call(self.malloc, [data_size])
+
+        # Store data pointer
+        dst_data_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(new_data, dst_data_ptr)
+
+        # Copy actual data: len * elem_size bytes (only copy used portion)
+        copy_size = builder.mul(src_len, src_elem_size)
+        builder.call(self.memcpy, [new_data, src_data, copy_size])
+
+        builder.ret(dst)
+
     def _register_list_methods(self):
         """Register List as a type with methods."""
         self.type_registry["List"] = self.list_struct
@@ -440,6 +527,7 @@ class CodeGenerator:
         self.functions["coex_list_append"] = self.list_append
         self.functions["coex_list_len"] = self.list_len
         self.functions["coex_list_size"] = self.list_size
+        self.functions["coex_list_copy"] = self.list_copy
 
     def _create_array_helpers(self):
         """Create helper functions for Array operations.
@@ -477,6 +565,10 @@ class CodeGenerator:
         array_size_ty = ir.FunctionType(i64, [array_ptr])
         self.array_size = ir.Function(self.module, array_size_ty, name="coex_array_size")
 
+        # array_copy(arr: Array*) -> Array* (deep copy for value semantics)
+        array_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
+        self.array_copy = ir.Function(self.module, array_copy_ty, name="coex_array_copy")
+
         # Implement all functions
         self._implement_array_new()
         self._implement_array_get()
@@ -484,6 +576,7 @@ class CodeGenerator:
         self._implement_array_append()
         self._implement_array_len()
         self._implement_array_size()
+        self._implement_array_copy()
         self._register_array_methods()
 
     def _implement_array_new(self):
@@ -693,6 +786,85 @@ class CodeGenerator:
 
         builder.ret(total_size)
 
+    def _implement_array_copy(self):
+        """Implement array_copy: create a deep copy of an array for value semantics.
+
+        Array layout: { i64 len, i64 cap, i64 elem_size, i8* data }
+        Same structure as List.
+        """
+        func = self.array_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        do_copy = func.append_basic_block("do_copy")
+        return_null = func.append_basic_block("return_null")
+
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        array_ptr_type = self.array_struct.as_pointer()
+
+        # Handle null input - return null
+        is_null = builder.icmp_unsigned("==", src, ir.Constant(array_ptr_type, None))
+        builder.cbranch(is_null, return_null, do_copy)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(array_ptr_type, None))
+
+        builder.position_at_end(do_copy)
+
+        # Load source fields
+        # len (field 0)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        # cap (field 1)
+        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_cap = builder.load(src_cap_ptr)
+
+        # elem_size (field 2)
+        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_elem_size = builder.load(src_elem_size_ptr)
+
+        # data pointer (field 3)
+        src_data_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_data = builder.load(src_data_ptr)
+
+        # Allocate new Array struct (32 bytes) via GC
+        array_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
+        raw_ptr = builder.call(self.gc.gc_alloc, [array_size, type_id])
+        dst = builder.bitcast(raw_ptr, array_ptr_type)
+
+        # Copy header fields to destination
+        # len
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_len, dst_len_ptr)
+
+        # cap
+        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(src_cap, dst_cap_ptr)
+
+        # elem_size
+        dst_elem_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_elem_size, dst_elem_size_ptr)
+
+        # Allocate new data array: cap * elem_size
+        data_size = builder.mul(src_cap, src_elem_size)
+        new_data = builder.call(self.malloc, [data_size])
+
+        # Store data pointer
+        dst_data_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(new_data, dst_data_ptr)
+
+        # Copy actual data: len * elem_size bytes (only copy used portion)
+        copy_size = builder.mul(src_len, src_elem_size)
+        builder.call(self.memcpy, [new_data, src_data, copy_size])
+
+        builder.ret(dst)
+
     def _register_array_methods(self):
         """Register Array as a type with methods."""
         self.type_registry["Array"] = self.array_struct
@@ -711,6 +883,7 @@ class CodeGenerator:
         self.functions["coex_array_append"] = self.array_append
         self.functions["coex_array_len"] = self.array_len
         self.functions["coex_array_size"] = self.array_size
+        self.functions["coex_array_copy"] = self.array_copy
 
     def _list_to_array(self, list_ptr: ir.Value) -> ir.Value:
         """Convert a List to an Array (List.packed() -> Array).
@@ -982,6 +1155,10 @@ class CodeGenerator:
         string_size_ty = ir.FunctionType(i64, [string_ptr])
         self.string_size = ir.Function(self.module, string_size_ty, name="coex_string_size")
 
+        # string_copy(s: String*) -> String* (deep copy for value semantics)
+        string_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
+        self.string_copy = ir.Function(self.module, string_copy_ty, name="coex_string_copy")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
@@ -994,6 +1171,7 @@ class CodeGenerator:
         self._implement_string_eq()
         self._implement_string_contains()
         self._implement_string_print()
+        self._implement_string_copy()
 
         # Register String type methods
         self._register_string_methods()
@@ -1525,7 +1703,506 @@ class CodeGenerator:
         builder.call(self.write_syscall, [stdout_fd, newline_ptr, ir.Constant(ir.IntType(64), 1)])
         
         builder.ret_void()
-    
+
+    def _implement_string_copy(self):
+        """Implement string_copy: create a deep copy of a string for value semantics.
+
+        String layout: { i64 byte_len, i64 char_count } + inline data at offset 16
+        Total size = 16 + byte_len
+        """
+        func = self.string_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        do_copy = func.append_basic_block("do_copy")
+        return_null = func.append_basic_block("return_null")
+
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Handle null input - return null
+        is_null = builder.icmp_unsigned("==", src, ir.Constant(string_ptr_type, None))
+        builder.cbranch(is_null, return_null, do_copy)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(string_ptr_type, None))
+
+        builder.position_at_end(do_copy)
+
+        # Load source fields
+        # byte_len (field 0)
+        src_byte_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_byte_len = builder.load(src_byte_len_ptr)
+
+        # char_count (field 1)
+        src_char_count_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_char_count = builder.load(src_char_count_ptr)
+
+        # Total allocation size = 16 (header) + byte_len
+        header_size = ir.Constant(i64, 16)
+        total_size = builder.add(header_size, src_byte_len)
+
+        # Allocate new String via GC
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [total_size, type_id])
+        dst = builder.bitcast(raw_ptr, string_ptr_type)
+
+        # Copy header fields
+        dst_byte_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_byte_len, dst_byte_len_ptr)
+
+        dst_char_count_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(src_char_count, dst_char_count_ptr)
+
+        # Copy inline data: memcpy from src+16 to dst+16 for byte_len bytes
+        src_i8 = builder.bitcast(src, i8_ptr)
+        src_data = builder.gep(src_i8, [ir.Constant(i64, 16)])
+
+        dst_i8 = builder.bitcast(dst, i8_ptr)
+        dst_data = builder.gep(dst_i8, [ir.Constant(i64, 16)])
+
+        builder.call(self.memcpy, [dst_data, src_data, src_byte_len])
+
+        builder.ret(dst)
+
+    # ============================================================
+    # Deep Copy Support for Value Semantics
+    # ============================================================
+
+    def _is_primitive_coex_type(self, coex_type: Type) -> bool:
+        """Check if a Coex type is a primitive (int, float, bool, byte, char)."""
+        if isinstance(coex_type, PrimitiveType):
+            return coex_type.name in ("int", "float", "bool", "byte", "char")
+        return False
+
+    def _is_collection_coex_type(self, coex_type: Type) -> bool:
+        """Check if a Coex type is a collection (List, Set, Map, Array, String)."""
+        if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
+            return True
+        if isinstance(coex_type, NamedType) and coex_type.name == "string":
+            return True
+        return False
+
+    def _needs_deep_copy(self, coex_type: Type) -> bool:
+        """Check if a type needs deep copy (has nested collections)."""
+        if isinstance(coex_type, ListType):
+            return self._is_collection_coex_type(coex_type.element_type)
+        if isinstance(coex_type, ArrayType):
+            return self._is_collection_coex_type(coex_type.element_type)
+        if isinstance(coex_type, SetType):
+            return self._is_collection_coex_type(coex_type.element_type)
+        if isinstance(coex_type, MapType):
+            return self._is_collection_coex_type(coex_type.value_type)
+        if isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
+            # Check if user type has any collection fields
+            for field_name, field_type in self.type_fields[coex_type.name]:
+                if self._is_collection_coex_type(field_type):
+                    return True
+        return False
+
+    def _generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
+        """Generate code to deep-copy a value based on its Coex type."""
+        # Primitives have value semantics already
+        if self._is_primitive_coex_type(coex_type):
+            return value
+
+        # String: shallow copy is sufficient (strings are immutable)
+        if isinstance(coex_type, NamedType) and coex_type.name == "string":
+            return self.builder.call(self.string_copy, [value])
+
+        # List<T>: deep copy if T is a collection, shallow otherwise
+        if isinstance(coex_type, ListType):
+            if self._needs_deep_copy(coex_type):
+                return self._generate_list_deep_copy(value, coex_type.element_type)
+            else:
+                return self.builder.call(self.list_copy, [value])
+
+        # Set<T>: deep copy if T is a collection, shallow otherwise
+        if isinstance(coex_type, SetType):
+            if self._needs_deep_copy(coex_type):
+                return self._generate_set_deep_copy(value, coex_type.element_type)
+            else:
+                return self.builder.call(self.set_copy, [value])
+
+        # Map<K,V>: deep copy if V is a collection, shallow otherwise
+        if isinstance(coex_type, MapType):
+            if self._needs_deep_copy(coex_type):
+                return self._generate_map_deep_copy(value, coex_type.key_type, coex_type.value_type)
+            else:
+                return self.builder.call(self.map_copy, [value])
+
+        # Array<T>: deep copy if T is a collection, shallow otherwise
+        if isinstance(coex_type, ArrayType):
+            if self._needs_deep_copy(coex_type):
+                return self._generate_array_deep_copy(value, coex_type.element_type)
+            else:
+                return self.builder.call(self.array_copy, [value])
+
+        # User-defined types: copy struct, recursively deep-copy collection fields
+        # Exclude enums - they have different structure and don't need deep copy
+        if isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
+            if not (hasattr(self, 'enum_variants') and coex_type.name in self.enum_variants):
+                return self._generate_type_deep_copy(value, coex_type)
+
+        # Fallback: return as-is
+        return value
+
+    def _generate_list_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
+        """Deep copy a list, recursively copying elements if they are collections."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        list_ptr_type = self.list_struct.as_pointer()
+
+        # Get source length
+        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_len = self.builder.load(src_len_ptr)
+
+        # Get source capacity
+        src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_cap = self.builder.load(src_cap_ptr)
+
+        # Get element size
+        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_elem_size = self.builder.load(src_elem_size_ptr)
+
+        # Create new list with same capacity
+        dst = self.builder.call(self.list_new, [src_elem_size])
+
+        # Allocate space for cap elements
+        dst_cap_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        self.builder.store(src_cap, dst_cap_ptr)
+
+        # Allocate data buffer
+        data_size = self.builder.mul(src_cap, src_elem_size)
+        new_data = self.builder.call(self.malloc, [data_size])
+
+        dst_data_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        self.builder.store(new_data, dst_data_ptr)
+
+        # Set destination length to 0 initially (we'll increment as we copy)
+        dst_len_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        self.builder.store(ir.Constant(i64, 0), dst_len_ptr)
+
+        # Loop through source elements and deep copy each
+        # Create loop blocks
+        current_func = self.builder.block.parent
+        loop_header = current_func.append_basic_block("deep_copy_header")
+        loop_body = current_func.append_basic_block("deep_copy_body")
+        loop_end = current_func.append_basic_block("deep_copy_end")
+
+        # Index variable
+        idx_ptr = self.builder.alloca(i64, name="deep_copy_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop header: check i < len
+        self.builder.position_at_end(loop_header)
+        idx = self.builder.load(idx_ptr)
+        cond = self.builder.icmp_signed("<", idx, src_len)
+        self.builder.cbranch(cond, loop_body, loop_end)
+
+        # Loop body: copy element
+        self.builder.position_at_end(loop_body)
+        idx = self.builder.load(idx_ptr)
+
+        # Get source element pointer
+        src_elem_ptr = self.builder.call(self.list_get, [src, idx])
+
+        # Load element based on type
+        elem_llvm_type = self._get_llvm_type(elem_type)
+        typed_src_ptr = self.builder.bitcast(src_elem_ptr, elem_llvm_type.as_pointer())
+        elem_val = self.builder.load(typed_src_ptr)
+
+        # Deep copy the element
+        copied_elem = self._generate_deep_copy(elem_val, elem_type)
+
+        # Store to temp and append to destination
+        temp = self.builder.alloca(elem_llvm_type, name="deep_copy_elem")
+        self.builder.store(copied_elem, temp)
+        temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+        self.builder.call(self.list_append, [dst, temp_ptr, src_elem_size])
+
+        # Increment index
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop end
+        self.builder.position_at_end(loop_end)
+        return dst
+
+    def _generate_set_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
+        """Deep copy a set, recursively copying elements if they are collections."""
+        # For Set, elements are stored as i64, and if they're collection pointers,
+        # we need to iterate and deep-copy each one
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get source length (number of entries)
+        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_len = self.builder.load(src_len_ptr)
+
+        # Get source capacity
+        src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_cap = self.builder.load(src_cap_ptr)
+
+        # Create new set
+        dst = self.builder.call(self.set_new, [])
+
+        # Get source entries array
+        src_entries_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_entries = self.builder.load(src_entries_ptr)
+
+        # Loop through all slots in source
+        current_func = self.builder.block.parent
+        loop_header = current_func.append_basic_block("set_deep_copy_header")
+        loop_body = current_func.append_basic_block("set_deep_copy_body")
+        slot_check = current_func.append_basic_block("set_deep_copy_check")
+        slot_copy = current_func.append_basic_block("set_deep_copy_slot")
+        loop_next = current_func.append_basic_block("set_deep_copy_next")
+        loop_end = current_func.append_basic_block("set_deep_copy_end")
+
+        idx_ptr = self.builder.alloca(i64, name="set_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop header
+        self.builder.position_at_end(loop_header)
+        idx = self.builder.load(idx_ptr)
+        cond = self.builder.icmp_signed("<", idx, src_cap)
+        self.builder.cbranch(cond, loop_body, loop_end)
+
+        # Loop body: check if slot is occupied
+        self.builder.position_at_end(loop_body)
+        idx = self.builder.load(idx_ptr)
+
+        # SetEntry: { i64 value, i8 occupied }
+        entry_ptr = self.builder.gep(src_entries, [idx], inbounds=True)
+        occupied_ptr = self.builder.gep(entry_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        occupied = self.builder.load(occupied_ptr)
+        is_occupied = self.builder.icmp_unsigned("!=", occupied, ir.Constant(ir.IntType(8), 0))
+        self.builder.cbranch(is_occupied, slot_copy, loop_next)
+
+        # Slot copy: deep copy the element
+        self.builder.position_at_end(slot_copy)
+        value_ptr = self.builder.gep(entry_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        value = self.builder.load(value_ptr)
+
+        # The value is stored as i64, cast to proper type
+        elem_llvm_type = self._get_llvm_type(elem_type)
+        if isinstance(elem_llvm_type, ir.PointerType):
+            elem_val = self.builder.inttoptr(value, elem_llvm_type)
+        else:
+            elem_val = self.builder.trunc(value, elem_llvm_type) if elem_llvm_type.width < 64 else value
+
+        # Deep copy
+        copied_elem = self._generate_deep_copy(elem_val, elem_type)
+
+        # Convert back to i64 for storage
+        if isinstance(copied_elem.type, ir.PointerType):
+            copied_i64 = self.builder.ptrtoint(copied_elem, i64)
+        else:
+            copied_i64 = self._cast_value(copied_elem, i64)
+
+        # Add to destination set
+        self.builder.call(self.set_add, [dst, copied_i64])
+        self.builder.branch(loop_next)
+
+        # Loop next
+        self.builder.position_at_end(loop_next)
+        idx = self.builder.load(idx_ptr)
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop end
+        self.builder.position_at_end(loop_end)
+        return dst
+
+    def _generate_map_deep_copy(self, src: ir.Value, key_type: Type, value_type: Type) -> ir.Value:
+        """Deep copy a map, recursively copying values if they are collections."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get source capacity
+        src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_cap = self.builder.load(src_cap_ptr)
+
+        # Create new map
+        dst = self.builder.call(self.map_new, [])
+
+        # Get source entries array
+        src_entries_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_entries = self.builder.load(src_entries_ptr)
+
+        # Loop through all slots in source
+        current_func = self.builder.block.parent
+        loop_header = current_func.append_basic_block("map_deep_copy_header")
+        loop_body = current_func.append_basic_block("map_deep_copy_body")
+        slot_copy = current_func.append_basic_block("map_deep_copy_slot")
+        loop_next = current_func.append_basic_block("map_deep_copy_next")
+        loop_end = current_func.append_basic_block("map_deep_copy_end")
+
+        idx_ptr = self.builder.alloca(i64, name="map_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop header
+        self.builder.position_at_end(loop_header)
+        idx = self.builder.load(idx_ptr)
+        cond = self.builder.icmp_signed("<", idx, src_cap)
+        self.builder.cbranch(cond, loop_body, loop_end)
+
+        # Loop body: check if slot is occupied
+        self.builder.position_at_end(loop_body)
+        idx = self.builder.load(idx_ptr)
+
+        # MapEntry: { i64 key, i64 value, i8 occupied }
+        entry_ptr = self.builder.gep(src_entries, [idx], inbounds=True)
+        occupied_ptr = self.builder.gep(entry_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        occupied = self.builder.load(occupied_ptr)
+        is_occupied = self.builder.icmp_unsigned("!=", occupied, ir.Constant(ir.IntType(8), 0))
+        self.builder.cbranch(is_occupied, slot_copy, loop_next)
+
+        # Slot copy: get key and deep copy value
+        self.builder.position_at_end(slot_copy)
+        key_ptr = self.builder.gep(entry_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        key = self.builder.load(key_ptr)
+
+        value_ptr = self.builder.gep(entry_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = self.builder.load(value_ptr)
+
+        # Convert value to proper type
+        value_llvm_type = self._get_llvm_type(value_type)
+        if isinstance(value_llvm_type, ir.PointerType):
+            val = self.builder.inttoptr(value, value_llvm_type)
+        else:
+            val = value
+
+        # Deep copy the value
+        copied_val = self._generate_deep_copy(val, value_type)
+
+        # Convert back to i64 for storage
+        if isinstance(copied_val.type, ir.PointerType):
+            copied_i64 = self.builder.ptrtoint(copied_val, i64)
+        else:
+            copied_i64 = self._cast_value(copied_val, i64)
+
+        # Add to destination map
+        self.builder.call(self.map_set, [dst, key, copied_i64])
+        self.builder.branch(loop_next)
+
+        # Loop next
+        self.builder.position_at_end(loop_next)
+        idx = self.builder.load(idx_ptr)
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop end
+        self.builder.position_at_end(loop_end)
+        return dst
+
+    def _generate_array_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
+        """Deep copy an array, recursively copying elements if they are collections."""
+        # Array has same structure as List
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get source length
+        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_len = self.builder.load(src_len_ptr)
+
+        # Get element size
+        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_elem_size = self.builder.load(src_elem_size_ptr)
+
+        # Create new array with same size
+        dst = self.builder.call(self.array_new, [src_len, src_elem_size])
+
+        # Loop through source elements and deep copy each
+        current_func = self.builder.block.parent
+        loop_header = current_func.append_basic_block("array_deep_copy_header")
+        loop_body = current_func.append_basic_block("array_deep_copy_body")
+        loop_end = current_func.append_basic_block("array_deep_copy_end")
+
+        idx_ptr = self.builder.alloca(i64, name="array_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop header
+        self.builder.position_at_end(loop_header)
+        idx = self.builder.load(idx_ptr)
+        cond = self.builder.icmp_signed("<", idx, src_len)
+        self.builder.cbranch(cond, loop_body, loop_end)
+
+        # Loop body
+        self.builder.position_at_end(loop_body)
+        idx = self.builder.load(idx_ptr)
+
+        # Get source element
+        src_elem_ptr = self.builder.call(self.array_get, [src, idx])
+        elem_llvm_type = self._get_llvm_type(elem_type)
+        typed_src_ptr = self.builder.bitcast(src_elem_ptr, elem_llvm_type.as_pointer())
+        elem_val = self.builder.load(typed_src_ptr)
+
+        # Deep copy
+        copied_elem = self._generate_deep_copy(elem_val, elem_type)
+
+        # Store to destination
+        dst_elem_ptr = self.builder.call(self.array_get, [dst, idx])
+        typed_dst_ptr = self.builder.bitcast(dst_elem_ptr, elem_llvm_type.as_pointer())
+        self.builder.store(copied_elem, typed_dst_ptr)
+
+        # Increment
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_ptr)
+        self.builder.branch(loop_header)
+
+        # Loop end
+        self.builder.position_at_end(loop_end)
+        return dst
+
+    def _generate_type_deep_copy(self, src: ir.Value, coex_type: NamedType) -> ir.Value:
+        """Deep copy a user-defined type, recursively copying collection fields."""
+        type_name = coex_type.name
+        if type_name not in self.type_fields:
+            return src
+
+        # Don't deep copy enums - they have different structure (tag + payload)
+        if hasattr(self, 'enum_variants') and type_name in self.enum_variants:
+            return src
+
+        i32 = ir.IntType(32)
+        struct_type = self.type_registry[type_name]
+
+        # Allocate new struct via GC
+        struct_size = ir.Constant(ir.IntType(64), struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
+        type_id = ir.Constant(i32, 0)  # Generic type ID
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        dst = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
+
+        # Copy each field
+        for i, (field_name, field_type) in enumerate(self.type_fields[type_name]):
+            # Load source field
+            src_field_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
+            field_val = self.builder.load(src_field_ptr)
+
+            # Deep copy if it's a collection
+            if self._is_collection_coex_type(field_type):
+                field_val = self._generate_deep_copy(field_val, field_type)
+
+            # Store to destination
+            dst_field_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
+            self.builder.store(field_val, dst_field_ptr)
+
+        return dst
+
     def _register_string_methods(self):
         """Register String as a type with methods for method call resolution"""
         # Add String to type registry
@@ -1554,6 +2231,7 @@ class CodeGenerator:
         self.functions["coex_string_contains"] = self.string_contains
         self.functions["coex_string_print"] = self.string_print
         self.functions["coex_string_data"] = self.string_data
+        self.functions["coex_string_copy"] = self.string_copy
 
     def _create_map_type(self):
         """Create the Map type and helper functions.
@@ -1632,6 +2310,10 @@ class CodeGenerator:
         map_find_slot_ty = ir.FunctionType(i64, [map_ptr, i64])
         self.map_find_slot = ir.Function(self.module, map_find_slot_ty, name="coex_map_find_slot")
 
+        # map_copy(map: Map*) -> Map*  (deep copy for value semantics)
+        map_copy_ty = ir.FunctionType(map_ptr, [map_ptr])
+        self.map_copy = ir.Function(self.module, map_copy_ty, name="coex_map_copy")
+
         # Implement all map functions
         self._implement_map_hash()
         self._implement_map_new()
@@ -1643,6 +2325,7 @@ class CodeGenerator:
         self._implement_map_remove()
         self._implement_map_len()
         self._implement_map_size()
+        self._implement_map_copy()
 
         # Register Map methods
         self._register_map_methods()
@@ -2167,6 +2850,79 @@ class CodeGenerator:
 
         builder.ret(total_size)
 
+    def _implement_map_copy(self):
+        """Implement map_copy: create a deep copy of a map for value semantics.
+
+        This ensures that assignment `b = a` creates an independent copy,
+        so mutations to `b` do not affect `a`.
+        """
+        func = self.map_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        do_copy = func.append_basic_block("do_copy")
+        return_null = func.append_basic_block("return_null")
+
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        map_ptr_type = self.map_struct.as_pointer()
+
+        # Handle null input - return null
+        is_null = builder.icmp_unsigned("==", src, ir.Constant(map_ptr_type, None))
+        builder.cbranch(is_null, return_null, do_copy)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(map_ptr_type, None))
+
+        builder.position_at_end(do_copy)
+
+        # Load source fields
+        # entries (field 0)
+        src_entries_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_entries = builder.load(src_entries_ptr)
+
+        # len (field 1)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        # cap (field 2)
+        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_cap = builder.load(src_cap_ptr)
+
+        # Allocate new Map struct (24 bytes) via GC
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        dst = builder.bitcast(raw_ptr, map_ptr_type)
+
+        # Copy header fields to destination
+        # len
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(src_len, dst_len_ptr)
+
+        # cap
+        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_cap, dst_cap_ptr)
+
+        # Allocate new entries array: cap * 24 bytes (MapEntry size)
+        entry_size = ir.Constant(i64, 24)
+        entries_size = builder.mul(src_cap, entry_size)
+        new_entries_raw = builder.call(self.malloc, [entries_size])
+        new_entries = builder.bitcast(new_entries_raw, self.map_entry_struct.as_pointer())
+
+        # Store entries pointer
+        dst_entries_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_entries, dst_entries_ptr)
+
+        # Copy entries data: cap * 24 bytes (copy all entries including empty slots)
+        src_entries_i8 = builder.bitcast(src_entries, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_entries_raw, src_entries_i8, entries_size])
+
+        builder.ret(dst)
+
     def _register_map_methods(self):
         """Register Map as a type with methods."""
         self.type_registry["Map"] = self.map_struct
@@ -2188,6 +2944,7 @@ class CodeGenerator:
         self.functions["coex_map_remove"] = self.map_remove
         self.functions["coex_map_len"] = self.map_len
         self.functions["coex_map_size"] = self.map_size
+        self.functions["coex_map_copy"] = self.map_copy
 
     # ========================================================================
     # Set Type Implementation
@@ -2258,6 +3015,10 @@ class CodeGenerator:
         set_find_slot_ty = ir.FunctionType(i64, [set_ptr, i64])
         self.set_find_slot = ir.Function(self.module, set_find_slot_ty, name="coex_set_find_slot")
 
+        # set_copy(set: Set*) -> Set*  (deep copy for value semantics)
+        set_copy_ty = ir.FunctionType(set_ptr, [set_ptr])
+        self.set_copy = ir.Function(self.module, set_copy_ty, name="coex_set_copy")
+
         # Implement all set functions
         self._implement_set_new()
         self._implement_set_find_slot()
@@ -2267,6 +3028,7 @@ class CodeGenerator:
         self._implement_set_remove()
         self._implement_set_len()
         self._implement_set_size()
+        self._implement_set_copy()
         self._register_set_methods()
     
     def _implement_set_new(self):
@@ -2747,6 +3509,79 @@ class CodeGenerator:
 
         builder.ret(total_size)
 
+    def _implement_set_copy(self):
+        """Implement set_copy: create a deep copy of a set for value semantics.
+
+        This ensures that assignment `b = a` creates an independent copy,
+        so mutations to `b` do not affect `a`.
+        """
+        func = self.set_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        do_copy = func.append_basic_block("do_copy")
+        return_null = func.append_basic_block("return_null")
+
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        set_ptr_type = self.set_struct.as_pointer()
+
+        # Handle null input - return null
+        is_null = builder.icmp_unsigned("==", src, ir.Constant(set_ptr_type, None))
+        builder.cbranch(is_null, return_null, do_copy)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(set_ptr_type, None))
+
+        builder.position_at_end(do_copy)
+
+        # Load source fields
+        # entries (field 0)
+        src_entries_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_entries = builder.load(src_entries_ptr)
+
+        # len (field 1)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        # cap (field 2)
+        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_cap = builder.load(src_cap_ptr)
+
+        # Allocate new Set struct (24 bytes) via GC
+        set_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_SET)
+        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        dst = builder.bitcast(raw_ptr, set_ptr_type)
+
+        # Copy header fields to destination
+        # len
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(src_len, dst_len_ptr)
+
+        # cap
+        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_cap, dst_cap_ptr)
+
+        # Allocate new entries array: cap * 16 bytes (SetEntry size)
+        entry_size = ir.Constant(i64, 16)
+        entries_size = builder.mul(src_cap, entry_size)
+        new_entries_raw = builder.call(self.malloc, [entries_size])
+        new_entries = builder.bitcast(new_entries_raw, self.set_entry_struct.as_pointer())
+
+        # Store entries pointer
+        dst_entries_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_entries, dst_entries_ptr)
+
+        # Copy entries data: cap * 16 bytes (copy all entries including empty slots)
+        src_entries_i8 = builder.bitcast(src_entries, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_entries_raw, src_entries_i8, entries_size])
+
+        builder.ret(dst)
+
     def _register_set_methods(self):
         """Register Set as a type with methods."""
         self.type_registry["Set"] = self.set_struct
@@ -2766,6 +3601,7 @@ class CodeGenerator:
         self.functions["coex_set_remove"] = self.set_remove
         self.functions["coex_set_len"] = self.set_len
         self.functions["coex_set_size"] = self.set_size
+        self.functions["coex_set_copy"] = self.set_copy
 
     # ========================================================================
     # Atomic Reference Type Implementation
@@ -4511,6 +5347,8 @@ class CodeGenerator:
         """Generate a local variable declaration"""
         if stmt.type_annotation:
             llvm_type = self._get_llvm_type(stmt.type_annotation)
+            # Track Coex AST type for deep copy and nested collection support
+            self.var_coex_types[stmt.name] = stmt.type_annotation
             # Track tuple field info if this is a tuple type
             if isinstance(stmt.type_annotation, TupleType):
                 self.tuple_field_info[stmt.name] = stmt.type_annotation.elements
@@ -4519,9 +5357,37 @@ class CodeGenerator:
             init_value = self._generate_expression(stmt.initializer)
             llvm_type = init_value.type
             alloca = self.builder.alloca(llvm_type, name=stmt.name)
+
+            # Value semantics: deep copy collections on assignment to prevent aliasing
+            # Try to get Coex type from initializer for proper deep copy
+            inferred_coex_type = None
+            if isinstance(stmt.initializer, Identifier):
+                var_name = stmt.initializer.name
+                if var_name in self.var_coex_types:
+                    inferred_coex_type = self.var_coex_types[var_name]
+
+            if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
+                init_value = self._generate_deep_copy(init_value, inferred_coex_type)
+                # Track the inferred type for this variable too
+                self.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(init_value.type, ir.PointerType):
+                # Fallback to shallow copy for unknown collection types
+                pointee = init_value.type.pointee
+                if hasattr(pointee, 'name'):
+                    if pointee.name == "struct.List":
+                        init_value = self.builder.call(self.list_copy, [init_value])
+                    elif pointee.name == "struct.Set":
+                        init_value = self.builder.call(self.set_copy, [init_value])
+                    elif pointee.name == "struct.Map":
+                        init_value = self.builder.call(self.map_copy, [init_value])
+                    elif pointee.name == "struct.String":
+                        init_value = self.builder.call(self.string_copy, [init_value])
+                    elif pointee.name == "struct.Array":
+                        init_value = self.builder.call(self.array_copy, [init_value])
+
             self.builder.store(init_value, alloca)
             self.locals[stmt.name] = alloca
-            
+
             # Try to infer tuple info from initializer
             tuple_info = self._infer_tuple_info(stmt.initializer)
             if tuple_info:
@@ -4529,16 +5395,25 @@ class CodeGenerator:
             return
         
         alloca = self.builder.alloca(llvm_type, name=stmt.name)
-        
+
         # Generate initializer
         init_value = self._generate_expression(stmt.initializer)
-        
+
         # Cast if needed
         init_value = self._cast_value(init_value, llvm_type)
-        
+
+        # Value semantics: deep copy collections on assignment to prevent aliasing
+        # We have the Coex type annotation, so use it for proper deep copy
+        if self._is_collection_coex_type(stmt.type_annotation):
+            init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+        elif isinstance(init_value.type, ir.PointerType):
+            # User-defined types may need deep copy too
+            if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in self.type_fields:
+                init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
-    
+
     def _infer_tuple_info(self, expr: Expr) -> Optional[PyList[tuple]]:
         """Infer tuple field info from an expression"""
         if isinstance(expr, TupleExpr):
@@ -4588,22 +5463,30 @@ class CodeGenerator:
         """Cast value to target type if needed"""
         if value.type == target_type:
             return value
-        
+
         # Int to int
         if isinstance(value.type, ir.IntType) and isinstance(target_type, ir.IntType):
             if target_type.width > value.type.width:
                 return self.builder.zext(value, target_type)
             elif target_type.width < value.type.width:
                 return self.builder.trunc(value, target_type)
-        
+
         # Int to float
         if isinstance(value.type, ir.IntType) and isinstance(target_type, ir.DoubleType):
             return self.builder.sitofp(value, target_type)
-        
+
         # Float to int
         if isinstance(value.type, ir.DoubleType) and isinstance(target_type, ir.IntType):
             return self.builder.fptosi(value, target_type)
-        
+
+        # Pointer to int (for storing pointers in i64 collections)
+        if isinstance(value.type, ir.PointerType) and isinstance(target_type, ir.IntType):
+            return self.builder.ptrtoint(value, target_type)
+
+        # Int to pointer (for loading pointers from i64 collections)
+        if isinstance(value.type, ir.IntType) and isinstance(target_type, ir.PointerType):
+            return self.builder.inttoptr(value, target_type)
+
         return value
     
     def _generate_assignment(self, stmt: Assignment):
@@ -4690,10 +5573,44 @@ class CodeGenerator:
                     elem_type = self._infer_list_element_type(stmt.value)
                     if elem_type:
                         self.list_element_types[name] = elem_type
-        
+
+        # Value semantics: deep copy collections on assignment to prevent aliasing
+        # Try to get Coex type for proper deep copy
+        coex_type = None
+        # First, try to get type from target variable
+        if isinstance(stmt.target, Identifier):
+            target_name = stmt.target.name
+            if target_name in self.var_coex_types:
+                coex_type = self.var_coex_types[target_name]
+        # If not found, try to get from source expression
+        if coex_type is None and isinstance(stmt.value, Identifier):
+            source_name = stmt.value.name
+            if source_name in self.var_coex_types:
+                coex_type = self.var_coex_types[source_name]
+                # Track for target too
+                if isinstance(stmt.target, Identifier):
+                    self.var_coex_types[stmt.target.name] = coex_type
+
+        if coex_type and self._is_collection_coex_type(coex_type):
+            value = self._generate_deep_copy(value, coex_type)
+        elif isinstance(value.type, ir.PointerType):
+            # Fallback to shallow copy for unknown collection types
+            pointee = value.type.pointee
+            if hasattr(pointee, 'name'):
+                if pointee.name == "struct.List":
+                    value = self.builder.call(self.list_copy, [value])
+                elif pointee.name == "struct.Set":
+                    value = self.builder.call(self.set_copy, [value])
+                elif pointee.name == "struct.Map":
+                    value = self.builder.call(self.map_copy, [value])
+                elif pointee.name == "struct.String":
+                    value = self.builder.call(self.string_copy, [value])
+                elif pointee.name == "struct.Array":
+                    value = self.builder.call(self.array_copy, [value])
+
         if ptr:
             self.builder.store(value, ptr)
-    
+
     def _generate_tuple_assignment(self, target: TupleExpr, value: ir.Value):
         """Generate code for tuple destructuring: (a, b) = value"""
         if isinstance(value.type, ir.LiteralStructType):
@@ -6258,12 +7175,33 @@ class CodeGenerator:
                     args.append(arg_val)
                 
                 result = self.builder.call(func, args)
-                
+
                 # Special handling for List.get and Array.get - returns pointer that needs dereferencing
                 if (type_name == "List" or type_name == "Array") and method == "get":
-                    # Result is i8*, need to load as i64
-                    typed_ptr = self.builder.bitcast(result, ir.IntType(64).as_pointer())
+                    # Try to get element type from Coex type tracking
+                    elem_llvm_type = ir.IntType(64)  # default
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
+                                elem_llvm_type = self._get_llvm_type(coex_type.element_type)
+                    # Result is i8*, bitcast to proper element type pointer and load
+                    typed_ptr = self.builder.bitcast(result, elem_llvm_type.as_pointer())
                     return self.builder.load(typed_ptr)
+
+                # Special handling for Map.get - returns i64 that may be a pointer
+                if type_name == "Map" and method == "get":
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, MapType):
+                                value_llvm_type = self._get_llvm_type(coex_type.value_type)
+                                # If value type is a pointer, convert i64 result back to pointer
+                                if isinstance(value_llvm_type, ir.PointerType):
+                                    return self.builder.inttoptr(result, value_llvm_type)
+                    return result
 
                 return result
         

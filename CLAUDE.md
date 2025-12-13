@@ -33,6 +33,38 @@ source.coex → ANTLR4 Parser → Parse Tree → AST Builder → AST → CodeGen
 
 ## Language Syntax
 
+### Language Specification
+
+Read the language specification document "coex-compiler/coex_specification_revised.txt" in the local directory.
+
+### Inviolable requirements. Be certain that changes and update planning adheres to the immutability principles below.
+
+coex uses value semantics. The only mutable states are atomics.
+
+ll types in Coex have value semantics. Assignment always produces a logically independent copy of the value. This applies uniformly to primitive types, user-defined types, and collections.
+a = [1, 2, 3]
+b = a           # b is an independent copy
+var c = a       # c is an independent copy, rebindable
+c.append(4)     # c is now [1, 2, 3, 4]; a and b unchanged
+There is no aliasing in Coex. Two bindings never refer to "the same" mutable storage such that modifications through one are visible through the other. This guarantee is foundational to Coex's concurrency safety: a task that receives a value as a parameter owns that value exclusively and cannot observe modifications from other tasks.
+The compiler may implement value semantics through copy-on-write, structural sharing, or other optimizations, but the observable behavior is always as if a full copy occurred at assignment.
+The "var" keyword is then syntactic sugar for rebinding a new value to a name. Without it, a compiler error is thrown.
+The Two Kinds of Mutability
+Coex distinguishes between rebinding and shared mutation.
+Rebinding is purely local. A var declaration creates a name that can be bound to different values over time within its scope. The values themselves are never shared; rebinding one variable cannot affect any other binding anywhere in the program.
+var x = 1
+x = 2      # Rebinding: x now refers to the value 2
+Rebinding is available in task and func contexts. It provides the ergonomics of imperative programming while preserving local reasoning—you need only consider the current scope to understand what a var can become.
+Shared mutation requires atomic types. When multiple tasks must coordinate through shared state, they do so through atomic_int, atomic_float, atomic_bool, or atomic_ref<T>. These are the only mechanism for shared mutable state in Coex.
+var counter: atomic_int = 0    # Module-level shared state
+
+task increment()
+    counter.increment()        # Shared mutation
+~
+There are no global mutable variables, no mutable references passed between functions, and no out-parameters. Functions receive values and return values. If a function must mutate shared state, it receives an atomic handle and the mutation is explicit in both the type signature and the call site.
+This design makes sharing visible. Code that contains no atomic types cannot exhibit data races, and the presence of atomics signals "concurrent coordination happens here."
+
+
 ### Block Termination
 Coex uses `~` or `end` to close blocks (not braces or indentation):
 ```coex
