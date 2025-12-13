@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 import struct
 import os
 
+# Import garbage collector (will be initialized after module creation)
+from coex_gc import GarbageCollector
+
 binding.initialize_native_target()
 binding.initialize_native_asmprinter()
 
@@ -107,6 +110,9 @@ class CodeGenerator:
         self._pending_inline_ir: PyList[Dict] = []  # Pending IR to inject during serialization
         self._inline_ir_counter = 0  # Counter for unique stub function names
 
+        # Garbage collector (initialized after module creation, before builtins)
+        self.gc: Optional[GarbageCollector] = None
+
         # Declare external functions
         self._declare_builtins()
     
@@ -124,12 +130,16 @@ class CodeGenerator:
         self.free = ir.Function(self.module, free_ty, name="free")
         
         # memcpy
-        memcpy_ty = ir.FunctionType(ir.IntType(8).as_pointer(), 
-                                     [ir.IntType(8).as_pointer(), 
-                                      ir.IntType(8).as_pointer(), 
+        memcpy_ty = ir.FunctionType(ir.IntType(8).as_pointer(),
+                                     [ir.IntType(8).as_pointer(),
+                                      ir.IntType(8).as_pointer(),
                                       ir.IntType(64)])
         self.memcpy = ir.Function(self.module, memcpy_ty, name="memcpy")
-        
+
+        # Initialize garbage collector (must be before struct helpers that use gc_alloc)
+        self.gc = GarbageCollector(self.module, self)
+        self.gc.generate_gc_runtime()
+
         # String format specifiers
         self._int_fmt = self._create_global_string("%lld\n", "int_fmt")
         self._float_fmt = self._create_global_string("%f\n", "float_fmt")
@@ -186,7 +196,7 @@ class CodeGenerator:
         self.current_matrix: Optional[str] = None
         self.current_cell_x: Optional[ir.Value] = None
         self.current_cell_y: Optional[ir.Value] = None
-    
+
     def _create_list_helpers(self):
         """Create helper functions for list operations"""
         list_ptr = self.list_struct.as_pointer()
@@ -220,13 +230,14 @@ class CodeGenerator:
         """Implement list_new: allocate a new list with given element size"""
         func = self.list_new
         func.args[0].name = "elem_size"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        # Allocate List struct (4 * 8 = 32 bytes)
+
+        # Allocate List struct (4 * 8 = 32 bytes) via GC
         list_size = ir.Constant(ir.IntType(64), 32)
-        raw_ptr = builder.call(self.malloc, [list_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_LIST)
+        raw_ptr = builder.call(self.gc.gc_alloc, [list_size, type_id])
         list_ptr = builder.bitcast(raw_ptr, self.list_struct.as_pointer())
         
         # Initialize fields
@@ -497,9 +508,10 @@ class CodeGenerator:
         data = func.args[0]
         length = func.args[1]
         
-        # Allocate 8 (length field) + len (data) bytes
+        # Allocate 8 (length field) + len (data) bytes via GC
         alloc_size = builder.add(ir.Constant(ir.IntType(64), 8), length)
-        raw_ptr = builder.call(self.malloc, [alloc_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [alloc_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
         
         # Store length at offset 0
@@ -1028,9 +1040,10 @@ class CodeGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
         
-        # Allocate Map struct (8 + 8 + 8 = 24 bytes)
+        # Allocate Map struct (8 + 8 + 8 = 24 bytes) via GC
         map_size = ir.Constant(ir.IntType(64), 24)
-        raw_ptr = builder.call(self.malloc, [map_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         map_ptr = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
         
         # Initial capacity = 8
@@ -1595,9 +1608,10 @@ class CodeGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
         
-        # Allocate Set struct (3 * 8 = 24 bytes)
+        # Allocate Set struct (3 * 8 = 24 bytes) via GC
         set_size = ir.Constant(ir.IntType(64), 24)
-        raw_ptr = builder.call(self.malloc, [set_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET)
+        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         set_ptr = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
         
         # Initial capacity = 8
@@ -2345,9 +2359,10 @@ class CodeGenerator:
         
         capacity = func.args[0]
         
-        # Allocate channel struct (48 bytes = 6 * 8)
+        # Allocate channel struct (48 bytes = 6 * 8) via GC
         struct_size = ir.Constant(i64, 48)
-        raw_ptr = builder.call(self.malloc, [struct_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         chan = builder.bitcast(raw_ptr, chan_ptr)
         
         # Initialize len = 0
@@ -2689,7 +2704,23 @@ class CodeGenerator:
         
         else:
             return ir.IntType(64)
-    
+
+    def _is_reference_type(self, coex_type: Type) -> bool:
+        """Check if a Coex type is a reference (pointer) type for GC tracking."""
+        if isinstance(coex_type, PrimitiveType):
+            # Only string is a reference among primitives
+            return coex_type.name == "string"
+        elif isinstance(coex_type, (ListType, MapType, SetType, ChannelType)):
+            return True
+        elif isinstance(coex_type, NamedType):
+            # User-defined types are pointers
+            return True
+        elif isinstance(coex_type, OptionalType):
+            # Optional of reference type needs tracking
+            return self._is_reference_type(coex_type.inner)
+        # TupleType, FunctionType, AtomicType, primitives (non-string) are not references
+        return False
+
     def _get_default_value(self, coex_type: Type) -> ir.Constant:
         """Get default value for a type"""
         llvm_type = self._get_llvm_type(coex_type)
@@ -3028,6 +3059,17 @@ class CodeGenerator:
         self.type_registry[mangled_name] = struct_type
         self.type_fields[mangled_name] = field_info
         self.type_methods[mangled_name] = {}
+
+        # Register type with GC for heap tracking
+        if self.gc is not None:
+            # Calculate size (8 bytes per field)
+            size = len(field_info) * 8 if field_info else 8
+            # Compute reference field offsets
+            ref_offsets = []
+            for i, (_, field_type) in enumerate(field_info):
+                if self._is_reference_type(field_type):
+                    ref_offsets.append(i * 8)
+            self.gc.register_type(mangled_name, size, ref_offsets)
     
     def _substitute_type(self, coex_type: Type) -> Type:
         """Substitute type parameters with concrete types"""
@@ -3521,6 +3563,19 @@ class CodeGenerator:
         if not hasattr(self, 'enum_variants'):
             self.enum_variants = {}
         self.enum_variants[type_decl.name] = variant_info
+
+        # Register enum type with GC for heap tracking
+        if self.gc is not None:
+            # Calculate size: (1 + max_fields) * 8 bytes
+            size = (1 + max_fields) * 8
+            # Compute reference field offsets across all variants
+            ref_offsets = set()
+            for variant_name, (tag, fields) in variant_info.items():
+                for i, (_, field_type) in enumerate(fields):
+                    if self._is_reference_type(field_type):
+                        # Offset is (1 + field_index) * 8 (tag is at offset 0)
+                        ref_offsets.add((1 + i) * 8)
+            self.gc.register_type(type_decl.name, size, list(ref_offsets))
     
     def _declare_type_methods(self, type_decl: TypeDecl):
         """Declare all methods for a type"""
@@ -3681,11 +3736,15 @@ class CodeGenerator:
         # Create entry block
         entry = llvm_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
-        
+
+        # Initialize GC at start of main function
+        if func.name == "main" and self.gc is not None:
+            self.gc.inject_gc_init(self.builder)
+
         # Clear locals
         self.locals = {}
         self.current_function = func
-        
+
         # Allocate parameters
         for i, param in enumerate(func.params):
             llvm_param = llvm_func.args[i]
@@ -5037,7 +5096,12 @@ class CodeGenerator:
                     # For now just return the value
                     return val
                 return ir.Constant(ir.DoubleType(), 0.0)
-            
+
+            if name == "gc":
+                # Trigger garbage collection
+                self.builder.call(self.gc.gc_collect, [])
+                return ir.Constant(ir.IntType(64), 0)
+
             if name == "print":
                 # print(value) - generate appropriate print based on type
                 if expr.args:
@@ -5206,12 +5270,14 @@ class CodeGenerator:
         """Generate code for type constructor: Point(x: 1, y: 2)"""
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
-        
+
         # Calculate size - estimate 8 bytes per field (works for most types)
         size = len(field_info) * 8 if field_info else 8
         size_val = ir.Constant(ir.IntType(64), size)
-        
-        raw_ptr = self.builder.call(self.malloc, [size_val])
+
+        # Allocate via GC with registered type ID
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Initialize fields
@@ -5328,13 +5394,14 @@ class CodeGenerator:
         variant_info = self.enum_variants[enum_name][variant_name]
         tag, fields = variant_info
         
-        # Allocate enum struct
+        # Allocate enum struct via GC
         # Count: 1 (tag) + max_fields
         max_fields = max(len(v[1]) for v in self.enum_variants[enum_name].values())
         size = (1 + max_fields) * 8
         size_val = ir.Constant(ir.IntType(64), size)
-        
-        raw_ptr = self.builder.call(self.malloc, [size_val])
+
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(enum_name))
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Store tag

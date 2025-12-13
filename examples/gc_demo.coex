@@ -1,0 +1,42 @@
+# gc_demo.coex - Demonstrates garbage collection
+
+type Node:
+    value: int
+~
+
+# Create objects that become garbage
+func create_garbage() -> int
+    var garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    return 0
+~
+
+# Create a node
+func create_node(n: int) -> Node
+    return Node(value: n)
+~
+
+func main() -> int
+    print(1)
+
+    # Create some garbage in a loop
+    for i in 0..100
+        create_garbage()
+    ~
+    print(2)
+
+    # Explicit GC - should reclaim all the garbage lists
+    gc()
+    print(3)
+
+    # Create live objects that should survive GC
+    var node1: Node = create_node(5)
+    var node2: Node = create_node(4)
+    gc()
+    print(node1.value)
+
+    # Verify node2 also survived
+    print(node2.value)
+
+    print(0)
+    return 0
+~
