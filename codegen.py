@@ -1785,6 +1785,36 @@ class CodeGenerator:
             return coex_type.name in ("int", "float", "bool", "byte", "char")
         return False
 
+    def _needs_parameter_copy(self, coex_type: Type) -> bool:
+        """Check if a parameter type needs to be copied on function entry.
+
+        Value semantics require that function parameters are independent copies.
+        This returns True for any type that has heap-allocated data:
+        - Collections (List, Set, Map, Array)
+        - String (heap-allocated)
+        - User-defined types (may have collection fields)
+        """
+        if coex_type is None:
+            return False
+        if self._is_primitive_coex_type(coex_type):
+            return False
+        if isinstance(coex_type, PrimitiveType) and coex_type.name == "string":
+            return True
+        if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
+            return True
+        if isinstance(coex_type, NamedType):
+            # String and user-defined types need copying
+            if coex_type.name == "string":
+                return True
+            if coex_type.name in self.type_fields:
+                return True
+        if isinstance(coex_type, TupleType):
+            # Tuples need copy if any element needs copy
+            for _, elem_type in coex_type.elements:
+                if self._needs_parameter_copy(elem_type):
+                    return True
+        return False
+
     def _is_collection_coex_type(self, coex_type: Type) -> bool:
         """Check if a Coex type is a collection (List, Set, Map, Array, String)."""
         if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
@@ -4912,15 +4942,23 @@ class CodeGenerator:
         old_current_function = self.current_function
         self.current_function = func_decl
         
-        # Allocate parameters
+        # Allocate parameters with value semantics (deep copy heap-allocated types)
         for i, param in enumerate(func_decl.params):
             llvm_param = llvm_func.args[i]
             llvm_param.name = param.name
-            
+
+            # Get the substituted type for this parameter
+            param_type = self._substitute_type(param.type_annotation)
+
+            # Deep copy parameter if it needs copying (value semantics)
+            param_value = llvm_param
+            if self._needs_parameter_copy(param_type):
+                param_value = self._generate_deep_copy(llvm_param, param_type)
+
             alloca = self.builder.alloca(llvm_param.type, name=param.name)
-            self.builder.store(llvm_param, alloca)
+            self.builder.store(param_value, alloca)
             self.locals[param.name] = alloca
-        
+
         # Generate body
         for stmt in func_decl.body:
             self._generate_statement(stmt)
@@ -5334,16 +5372,21 @@ class CodeGenerator:
         self.locals = {}
         self.current_function = func
 
-        # Allocate parameters
+        # Allocate parameters with value semantics (deep copy heap-allocated types)
         for i, param in enumerate(func.params):
             llvm_param = llvm_func.args[i]
             llvm_param.name = param.name
-            
-            # Allocate on stack
+
+            # Deep copy parameter if it needs copying (value semantics)
+            param_value = llvm_param
+            if self._needs_parameter_copy(param.type_annotation):
+                param_value = self._generate_deep_copy(llvm_param, param.type_annotation)
+
+            # Allocate on stack and store the (possibly copied) value
             alloca = self.builder.alloca(llvm_param.type, name=param.name)
-            self.builder.store(llvm_param, alloca)
+            self.builder.store(param_value, alloca)
             self.locals[param.name] = alloca
-        
+
         # Generate body
         for stmt in func.body:
             self._generate_statement(stmt)

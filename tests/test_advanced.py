@@ -708,3 +708,94 @@ func main() -> int
     return 0
 ~
 ''', "3\n96\n")
+
+
+class TestParameterValueSemantics:
+    """Tests that function parameters are deep-copied on entry (value semantics)."""
+
+    def test_list_parameter_isolated(self, expect_output):
+        """Modifying list parameter inside function should not affect caller."""
+        expect_output('''
+func modify_list(lst: List<int>) -> int
+    lst = lst.append(99)
+    return lst.len()
+~
+
+func main() -> int
+    var original: List<int> = [1, 2, 3]
+    var new_len: int = modify_list(original)
+    print(original.len())
+    print(new_len)
+    return 0
+~
+''', "3\n4\n")
+
+    def test_map_parameter_isolated(self, expect_output):
+        """Modifying map parameter inside function should not affect caller."""
+        expect_output('''
+func modify_map(m: Map<int, int>) -> int
+    m = m.set(99, 999)
+    return m.len()
+~
+
+func main() -> int
+    var original: Map<int, int> = {1: 10, 2: 20}
+    var new_len: int = modify_map(original)
+    print(original.len())
+    print(new_len)
+    return 0
+~
+''', "2\n3\n")
+
+    def test_set_parameter_isolated(self, expect_output):
+        """Modifying set parameter inside function should not affect caller."""
+        expect_output('''
+func modify_set(s: Set<int>) -> int
+    s = s.add(99)
+    return s.len()
+~
+
+func main() -> int
+    var original: Set<int> = {1, 2, 3}
+    var new_len: int = modify_set(original)
+    print(original.len())
+    print(new_len)
+    return 0
+~
+''', "3\n4\n")
+
+    def test_string_parameter_isolated(self, expect_output):
+        """String parameter should be copied (verify it doesn't crash)."""
+        expect_output('''
+func use_string(s: string) -> int
+    return s.len()
+~
+
+func main() -> int
+    var original: string = "hello"
+    print(use_string(original))
+    print(original.len())
+    return 0
+~
+''', "5\n5\n")
+
+    @pytest.mark.xfail(reason="Nested lists have a preexisting bug - .get() crashes")
+    def test_nested_list_parameter_isolated(self, expect_output):
+        """Nested list modifications should not affect caller."""
+        expect_output('''
+func modify_nested(lst: List<List<int>>) -> int
+    var inner: List<int> = lst.get(0)
+    inner = inner.append(99)
+    return inner.len()
+~
+
+func main() -> int
+    var inner: List<int> = [1, 2]
+    var outer: List<List<int>> = [inner]
+    var new_len: int = modify_nested(outer)
+    var orig_inner: List<int> = outer.get(0)
+    print(orig_inner.len())
+    print(new_len)
+    return 0
+~
+''', "2\n3\n")
