@@ -5400,6 +5400,14 @@ class CodeGenerator:
     
     def _generate_var_decl(self, stmt: VarDecl):
         """Generate a local variable declaration"""
+        # Check: var (mutable) declarations are prohibited in formulas
+        if stmt.is_mutable and self.current_function is not None:
+            if self.current_function.kind == FunctionKind.FORMULA:
+                raise RuntimeError(
+                    f"Mutable variable 'var {stmt.name}' is not allowed in formula '{self.current_function.name}'. "
+                    f"Formulas must be pure - use immutable bindings (without 'var') instead."
+                )
+
         if stmt.type_annotation:
             llvm_type = self._get_llvm_type(stmt.type_annotation)
             # Track Coex AST type for deep copy and nested collection support

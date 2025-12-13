@@ -305,3 +305,66 @@ func main() -> int
     return 0
 ~
 ''', "30\n")
+
+
+class TestFormulaPurity:
+    """Tests that formulas are pure (no var declarations allowed)."""
+
+    def test_var_in_formula_rejected(self, expect_compile_error):
+        """var declarations should be rejected in formulas."""
+        expect_compile_error('''
+formula bad_formula(x: int) -> int
+    var total: int = 0
+    total = x * 2
+    return total
+~
+
+func main() -> int
+    print(bad_formula(21))
+    return 0
+~
+''', "mutable variable")
+
+    def test_assignment_in_formula_allowed(self, expect_output):
+        """Assignment in formulas creates functional bindings (shadowing)."""
+        expect_output('''
+formula good_formula(x: int) -> int
+    result = x * 2
+    return result
+~
+
+func main() -> int
+    print(good_formula(21))
+    return 0
+~
+''', "42\n")
+
+    def test_var_in_func_allowed(self, expect_output):
+        """var declarations should be allowed in func."""
+        expect_output('''
+func compute(x: int) -> int
+    var total: int = 0
+    total = x * 2
+    return total
+~
+
+func main() -> int
+    print(compute(21))
+    return 0
+~
+''', "42\n")
+
+    def test_var_in_task_allowed(self, expect_output):
+        """var declarations should be allowed in task."""
+        expect_output('''
+task compute(x: int) -> int
+    var total: int = 0
+    total = x * 2
+    return total
+~
+
+func main() -> int
+    print(compute(21))
+    return 0
+~
+''', "42\n")
