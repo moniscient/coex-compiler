@@ -346,6 +346,8 @@ class ASTBuilder:
                     return MapType(type_args[0], type_args[1])
                 elif name == "Set" and len(type_args) == 1:
                     return SetType(type_args[0])
+                elif name == "Array" and len(type_args) == 1:
+                    return ArrayType(type_args[0])
                 elif name == "Channel" and len(type_args) == 1:
                     return ChannelType(type_args[0])
                 else:

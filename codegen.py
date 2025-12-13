@@ -95,6 +95,9 @@ class CodeGenerator:
         
         # List element type tracking for proper destructuring
         self.list_element_types: Dict[str, ir.Type] = {}  # var_name -> element LLVM type
+
+        # Array element type tracking for proper destructuring
+        self.array_element_types: Dict[str, ir.Type] = {}  # var_name -> element LLVM type
         
         # List and channel runtime support
         self.list_type = None
@@ -169,7 +172,18 @@ class CodeGenerator:
         
         # Create Set type and helpers
         self._create_set_type()
-        
+
+        # Create Array type and helpers (dense, contiguous collection)
+        # struct Array { i64 len, i64 cap, i64 elem_size, i8* data }
+        self.array_struct = ir.global_context.get_identified_type("struct.Array")
+        self.array_struct.set_body(
+            ir.IntType(64),  # len
+            ir.IntType(64),  # cap
+            ir.IntType(64),  # elem_size
+            ir.IntType(8).as_pointer()  # data
+        )
+        self._create_array_helpers()
+
         # Create atomic_ref type and helpers
         self._create_atomic_ref_type()
         
@@ -426,6 +440,474 @@ class CodeGenerator:
         self.functions["coex_list_append"] = self.list_append
         self.functions["coex_list_len"] = self.list_len
         self.functions["coex_list_size"] = self.list_size
+
+    def _create_array_helpers(self):
+        """Create helper functions for Array operations.
+
+        Array is a dense, contiguous collection with value semantics.
+        All 'mutation' operations return a new array.
+        """
+        array_ptr = self.array_struct.as_pointer()
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # array_new(cap: i64, elem_size: i64) -> Array*
+        array_new_ty = ir.FunctionType(array_ptr, [i64, i64])
+        self.array_new = ir.Function(self.module, array_new_ty, name="coex_array_new")
+
+        # array_get(arr: Array*, index: i64) -> i8*
+        array_get_ty = ir.FunctionType(i8_ptr, [array_ptr, i64])
+        self.array_get = ir.Function(self.module, array_get_ty, name="coex_array_get")
+
+        # array_set(arr: Array*, index: i64, value: i8*, elem_size: i64) -> Array*
+        # Returns a NEW array with the element at index replaced
+        array_set_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i8_ptr, i64])
+        self.array_set = ir.Function(self.module, array_set_ty, name="coex_array_set")
+
+        # array_append(arr: Array*, value: i8*, elem_size: i64) -> Array*
+        # Returns a NEW array with the element appended
+        array_append_ty = ir.FunctionType(array_ptr, [array_ptr, i8_ptr, i64])
+        self.array_append = ir.Function(self.module, array_append_ty, name="coex_array_append")
+
+        # array_len(arr: Array*) -> i64
+        array_len_ty = ir.FunctionType(i64, [array_ptr])
+        self.array_len = ir.Function(self.module, array_len_ty, name="coex_array_len")
+
+        # array_size(arr: Array*) -> i64 (total memory footprint)
+        array_size_ty = ir.FunctionType(i64, [array_ptr])
+        self.array_size = ir.Function(self.module, array_size_ty, name="coex_array_size")
+
+        # Implement all functions
+        self._implement_array_new()
+        self._implement_array_get()
+        self._implement_array_set()
+        self._implement_array_append()
+        self._implement_array_len()
+        self._implement_array_size()
+        self._register_array_methods()
+
+    def _implement_array_new(self):
+        """Implement array_new: allocate a new array with given capacity and element size."""
+        func = self.array_new
+        func.args[0].name = "cap"
+        func.args[1].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        cap = func.args[0]
+        elem_size = func.args[1]
+
+        # Allocate Array struct (32 bytes) via GC
+        array_size_const = ir.Constant(ir.IntType(64), 32)
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY)
+        raw_ptr = builder.call(self.gc.gc_alloc, [array_size_const, type_id])
+        array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
+
+        # Initialize fields
+        # len = 0
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
+
+        # cap
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(cap, cap_ptr)
+
+        # elem_size
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(elem_size, elem_size_ptr)
+
+        # Allocate data: cap * elem_size
+        data_size = builder.mul(cap, elem_size)
+        data_ptr = builder.call(self.malloc, [data_size])
+        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(data_ptr, data_field_ptr)
+
+        builder.ret(array_ptr)
+
+    def _implement_array_get(self):
+        """Implement array_get: return pointer to element at index."""
+        func = self.array_get
+        func.args[0].name = "arr"
+        func.args[1].name = "index"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        array_ptr = func.args[0]
+        index = func.args[1]
+
+        # Get elem_size
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        # Get data pointer
+        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        data = builder.load(data_field_ptr)
+
+        # Calculate offset: index * elem_size
+        offset = builder.mul(index, elem_size)
+        result = builder.gep(data, [offset])
+
+        builder.ret(result)
+
+    def _implement_array_set(self):
+        """Implement array_set: return a NEW array with element at index replaced.
+
+        This implements value semantics - original array is unchanged.
+        """
+        func = self.array_set
+        func.args[0].name = "arr"
+        func.args[1].name = "index"
+        func.args[2].name = "value"
+        func.args[3].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        old_arr = func.args[0]
+        index = func.args[1]
+        value_ptr = func.args[2]
+        elem_size = func.args[3]
+
+        # Get old array's len and cap
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_len = builder.load(old_len_ptr)
+
+        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        old_cap = builder.load(old_cap_ptr)
+
+        # Create new array with same capacity
+        new_arr = builder.call(self.array_new, [old_cap, elem_size])
+
+        # Set new array's len to old len
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(old_len, new_len_ptr)
+
+        # Copy all data from old to new
+        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_data = builder.load(old_data_ptr)
+
+        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_data = builder.load(new_data_ptr)
+
+        copy_size = builder.mul(old_len, elem_size)
+        builder.call(self.memcpy, [new_data, old_data, copy_size])
+
+        # Overwrite the element at index
+        offset = builder.mul(index, elem_size)
+        dest = builder.gep(new_data, [offset])
+        builder.call(self.memcpy, [dest, value_ptr, elem_size])
+
+        builder.ret(new_arr)
+
+    def _implement_array_append(self):
+        """Implement array_append: return a NEW array with element appended.
+
+        This implements value semantics - original array is unchanged.
+        New array has capacity = old_len + 1.
+        """
+        func = self.array_append
+        func.args[0].name = "arr"
+        func.args[1].name = "value"
+        func.args[2].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        old_arr = func.args[0]
+        value_ptr = func.args[1]
+        elem_size = func.args[2]
+
+        # Get old array's len
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_len = builder.load(old_len_ptr)
+
+        # New capacity = old_len + 1
+        new_cap = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
+
+        # Create new array
+        new_arr = builder.call(self.array_new, [new_cap, elem_size])
+
+        # Set new array's len = old_len + 1
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(new_cap, new_len_ptr)
+
+        # Copy old data to new
+        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_data = builder.load(old_data_ptr)
+
+        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_data = builder.load(new_data_ptr)
+
+        copy_size = builder.mul(old_len, elem_size)
+        builder.call(self.memcpy, [new_data, old_data, copy_size])
+
+        # Append the new element
+        offset = builder.mul(old_len, elem_size)
+        dest = builder.gep(new_data, [offset])
+        builder.call(self.memcpy, [dest, value_ptr, elem_size])
+
+        builder.ret(new_arr)
+
+    def _implement_array_len(self):
+        """Implement array_len: return array length."""
+        func = self.array_len
+        func.args[0].name = "arr"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        array_ptr = func.args[0]
+
+        # Get len field
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        length = builder.load(len_ptr)
+
+        builder.ret(length)
+
+    def _implement_array_size(self):
+        """Implement array_size: return total memory footprint in bytes.
+
+        Size = 32 (header) + cap * elem_size (data array)
+        """
+        func = self.array_size
+        func.args[0].name = "arr"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        array_ptr = func.args[0]
+
+        # Get cap field (field 1)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Get elem_size field (field 2)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        # Size = 32 (header) + cap * elem_size
+        data_size = builder.mul(cap, elem_size)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 32), data_size)
+
+        builder.ret(total_size)
+
+    def _register_array_methods(self):
+        """Register Array as a type with methods."""
+        self.type_registry["Array"] = self.array_struct
+        self.type_fields["Array"] = []  # Internal structure, not user-accessible fields
+
+        self.type_methods["Array"] = {
+            "get": "coex_array_get",
+            "len": "coex_array_len",
+            "size": "coex_array_size",
+            # "set" and "append" handled specially (need alloca + return new array)
+        }
+
+        self.functions["coex_array_new"] = self.array_new
+        self.functions["coex_array_get"] = self.array_get
+        self.functions["coex_array_set"] = self.array_set
+        self.functions["coex_array_append"] = self.array_append
+        self.functions["coex_array_len"] = self.array_len
+        self.functions["coex_array_size"] = self.array_size
+
+    def _list_to_array(self, list_ptr: ir.Value) -> ir.Value:
+        """Convert a List to an Array (List.packed() -> Array).
+
+        Creates a new Array with the same elements as the List.
+        """
+        func = self.builder.function
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get List length
+        list_len = self.builder.call(self.list_len, [list_ptr])
+
+        # Get List elem_size (field 2)
+        elem_size_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        elem_size = self.builder.load(elem_size_ptr)
+
+        # Create new Array with same capacity as List length
+        array_ptr = self.builder.call(self.array_new, [list_len, elem_size])
+
+        # Set Array len = list_len
+        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        self.builder.store(list_len, array_len_ptr)
+
+        # Get data pointers
+        list_data_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        list_data = self.builder.load(list_data_ptr)
+
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        array_data = self.builder.load(array_data_ptr)
+
+        # Copy all data: memcpy(array_data, list_data, list_len * elem_size)
+        copy_size = self.builder.mul(list_len, elem_size)
+        self.builder.call(self.memcpy, [array_data, list_data, copy_size])
+
+        return array_ptr
+
+    def _set_to_array(self, set_ptr: ir.Value) -> ir.Value:
+        """Convert a Set to an Array (Set.packed() -> Array).
+
+        Creates a new Array with the occupied elements from the Set.
+        Elements are stored in iteration order (arbitrary).
+        """
+        func = self.builder.function
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get Set len (number of elements)
+        set_len = self.builder.call(self.set_len, [set_ptr])
+
+        # Create Array with capacity = set_len, elem_size = 8 (i64 keys)
+        elem_size = ir.Constant(i64, 8)
+        array_ptr = self.builder.call(self.array_new, [set_len, elem_size])
+
+        # We need to iterate over Set entries and copy occupied ones to Array
+        # This requires a loop - for simplicity, use basic blocks
+
+        # Get set capacity and entries pointer
+        set_cap_ptr = self.builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        set_cap = self.builder.load(set_cap_ptr)
+
+        set_entries_ptr = self.builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        set_entries = self.builder.load(set_entries_ptr)
+
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        array_data = self.builder.load(array_data_ptr)
+
+        # Loop variables
+        idx_alloca = self.builder.alloca(i64, name="set_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        arr_idx_alloca = self.builder.alloca(i64, name="arr_idx")
+        self.builder.store(ir.Constant(i64, 0), arr_idx_alloca)
+
+        # Loop blocks
+        cond_block = func.append_basic_block("set_to_arr_cond")
+        body_block = func.append_basic_block("set_to_arr_body")
+        inc_block = func.append_basic_block("set_to_arr_inc")
+        exit_block = func.append_basic_block("set_to_arr_exit")
+
+        self.builder.branch(cond_block)
+
+        # Condition: idx < set_cap
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, set_cap)
+        self.builder.cbranch(cond, body_block, exit_block)
+
+        # Body: check if entry is occupied, if so copy to array
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+
+        # Get entry state (offset 8 in SetEntry: { i64 key, i8 state })
+        entry_ptr = self.builder.gep(set_entries, [idx], inbounds=True)
+        state_ptr = self.builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        state = self.builder.load(state_ptr)
+
+        # Check if state == 1 (occupied)
+        is_occupied = self.builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+
+        copy_block = func.append_basic_block("set_to_arr_copy")
+        skip_block = func.append_basic_block("set_to_arr_skip")
+        self.builder.cbranch(is_occupied, copy_block, skip_block)
+
+        # Copy block: copy key to array
+        self.builder.position_at_end(copy_block)
+        key_ptr = self.builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        key_val = self.builder.load(key_ptr)
+
+        arr_idx = self.builder.load(arr_idx_alloca)
+        offset = self.builder.mul(arr_idx, elem_size)
+        dest_ptr = self.builder.gep(array_data, [offset])
+        dest_typed = self.builder.bitcast(dest_ptr, i64.as_pointer())
+        self.builder.store(key_val, dest_typed)
+
+        # Increment array index
+        new_arr_idx = self.builder.add(arr_idx, ir.Constant(i64, 1))
+        self.builder.store(new_arr_idx, arr_idx_alloca)
+        self.builder.branch(skip_block)
+
+        # Skip/continue to increment
+        self.builder.position_at_end(skip_block)
+        self.builder.branch(inc_block)
+
+        # Increment set index
+        self.builder.position_at_end(inc_block)
+        idx = self.builder.load(idx_alloca)
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        # Exit: set array len
+        self.builder.position_at_end(exit_block)
+        final_arr_idx = self.builder.load(arr_idx_alloca)
+        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        self.builder.store(final_arr_idx, arr_len_ptr)
+
+        return array_ptr
+
+    def _array_to_list(self, array_ptr: ir.Value) -> ir.Value:
+        """Convert an Array to a List (Array.unpacked() -> List).
+
+        Creates a new List with the same elements as the Array.
+        """
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get Array length
+        array_len = self.builder.call(self.array_len, [array_ptr])
+
+        # Get Array elem_size (field 2)
+        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        elem_size = self.builder.load(elem_size_ptr)
+
+        # Create new List with same elem_size
+        list_ptr = self.builder.call(self.list_new, [elem_size])
+
+        # Get data pointers
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        array_data = self.builder.load(array_data_ptr)
+
+        # We need to append each element to the list
+        # For efficiency, we'll just copy the data and set list's len/cap
+        list_data_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+
+        # Check if array_len > 8 (list's initial capacity)
+        func = self.builder.function
+        need_realloc_block = func.append_basic_block("list_realloc")
+        copy_block = func.append_basic_block("list_copy")
+
+        eight = ir.Constant(i64, 8)
+        need_realloc = self.builder.icmp_signed(">", array_len, eight)
+        self.builder.cbranch(need_realloc, need_realloc_block, copy_block)
+
+        # Reallocate list data if needed
+        self.builder.position_at_end(need_realloc_block)
+        new_data_size = self.builder.mul(array_len, elem_size)
+        new_data = self.builder.call(self.malloc, [new_data_size])
+        old_data = self.builder.load(list_data_ptr)
+        self.builder.call(self.free, [old_data])
+        self.builder.store(new_data, list_data_ptr)
+        # Update capacity
+        cap_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        self.builder.store(array_len, cap_ptr)
+        self.builder.branch(copy_block)
+
+        # Copy data
+        self.builder.position_at_end(copy_block)
+        list_data = self.builder.load(list_data_ptr)
+        copy_size = self.builder.mul(array_len, elem_size)
+        self.builder.call(self.memcpy, [list_data, array_data, copy_size])
+
+        # Set list len = array_len
+        len_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        self.builder.store(array_len, len_ptr)
+
+        return list_ptr
 
     def _create_string_type(self):
         """Create the String struct type and helper functions.
@@ -2876,7 +3358,11 @@ class CodeGenerator:
         elif isinstance(coex_type, SetType):
             # Sets are pointers to Set struct
             return self.set_struct.as_pointer()
-        
+
+        elif isinstance(coex_type, ArrayType):
+            # Arrays are pointers to Array struct
+            return self.array_struct.as_pointer()
+
         elif isinstance(coex_type, ChannelType):
             # Channels are pointers to Channel struct
             return self.channel_struct.as_pointer()
@@ -4462,8 +4948,8 @@ class CodeGenerator:
             self._generate_range_expr_for(stmt)
             return
         
-        # Check if iterable is a list
-        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr)):
+        # Check if iterable is a list or array
+        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr)):
             # Generate the iterable expression
             iterable = self._generate_expression(stmt.iterable)
             if isinstance(iterable.type, ir.PointerType):
@@ -4471,7 +4957,10 @@ class CodeGenerator:
                 if hasattr(pointee, 'name') and pointee.name == "struct.List":
                     self._generate_list_for(stmt, iterable)
                     return
-        
+                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                    self._generate_array_for(stmt, iterable)
+                    return
+
         # For other iterables, we need iterator protocol
         # For now, just execute body once as fallback
         for s in stmt.body:
@@ -4694,7 +5183,83 @@ class CodeGenerator:
         # Restore loop blocks
         self.loop_exit_block = old_exit
         self.loop_continue_block = old_continue
-    
+
+    def _generate_array_for(self, stmt: ForStmt, array_ptr: ir.Value):
+        """Generate for item in array with destructuring support"""
+        func = self.builder.function
+
+        # Get array length
+        array_len = self.builder.call(self.array_len, [array_ptr])
+
+        # PRE-ALLOCATE all local variables used in the loop body
+        local_vars = self._collect_local_variables(stmt.body)
+        for lv_name in local_vars:
+            if lv_name not in self.locals:
+                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
+                self.locals[lv_name] = lv_alloca
+
+        # Allocate index variable
+        index_var = self.builder.alloca(ir.IntType(64), name="array_idx")
+        self.builder.store(ir.Constant(ir.IntType(64), 0), index_var)
+
+        # Create blocks
+        cond_block = func.append_basic_block("array_for_cond")
+        body_block = func.append_basic_block("array_for_body")
+        inc_block = func.append_basic_block("array_for_inc")
+        exit_block = func.append_basic_block("array_for_exit")
+
+        # Save loop blocks
+        old_exit = self.loop_exit_block
+        old_continue = self.loop_continue_block
+        self.loop_exit_block = exit_block
+        self.loop_continue_block = inc_block
+
+        # Jump to condition
+        self.builder.branch(cond_block)
+
+        # Condition: index < len
+        self.builder.position_at_end(cond_block)
+        current_idx = self.builder.load(index_var)
+        cond = self.builder.icmp_signed("<", current_idx, array_len)
+        self.builder.cbranch(cond, body_block, exit_block)
+
+        # Body
+        self.builder.position_at_end(body_block)
+
+        # Get element: array[index]
+        current_idx = self.builder.load(index_var)
+        elem_ptr = self.builder.call(self.array_get, [array_ptr, current_idx])
+
+        # Determine element type from pattern or tracked type
+        elem_type = self._get_array_element_type_for_pattern(stmt)
+        typed_ptr = self.builder.bitcast(elem_ptr, elem_type.as_pointer())
+        elem_val = self.builder.load(typed_ptr)
+
+        # Bind pattern variables (supports destructuring)
+        self._bind_pattern(stmt.pattern, elem_val)
+
+        # Generate body statements
+        for s in stmt.body:
+            self._generate_statement(s)
+            if self.builder.block.is_terminated:
+                break
+        if not self.builder.block.is_terminated:
+            self.builder.branch(inc_block)
+
+        # Increment index
+        self.builder.position_at_end(inc_block)
+        current_idx = self.builder.load(index_var)
+        next_idx = self.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
+        self.builder.store(next_idx, index_var)
+        self.builder.branch(cond_block)
+
+        # Exit
+        self.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        self.loop_exit_block = old_exit
+        self.loop_continue_block = old_continue
+
     def _generate_for_assign(self, stmt: ForAssignStmt):
         """Generate results = for item in items expr"""
         # This is syntactic sugar for map operation
@@ -5694,12 +6259,12 @@ class CodeGenerator:
                 
                 result = self.builder.call(func, args)
                 
-                # Special handling for List.get - returns pointer that needs dereferencing
-                if type_name == "List" and method == "get":
+                # Special handling for List.get and Array.get - returns pointer that needs dereferencing
+                if (type_name == "List" or type_name == "Array") and method == "get":
                     # Result is i8*, need to load as i64
                     typed_ptr = self.builder.bitcast(result, ir.IntType(64).as_pointer())
                     return self.builder.load(typed_ptr)
-                
+
                 return result
         
         # Built-in methods for primitive types
@@ -5767,8 +6332,80 @@ class CodeGenerator:
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
                     
                     self.builder.call(self.list_append, [obj, temp_ptr, elem_size])
+                    return ir.Constant(ir.IntType(64), 0)
+
+                # Check if this is an Array - Array.append returns a NEW array
+                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                    elem_val = self._generate_expression(expr.args[0])
+                    elem_type = elem_val.type
+
+                    # Calculate element size
+                    if isinstance(elem_type, ir.IntType):
+                        size = elem_type.width // 8
+                    elif isinstance(elem_type, ir.DoubleType):
+                        size = 8
+                    elif isinstance(elem_type, ir.PointerType):
+                        size = 8
+                    elif isinstance(elem_type, ir.LiteralStructType):
+                        size = sum(
+                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            for e in elem_type.elements
+                        )
+                    else:
+                        size = 8
+
+                    elem_size = ir.Constant(ir.IntType(64), size)
+
+                    # Store element to temp and get pointer
+                    temp = self.builder.alloca(elem_type, name="array_append_elem")
+                    self.builder.store(elem_val, temp)
+                    temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+                    # Call array_append which returns a NEW array
+                    return self.builder.call(self.array_append, [obj, temp_ptr, elem_size])
+
             return ir.Constant(ir.IntType(64), 0)
-        
+
+        if method == "set":
+            # array.set(index, value) - returns a NEW array with element at index replaced
+            if len(expr.args) >= 2 and isinstance(obj.type, ir.PointerType):
+                pointee = obj.type.pointee
+                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                    index = self._generate_expression(expr.args[0])
+                    elem_val = self._generate_expression(expr.args[1])
+                    elem_type = elem_val.type
+
+                    # Calculate element size
+                    if isinstance(elem_type, ir.IntType):
+                        size = elem_type.width // 8
+                    elif isinstance(elem_type, ir.DoubleType):
+                        size = 8
+                    elif isinstance(elem_type, ir.PointerType):
+                        size = 8
+                    elif isinstance(elem_type, ir.LiteralStructType):
+                        size = sum(
+                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            for e in elem_type.elements
+                        )
+                    else:
+                        size = 8
+
+                    elem_size = ir.Constant(ir.IntType(64), size)
+
+                    # Store element to temp and get pointer
+                    temp = self.builder.alloca(elem_type, name="array_set_elem")
+                    self.builder.store(elem_val, temp)
+                    temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+                    # Cast index to i64 if needed
+                    if index.type != ir.IntType(64):
+                        index = self.builder.sext(index, ir.IntType(64))
+
+                    # Call array_set which returns a NEW array
+                    return self.builder.call(self.array_set, [obj, index, temp_ptr, elem_size])
+
+            return ir.Constant(ir.IntType(64), 0)
+
         if method == "load":
             # atomic.load() - just return value
             return obj
@@ -5786,7 +6423,27 @@ class CodeGenerator:
         if method == "fetch_add":
             # atomic.fetch_add(delta)
             return obj
-        
+
+        if method == "packed":
+            # List.packed() -> Array or Set.packed() -> Array
+            # Convert collection to dense Array
+            if isinstance(obj.type, ir.PointerType):
+                pointee = obj.type.pointee
+                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                    return self._list_to_array(obj)
+                if hasattr(pointee, 'name') and pointee.name == "struct.Set":
+                    return self._set_to_array(obj)
+            return ir.Constant(ir.IntType(64), 0)
+
+        if method == "unpacked":
+            # Array.unpacked() -> List
+            # Convert Array to persistent List
+            if isinstance(obj.type, ir.PointerType):
+                pointee = obj.type.pointee
+                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                    return self._array_to_list(obj)
+            return ir.Constant(ir.IntType(64), 0)
+
         # Generic method lookup failed
         return ir.Constant(ir.IntType(64), 0)
     
@@ -5936,16 +6593,28 @@ class CodeGenerator:
                     args.append(idx_val)
                 
                 result = self.builder.call(func, args)
-                
-                # Special handling for List.get - returns i8* that needs dereferencing
-                if type_name == "List":
+
+                # Special handling for List.get and Array.get - returns i8* that needs dereferencing
+                if type_name == "List" or type_name == "Array":
                     typed_ptr = self.builder.bitcast(result, ir.IntType(64).as_pointer())
                     return self.builder.load(typed_ptr)
-                
+
                 return result
-        
+
         index = self._generate_expression(expr.indices[0])
-        
+
+        # Check if this is an Array
+        if isinstance(obj.type, ir.PointerType):
+            pointee = obj.type.pointee
+            if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                # Array indexing - call array_get and load the value
+                if index.type != ir.IntType(64):
+                    index = self._cast_value(index, ir.IntType(64))
+
+                elem_ptr = self.builder.call(self.array_get, [obj, index])
+                typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                return self.builder.load(typed_ptr)
+
         # Check if this is a List
         if isinstance(obj.type, ir.PointerType):
             pointee = obj.type.pointee
@@ -6492,14 +7161,39 @@ class CodeGenerator:
             var_name = stmt.iterable.name
             if var_name in self.list_element_types:
                 return self.list_element_types[var_name]
-        
+
         # Infer from pattern structure
         pattern = stmt.pattern
         if isinstance(pattern, TuplePattern):
             # For tuple patterns, assume i64 for each element
             elem_types = [ir.IntType(64) for _ in pattern.elements]
             return ir.LiteralStructType(elem_types)
-        
+
+        # Default to i64
+        return ir.IntType(64)
+
+    def _get_array_element_type_for_pattern(self, stmt: ForStmt) -> ir.Type:
+        """Get the LLVM type for array elements based on pattern and tracked info."""
+        # First try to look up tracked element type
+        if isinstance(stmt.iterable, Identifier):
+            var_name = stmt.iterable.name
+            if var_name in self.array_element_types:
+                return self.array_element_types[var_name]
+
+        # If iterable is a method call like list.packed(), try to get list's element type
+        if isinstance(stmt.iterable, MethodCallExpr):
+            if stmt.iterable.method == "packed" and isinstance(stmt.iterable.object, Identifier):
+                list_var = stmt.iterable.object.name
+                if list_var in self.list_element_types:
+                    return self.list_element_types[list_var]
+
+        # Infer from pattern structure
+        pattern = stmt.pattern
+        if isinstance(pattern, TuplePattern):
+            # For tuple patterns, assume i64 for each element
+            elem_types = [ir.IntType(64) for _ in pattern.elements]
+            return ir.LiteralStructType(elem_types)
+
         # Default to i64
         return ir.IntType(64)
 

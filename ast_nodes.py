@@ -118,9 +118,17 @@ class MapType(Type):
 @dataclass
 class SetType(Type):
     element_type: Type
-    
+
     def __repr__(self):
         return f"Set<{self.element_type}>"
+
+
+@dataclass
+class ArrayType(Type):
+    element_type: Type
+
+    def __repr__(self):
+        return f"Array<{self.element_type}>"
 
 
 @dataclass

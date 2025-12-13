@@ -35,7 +35,8 @@ class GarbageCollector:
     TYPE_SET = 5
     TYPE_SET_ENTRY = 6
     TYPE_CHANNEL = 7
-    TYPE_FIRST_USER = 8      # First ID for user-defined types
+    TYPE_ARRAY = 8
+    TYPE_FIRST_USER = 9      # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -234,6 +235,11 @@ class GarbageCollector:
         # data field at offset 32 is a reference
         self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': [32]}
         self.type_descriptors['Channel'] = self.TYPE_CHANNEL
+
+        # Type 8: Array - { i64 len, i64 cap, i64 elem_size, i8* data }
+        # data field at offset 24 is a reference (same layout as List)
+        self.type_info[self.TYPE_ARRAY] = {'size': 32, 'ref_offsets': [24]}
+        self.type_descriptors['Array'] = self.TYPE_ARRAY
 
     def register_type(self, type_name: str, size: int, ref_offsets: PyList[int]) -> int:
         """Register a user-defined type and return its type_id"""
