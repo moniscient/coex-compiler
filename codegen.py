@@ -101,7 +101,10 @@ class CodeGenerator:
 
         # Coex AST type tracking for deep copy and nested collections
         self.var_coex_types: Dict[str, Type] = {}  # var_name -> Coex AST Type
-        
+
+        # Move tracking for use-after-move detection
+        self.moved_vars: set = set()  # Set of variable names that have been moved
+
         # List and channel runtime support
         self.list_type = None
         self.channel_type = None
@@ -154,14 +157,26 @@ class CodeGenerator:
         self._false_str = self._create_global_string("false\n", "false_str")
         self._nil_str = self._create_global_string("nil\n", "nil_str")
         
-        # Create list struct type
-        # struct List { i64 len, i64 cap, i64 elem_size, i8* data }
+        # Create Persistent Vector Node structure (for List's tree structure)
+        # struct PVNode { i64 refcount, void* children[32] }
+        # 32-way branching trie for O(log32 n) access
+        self.pv_node_struct = ir.global_context.get_identified_type("struct.PVNode")
+        self.pv_node_struct.set_body(
+            ir.IntType(64),  # refcount for structural sharing
+            ir.ArrayType(ir.IntType(8).as_pointer(), 32)  # children[32] - either PVNode* or element pointers
+        )
+
+        # Create list struct type using Persistent Vector structure
+        # struct List { PVNode* root, i64 len, i32 depth, i8* tail, i32 tail_len, i64 elem_size }
+        # Tail optimization: rightmost 1-32 elements stored separately for fast append
         self.list_struct = ir.global_context.get_identified_type("struct.List")
         self.list_struct.set_body(
-            ir.IntType(64),  # len
-            ir.IntType(64),  # cap
-            ir.IntType(64),  # elem_size
-            ir.IntType(8).as_pointer()  # data
+            self.pv_node_struct.as_pointer(),  # root - tree root (null for small lists) (field 0)
+            ir.IntType(64),   # len - total element count (field 1)
+            ir.IntType(32),   # depth - tree depth (0 = tail only) (field 2)
+            ir.IntType(8).as_pointer(),  # tail - rightmost leaf array (field 3)
+            ir.IntType(32),   # tail_len - elements in tail (1-32) (field 4)
+            ir.IntType(64),   # elem_size (field 5)
         )
         
         # Create list helper functions
@@ -177,15 +192,21 @@ class CodeGenerator:
         self._create_set_type()
 
         # Create Array type and helpers (dense, contiguous collection)
-        # struct Array { i64 len, i64 cap, i64 elem_size, i8* data }
+        # struct Array { i8* data, i64 refcount, i64 len, i64 cap, i64 elem_size }
+        # Data pointer first for fast dereferencing (*array_ptr yields data directly)
+        # COW: refcount for copy-on-write optimization
         self.array_struct = ir.global_context.get_identified_type("struct.Array")
         self.array_struct.set_body(
-            ir.IntType(64),  # len
-            ir.IntType(64),  # cap
-            ir.IntType(64),  # elem_size
-            ir.IntType(8).as_pointer()  # data
+            ir.IntType(8).as_pointer(),  # data (field 0)
+            ir.IntType(64),  # refcount (field 1)
+            ir.IntType(64),  # len (field 2)
+            ir.IntType(64),  # cap (field 3)
+            ir.IntType(64),  # elem_size (field 4)
         )
         self._create_array_helpers()
+
+        # NOTE: Conversion helpers (_list_to_array, _array_to_list, etc.)
+        # are inline methods, not separate function declarations
 
         # Create atomic_ref type and helpers
         self._create_atomic_ref_type()
@@ -245,55 +266,91 @@ class CodeGenerator:
         list_copy_ty = ir.FunctionType(list_ptr, [list_ptr])
         self.list_copy = ir.Function(self.module, list_copy_ty, name="coex_list_copy")
 
+        # list_set(list: List*, index: i64, value: i8*, elem_size: i64) -> List*
+        # Returns a NEW list with element at index replaced (value semantics, path copying)
+        list_set_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i8_ptr, i64])
+        self.list_set = ir.Function(self.module, list_set_ty, name="coex_list_set")
+
+        # NOTE: list_to_array is declared after Array type exists (in _create_conversion_helpers)
+
         # Now implement these functions inline
         self._implement_list_new()
         self._implement_list_append()
         self._implement_list_get()
+        self._implement_list_set()
         self._implement_list_len()
         self._implement_list_size()
         self._implement_list_copy()
         self._register_list_methods()
     
     def _implement_list_new(self):
-        """Implement list_new: allocate a new list with given element size"""
+        """Implement list_new: allocate a new empty list with given element size.
+
+        Persistent Vector List struct:
+        - field 0: root (PVNode*) - null for empty/small lists
+        - field 1: len (i64) - total element count
+        - field 2: depth (i32) - tree depth (0 = tail only)
+        - field 3: tail (i8*) - rightmost leaf array
+        - field 4: tail_len (i32) - elements in tail (0-32)
+        - field 5: elem_size (i64)
+        """
         func = self.list_new
         func.args[0].name = "elem_size"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        # Allocate List struct (4 * 8 = 32 bytes) via GC
-        list_size = ir.Constant(ir.IntType(64), 32)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_LIST)
+        # Allocate List struct via GC
+        # Size: 8 (root ptr) + 8 (len) + 4 (depth) + 8 (tail ptr) + 4 (tail_len) + 8 (elem_size) = 40 bytes
+        # With padding/alignment, use 48 for safety
+        list_size = ir.Constant(i64, 48)
+        type_id = ir.Constant(i32, self.gc.TYPE_LIST)
         raw_ptr = builder.call(self.gc.gc_alloc, [list_size, type_id])
         list_ptr = builder.bitcast(raw_ptr, self.list_struct.as_pointer())
-        
-        # Initialize fields
-        # len = 0
-        len_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
-        
-        # cap = 8 (initial capacity)
-        cap_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 8), cap_ptr)
-        
-        # elem_size
-        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+
+        # Initialize fields for empty list
+        # root = null (field 0)
+        root_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(self.pv_node_struct.as_pointer(), None), root_ptr)
+
+        # len = 0 (field 1)
+        len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), len_ptr)
+
+        # depth = 0 (field 2)
+        depth_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(ir.Constant(i32, 0), depth_ptr)
+
+        # tail = allocate space for 32 elements (field 3)
+        # Initial allocation: 32 * elem_size bytes
+        tail_capacity = ir.Constant(i64, 32)
+        tail_size = builder.mul(tail_capacity, func.args[0])
+        tail_ptr = builder.call(self.malloc, [tail_size])
+        tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(tail_ptr, tail_field_ptr)
+
+        # tail_len = 0 (field 4)
+        tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(ir.Constant(i32, 0), tail_len_ptr)
+
+        # elem_size (field 5)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         builder.store(func.args[0], elem_size_ptr)
-        
-        # Allocate data: 8 elements * elem_size
-        data_size = builder.mul(ir.Constant(ir.IntType(64), 8), func.args[0])
-        data_ptr = builder.call(self.malloc, [data_size])
-        data_field_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        builder.store(data_ptr, data_field_ptr)
-        
+
         builder.ret(list_ptr)
     
     def _implement_list_append(self):
         """Implement list_append: return a NEW list with element appended.
 
-        This implements value semantics - original list is unchanged.
-        New list has capacity = max(old_cap, old_len + 1).
+        Persistent Vector append algorithm:
+        - If tail has room (tail_len < 32): copy tail, add element, share tree
+        - If tail is full: push tail into tree, start new tail
+
+        For Session 4, we implement a simpler version that copies the tail
+        and shares the tree root (structural sharing at root level).
+        Full path copying (Session 5) will enable O(log n) mutations.
         """
         func = self.list_append
         func.args[0].name = "list"
@@ -302,145 +359,752 @@ class CodeGenerator:
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         old_list = func.args[0]
         elem_ptr = func.args[1]
         elem_size = func.args[2]
 
-        # Get old list's len and elem_size
-        old_len_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Load old list fields
+        # len (field 1)
+        old_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
-        # New length = old_len + 1
-        new_len = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
+        # depth (field 2)
+        old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_depth = builder.load(old_depth_ptr)
 
-        # Create new list with elem_size from old list
-        old_elem_size_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # tail (field 3)
+        old_tail_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        old_tail = builder.load(old_tail_ptr)
+
+        # tail_len (field 4)
+        old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        old_tail_len = builder.load(old_tail_len_ptr)
+
+        # elem_size (field 5)
+        old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         old_elem_size = builder.load(old_elem_size_ptr)
+
+        # root (field 0)
+        old_root_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(old_root_ptr)
+
+        # Create new list
         new_list = builder.call(self.list_new, [old_elem_size])
 
-        # Set new list's len = old_len + 1
-        new_len_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Set new len = old_len + 1
+        new_len = builder.add(old_len, ir.Constant(i64, 1))
+        new_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(new_len, new_len_ptr)
 
-        # Ensure new list has enough capacity
-        # Get new list's current cap (starts at 8 from list_new)
-        new_cap_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        new_cap = builder.load(new_cap_ptr)
+        # Check if tail has room (tail_len < 32)
+        tail_has_room = builder.icmp_signed("<", old_tail_len, ir.Constant(i32, 32))
+        tail_room_block = func.append_basic_block("tail_has_room")
+        tail_full_block = func.append_basic_block("tail_full")
+        builder.cbranch(tail_has_room, tail_room_block, tail_full_block)
 
-        # If new_len > new_cap, we need to reallocate
-        need_grow = builder.icmp_signed(">", new_len, new_cap)
-        grow_block = func.append_basic_block("grow")
-        continue_block = func.append_basic_block("continue")
-        builder.cbranch(need_grow, grow_block, continue_block)
+        # --- CASE 1: Tail has room ---
+        builder.position_at_end(tail_room_block)
 
-        # Grow block: reallocate data buffer
-        builder.position_at_end(grow_block)
-        # New capacity = new_len (exact fit for appended list)
-        builder.store(new_len, new_cap_ptr)
-        new_data_size = builder.mul(new_len, old_elem_size)
-        new_data_ptr_field = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        old_new_data = builder.load(new_data_ptr_field)
-        builder.call(self.free, [old_new_data])
-        fresh_data = builder.call(self.malloc, [new_data_size])
-        builder.store(fresh_data, new_data_ptr_field)
-        builder.branch(continue_block)
+        # Share the root (structural sharing)
+        new_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(old_root, new_root_ptr)
 
-        # Continue block: copy old data and append new element
-        builder.position_at_end(continue_block)
+        # Copy depth
+        new_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_depth, new_depth_ptr)
 
-        # Get data pointers
-        old_data_ptr = builder.gep(old_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        old_data = builder.load(old_data_ptr)
+        # Get new tail pointer (already allocated by list_new)
+        new_tail_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail = builder.load(new_tail_ptr_field)
 
-        new_data_ptr = builder.gep(new_list, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        new_data = builder.load(new_data_ptr)
+        # Copy old tail contents to new tail
+        old_tail_len_64 = builder.zext(old_tail_len, i64)
+        old_tail_size = builder.mul(old_tail_len_64, old_elem_size)
+        builder.call(self.memcpy, [new_tail, old_tail, old_tail_size])
 
-        # Copy old data to new list
-        copy_size = builder.mul(old_len, elem_size)
-        builder.call(self.memcpy, [new_data, old_data, copy_size])
+        # Append new element at position old_tail_len
+        new_elem_offset = builder.mul(old_tail_len_64, old_elem_size)
+        new_elem_dest = builder.gep(new_tail, [new_elem_offset])
+        builder.call(self.memcpy, [new_elem_dest, elem_ptr, elem_size])
 
-        # Append the new element at position old_len
-        offset = builder.mul(old_len, elem_size)
-        dest = builder.gep(new_data, [offset])
-        builder.call(self.memcpy, [dest, elem_ptr, elem_size])
+        # Set new tail_len = old_tail_len + 1
+        new_tail_len = builder.add(old_tail_len, ir.Constant(i32, 1))
+        new_tail_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(new_tail_len, new_tail_len_ptr)
+
+        # Increment root refcount if non-null (for structural sharing)
+        root_is_null = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        incref_block = func.append_basic_block("incref_root")
+        done_room_block = func.append_basic_block("done_room")
+        builder.cbranch(root_is_null, done_room_block, incref_block)
+
+        builder.position_at_end(incref_block)
+        # Increment refcount: root->refcount++
+        refcount_ptr = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_refcount = builder.load(refcount_ptr)
+        new_refcount = builder.add(old_refcount, ir.Constant(i64, 1))
+        builder.store(new_refcount, refcount_ptr)
+        builder.branch(done_room_block)
+
+        builder.position_at_end(done_room_block)
+        builder.ret(new_list)
+
+        # --- CASE 2: Tail is full, need to push into tree ---
+        builder.position_at_end(tail_full_block)
+
+        # Push the full tail into the tree structure.
+        # Algorithm:
+        # 1. Copy the tail data into a new leaf buffer
+        # 2. If no tree exists (depth=0): create root with leaf as children[0], depth=1
+        # 3. If tree exists at depth 1 and has room: copy root, add leaf to next slot
+        # 4. If tree is full at current depth: increase depth and restructure
+        #
+        # For depth 1, the number of leaves in tree = (len - tail_len) / 32
+        # Max leaves at depth 1 = 32, so max elements in tree = 1024
+
+        pv_node_size = ir.Constant(i64, 8 + 32 * 8)  # refcount + 32 pointers
+
+        # Copy the old tail data into a new leaf buffer
+        leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
+        leaf_data = builder.call(self.malloc, [leaf_size])
+        builder.call(self.memcpy, [leaf_data, old_tail, leaf_size])
+
+        # Calculate how many leaves are currently in the tree
+        # tree_elements = old_len - old_tail_len (where old_tail_len = 32 since tail is full)
+        tree_elements = builder.sub(old_len, ir.Constant(i64, 32))
+        leaves_in_tree_64 = builder.udiv(tree_elements, ir.Constant(i64, 32))
+        leaves_in_tree = builder.trunc(leaves_in_tree_64, i32)
+
+        # Determine new root based on old root
+        old_root_is_null = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        create_root_block = func.append_basic_block("create_root")
+        add_to_tree_block = func.append_basic_block("add_to_tree")
+        merge_block = func.append_basic_block("merge")
+        builder.cbranch(old_root_is_null, create_root_block, add_to_tree_block)
+
+        # Create root block: no existing tree, create root with leaf as children[0]
+        builder.position_at_end(create_root_block)
+
+        # Create new root node
+        new_root_raw_create = builder.call(self.malloc, [pv_node_size])
+        new_root_create = builder.bitcast(new_root_raw_create, self.pv_node_struct.as_pointer())
+
+        # Initialize refcount = 1
+        create_refcount_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), create_refcount_ptr)
+
+        # Store leaf_data pointer in children[0]
+        create_child0_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 1), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(leaf_data, create_child0_ptr)
+
+        new_depth_create = ir.Constant(i32, 1)
+        builder.branch(merge_block)
+
+        # Add to tree block: existing tree, need to add leaf at correct position
+        builder.position_at_end(add_to_tree_block)
+
+        # For depth 1, leaves_in_tree tells us which slot to use (it's the next index)
+        # We need to copy the root node (path copying for immutability)
+
+        # Copy old root node
+        new_root_raw_add = builder.call(self.malloc, [pv_node_size])
+        new_root_add = builder.bitcast(new_root_raw_add, self.pv_node_struct.as_pointer())
+
+        # Initialize refcount = 1
+        add_refcount_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), add_refcount_ptr)
+
+        # Copy all 32 children pointers from old root to new root
+        # (This is a simplified approach - we copy all slots)
+        old_children_ptr = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_children_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_array_size = ir.Constant(i64, 32 * 8)  # 32 pointers * 8 bytes
+        old_children_i8 = builder.bitcast(old_children_ptr, ir.IntType(8).as_pointer())
+        new_children_i8 = builder.bitcast(new_children_ptr, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_children_i8, old_children_i8, children_array_size])
+
+        # Add new leaf at position leaves_in_tree
+        # Note: For depth > 1 this would need to be a recursive path copy, but for depth 1 it's direct
+        new_child_slot_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaves_in_tree], inbounds=True)
+        builder.store(leaf_data, new_child_slot_ptr)
+
+        # For depth 1, we don't need to increment depth unless we've filled all 32 slots
+        # But for simplicity now, keep depth the same (this limits us to 1024 elements + 32 in tail)
+        # Full support for depth > 1 will come in Session 5
+        new_depth_add = old_depth
+        builder.branch(merge_block)
+
+        # Merge block: finalize new list
+        builder.position_at_end(merge_block)
+
+        # PHI nodes for new_root and new_depth
+        new_root_phi = builder.phi(self.pv_node_struct.as_pointer(), name="new_root")
+        new_root_phi.add_incoming(new_root_create, create_root_block)
+        new_root_phi.add_incoming(new_root_add, add_to_tree_block)
+
+        new_depth_phi = builder.phi(i32, name="new_depth")
+        new_depth_phi.add_incoming(new_depth_create, create_root_block)
+        new_depth_phi.add_incoming(new_depth_add, add_to_tree_block)
+
+        # Set new list's root
+        new_list_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root_phi, new_list_root_ptr)
+
+        # Set new list's depth
+        new_list_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(new_depth_phi, new_list_depth_ptr)
+
+        # Create new tail with just the appended element
+        new_list_tail_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_list_tail = builder.load(new_list_tail_ptr_field)
+
+        # Copy element to new tail at position 0
+        builder.call(self.memcpy, [new_list_tail, elem_ptr, elem_size])
+
+        # Set tail_len = 1
+        new_list_tail_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(ir.Constant(i32, 1), new_list_tail_len_ptr)
 
         builder.ret(new_list)
     
     def _implement_list_get(self):
-        """Implement list_get: return pointer to element at index"""
+        """Implement list_get: return pointer to element at index.
+
+        Persistent Vector get algorithm:
+        1. Check if index is in tail (index >= len - tail_len)
+        2. If in tail: return tail[index - (len - tail_len)]
+        3. If in tree: navigate using bit manipulation (5 bits per level)
+
+        For a 32-way trie:
+        - Level 0 (leaf): bits 0-4 (index & 0x1F)
+        - Level 1: bits 5-9 ((index >> 5) & 0x1F)
+        - etc.
+        """
         func = self.list_get
         func.args[0].name = "list"
         func.args[1].name = "index"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
         list_ptr = func.args[0]
         index = func.args[1]
-        
-        # Get elem_size
-        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+
+        # Load list fields
+        # len (field 1)
+        len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        list_len = builder.load(len_ptr)
+
+        # depth (field 2)
+        depth_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        depth = builder.load(depth_ptr)
+
+        # tail (field 3)
+        tail_ptr_field = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail = builder.load(tail_ptr_field)
+
+        # tail_len (field 4)
+        tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        tail_len = builder.load(tail_len_ptr)
+
+        # elem_size (field 5)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
-        
-        # Get data pointer
-        data_field_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        data = builder.load(data_field_ptr)
-        
-        # Calculate offset: index * elem_size
-        offset = builder.mul(index, elem_size)
-        result = builder.gep(data, [offset])
-        
-        builder.ret(result)
-    
-    def _implement_list_len(self):
-        """Implement list_len: return list length"""
-        func = self.list_len
+
+        # root (field 0)
+        root_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
+
+        # Calculate tail_start = len - tail_len
+        tail_len_64 = builder.zext(tail_len, i64)
+        tail_start = builder.sub(list_len, tail_len_64)
+
+        # Check if index is in tail
+        in_tail = builder.icmp_unsigned(">=", index, tail_start)
+        tail_block = func.append_basic_block("in_tail")
+        tree_block = func.append_basic_block("in_tree")
+        builder.cbranch(in_tail, tail_block, tree_block)
+
+        # --- Element is in tail ---
+        builder.position_at_end(tail_block)
+
+        # tail_index = index - tail_start
+        tail_index = builder.sub(index, tail_start)
+
+        # Calculate offset in tail
+        tail_offset = builder.mul(tail_index, elem_size)
+        tail_result = builder.gep(tail, [tail_offset])
+        builder.ret(tail_result)
+
+        # --- Element is in tree ---
+        builder.position_at_end(tree_block)
+
+        # Navigate tree using bit manipulation
+        # For depth d, we need to traverse d levels
+        # At each level l (from depth-1 down to 0), extract bits: (index >> (5*l)) & 0x1F
+
+        # Since depth can vary, we need a loop structure
+        # Allocate a node pointer to track current position
+        current_node_alloca = builder.alloca(self.pv_node_struct.as_pointer(), name="current_node")
+        builder.store(root, current_node_alloca)
+
+        # Allocate level counter (starts at depth-1, goes down to 0)
+        level_alloca = builder.alloca(i32, name="level")
+        start_level = builder.sub(depth, ir.Constant(i32, 1))
+        builder.store(start_level, level_alloca)
+
+        # Convert index to i32 for bit manipulation
+        index_32 = builder.trunc(index, i32)
+
+        # Loop: while level >= 0
+        loop_cond = func.append_basic_block("tree_loop_cond")
+        loop_body = func.append_basic_block("tree_loop_body")
+        loop_done = func.append_basic_block("tree_loop_done")
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        current_level = builder.load(level_alloca)
+        continue_loop = builder.icmp_signed(">=", current_level, ir.Constant(i32, 0))
+        builder.cbranch(continue_loop, loop_body, loop_done)
+
+        builder.position_at_end(loop_body)
+
+        # Calculate child index: (index >> (5 * (level + 1))) & 0x1F
+        # Level 0 means we're at the lowest node level (parents of leaves)
+        # For depth=1, level=0, we need shift of 5 to get leaf index
+        # For depth=2, level=1 at root needs shift of 10, level=0 needs shift of 5
+        level_loaded = builder.load(level_alloca)
+        level_plus_one = builder.add(level_loaded, ir.Constant(i32, 1))
+        shift_amount = builder.mul(level_plus_one, ir.Constant(i32, 5))
+        shifted = builder.lshr(index_32, shift_amount)
+        child_idx = builder.and_(shifted, ir.Constant(i32, 0x1F))
+
+        # Get current node
+        current_node = builder.load(current_node_alloca)
+
+        # Get children array pointer
+        children_array_ptr = builder.gep(current_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+
+        # Get child at child_idx
+        child_ptr_ptr = builder.gep(children_array_ptr, [ir.Constant(i32, 0), child_idx], inbounds=True)
+        child_ptr = builder.load(child_ptr_ptr)
+
+        # Check if we're at the last level (level == 0)
+        at_leaf_level = builder.icmp_signed("==", level_loaded, ir.Constant(i32, 0))
+        leaf_access = func.append_basic_block("leaf_access")
+        continue_descent = func.append_basic_block("continue_descent")
+        builder.cbranch(at_leaf_level, leaf_access, continue_descent)
+
+        # At leaf level: child_ptr points to element data (leaf array)
+        builder.position_at_end(leaf_access)
+
+        # The leaf is an array of 32 elements, access index & 0x1F
+        leaf_idx = builder.and_(index_32, ir.Constant(i32, 0x1F))
+        leaf_idx_64 = builder.zext(leaf_idx, i64)
+        leaf_offset = builder.mul(leaf_idx_64, elem_size)
+        leaf_result = builder.gep(child_ptr, [leaf_offset])
+        builder.ret(leaf_result)
+
+        # Continue descent: child_ptr is another PVNode
+        builder.position_at_end(continue_descent)
+        next_node = builder.bitcast(child_ptr, self.pv_node_struct.as_pointer())
+        builder.store(next_node, current_node_alloca)
+
+        # Decrement level
+        new_level = builder.sub(level_loaded, ir.Constant(i32, 1))
+        builder.store(new_level, level_alloca)
+        builder.branch(loop_cond)
+
+        # Loop done (shouldn't reach here if tree is correct, but handle it)
+        builder.position_at_end(loop_done)
+        # Fallback: return null pointer (indicates error)
+        builder.ret(ir.Constant(ir.IntType(8).as_pointer(), None))
+
+    def _implement_list_set(self):
+        """Implement list_set: return a NEW list with element at index replaced.
+
+        Persistent Vector set algorithm with path copying:
+        1. Check if index is in tail (index >= len - tail_len)
+        2. If in tail: copy tail, modify element, share tree
+        3. If in tree: path copy from root to leaf, modify element
+
+        Path copying ensures structural sharing - unchanged nodes are shared.
+        """
+        func = self.list_set
         func.args[0].name = "list"
-        
+        func.args[1].name = "index"
+        func.args[2].name = "value"
+        func.args[3].name = "elem_size"
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        old_list = func.args[0]
+        index = func.args[1]
+        value_ptr = func.args[2]
+        elem_size = func.args[3]
+
+        # Load old list fields
+        # len (field 1)
+        old_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(old_len_ptr)
+
+        # depth (field 2)
+        old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_depth = builder.load(old_depth_ptr)
+
+        # tail (field 3)
+        old_tail_ptr_field = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        old_tail = builder.load(old_tail_ptr_field)
+
+        # tail_len (field 4)
+        old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        old_tail_len = builder.load(old_tail_len_ptr)
+
+        # elem_size (field 5) - use stored value, not parameter
+        old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        stored_elem_size = builder.load(old_elem_size_ptr)
+
+        # root (field 0)
+        old_root_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(old_root_ptr)
+
+        # Calculate tail_start = len - tail_len
+        tail_len_64 = builder.zext(old_tail_len, i64)
+        tail_start = builder.sub(old_len, tail_len_64)
+
+        # Check if index is in tail
+        in_tail = builder.icmp_unsigned(">=", index, tail_start)
+        tail_set_block = func.append_basic_block("tail_set")
+        tree_set_block = func.append_basic_block("tree_set")
+        builder.cbranch(in_tail, tail_set_block, tree_set_block)
+
+        # --- CASE 1: Index is in tail ---
+        builder.position_at_end(tail_set_block)
+
+        # Create new list
+        new_list_tail = builder.call(self.list_new, [stored_elem_size])
+
+        # Share the root (incref if non-null)
+        new_root_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(old_root, new_root_ptr_t)
+
+        root_is_null_t = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        incref_tail_block = func.append_basic_block("incref_root_tail")
+        after_incref_tail = func.append_basic_block("after_incref_tail")
+        builder.cbranch(root_is_null_t, after_incref_tail, incref_tail_block)
+
+        builder.position_at_end(incref_tail_block)
+        refcount_ptr_t = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_refcount_t = builder.load(refcount_ptr_t)
+        new_refcount_t = builder.add(old_refcount_t, ir.Constant(i64, 1))
+        builder.store(new_refcount_t, refcount_ptr_t)
+        builder.branch(after_incref_tail)
+
+        builder.position_at_end(after_incref_tail)
+
+        # Copy depth and len
+        new_depth_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_depth, new_depth_ptr_t)
+        new_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(old_len, new_len_ptr_t)
+
+        # Get new tail pointer (allocated by list_new)
+        new_tail_ptr_field_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail_t = builder.load(new_tail_ptr_field_t)
+
+        # Copy old tail contents to new tail
+        old_tail_len_64_t = builder.zext(old_tail_len, i64)
+        old_tail_size_t = builder.mul(old_tail_len_64_t, stored_elem_size)
+        builder.call(self.memcpy, [new_tail_t, old_tail, old_tail_size_t])
+
+        # Set new tail_len
+        new_tail_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(old_tail_len, new_tail_len_ptr_t)
+
+        # Modify element at tail_index = index - tail_start
+        tail_index = builder.sub(index, tail_start)
+        elem_offset_t = builder.mul(tail_index, stored_elem_size)
+        elem_dest_t = builder.gep(new_tail_t, [elem_offset_t])
+        builder.call(self.memcpy, [elem_dest_t, value_ptr, elem_size])
+
+        builder.ret(new_list_tail)
+
+        # --- CASE 2: Index is in tree - path copy ---
+        builder.position_at_end(tree_set_block)
+
+        # Create new list
+        new_list_tree = builder.call(self.list_new, [stored_elem_size])
+
+        # Copy len and depth
+        new_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(old_len, new_len_ptr_tr)
+        new_depth_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_depth, new_depth_ptr_tr)
+
+        # Copy tail (tail is unchanged, just copy the whole thing)
+        new_tail_ptr_field_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail_tr = builder.load(new_tail_ptr_field_tr)
+        old_tail_size_tr = builder.mul(tail_len_64, stored_elem_size)
+        builder.call(self.memcpy, [new_tail_tr, old_tail, old_tail_size_tr])
+        new_tail_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(old_tail_len, new_tail_len_ptr_tr)
+
+        # Path copy the tree from root to the target leaf
+        # For depth 1, we have: root -> leaf arrays
+        # For depth > 1, we have: root -> internal nodes -> ... -> leaf arrays
+
+        pv_node_size = ir.Constant(i64, 8 + 32 * 8)  # refcount + 32 pointers
+
+        # Check if root is null (shouldn't happen if index is in tree, but handle it)
+        root_null_check = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        root_exists = func.append_basic_block("root_exists")
+        ret_empty = func.append_basic_block("ret_empty")
+        builder.cbranch(root_null_check, ret_empty, root_exists)
+
+        builder.position_at_end(ret_empty)
+        builder.ret(new_list_tree)  # Return list with copied tail but no tree
+
+        builder.position_at_end(root_exists)
+
+        # Copy the root node
+        new_root_raw = builder.call(self.malloc, [pv_node_size])
+        new_root = builder.bitcast(new_root_raw, self.pv_node_struct.as_pointer())
+
+        # Initialize new root refcount = 1
+        new_root_refcount_ptr = builder.gep(new_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), new_root_refcount_ptr)
+
+        # Copy children pointers from old root
+        old_root_children = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_root_children = builder.gep(new_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_size = ir.Constant(i64, 32 * 8)
+        old_root_children_i8 = builder.bitcast(old_root_children, ir.IntType(8).as_pointer())
+        new_root_children_i8 = builder.bitcast(new_root_children, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_root_children_i8, old_root_children_i8, children_size])
+
+        # Store new root in new list
+        new_root_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_ptr_tr)
+
+        # Convert index to i32 for bit manipulation
+        index_32 = builder.trunc(index, i32)
+
+        # For depth=1 (most common case), we just need to:
+        # 1. Calculate which leaf (child_idx = (index >> 5) & 0x1F)
+        # 2. Copy that leaf
+        # 3. Modify the element in the new leaf
+        # 4. Update new_root's child pointer
+
+        # For depth>1, we need to path copy all nodes from root to leaf
+
+        # Check if depth == 1 (simple case)
+        depth_is_one = builder.icmp_signed("==", old_depth, ir.Constant(i32, 1))
+        depth_one_block = func.append_basic_block("depth_one")
+        depth_multi_block = func.append_basic_block("depth_multi")
+        builder.cbranch(depth_is_one, depth_one_block, depth_multi_block)
+
+        # --- Depth == 1 case ---
+        builder.position_at_end(depth_one_block)
+
+        # Calculate child index: (index >> 5) & 0x1F
+        child_idx_d1 = builder.lshr(index_32, ir.Constant(i32, 5))
+        child_idx_d1 = builder.and_(child_idx_d1, ir.Constant(i32, 0x1F))
+
+        # Get old leaf pointer from old root
+        old_leaf_ptr_d1 = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 1), child_idx_d1], inbounds=True)
+        old_leaf_d1 = builder.load(old_leaf_ptr_d1)
+
+        # Create new leaf (copy of old leaf)
+        leaf_size_d1 = builder.mul(ir.Constant(i64, 32), stored_elem_size)
+        new_leaf_d1 = builder.call(self.malloc, [leaf_size_d1])
+        builder.call(self.memcpy, [new_leaf_d1, old_leaf_d1, leaf_size_d1])
+
+        # Modify element in new leaf at position index & 0x1F
+        leaf_elem_idx_d1 = builder.and_(index_32, ir.Constant(i32, 0x1F))
+        leaf_elem_idx_d1_64 = builder.zext(leaf_elem_idx_d1, i64)
+        leaf_elem_offset_d1 = builder.mul(leaf_elem_idx_d1_64, stored_elem_size)
+        leaf_elem_dest_d1 = builder.gep(new_leaf_d1, [leaf_elem_offset_d1])
+        builder.call(self.memcpy, [leaf_elem_dest_d1, value_ptr, elem_size])
+
+        # Update new root's child pointer to point to new leaf
+        new_leaf_slot_d1 = builder.gep(new_root, [ir.Constant(i32, 0), ir.Constant(i32, 1), child_idx_d1], inbounds=True)
+        builder.store(new_leaf_d1, new_leaf_slot_d1)
+
+        builder.ret(new_list_tree)
+
+        # --- Depth > 1 case (path copy through multiple levels) ---
+        builder.position_at_end(depth_multi_block)
+
+        # We need to navigate and copy the path from root to leaf
+        # Level indices from top (root) to bottom (parent of leaf):
+        # At each level l (from depth-1 down to 1), the child index is ((index >> (5*(l+1))) & 0x1F)
+        # At level 0 (parent of leaves), child index is (index >> 5) & 0x1F
+        # Within leaf, element index is index & 0x1F
+
+        # Allocate storage for current nodes (old and new) during traversal
+        current_old_node = builder.alloca(self.pv_node_struct.as_pointer(), name="curr_old")
+        current_new_node = builder.alloca(self.pv_node_struct.as_pointer(), name="curr_new")
+        builder.store(old_root, current_old_node)
+        builder.store(new_root, current_new_node)
+
+        # Level counter: start at depth-1, go down to 0
+        level_alloca = builder.alloca(i32, name="level")
+        start_level = builder.sub(old_depth, ir.Constant(i32, 1))
+        builder.store(start_level, level_alloca)
+
+        # Loop through levels
+        path_loop_cond = func.append_basic_block("path_loop_cond")
+        path_loop_body = func.append_basic_block("path_loop_body")
+        path_loop_done = func.append_basic_block("path_loop_done")
+        builder.branch(path_loop_cond)
+
+        builder.position_at_end(path_loop_cond)
+        curr_level = builder.load(level_alloca)
+        continue_path = builder.icmp_signed(">", curr_level, ir.Constant(i32, 0))
+        builder.cbranch(continue_path, path_loop_body, path_loop_done)
+
+        builder.position_at_end(path_loop_body)
+        level_val = builder.load(level_alloca)
+
+        # Calculate child index at this level: (index >> (5 * (level + 1))) & 0x1F
+        level_plus_one = builder.add(level_val, ir.Constant(i32, 1))
+        shift_amt = builder.mul(level_plus_one, ir.Constant(i32, 5))
+        child_idx_path = builder.lshr(index_32, shift_amt)
+        child_idx_path = builder.and_(child_idx_path, ir.Constant(i32, 0x1F))
+
+        # Get old child node
+        old_node_curr = builder.load(current_old_node)
+        old_child_ptr = builder.gep(old_node_curr, [ir.Constant(i32, 0), ir.Constant(i32, 1), child_idx_path], inbounds=True)
+        old_child_raw = builder.load(old_child_ptr)
+        old_child = builder.bitcast(old_child_raw, self.pv_node_struct.as_pointer())
+
+        # Create new child node (copy of old)
+        new_child_raw = builder.call(self.malloc, [pv_node_size])
+        new_child = builder.bitcast(new_child_raw, self.pv_node_struct.as_pointer())
+
+        # Initialize refcount = 1
+        new_child_refcount = builder.gep(new_child, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), new_child_refcount)
+
+        # Copy children array from old child
+        old_child_children = builder.gep(old_child, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_child_children = builder.gep(new_child, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_child_children_i8 = builder.bitcast(old_child_children, ir.IntType(8).as_pointer())
+        new_child_children_i8 = builder.bitcast(new_child_children, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_child_children_i8, old_child_children_i8, children_size])
+
+        # Update parent (new_node_curr) to point to new_child
+        new_node_curr = builder.load(current_new_node)
+        new_child_slot = builder.gep(new_node_curr, [ir.Constant(i32, 0), ir.Constant(i32, 1), child_idx_path], inbounds=True)
+        new_child_i8 = builder.bitcast(new_child, ir.IntType(8).as_pointer())
+        builder.store(new_child_i8, new_child_slot)
+
+        # Move to next level
+        builder.store(old_child, current_old_node)
+        builder.store(new_child, current_new_node)
+
+        # Decrement level
+        new_level = builder.sub(level_val, ir.Constant(i32, 1))
+        builder.store(new_level, level_alloca)
+        builder.branch(path_loop_cond)
+
+        # Path loop done - now at level 0, need to handle leaf
+        builder.position_at_end(path_loop_done)
+
+        # Calculate leaf index: (index >> 5) & 0x1F
+        leaf_idx_multi = builder.lshr(index_32, ir.Constant(i32, 5))
+        leaf_idx_multi = builder.and_(leaf_idx_multi, ir.Constant(i32, 0x1F))
+
+        # Get old leaf from current old node (which is now at level 0)
+        final_old_node = builder.load(current_old_node)
+        old_leaf_ptr_m = builder.gep(final_old_node, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaf_idx_multi], inbounds=True)
+        old_leaf_m = builder.load(old_leaf_ptr_m)
+
+        # Create new leaf
+        leaf_size_m = builder.mul(ir.Constant(i64, 32), stored_elem_size)
+        new_leaf_m = builder.call(self.malloc, [leaf_size_m])
+        builder.call(self.memcpy, [new_leaf_m, old_leaf_m, leaf_size_m])
+
+        # Modify element in new leaf
+        elem_idx_m = builder.and_(index_32, ir.Constant(i32, 0x1F))
+        elem_idx_m_64 = builder.zext(elem_idx_m, i64)
+        elem_offset_m = builder.mul(elem_idx_m_64, stored_elem_size)
+        elem_dest_m = builder.gep(new_leaf_m, [elem_offset_m])
+        builder.call(self.memcpy, [elem_dest_m, value_ptr, elem_size])
+
+        # Update current new node to point to new leaf
+        final_new_node = builder.load(current_new_node)
+        new_leaf_slot_m = builder.gep(final_new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaf_idx_multi], inbounds=True)
+        builder.store(new_leaf_m, new_leaf_slot_m)
+
+        builder.ret(new_list_tree)
+
+    def _implement_list_len(self):
+        """Implement list_len: return list length.
+
+        In Persistent Vector structure, len is field 1.
+        """
+        func = self.list_len
+        func.args[0].name = "list"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i32 = ir.IntType(32)
+
         list_ptr = func.args[0]
-        
-        # Get len field
-        len_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+
+        # Get len field (field 1 in PV structure)
+        len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         length = builder.load(len_ptr)
-        
+
         builder.ret(length)
 
     def _implement_list_size(self):
         """Implement list_size: return total memory footprint in bytes.
 
-        Size = 32 (header) + cap * elem_size (data array)
+        For PV structure: header (48) + tail (32 * elem_size) + tree nodes
+        This is an approximation - we return header + tail size.
         """
         func = self.list_size
         func.args[0].name = "list"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         list_ptr = func.args[0]
 
-        # Get cap field (field 1)
-        cap_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        cap = builder.load(cap_ptr)
+        # Get tail_len field (field 4)
+        tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        tail_len = builder.load(tail_len_ptr)
 
-        # Get elem_size field (field 2)
-        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get elem_size field (field 5)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Size = 32 (header) + cap * elem_size
-        data_size = builder.mul(cap, elem_size)
-        total_size = builder.add(ir.Constant(ir.IntType(64), 32), data_size)
+        # Size = 48 (header) + 32 * elem_size (tail capacity)
+        tail_len_64 = builder.zext(tail_len, i64)
+        tail_size = builder.mul(ir.Constant(i64, 32), elem_size)
+        total_size = builder.add(ir.Constant(i64, 48), tail_size)
 
         builder.ret(total_size)
 
     def _implement_list_copy(self):
-        """Implement list_copy: create a deep copy of a list for value semantics.
+        """Implement list_copy: create a shallow copy of a list for structural sharing.
 
-        This ensures that assignment `b = a` creates an independent copy,
-        so mutations to `b` do not affect `a`.
+        For Persistent Vector, "copy" just increments refcounts and copies the header.
+        The tree and tail are shared via reference counting.
+        True deep copy only needed when we need to mutate (done lazily in mutations).
         """
         func = self.list_copy
         func.args[0].name = "src"
@@ -466,53 +1130,84 @@ class CodeGenerator:
         builder.position_at_end(do_copy)
 
         # Load source fields
-        # len (field 0)
-        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        # root (field 0)
+        src_root_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_root = builder.load(src_root_ptr)
+
+        # len (field 1)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_len = builder.load(src_len_ptr)
 
-        # cap (field 1)
-        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        src_cap = builder.load(src_cap_ptr)
+        # depth (field 2)
+        src_depth_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_depth = builder.load(src_depth_ptr)
 
-        # elem_size (field 2)
-        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # tail (field 3)
+        src_tail_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_tail = builder.load(src_tail_ptr)
+
+        # tail_len (field 4)
+        src_tail_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        src_tail_len = builder.load(src_tail_len_ptr)
+
+        # elem_size (field 5)
+        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         src_elem_size = builder.load(src_elem_size_ptr)
 
-        # data pointer (field 3)
-        src_data_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        src_data = builder.load(src_data_ptr)
-
-        # Allocate new List struct (32 bytes) via GC
-        list_size = ir.Constant(i64, 32)
+        # Allocate new List struct (48 bytes) via GC
+        list_size = ir.Constant(i64, 48)
         type_id = ir.Constant(i32, self.gc.TYPE_LIST)
         raw_ptr = builder.call(self.gc.gc_alloc, [list_size, type_id])
         dst = builder.bitcast(raw_ptr, list_ptr_type)
 
         # Copy header fields to destination
+        # root - share the same tree (will incref below)
+        dst_root_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_root, dst_root_ptr)
+
         # len
-        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(src_len, dst_len_ptr)
 
-        # cap
-        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(src_cap, dst_cap_ptr)
+        # depth
+        dst_depth_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_depth, dst_depth_ptr)
+
+        # For tail, we need to copy the data (tail is mutable in append operations)
+        tail_capacity = ir.Constant(i64, 32)
+        tail_size = builder.mul(tail_capacity, src_elem_size)
+        new_tail = builder.call(self.malloc, [tail_size])
+        dst_tail_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(new_tail, dst_tail_ptr)
+
+        # Copy tail data
+        src_tail_len_64 = builder.zext(src_tail_len, i64)
+        copy_size = builder.mul(src_tail_len_64, src_elem_size)
+        builder.call(self.memcpy, [new_tail, src_tail, copy_size])
+
+        # tail_len
+        dst_tail_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(src_tail_len, dst_tail_len_ptr)
 
         # elem_size
-        dst_elem_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        dst_elem_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         builder.store(src_elem_size, dst_elem_size_ptr)
 
-        # Allocate new data array: cap * elem_size
-        data_size = builder.mul(src_cap, src_elem_size)
-        new_data = builder.call(self.malloc, [data_size])
+        # Increment root refcount if non-null (structural sharing)
+        root_is_null = builder.icmp_unsigned("==", src_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        incref_block = func.append_basic_block("incref_root")
+        done_block = func.append_basic_block("done")
+        builder.cbranch(root_is_null, done_block, incref_block)
 
-        # Store data pointer
-        dst_data_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        builder.store(new_data, dst_data_ptr)
+        builder.position_at_end(incref_block)
+        # Increment refcount: root->refcount++
+        refcount_ptr = builder.gep(src_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_refcount = builder.load(refcount_ptr)
+        new_refcount = builder.add(old_refcount, ir.Constant(i64, 1))
+        builder.store(new_refcount, refcount_ptr)
+        builder.branch(done_block)
 
-        # Copy actual data: len * elem_size bytes (only copy used portion)
-        copy_size = builder.mul(src_len, src_elem_size)
-        builder.call(self.memcpy, [new_data, src_data, copy_size])
-
+        builder.position_at_end(done_block)
         builder.ret(dst)
 
     def _register_list_methods(self):
@@ -530,6 +1225,7 @@ class CodeGenerator:
         self.functions["coex_list_new"] = self.list_new
         self.functions["coex_list_get"] = self.list_get
         self.functions["coex_list_append"] = self.list_append
+        self.functions["coex_list_set"] = self.list_set
         self.functions["coex_list_len"] = self.list_len
         self.functions["coex_list_size"] = self.list_size
         self.functions["coex_list_copy"] = self.list_copy
@@ -585,7 +1281,11 @@ class CodeGenerator:
         self._register_array_methods()
 
     def _implement_array_new(self):
-        """Implement array_new: allocate a new array with given capacity and element size."""
+        """Implement array_new: allocate a new array with given capacity and element size.
+
+        New struct layout: { i8* data, i64 refcount, i64 len, i64 cap, i64 elem_size }
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
+        """
         func = self.array_new
         func.args[0].name = "cap"
         func.args[1].name = "elem_size"
@@ -596,35 +1296,44 @@ class CodeGenerator:
         cap = func.args[0]
         elem_size = func.args[1]
 
-        # Allocate Array struct (32 bytes) via GC
-        array_size_const = ir.Constant(ir.IntType(64), 32)
+        # Allocate Array struct (40 bytes: 5 x 8-byte fields) via GC
+        array_size_const = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY)
         raw_ptr = builder.call(self.gc.gc_alloc, [array_size_const, type_id])
         array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
 
-        # Initialize fields
-        # len = 0
-        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
-
-        # cap
-        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(cap, cap_ptr)
-
-        # elem_size
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(elem_size, elem_size_ptr)
-
-        # Allocate data: cap * elem_size
+        # Allocate data buffer first: cap * elem_size
         data_size = builder.mul(cap, elem_size)
         data_ptr = builder.call(self.malloc, [data_size])
-        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+
+        # Initialize fields with new layout
+        # data (field 0)
+        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(data_ptr, data_field_ptr)
+
+        # refcount = 1 (field 1) - new array starts with refcount 1
+        refcount_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 1), refcount_ptr)
+
+        # len = 0 (field 2)
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
+
+        # cap (field 3)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(cap, cap_ptr)
+
+        # elem_size (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+        builder.store(elem_size, elem_size_ptr)
 
         builder.ret(array_ptr)
 
     def _implement_array_get(self):
-        """Implement array_get: return pointer to element at index."""
+        """Implement array_get: return pointer to element at index.
+
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
+        """
         func = self.array_get
         func.args[0].name = "arr"
         func.args[1].name = "index"
@@ -635,12 +1344,12 @@ class CodeGenerator:
         array_ptr = func.args[0]
         index = func.args[1]
 
-        # Get elem_size
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get elem_size (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Get data pointer
-        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Get data pointer (field 0)
+        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         data = builder.load(data_field_ptr)
 
         # Calculate offset: index * elem_size
@@ -653,6 +1362,9 @@ class CodeGenerator:
         """Implement array_set: return a NEW array with element at index replaced.
 
         This implements value semantics - original array is unchanged.
+        With COW: if refcount == 1, mutate in-place. Otherwise copy first.
+
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
         """
         func = self.array_set
         func.args[0].name = "arr"
@@ -661,6 +1373,10 @@ class CodeGenerator:
         func.args[3].name = "elem_size"
 
         entry = func.append_basic_block("entry")
+        sole_owner = func.append_basic_block("sole_owner")
+        shared = func.append_basic_block("shared")
+        do_set = func.append_basic_block("do_set")
+
         builder = ir.IRBuilder(entry)
 
         old_arr = func.args[0]
@@ -668,42 +1384,75 @@ class CodeGenerator:
         value_ptr = func.args[2]
         elem_size = func.args[3]
 
+        # Check refcount for COW
+        refcount_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        refcount = builder.load(refcount_ptr)
+        is_sole_owner = builder.icmp_unsigned("==", refcount, ir.Constant(ir.IntType(64), 1))
+        builder.cbranch(is_sole_owner, sole_owner, shared)
+
+        # Sole owner: mutate in-place, return same array
+        builder.position_at_end(sole_owner)
+        builder.branch(do_set)
+
+        # Shared: create copy first
+        builder.position_at_end(shared)
         # Get old array's len and cap
-        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
-        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         old_cap = builder.load(old_cap_ptr)
 
         # Create new array with same capacity
         new_arr = builder.call(self.array_new, [old_cap, elem_size])
 
-        # Set new array's len to old len
-        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Set new array's len to old len (field 2)
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(old_len, new_len_ptr)
 
         # Copy all data from old to new
-        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         old_data = builder.load(old_data_ptr)
 
-        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         new_data = builder.load(new_data_ptr)
 
         copy_size = builder.mul(old_len, elem_size)
         builder.call(self.memcpy, [new_data, old_data, copy_size])
 
+        # Decrement refcount of old array (could be done via decref helper)
+        old_refcount = builder.load(refcount_ptr)
+        new_refcount = builder.sub(old_refcount, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_refcount, refcount_ptr)
+
+        builder.branch(do_set)
+
+        # Do the actual set operation
+        builder.position_at_end(do_set)
+        # PHI node to select which array to use
+        result_arr = builder.phi(self.array_struct.as_pointer(), name="result_arr")
+        result_arr.add_incoming(old_arr, sole_owner)
+        result_arr.add_incoming(new_arr, shared)
+
+        # Get data pointer of result array
+        result_data_ptr = builder.gep(result_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        result_data = builder.load(result_data_ptr)
+
         # Overwrite the element at index
         offset = builder.mul(index, elem_size)
-        dest = builder.gep(new_data, [offset])
+        dest = builder.gep(result_data, [offset])
         builder.call(self.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        builder.ret(result_arr)
 
     def _implement_array_append(self):
         """Implement array_append: return a NEW array with element appended.
 
         This implements value semantics - original array is unchanged.
-        New array has capacity = old_len + 1.
+        With COW: if refcount == 1 and has capacity, mutate in-place.
+        Otherwise create new array.
+
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
         """
         func = self.array_append
         func.args[0].name = "arr"
@@ -711,31 +1460,65 @@ class CodeGenerator:
         func.args[2].name = "elem_size"
 
         entry = func.append_basic_block("entry")
+        check_capacity = func.append_basic_block("check_capacity")
+        inplace_append = func.append_basic_block("inplace_append")
+        create_new = func.append_basic_block("create_new")
+        do_append = func.append_basic_block("do_append")
+
         builder = ir.IRBuilder(entry)
 
         old_arr = func.args[0]
         value_ptr = func.args[1]
         elem_size = func.args[2]
 
-        # Get old array's len
-        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Get old array's len (field 2)
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
+        # Get old array's cap (field 3)
+        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        old_cap = builder.load(old_cap_ptr)
+
+        # Check refcount for COW (field 1)
+        refcount_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        refcount = builder.load(refcount_ptr)
+        is_sole_owner = builder.icmp_unsigned("==", refcount, ir.Constant(ir.IntType(64), 1))
+        builder.cbranch(is_sole_owner, check_capacity, create_new)
+
+        # Check if there's capacity for in-place append
+        builder.position_at_end(check_capacity)
+        has_capacity = builder.icmp_unsigned("<", old_len, old_cap)
+        builder.cbranch(has_capacity, inplace_append, create_new)
+
+        # In-place append: just update len and append element
+        builder.position_at_end(inplace_append)
+        new_len_inplace = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
+        builder.store(new_len_inplace, old_len_ptr)
+        # Get data pointer (field 0)
+        inplace_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        inplace_data = builder.load(inplace_data_ptr)
+        inplace_offset = builder.mul(old_len, elem_size)
+        inplace_dest = builder.gep(inplace_data, [inplace_offset])
+        builder.call(self.memcpy, [inplace_dest, value_ptr, elem_size])
+        builder.branch(do_append)
+
+        # Create new array (shared or no capacity)
+        builder.position_at_end(create_new)
         # New capacity = old_len + 1
         new_cap = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
 
         # Create new array
         new_arr = builder.call(self.array_new, [new_cap, elem_size])
 
-        # Set new array's len = old_len + 1
-        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Set new array's len = old_len + 1 (field 2)
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(new_cap, new_len_ptr)
 
-        # Copy old data to new
-        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Copy old data to new (field 0)
+        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         old_data = builder.load(old_data_ptr)
 
-        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         new_data = builder.load(new_data_ptr)
 
         copy_size = builder.mul(old_len, elem_size)
@@ -746,10 +1529,26 @@ class CodeGenerator:
         dest = builder.gep(new_data, [offset])
         builder.call(self.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        # Decrement refcount of old array if shared
+        # (Only needed if refcount > 1, but simpler to always decrement here)
+        # Actually, we should not decrement here since the old array is still valid
+        # The caller may still reference it. Just return the new array.
+
+        builder.branch(do_append)
+
+        # Return result
+        builder.position_at_end(do_append)
+        result_arr = builder.phi(self.array_struct.as_pointer(), name="result_arr")
+        result_arr.add_incoming(old_arr, inplace_append)
+        result_arr.add_incoming(new_arr, create_new)
+
+        builder.ret(result_arr)
 
     def _implement_array_len(self):
-        """Implement array_len: return array length."""
+        """Implement array_len: return array length.
+
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
+        """
         func = self.array_len
         func.args[0].name = "arr"
 
@@ -758,8 +1557,8 @@ class CodeGenerator:
 
         array_ptr = func.args[0]
 
-        # Get len field
-        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Get len field (field 2)
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         length = builder.load(len_ptr)
 
         builder.ret(length)
@@ -767,7 +1566,9 @@ class CodeGenerator:
     def _implement_array_size(self):
         """Implement array_size: return total memory footprint in bytes.
 
-        Size = 32 (header) + cap * elem_size (data array)
+        Size = 40 (header, 5 x 8-byte fields) + cap * elem_size (data array)
+
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
         """
         func = self.array_size
         func.args[0].name = "arr"
@@ -777,25 +1578,28 @@ class CodeGenerator:
 
         array_ptr = func.args[0]
 
-        # Get cap field (field 1)
-        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Get cap field (field 3)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         cap = builder.load(cap_ptr)
 
-        # Get elem_size field (field 2)
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get elem_size field (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Size = 32 (header) + cap * elem_size
+        # Size = 40 (header) + cap * elem_size
         data_size = builder.mul(cap, elem_size)
-        total_size = builder.add(ir.Constant(ir.IntType(64), 32), data_size)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 40), data_size)
 
         builder.ret(total_size)
 
     def _implement_array_copy(self):
-        """Implement array_copy: create a deep copy of an array for value semantics.
+        """Implement array_copy: COW copy - increment refcount and return same pointer.
 
-        Array layout: { i64 len, i64 cap, i64 elem_size, i8* data }
-        Same structure as List.
+        Array layout: { i8* data, i64 refcount, i64 len, i64 cap, i64 elem_size }
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
+
+        With COW, 'copying' just means incrementing the refcount.
+        The actual data copy is deferred until mutation.
         """
         func = self.array_copy
         func.args[0].name = "src"
@@ -820,55 +1624,14 @@ class CodeGenerator:
 
         builder.position_at_end(do_copy)
 
-        # Load source fields
-        # len (field 0)
-        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_len = builder.load(src_len_ptr)
+        # Increment refcount (field 1)
+        refcount_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_refcount = builder.load(refcount_ptr)
+        new_refcount = builder.add(old_refcount, ir.Constant(i64, 1))
+        builder.store(new_refcount, refcount_ptr)
 
-        # cap (field 1)
-        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        src_cap = builder.load(src_cap_ptr)
-
-        # elem_size (field 2)
-        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        src_elem_size = builder.load(src_elem_size_ptr)
-
-        # data pointer (field 3)
-        src_data_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        src_data = builder.load(src_data_ptr)
-
-        # Allocate new Array struct (32 bytes) via GC
-        array_size = ir.Constant(i64, 32)
-        type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
-        raw_ptr = builder.call(self.gc.gc_alloc, [array_size, type_id])
-        dst = builder.bitcast(raw_ptr, array_ptr_type)
-
-        # Copy header fields to destination
-        # len
-        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(src_len, dst_len_ptr)
-
-        # cap
-        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(src_cap, dst_cap_ptr)
-
-        # elem_size
-        dst_elem_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        builder.store(src_elem_size, dst_elem_size_ptr)
-
-        # Allocate new data array: cap * elem_size
-        data_size = builder.mul(src_cap, src_elem_size)
-        new_data = builder.call(self.malloc, [data_size])
-
-        # Store data pointer
-        dst_data_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        builder.store(new_data, dst_data_ptr)
-
-        # Copy actual data: len * elem_size bytes (only copy used portion)
-        copy_size = builder.mul(src_len, src_elem_size)
-        builder.call(self.memcpy, [new_data, src_data, copy_size])
-
-        builder.ret(dst)
+        # Return the same pointer (data is shared)
+        builder.ret(src)
 
     def _register_array_methods(self):
         """Register Array as a type with methods."""
@@ -894,35 +1657,72 @@ class CodeGenerator:
         """Convert a List to an Array (List.packed() -> Array).
 
         Creates a new Array with the same elements as the List.
+        For Persistent Vector List, we iterate using list_get since
+        the data is stored in a tree structure, not contiguously.
         """
         func = self.builder.function
+        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
         # Get List length
         list_len = self.builder.call(self.list_len, [list_ptr])
 
-        # Get List elem_size (field 2)
-        elem_size_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get List elem_size (field 5 in PV structure)
+        elem_size_ptr = self.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
         # Create new Array with same capacity as List length
         array_ptr = self.builder.call(self.array_new, [list_len, elem_size])
 
-        # Set Array len = list_len
-        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Set Array len = list_len (field 2 in Array layout)
+        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         self.builder.store(list_len, array_len_ptr)
 
-        # Get data pointers
-        list_data_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        list_data = self.builder.load(list_data_ptr)
-
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Array data is field 0 (Array layout)
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_data = self.builder.load(array_data_ptr)
 
-        # Copy all data: memcpy(array_data, list_data, list_len * elem_size)
-        copy_size = self.builder.mul(list_len, elem_size)
-        self.builder.call(self.memcpy, [array_data, list_data, copy_size])
+        # For Persistent Vector List, we can't just memcpy - we need to iterate
+        # through the list using list_get since data may be in tree structure.
+        # Loop through each element and copy to array
+
+        idx_alloca = self.builder.alloca(i64, name="list_to_arr_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = func.append_basic_block("list_to_arr_cond")
+        body_block = func.append_basic_block("list_to_arr_body")
+        end_block = func.append_basic_block("list_to_arr_end")
+
+        self.builder.branch(cond_block)
+
+        # Condition: idx < list_len
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, list_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        # Body: copy element from list to array
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+
+        # Get element from list
+        elem_ptr = self.builder.call(self.list_get, [list_ptr, idx])
+
+        # Calculate destination in array
+        offset = self.builder.mul(idx, elem_size)
+        dest_ptr = self.builder.gep(array_data, [offset])
+
+        # Copy element
+        self.builder.call(self.memcpy, [dest_ptr, elem_ptr, elem_size])
+
+        # Increment index
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        # End
+        self.builder.position_at_end(end_block)
 
         return array_ptr
 
@@ -953,7 +1753,8 @@ class CodeGenerator:
         set_entries_ptr = self.builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         set_entries = self.builder.load(set_entries_ptr)
 
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Array data is field 0 (new layout)
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         array_data = self.builder.load(array_data_ptr)
 
         # Loop variables
@@ -1020,10 +1821,10 @@ class CodeGenerator:
         self.builder.store(next_idx, idx_alloca)
         self.builder.branch(cond_block)
 
-        # Exit: set array len
+        # Exit: set array len (field 2 in new Array layout)
         self.builder.position_at_end(exit_block)
         final_arr_idx = self.builder.load(arr_idx_alloca)
-        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         self.builder.store(final_arr_idx, arr_len_ptr)
 
         return array_ptr
@@ -1032,78 +1833,169 @@ class CodeGenerator:
         """Convert an Array to a List (Array.unpacked() -> List).
 
         Creates a new List with the same elements as the Array.
+        For Persistent Vector List, we iterate through the array and
+        append each element to build the list.
         """
+        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
+
+        func = self.builder.function
 
         # Get Array length
         array_len = self.builder.call(self.array_len, [array_ptr])
 
-        # Get Array elem_size (field 2)
-        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get Array elem_size (field 4 in Array layout)
+        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
-        # Create new List with same elem_size
-        list_ptr = self.builder.call(self.list_new, [elem_size])
-
-        # Get data pointers
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Get Array data (field 0)
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_data = self.builder.load(array_data_ptr)
 
-        # We need to append each element to the list
-        # For efficiency, we'll just copy the data and set list's len/cap
-        list_data_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Create new empty List with same elem_size
+        list_ptr = self.builder.call(self.list_new, [elem_size])
 
-        # Check if array_len > 8 (list's initial capacity)
+        # Store list_ptr in alloca since list_append returns new list
+        list_alloca = self.builder.alloca(self.list_struct.as_pointer(), name="arr_to_list")
+        self.builder.store(list_ptr, list_alloca)
+
+        # Loop through array elements and append to list
+        idx_alloca = self.builder.alloca(i64, name="arr_to_list_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = func.append_basic_block("arr_to_list_cond")
+        body_block = func.append_basic_block("arr_to_list_body")
+        end_block = func.append_basic_block("arr_to_list_end")
+
+        self.builder.branch(cond_block)
+
+        # Condition: idx < array_len
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, array_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        # Body: get element from array and append to list
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+
+        # Calculate source address in array
+        offset = self.builder.mul(idx, elem_size)
+        elem_ptr = self.builder.gep(array_data, [offset])
+
+        # Append element to list
+        current_list = self.builder.load(list_alloca)
+        new_list = self.builder.call(self.list_append, [current_list, elem_ptr, elem_size])
+        self.builder.store(new_list, list_alloca)
+
+        # Increment index
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        # End
+        self.builder.position_at_end(end_block)
+        return self.builder.load(list_alloca)
+
+    def _array_to_set(self, array_ptr: ir.Value) -> ir.Value:
+        """Convert an Array to a Set (Array.toSet() -> Set).
+
+        Creates a new Set with the same elements as the Array.
+        Duplicate elements in the Array are deduplicated.
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
         func = self.builder.function
-        need_realloc_block = func.append_basic_block("list_realloc")
-        copy_block = func.append_basic_block("list_copy")
 
-        eight = ir.Constant(i64, 8)
-        need_realloc = self.builder.icmp_signed(">", array_len, eight)
-        self.builder.cbranch(need_realloc, need_realloc_block, copy_block)
+        # Get Array length
+        array_len = self.builder.call(self.array_len, [array_ptr])
 
-        # Reallocate list data if needed
-        self.builder.position_at_end(need_realloc_block)
-        new_data_size = self.builder.mul(array_len, elem_size)
-        new_data = self.builder.call(self.malloc, [new_data_size])
-        old_data = self.builder.load(list_data_ptr)
-        self.builder.call(self.free, [old_data])
-        self.builder.store(new_data, list_data_ptr)
-        # Update capacity
-        cap_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        self.builder.store(array_len, cap_ptr)
-        self.builder.branch(copy_block)
+        # Get Array elem_size (field 4 in Array layout)
+        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        elem_size = self.builder.load(elem_size_ptr)
 
-        # Copy data
-        self.builder.position_at_end(copy_block)
-        list_data = self.builder.load(list_data_ptr)
-        copy_size = self.builder.mul(array_len, elem_size)
-        self.builder.call(self.memcpy, [list_data, array_data, copy_size])
+        # Get Array data (field 0)
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_data = self.builder.load(array_data_ptr)
 
-        # Set list len = array_len
-        len_ptr = self.builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        self.builder.store(array_len, len_ptr)
+        # Create new empty Set
+        set_ptr = self.builder.call(self.set_new, [])
 
-        return list_ptr
+        # Store set_ptr in alloca since set_add returns new set
+        set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="arr_to_set")
+        self.builder.store(set_ptr, set_alloca)
+
+        # Loop through array elements and add to set
+        idx_alloca = self.builder.alloca(i64, name="arr_to_set_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = func.append_basic_block("arr_to_set_cond")
+        body_block = func.append_basic_block("arr_to_set_body")
+        end_block = func.append_basic_block("arr_to_set_end")
+
+        self.builder.branch(cond_block)
+
+        # Condition: idx < array_len
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, array_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        # Body: get element from array and add to set
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+
+        # Calculate source address in array and load value
+        offset = self.builder.mul(idx, elem_size)
+        elem_ptr = self.builder.gep(array_data, [offset])
+        # Load element as i64 (assuming elements are stored as i64)
+        typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
+        elem_val = self.builder.load(typed_ptr)
+
+        # Add element to set (set_add returns new set)
+        current_set = self.builder.load(set_alloca)
+        new_set = self.builder.call(self.set_add, [current_set, elem_val])
+        self.builder.store(new_set, set_alloca)
+
+        # Increment index
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        # End
+        self.builder.position_at_end(end_block)
+        return self.builder.load(set_alloca)
 
     def _create_string_type(self):
         """Create the String struct type and helper functions.
 
-        String layout (contiguous allocation, no null terminator):
-            Bytes 0-7:   i64 byte_len (number of UTF-8 bytes)
-            Bytes 8-15:  i64 char_count (number of UTF-8 codepoints)
-            Bytes 16+:   UTF-8 data (byte_len bytes, no null terminator)
+        String layout with COW (Copy-on-Write):
+            Field 0: i8* data     - pointer to UTF-8 bytes (separate allocation)
+            Field 1: i64 refcount - reference count for COW (IMMORTAL for literals)
+            Field 2: i64 len      - number of UTF-8 codepoints (what .len() returns)
+            Field 3: i64 size     - byte count (for memory operations)
+            Field 4: i64 cap      - capacity in bytes (for efficient appends)
 
-        A String* points to the start of this block.
-        Total allocation size = 16 + byte_len
+        A String* points to the struct. Data is stored separately.
+        Total struct size = 40 bytes (5 x 8-byte fields)
+
+        IMMORTAL_REFCOUNT = 0x7FFFFFFFFFFFFFFF means string literal, never freed
         """
-        # The struct contains byte_len and char_count; data follows immediately after
+        # String struct with COW support
         self.string_struct = ir.global_context.get_identified_type("struct.String")
         self.string_struct.set_body(
-            ir.IntType(64),  # byte_len (data follows at offset 16)
-            ir.IntType(64),  # char_count (number of UTF-8 codepoints)
+            ir.IntType(8).as_pointer(),  # data (field 0 - fast access)
+            ir.IntType(64),  # refcount (field 1)
+            ir.IntType(64),  # len - codepoint count (field 2)
+            ir.IntType(64),  # size - byte count (field 3)
+            ir.IntType(64),  # cap - capacity in bytes (field 4)
         )
+
+        # Immortal refcount for string literals (never freed)
+        self.STRING_IMMORTAL_REFCOUNT = 0x7FFFFFFFFFFFFFFF
         
         string_ptr = self.string_struct.as_pointer()
         i64 = ir.IntType(64)
@@ -1164,12 +2056,30 @@ class CodeGenerator:
         string_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
         self.string_copy = ir.Function(self.module, string_copy_ty, name="coex_string_copy")
 
+        # COW helpers for string
+        # string_incref(s: String*) -> void (atomically increment refcount)
+        string_incref_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
+        self.string_incref = ir.Function(self.module, string_incref_ty, name="coex_string_incref")
+
+        # string_decref(s: String*) -> void (atomically decrement refcount, free if zero)
+        string_decref_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
+        self.string_decref = ir.Function(self.module, string_decref_ty, name="coex_string_decref")
+
+        # string_byte_size(s: String*) -> i64 (return byte size, internal use)
+        string_byte_size_ty = ir.FunctionType(i64, [string_ptr])
+        self.string_byte_size = ir.Function(self.module, string_byte_size_ty, name="coex_string_byte_size")
+
+        # string_hash(s: String*) -> i64 (hash a string by its content)
+        string_hash_ty = ir.FunctionType(i64, [string_ptr])
+        self.string_hash = ir.Function(self.module, string_hash_ty, name="coex_string_hash")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
         self._implement_string_from_literal()
         self._implement_string_len()
         self._implement_string_size()
+        self._implement_string_byte_size()
         self._implement_string_get()
         self._implement_string_slice()
         self._implement_string_concat()
@@ -1177,12 +2087,18 @@ class CodeGenerator:
         self._implement_string_contains()
         self._implement_string_print()
         self._implement_string_copy()
+        self._implement_string_incref()
+        self._implement_string_decref()
+        self._implement_string_hash()
 
         # Register String type methods
         self._register_string_methods()
     
     def _implement_string_data(self):
-        """Get pointer to data portion (offset 16 from string pointer)"""
+        """Get pointer to data portion (field 0 of string struct).
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
         func = self.string_data
         func.args[0].name = "s"
 
@@ -1191,19 +2107,19 @@ class CodeGenerator:
 
         s = func.args[0]
 
-        # Cast to i8*, add 16 bytes offset to skip byte_len and char_count fields
-        raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+        # Load data pointer from field 0
+        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
 
         builder.ret(data_ptr)
     
     def _implement_string_new(self):
         """Create String from data pointer, byte length, and char count.
 
-        Allocates 16 + byte_len bytes:
-          - Stores byte_len at offset 0
-          - Stores char_count at offset 8
-          - Copies data to offset 16
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        - Allocates 40 bytes for struct via GC
+        - Allocates byte_len bytes for data via malloc
+        - Sets refcount = 1 (new heap string)
         """
         func = self.string_new
         func.args[0].name = "data"
@@ -1217,23 +2133,37 @@ class CodeGenerator:
         byte_len = func.args[1]
         char_count = func.args[2]
 
-        # Allocate 16 (byte_len + char_count fields) + byte_len (data) bytes via GC
-        alloc_size = builder.add(ir.Constant(ir.IntType(64), 16), byte_len)
+        # Allocate 40 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [alloc_size, type_id])
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Store byte_len at offset 0
-        byte_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(byte_len, byte_len_ptr)
+        # Allocate data buffer: byte_len bytes via malloc
+        data_buf = builder.call(self.malloc, [byte_len])
 
-        # Store char_count at offset 1 (byte 8)
-        char_count_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(char_count, char_count_ptr)
+        # Copy source data to buffer
+        builder.call(self.memcpy, [data_buf, data, byte_len])
 
-        # Copy data to offset 16
-        data_dest = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
-        builder.call(self.memcpy, [data_dest, data, byte_len])
+        # Store data pointer at field 0
+        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(data_buf, data_ptr_ptr)
+
+        # Store refcount = 1 at field 1 (new heap string)
+        refcount_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 1), refcount_ptr)
+
+        # Store len (codepoint count) at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(char_count, len_ptr)
+
+        # Store size (byte count) at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(byte_len, size_ptr)
+
+        # Store cap (capacity = byte_len initially) at field 4
+        cap_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+        builder.store(byte_len, cap_ptr)
 
         builder.ret(string_ptr)
     
@@ -1241,10 +2171,14 @@ class CodeGenerator:
         """Create String from null-terminated C string literal.
 
         Used for string literals in source code. Scans for byte length
-        and UTF-8 codepoint count, then calls string_new.
+        and UTF-8 codepoint count, then creates String struct with:
+        - data pointer pointing directly to literal (read-only memory)
+        - IMMORTAL refcount (never freed)
 
         UTF-8 codepoint counting: A byte starts a new codepoint if it's NOT
         a continuation byte (10xxxxxx). So we count bytes where (byte & 0xC0) != 0x80.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
         """
         func = self.string_from_literal
         func.args[0].name = "cstr"
@@ -1297,12 +2231,41 @@ class CodeGenerator:
         builder.position_at_end(done)
         final_byte_len = builder.load(byte_len_ptr)
         final_char_count = builder.load(char_count_ptr)
-        # Create new string with both byte_len and char_count
-        result = builder.call(self.string_new, [cstr, final_byte_len, final_char_count])
-        builder.ret(result)
+
+        # Allocate 40 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 40)
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
+
+        # Store data pointer at field 0 (points directly to literal in read-only memory)
+        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(cstr, data_ptr_ptr)
+
+        # Store IMMORTAL refcount at field 1 (never freed)
+        refcount_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        immortal = ir.Constant(ir.IntType(64), self.STRING_IMMORTAL_REFCOUNT)
+        builder.store(immortal, refcount_ptr)
+
+        # Store len (codepoint count) at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(final_char_count, len_ptr)
+
+        # Store size (byte count) at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(final_byte_len, size_ptr)
+
+        # Store cap at field 4 (same as size for literals)
+        cap_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+        builder.store(final_byte_len, cap_ptr)
+
+        builder.ret(string_ptr)
     
     def _implement_string_len(self):
-        """Return string length (char_count at offset 1, i.e. bytes 8-15)"""
+        """Return string length (codepoint count at field 2).
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
         func = self.string_len
         func.args[0].name = "s"
 
@@ -1310,15 +2273,16 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
-        # Read char_count from offset 1 (second field)
-        char_count_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        char_count = builder.load(char_count_ptr)
-        builder.ret(char_count)
+        # Read len (codepoint count) from field 2
+        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        length = builder.load(len_ptr)
+        builder.ret(length)
 
     def _implement_string_size(self):
         """Return string total memory footprint in bytes.
 
-        Size = 16 (header: byte_len + char_count) + byte_len (data)
+        Size = 40 (struct) + size (data bytes)
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
         """
         func = self.string_size
         func.args[0].name = "s"
@@ -1327,53 +2291,71 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
-        # Read byte_len from offset 0 (first field)
-        byte_len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        byte_len = builder.load(byte_len_ptr)
+        # Read size (byte count) from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
 
-        # Size = 16 (header) + byte_len
-        total_size = builder.add(ir.Constant(ir.IntType(64), 16), byte_len)
+        # Total size = 40 (struct) + size (data bytes)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 40), byte_size)
         builder.ret(total_size)
+
+    def _implement_string_byte_size(self):
+        """Return string byte size (field 3) - internal use.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
+        func = self.string_byte_size
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+        # Read size (byte count) from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
+        builder.ret(byte_size)
 
     def _implement_string_get(self):
         """Get byte at index with bounds checking.
-        
+
         Returns 0 if index is out of bounds (safe default).
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
         """
         func = self.string_get
         func.args[0].name = "s"
         func.args[1].name = "index"
-        
+
         entry = func.append_basic_block("entry")
         in_bounds = func.append_basic_block("in_bounds")
         out_of_bounds = func.append_basic_block("out_of_bounds")
-        
+
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
         index = func.args[1]
-        
-        # Get length
-        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        length = builder.load(len_ptr)
-        
-        # Bounds check: 0 <= index < length
+
+        # Get byte size from field 3 (use byte size for bounds check)
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size = builder.load(size_ptr)
+
+        # Bounds check: 0 <= index < size (byte size)
         is_negative = builder.icmp_signed("<", index, ir.Constant(ir.IntType(64), 0))
-        is_too_large = builder.icmp_signed(">=", index, length)
+        is_too_large = builder.icmp_signed(">=", index, size)
         is_invalid = builder.or_(is_negative, is_too_large)
         builder.cbranch(is_invalid, out_of_bounds, in_bounds)
-        
+
         builder.position_at_end(in_bounds)
-        # Get data pointer (offset 16)
-        raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
-        
+        # Get data pointer from field 0
+        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
         # Get byte at index
         byte_ptr = builder.gep(data_ptr, [index])
         byte_val = builder.load(byte_ptr)
         result = builder.zext(byte_val, ir.IntType(64))
         builder.ret(result)
-        
+
         builder.position_at_end(out_of_bounds)
         # Return 0 for out-of-bounds access (safe failure)
         builder.ret(ir.Constant(ir.IntType(64), 0))
@@ -1384,6 +2366,8 @@ class CodeGenerator:
         Clamps indices to valid range for safety.
         Note: This slices by byte index. For proper UTF-8 handling, the slice
         boundaries should align with codepoint boundaries.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
         """
         func = self.string_slice
         func.args[0].name = "s"
@@ -1403,26 +2387,26 @@ class CodeGenerator:
         start = func.args[1]
         end = func.args[2]
 
-        # Get byte_len
-        byte_len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        byte_len = builder.load(byte_len_ptr)
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
 
-        # Clamp start: max(0, min(start, byte_len))
+        # Clamp start: max(0, min(start, byte_size))
         zero = ir.Constant(ir.IntType(64), 0)
         start_clamped = builder.select(builder.icmp_signed("<", start, zero), zero, start)
-        start_clamped = builder.select(builder.icmp_signed(">", start_clamped, byte_len), byte_len, start_clamped)
+        start_clamped = builder.select(builder.icmp_signed(">", start_clamped, byte_size), byte_size, start_clamped)
 
-        # Clamp end: max(start, min(end, byte_len))
+        # Clamp end: max(start, min(end, byte_size))
         end_clamped = builder.select(builder.icmp_signed("<", end, zero), zero, end)
-        end_clamped = builder.select(builder.icmp_signed(">", end_clamped, byte_len), byte_len, end_clamped)
+        end_clamped = builder.select(builder.icmp_signed(">", end_clamped, byte_size), byte_size, end_clamped)
         end_clamped = builder.select(builder.icmp_signed("<", end_clamped, start_clamped), start_clamped, end_clamped)
 
         # Calculate new byte length
         new_byte_len = builder.sub(end_clamped, start_clamped)
 
-        # Get source data pointer (offset 16)
-        raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+        # Get source data pointer from field 0
+        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
         slice_start = builder.gep(data_ptr, [start_clamped])
 
         # Count codepoints in the slice (scan for non-continuation bytes)
@@ -1464,7 +2448,11 @@ class CodeGenerator:
         builder.ret(result)
     
     def _implement_string_concat(self):
-        """Concatenate two strings."""
+        """Concatenate two strings.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Creates a new string with refcount = 1.
+        """
         func = self.string_concat
         func.args[0].name = "a"
         func.args[1].name = "b"
@@ -1475,124 +2463,144 @@ class CodeGenerator:
         a = func.args[0]
         b = func.args[1]
 
-        # Get byte_len from both strings
-        a_byte_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_byte_len = builder.load(a_byte_len_ptr)
+        # Get size (byte count) from both strings (field 3)
+        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        a_size = builder.load(a_size_ptr)
 
-        b_byte_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_byte_len = builder.load(b_byte_len_ptr)
+        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        b_size = builder.load(b_size_ptr)
 
-        # Get char_count from both strings
-        a_char_count_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        a_char_count = builder.load(a_char_count_ptr)
+        # Get len (codepoint count) from both strings (field 2)
+        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        a_len = builder.load(a_len_ptr)
 
-        b_char_count_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        b_char_count = builder.load(b_char_count_ptr)
+        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        b_len = builder.load(b_len_ptr)
 
-        # Total byte length and char count
-        total_byte_len = builder.add(a_byte_len, b_byte_len)
-        total_char_count = builder.add(a_char_count, b_char_count)
+        # Total byte size and codepoint count
+        total_size = builder.add(a_size, b_size)
+        total_len = builder.add(a_len, b_len)
 
-        # Allocate new string: 16 + total_byte_len via GC
-        alloc_size = builder.add(ir.Constant(ir.IntType(64), 16), total_byte_len)
+        # Allocate 40 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [alloc_size, type_id])
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Store byte_len at offset 0
-        byte_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(total_byte_len, byte_len_ptr)
-
-        # Store char_count at offset 1
-        char_count_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(total_char_count, char_count_ptr)
-
-        # Get data destination (offset 16)
-        dest_data = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
+        # Allocate data buffer: total_size bytes via malloc
+        dest_data = builder.call(self.malloc, [total_size])
 
         # Copy a's data
-        a_raw = builder.bitcast(a, ir.IntType(8).as_pointer())
-        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 16)])
-        builder.call(self.memcpy, [dest_data, a_data, a_byte_len])
+        a_data_ptr_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_data = builder.load(a_data_ptr_ptr)
+        builder.call(self.memcpy, [dest_data, a_data, a_size])
 
         # Copy b's data after a
-        b_dest = builder.gep(dest_data, [a_byte_len])
-        b_raw = builder.bitcast(b, ir.IntType(8).as_pointer())
-        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 16)])
-        builder.call(self.memcpy, [b_dest, b_data, b_byte_len])
+        b_dest = builder.gep(dest_data, [a_size])
+        b_data_ptr_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_data = builder.load(b_data_ptr_ptr)
+        builder.call(self.memcpy, [b_dest, b_data, b_size])
+
+        # Store data pointer at field 0
+        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(dest_data, data_ptr_ptr)
+
+        # Store refcount = 1 at field 1 (new heap string)
+        refcount_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 1), refcount_ptr)
+
+        # Store len at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(total_len, len_ptr)
+
+        # Store size at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(total_size, size_ptr)
+
+        # Store cap at field 4 (same as size initially)
+        cap_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+        builder.store(total_size, cap_ptr)
 
         builder.ret(string_ptr)
     
     def _implement_string_eq(self):
-        """Compare two strings for equality."""
+        """Compare two strings for equality.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Compare by byte size (field 3) and then byte-by-byte.
+        """
         func = self.string_eq
         func.args[0].name = "a"
         func.args[1].name = "b"
-        
+
         entry = func.append_basic_block("entry")
         check_data = func.append_basic_block("check_data")
         compare_loop = func.append_basic_block("compare_loop")
         compare_body = func.append_basic_block("compare_body")
         not_equal = func.append_basic_block("not_equal")
         equal = func.append_basic_block("equal")
-        
+
         builder = ir.IRBuilder(entry)
-        
+
         a = func.args[0]
         b = func.args[1]
-        
-        # Get lengths
-        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_len = builder.load(a_len_ptr)
-        
-        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_len = builder.load(b_len_ptr)
-        
-        # Check if lengths are equal
-        len_eq = builder.icmp_signed("==", a_len, b_len)
-        builder.cbranch(len_eq, check_data, not_equal)
-        
-        builder.position_at_end(check_data)
-        # Get data pointers (offset 16)
-        a_raw = builder.bitcast(a, ir.IntType(8).as_pointer())
-        a_data = builder.gep(a_raw, [ir.Constant(ir.IntType(64), 16)])
 
-        b_raw = builder.bitcast(b, ir.IntType(8).as_pointer())
-        b_data = builder.gep(b_raw, [ir.Constant(ir.IntType(64), 16)])
-        
+        # Get byte sizes from field 3
+        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        a_size = builder.load(a_size_ptr)
+
+        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        b_size = builder.load(b_size_ptr)
+
+        # Check if sizes are equal
+        size_eq = builder.icmp_signed("==", a_size, b_size)
+        builder.cbranch(size_eq, check_data, not_equal)
+
+        builder.position_at_end(check_data)
+        # Get data pointers from field 0
+        a_data_ptr_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_data = builder.load(a_data_ptr_ptr)
+
+        b_data_ptr_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_data = builder.load(b_data_ptr_ptr)
+
         # Compare bytes
         idx_ptr = builder.alloca(ir.IntType(64), name="idx")
         builder.store(ir.Constant(ir.IntType(64), 0), idx_ptr)
         builder.branch(compare_loop)
-        
+
         builder.position_at_end(compare_loop)
         idx = builder.load(idx_ptr)
-        done = builder.icmp_signed(">=", idx, a_len)
+        done = builder.icmp_signed(">=", idx, a_size)
         builder.cbranch(done, equal, compare_body)
-        
+
         builder.position_at_end(compare_body)
         a_char_ptr = builder.gep(a_data, [idx])
         a_char = builder.load(a_char_ptr)
         b_char_ptr = builder.gep(b_data, [idx])
         b_char = builder.load(b_char_ptr)
-        
+
         chars_eq = builder.icmp_unsigned("==", a_char, b_char)
         new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
         builder.store(new_idx, idx_ptr)
         builder.cbranch(chars_eq, compare_loop, not_equal)
-        
+
         builder.position_at_end(not_equal)
         builder.ret(ir.Constant(ir.IntType(1), 0))
-        
+
         builder.position_at_end(equal)
         builder.ret(ir.Constant(ir.IntType(1), 1))
     
     def _implement_string_contains(self):
-        """Check if string contains substring (naive search)."""
+        """Check if string contains substring (naive search).
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Uses byte size (field 3) for comparisons.
+        """
         func = self.string_contains
         func.args[0].name = "s"
         func.args[1].name = "needle"
-        
+
         entry = func.append_basic_block("entry")
         outer_loop = func.append_basic_block("outer_loop")
         inner_setup = func.append_basic_block("inner_setup")
@@ -1601,119 +2609,122 @@ class CodeGenerator:
         mismatch = func.append_basic_block("mismatch")
         found = func.append_basic_block("found")
         not_found = func.append_basic_block("not_found")
-        
+
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
         needle = func.args[1]
-        
-        # Get lengths
-        s_len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        s_len = builder.load(s_len_ptr)
-        
-        needle_len_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        needle_len = builder.load(needle_len_ptr)
-        
-        # Get data pointers (offset 16)
-        s_raw = builder.bitcast(s, ir.IntType(8).as_pointer())
-        s_data = builder.gep(s_raw, [ir.Constant(ir.IntType(64), 16)])
 
-        needle_raw = builder.bitcast(needle, ir.IntType(8).as_pointer())
-        needle_data = builder.gep(needle_raw, [ir.Constant(ir.IntType(64), 16)])
-        
+        # Get byte sizes from field 3
+        s_size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        s_size = builder.load(s_size_ptr)
+
+        needle_size_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        needle_size = builder.load(needle_size_ptr)
+
+        # Get data pointers from field 0
+        s_data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        s_data = builder.load(s_data_ptr_ptr)
+
+        needle_data_ptr_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        needle_data = builder.load(needle_data_ptr_ptr)
+
         # Empty needle always matches
-        empty_needle = builder.icmp_signed("==", needle_len, ir.Constant(ir.IntType(64), 0))
-        
+        empty_needle = builder.icmp_signed("==", needle_size, ir.Constant(ir.IntType(64), 0))
+
         # Loop indices
         i_ptr = builder.alloca(ir.IntType(64), name="i")
         j_ptr = builder.alloca(ir.IntType(64), name="j")
         builder.store(ir.Constant(ir.IntType(64), 0), i_ptr)
-        
+
         builder.cbranch(empty_needle, found, outer_loop)
-        
+
         # Outer loop: for each starting position
         builder.position_at_end(outer_loop)
         i = builder.load(i_ptr)
-        remaining = builder.sub(s_len, i)
-        can_fit = builder.icmp_signed(">=", remaining, needle_len)
+        remaining = builder.sub(s_size, i)
+        can_fit = builder.icmp_signed(">=", remaining, needle_size)
         builder.cbranch(can_fit, inner_setup, not_found)
-        
+
         # Setup inner loop
         builder.position_at_end(inner_setup)
         builder.store(ir.Constant(ir.IntType(64), 0), j_ptr)
         builder.branch(inner_loop)
-        
+
         # Inner loop: compare characters
         builder.position_at_end(inner_loop)
         j = builder.load(j_ptr)
-        matched_all = builder.icmp_signed(">=", j, needle_len)
+        matched_all = builder.icmp_signed(">=", j, needle_size)
         builder.cbranch(matched_all, found, inner_check)
-        
+
         # Check current character
         builder.position_at_end(inner_check)
         i_val = builder.load(i_ptr)
         j_val = builder.load(j_ptr)
         s_idx = builder.add(i_val, j_val)
-        
+
         s_char_ptr = builder.gep(s_data, [s_idx])
         s_char = builder.load(s_char_ptr)
-        
+
         needle_char_ptr = builder.gep(needle_data, [j_val])
         needle_char = builder.load(needle_char_ptr)
-        
+
         chars_match = builder.icmp_unsigned("==", s_char, needle_char)
-        
+
         new_j = builder.add(j_val, ir.Constant(ir.IntType(64), 1))
         builder.store(new_j, j_ptr)
-        
+
         builder.cbranch(chars_match, inner_loop, mismatch)
-        
+
         # Mismatch - try next position
         builder.position_at_end(mismatch)
         i_val = builder.load(i_ptr)
         new_i = builder.add(i_val, ir.Constant(ir.IntType(64), 1))
         builder.store(new_i, i_ptr)
         builder.branch(outer_loop)
-        
+
         builder.position_at_end(found)
         builder.ret(ir.Constant(ir.IntType(1), 1))
-        
+
         builder.position_at_end(not_found)
         builder.ret(ir.Constant(ir.IntType(1), 0))
     
     def _implement_string_print(self):
-        """Print string to stdout using POSIX write (no null terminator needed)."""
+        """Print string to stdout using POSIX write (no null terminator needed).
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
         func = self.string_print
         func.args[0].name = "s"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         s = func.args[0]
-        
-        # Get length
-        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        length = builder.load(len_ptr)
-        
-        # Get data pointer (offset 16)
-        raw_ptr = builder.bitcast(s, ir.IntType(8).as_pointer())
-        data_ptr = builder.gep(raw_ptr, [ir.Constant(ir.IntType(64), 16)])
-        
-        # write(1, data, length) - fd 1 is stdout
+
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size = builder.load(size_ptr)
+
+        # Get data pointer from field 0
+        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        # write(1, data, size) - fd 1 is stdout
         stdout_fd = ir.Constant(ir.IntType(32), 1)
-        builder.call(self.write_syscall, [stdout_fd, data_ptr, length])
-        
+        builder.call(self.write_syscall, [stdout_fd, data_ptr, size])
+
         # Print newline
         newline_ptr = builder.bitcast(self._create_global_string("\n", "newline"), ir.IntType(8).as_pointer())
         builder.call(self.write_syscall, [stdout_fd, newline_ptr, ir.Constant(ir.IntType(64), 1)])
-        
+
         builder.ret_void()
 
     def _implement_string_copy(self):
         """Implement string_copy: create a deep copy of a string for value semantics.
 
-        String layout: { i64 byte_len, i64 char_count } + inline data at offset 16
-        Total size = 16 + byte_len
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Creates a new string with refcount = 1 and copies the data.
         """
         func = self.string_copy
         func.args[0].name = "src"
@@ -1740,40 +2751,230 @@ class CodeGenerator:
         builder.position_at_end(do_copy)
 
         # Load source fields
-        # byte_len (field 0)
-        src_byte_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_byte_len = builder.load(src_byte_len_ptr)
+        # data (field 0)
+        src_data_ptr_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_data = builder.load(src_data_ptr_ptr)
 
-        # char_count (field 1)
-        src_char_count_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        src_char_count = builder.load(src_char_count_ptr)
+        # len (field 2)
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
 
-        # Total allocation size = 16 (header) + byte_len
-        header_size = ir.Constant(i64, 16)
-        total_size = builder.add(header_size, src_byte_len)
+        # size (field 3)
+        src_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_size = builder.load(src_size_ptr)
 
-        # Allocate new String via GC
+        # cap (field 4)
+        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        src_cap = builder.load(src_cap_ptr)
+
+        # Allocate 40 bytes for String struct via GC
+        struct_size = ir.Constant(i64, 40)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [total_size, type_id])
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         dst = builder.bitcast(raw_ptr, string_ptr_type)
 
-        # Copy header fields
-        dst_byte_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(src_byte_len, dst_byte_len_ptr)
+        # Allocate new data buffer: src_size bytes via malloc
+        dst_data = builder.call(self.malloc, [src_size])
 
-        dst_char_count_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(src_char_count, dst_char_count_ptr)
+        # Copy data from src to dst
+        builder.call(self.memcpy, [dst_data, src_data, src_size])
 
-        # Copy inline data: memcpy from src+16 to dst+16 for byte_len bytes
-        src_i8 = builder.bitcast(src, i8_ptr)
-        src_data = builder.gep(src_i8, [ir.Constant(i64, 16)])
+        # Store data pointer at field 0
+        dst_data_ptr_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(dst_data, dst_data_ptr_ptr)
 
-        dst_i8 = builder.bitcast(dst, i8_ptr)
-        dst_data = builder.gep(dst_i8, [ir.Constant(i64, 16)])
+        # Store refcount = 1 at field 1 (new heap string)
+        dst_refcount_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), dst_refcount_ptr)
 
-        builder.call(self.memcpy, [dst_data, src_data, src_byte_len])
+        # Store len at field 2
+        dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_len, dst_len_ptr)
+
+        # Store size at field 3
+        dst_size_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(src_size, dst_size_ptr)
+
+        # Store cap at field 4 (use src_size as cap for copy)
+        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(src_size, dst_cap_ptr)
 
         builder.ret(dst)
+
+    def _implement_string_incref(self):
+        """Atomically increment string refcount.
+
+        If refcount is IMMORTAL, do nothing (literal strings).
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
+        func = self.string_incref
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        check_immortal = func.append_basic_block("check_immortal")
+        do_incref = func.append_basic_block("do_incref")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Handle null input - do nothing
+        is_null = builder.icmp_unsigned("==", s, ir.Constant(string_ptr_type, None))
+        builder.cbranch(is_null, done, check_immortal)
+
+        builder.position_at_end(check_immortal)
+        # Get refcount pointer (field 1)
+        refcount_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        refcount = builder.load(refcount_ptr)
+
+        # Check if immortal (IMMORTAL_REFCOUNT = 0x7FFFFFFFFFFFFFFF)
+        immortal = ir.Constant(i64, self.STRING_IMMORTAL_REFCOUNT)
+        is_immortal = builder.icmp_unsigned("==", refcount, immortal)
+        builder.cbranch(is_immortal, done, do_incref)
+
+        builder.position_at_end(do_incref)
+        # Atomically increment refcount
+        builder.atomic_rmw('add', refcount_ptr, ir.Constant(i64, 1), 'seq_cst')
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_string_decref(self):
+        """Atomically decrement string refcount, free data if zero.
+
+        If refcount is IMMORTAL, do nothing (literal strings).
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        """
+        func = self.string_decref
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        check_immortal = func.append_basic_block("check_immortal")
+        do_decref = func.append_basic_block("do_decref")
+        do_free = func.append_basic_block("do_free")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Handle null input - do nothing
+        is_null = builder.icmp_unsigned("==", s, ir.Constant(string_ptr_type, None))
+        builder.cbranch(is_null, done, check_immortal)
+
+        builder.position_at_end(check_immortal)
+        # Get refcount pointer (field 1)
+        refcount_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        refcount = builder.load(refcount_ptr)
+
+        # Check if immortal (IMMORTAL_REFCOUNT = 0x7FFFFFFFFFFFFFFF)
+        immortal = ir.Constant(i64, self.STRING_IMMORTAL_REFCOUNT)
+        is_immortal = builder.icmp_unsigned("==", refcount, immortal)
+        builder.cbranch(is_immortal, done, do_decref)
+
+        builder.position_at_end(do_decref)
+        # Atomically decrement refcount and get old value
+        old_refcount = builder.atomic_rmw('sub', refcount_ptr, ir.Constant(i64, 1), 'seq_cst')
+        # Check if old value was 1 (meaning new value is 0)
+        was_one = builder.icmp_unsigned("==", old_refcount, ir.Constant(i64, 1))
+        builder.cbranch(was_one, do_free, done)
+
+        builder.position_at_end(do_free)
+        # Free the data buffer (field 0)
+        data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+        builder.call(self.free, [data_ptr])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_string_hash(self):
+        """Compute hash of string content using FNV-1a algorithm.
+
+        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Hash is computed over the bytes (field 3 = size, field 0 = data).
+        """
+        func = self.string_hash
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        null_case = func.append_basic_block("null_case")
+        init_loop = func.append_basic_block("init_loop")
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Handle null input - return 0
+        is_null = builder.icmp_unsigned("==", s, ir.Constant(string_ptr_type, None))
+        builder.cbranch(is_null, null_case, init_loop)
+
+        builder.position_at_end(null_case)
+        builder.ret(ir.Constant(i64, 0))
+
+        builder.position_at_end(init_loop)
+        # Get data pointer (field 0) and byte size (field 3)
+        data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        size = builder.load(size_ptr)
+
+        # FNV-1a: hash = offset_basis, then for each byte: hash ^= byte; hash *= prime
+        # FNV offset basis for 64-bit: 14695981039346656037
+        # FNV prime for 64-bit: 1099511628211
+        fnv_offset_basis = ir.Constant(i64, 14695981039346656037)
+        fnv_prime = ir.Constant(i64, 1099511628211)
+
+        hash_ptr = builder.alloca(i64, name="hash")
+        builder.store(fnv_offset_basis, hash_ptr)
+
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        done_cmp = builder.icmp_signed(">=", idx, size)
+        builder.cbranch(done_cmp, loop_done, loop_body)
+
+        builder.position_at_end(loop_body)
+        # Get byte at index
+        byte_ptr = builder.gep(data_ptr, [idx])
+        byte_val = builder.load(byte_ptr)
+        byte_i64 = builder.zext(byte_val, i64)
+
+        # hash ^= byte
+        h = builder.load(hash_ptr)
+        h = builder.xor(h, byte_i64)
+        # hash *= prime
+        h = builder.mul(h, fnv_prime)
+        builder.store(h, hash_ptr)
+
+        # Increment index
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_hash = builder.load(hash_ptr)
+        builder.ret(final_hash)
 
     # ============================================================
     # Deep Copy Support for Value Semantics
@@ -1840,6 +3041,105 @@ class CodeGenerator:
                     return True
         return False
 
+    def _generate_move_or_eager_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
+        """Generate code for := (move/eager assign) semantics.
+
+        If refcount == 1: return same pointer (no copy needed, caller has sole ownership)
+        If refcount > 1: copy now and decref source to get sole ownership
+
+        This guarantees the destination has refcount == 1 after the operation.
+        """
+        # Primitives have value semantics already - no refcount
+        if self._is_primitive_coex_type(coex_type):
+            return value
+
+        # For refcounted types (Array, String), check refcount and decide
+        if isinstance(coex_type, ArrayType):
+            return self._generate_array_move(value, coex_type)
+
+        # For String, just share - strings are immutable so sharing is safe
+        # String copy is cheap (just increments refcount)
+        if isinstance(coex_type, NamedType) and coex_type.name == "string":
+            return self.builder.call(self.string_copy, [value])
+
+        # For List, Set, Map - these don't have COW yet, so fall back to deep copy
+        # TODO: When COW is implemented for these, add move semantics
+        if isinstance(coex_type, (ListType, SetType, MapType)):
+            return self._generate_deep_copy(value, coex_type)
+
+        # For user-defined types, fall back to deep copy
+        if isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
+            return self._generate_deep_copy(value, coex_type)
+
+        # Fallback: return as-is
+        return value
+
+    def _generate_array_move(self, value: ir.Value, coex_type: ArrayType) -> ir.Value:
+        """Generate move semantics for Array.
+
+        If refcount == 1: return same pointer (no copy)
+        If refcount > 1: physical copy to get sole ownership with refcount == 1
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get refcount of source
+        refcount_ptr = self.builder.gep(value,
+            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            inbounds=True, name="refcount_ptr")
+        refcount = self.builder.load(refcount_ptr, name="refcount")
+
+        # Check if sole owner
+        is_sole = self.builder.icmp_unsigned('==', refcount, ir.Constant(i64, 1), name="is_sole")
+
+        # Create blocks for the branch
+        sole_owner_block = self.builder.append_basic_block(name="move_sole_owner")
+        shared_block = self.builder.append_basic_block(name="move_shared")
+        merge_block = self.builder.append_basic_block(name="move_merge")
+
+        self.builder.cbranch(is_sole, sole_owner_block, shared_block)
+
+        # Sole owner path: just return the same pointer
+        self.builder.position_at_end(sole_owner_block)
+        sole_result = value
+        self.builder.branch(merge_block)
+
+        # Shared path: physical copy to get sole ownership
+        self.builder.position_at_end(shared_block)
+        # Get source array info
+        src_len_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_len = self.builder.load(src_len_ptr)
+        src_elem_size_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        src_elem_size = self.builder.load(src_elem_size_ptr)
+
+        # Create new array with same capacity as length (tight allocation)
+        new_arr = self.builder.call(self.array_new, [src_len, src_elem_size])
+
+        # Set new array's len
+        new_len_ptr = self.builder.gep(new_arr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        self.builder.store(src_len, new_len_ptr)
+
+        # Copy data from source to new array
+        src_data_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_data = self.builder.load(src_data_ptr)
+        new_data_ptr = self.builder.gep(new_arr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        new_data = self.builder.load(new_data_ptr)
+
+        copy_size = self.builder.mul(src_len, src_elem_size)
+        self.builder.call(self.memcpy, [new_data, src_data, copy_size])
+
+        # New array already has refcount == 1 from array_new
+
+        self.builder.branch(merge_block)
+
+        # Merge: use phi node to select result
+        self.builder.position_at_end(merge_block)
+        result = self.builder.phi(value.type, name="move_result")
+        result.add_incoming(sole_result, sole_owner_block)
+        result.add_incoming(new_arr, shared_block)
+
+        return result
+
     def _generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
         """Generate code to deep-copy a value based on its Coex type."""
         # Primitives have value semantics already
@@ -1888,40 +3188,29 @@ class CodeGenerator:
         return value
 
     def _generate_list_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy a list, recursively copying elements if they are collections."""
+        """Deep copy a list, recursively copying elements if they are collections.
+
+        For Persistent Vector structure, we iterate using list_get and build
+        a new list using list_append. The helper functions handle the internal
+        structure correctly.
+        """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         list_ptr_type = self.list_struct.as_pointer()
 
-        # Get source length
-        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_len = self.builder.load(src_len_ptr)
+        # Get source length using list_len
+        src_len = self.builder.call(self.list_len, [src])
 
-        # Get source capacity
-        src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        src_cap = self.builder.load(src_cap_ptr)
-
-        # Get element size
-        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # Get element size (field 5 in PV structure)
+        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         src_elem_size = self.builder.load(src_elem_size_ptr)
 
-        # Create new list with same capacity
+        # Create new empty list
         dst = self.builder.call(self.list_new, [src_elem_size])
 
-        # Allocate space for cap elements
-        dst_cap_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        self.builder.store(src_cap, dst_cap_ptr)
-
-        # Allocate data buffer
-        data_size = self.builder.mul(src_cap, src_elem_size)
-        new_data = self.builder.call(self.malloc, [data_size])
-
-        dst_data_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        self.builder.store(new_data, dst_data_ptr)
-
-        # Set destination length to 0 initially (we'll increment as we copy)
-        dst_len_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        self.builder.store(ir.Constant(i64, 0), dst_len_ptr)
+        # Store dst in a local variable since list_append returns a new list
+        dst_ptr = self.builder.alloca(list_ptr_type, name="dst_list")
+        self.builder.store(dst, dst_ptr)
 
         # Loop through source elements and deep copy each
         # Create loop blocks
@@ -1960,7 +3249,11 @@ class CodeGenerator:
         temp = self.builder.alloca(elem_llvm_type, name="deep_copy_elem")
         self.builder.store(copied_elem, temp)
         temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
-        self.builder.call(self.list_append, [dst, temp_ptr, src_elem_size])
+
+        # list_append returns a NEW list, update our reference
+        current_dst = self.builder.load(dst_ptr)
+        new_dst = self.builder.call(self.list_append, [current_dst, temp_ptr, src_elem_size])
+        self.builder.store(new_dst, dst_ptr)
 
         # Increment index
         next_idx = self.builder.add(idx, ir.Constant(i64, 1))
@@ -1969,7 +3262,7 @@ class CodeGenerator:
 
         # Loop end
         self.builder.position_at_end(loop_end)
-        return dst
+        return self.builder.load(dst_ptr)
 
     def _generate_set_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
         """Deep copy a set, recursively copying elements if they are collections."""
@@ -2156,17 +3449,20 @@ class CodeGenerator:
         return self.builder.load(dst_ptr)
 
     def _generate_array_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy an array, recursively copying elements if they are collections."""
-        # Array has same structure as List
+        """Deep copy an array, recursively copying elements if they are collections.
+
+        Array layout: { i8* data, i64 refcount, i64 len, i64 cap, i64 elem_size }
+        Field indices: data=0, refcount=1, len=2, cap=3, elem_size=4
+        """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get source length
-        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        # Get source length (field 2)
+        src_len_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         src_len = self.builder.load(src_len_ptr)
 
-        # Get element size
-        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # Get element size (field 4)
+        src_elem_size_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         src_elem_size = self.builder.load(src_elem_size_ptr)
 
         # Create new array with same size
@@ -2334,8 +3630,9 @@ class CodeGenerator:
         map_has_ty = ir.FunctionType(i1, [map_ptr, i64])
         self.map_has = ir.Function(self.module, map_has_ty, name="coex_map_has")
         
-        # map_remove(map: Map*, key: i64) -> bool
-        map_remove_ty = ir.FunctionType(i1, [map_ptr, i64])
+        # map_remove(map: Map*, key: i64) -> Map*
+        # Returns a NEW map with key removed (value semantics)
+        map_remove_ty = ir.FunctionType(map_ptr, [map_ptr, i64])
         self.map_remove = ir.Function(self.module, map_remove_ty, name="coex_map_remove")
         
         # map_len(map: Map*) -> i64
@@ -2362,6 +3659,30 @@ class CodeGenerator:
         map_copy_ty = ir.FunctionType(map_ptr, [map_ptr])
         self.map_copy = ir.Function(self.module, map_copy_ty, name="coex_map_copy")
 
+        # String-key variants - use string content for hashing and comparison
+        string_ptr = self.string_struct.as_pointer()
+
+        # map_set_string(map: Map*, key: String*, value: i64) -> Map*
+        map_set_string_ty = ir.FunctionType(map_ptr, [map_ptr, string_ptr, i64])
+        self.map_set_string = ir.Function(self.module, map_set_string_ty, name="coex_map_set_string")
+
+        # map_get_string(map: Map*, key: String*) -> i64
+        map_get_string_ty = ir.FunctionType(i64, [map_ptr, string_ptr])
+        self.map_get_string = ir.Function(self.module, map_get_string_ty, name="coex_map_get_string")
+
+        # map_has_string(map: Map*, key: String*) -> bool
+        map_has_string_ty = ir.FunctionType(i1, [map_ptr, string_ptr])
+        self.map_has_string = ir.Function(self.module, map_has_string_ty, name="coex_map_has_string")
+
+        # map_find_slot_string(map: Map*, key: String*) -> i64  (internal)
+        map_find_slot_string_ty = ir.FunctionType(i64, [map_ptr, string_ptr])
+        self.map_find_slot_string = ir.Function(self.module, map_find_slot_string_ty, name="coex_map_find_slot_string")
+
+        # map_keys(map: Map*) -> List*  (for iteration - returns list of keys as i64)
+        list_ptr = self.list_struct.as_pointer()
+        map_keys_ty = ir.FunctionType(list_ptr, [map_ptr])
+        self.map_keys = ir.Function(self.module, map_keys_ty, name="coex_map_keys")
+
         # Implement all map functions
         self._implement_map_hash()
         self._implement_map_new()
@@ -2374,6 +3695,11 @@ class CodeGenerator:
         self._implement_map_len()
         self._implement_map_size()
         self._implement_map_copy()
+        self._implement_map_find_slot_string()
+        self._implement_map_set_string()
+        self._implement_map_get_string()
+        self._implement_map_has_string()
+        self._implement_map_keys()
 
         # Register Map methods
         self._register_map_methods()
@@ -2826,49 +4152,60 @@ class CodeGenerator:
         builder.ret(ir.Constant(ir.IntType(1), 0))
     
     def _implement_map_remove(self):
-        """Remove key from map (returns true if removed)."""
+        """Return a NEW map with key removed (value semantics).
+
+        This implements value semantics - original map is unchanged.
+        If key doesn't exist, returns a copy of the original map.
+        """
         func = self.map_remove
-        func.args[0].name = "map"
+        func.args[0].name = "old_map"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
         check_found = func.append_basic_block("check_found")
         found = func.append_basic_block("found")
         not_found = func.append_basic_block("not_found")
-        
+
         builder = ir.IRBuilder(entry)
-        
-        map_ptr = func.args[0]
+
+        old_map = func.args[0]
         key = func.args[1]
-        
-        slot = builder.call(self.map_find_slot, [map_ptr, key])
-        
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+
+        # First, create a copy of the old map (value semantics)
+        new_map = builder.call(self.map_copy, [old_map])
+
+        # Find the slot for this key in the new map
+        slot = builder.call(self.map_find_slot, [new_map, key])
+
+        entries_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         entries = builder.load(entries_field)
-        
+
         e_ptr = builder.gep(entries, [slot])
         state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         state = builder.load(state_ptr)
-        
+
         is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
         builder.cbranch(is_occupied, check_found, not_found)
-        
+
         builder.position_at_end(check_found)
         key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         stored_key = builder.load(key_ptr)
         keys_match = builder.icmp_signed("==", stored_key, key)
         builder.cbranch(keys_match, found, not_found)
-        
+
         builder.position_at_end(found)
+        # Mark slot as deleted in the NEW map
         builder.store(ir.Constant(ir.IntType(8), 2), state_ptr)
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        len_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         current_len = builder.load(len_field)
         new_len = builder.sub(current_len, ir.Constant(ir.IntType(64), 1))
         builder.store(new_len, len_field)
-        builder.ret(ir.Constant(ir.IntType(1), 1))
-        
+        # Return the new map with key removed
+        builder.ret(new_map)
+
         builder.position_at_end(not_found)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
+        # Key not found - return the copy (same as original)
+        builder.ret(new_map)
     
     def _implement_map_len(self):
         """Return number of entries in map."""
@@ -2980,6 +4317,360 @@ class CodeGenerator:
 
         builder.ret(dst)
 
+    def _implement_map_find_slot_string(self):
+        """Find slot for string key using string hash and string equality."""
+        func = self.map_find_slot_string
+        func.args[0].name = "map"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        probe_loop = func.append_basic_block("probe_loop")
+        check_state = func.append_basic_block("check_state")
+        check_occupied = func.append_basic_block("check_occupied")
+        check_match = func.append_basic_block("check_match")
+        record_deleted = func.append_basic_block("record_deleted")
+        next_probe = func.append_basic_block("next_probe")
+        found_empty = func.append_basic_block("found_empty")
+        found_match = func.append_basic_block("found_match")
+
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Get entries and cap
+        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        cap_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_field)
+
+        # Use string_hash for hashing
+        hash_val = builder.call(self.string_hash, [key])
+        mask = builder.sub(cap, ir.Constant(i64, 1))
+        start_idx = builder.and_(hash_val, mask)
+
+        # Track first deleted slot
+        first_deleted_ptr = builder.alloca(i64, name="first_deleted")
+        builder.store(ir.Constant(i64, -1), first_deleted_ptr)
+
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(start_idx, idx_ptr)
+
+        builder.branch(probe_loop)
+
+        builder.position_at_end(probe_loop)
+        idx = builder.load(idx_ptr)
+        e_ptr = builder.gep(entries, [idx])
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        state = builder.load(state_ptr)
+        builder.branch(check_state)
+
+        builder.position_at_end(check_state)
+        # state == 0 (empty)?
+        is_empty = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 0))
+        builder.cbranch(is_empty, found_empty, check_occupied)
+
+        builder.position_at_end(check_occupied)
+        # state == 1 (occupied)?
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, check_match, record_deleted)
+
+        builder.position_at_end(check_match)
+        # Compare keys using string_eq
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_key_i64 = builder.load(key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.cbranch(keys_match, found_match, next_probe)
+
+        builder.position_at_end(record_deleted)
+        # state == 2 (deleted), record first deleted
+        first_deleted = builder.load(first_deleted_ptr)
+        is_neg1 = builder.icmp_signed("==", first_deleted, ir.Constant(i64, -1))
+
+        record_bb = func.append_basic_block("record_bb")
+        skip_record = func.append_basic_block("skip_record")
+        builder.cbranch(is_neg1, record_bb, skip_record)
+
+        builder.position_at_end(record_bb)
+        builder.store(idx, first_deleted_ptr)
+        builder.branch(next_probe)
+
+        builder.position_at_end(skip_record)
+        builder.branch(next_probe)
+
+        builder.position_at_end(next_probe)
+        # Linear probing: idx = (idx + 1) & mask
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        new_idx = builder.and_(new_idx, mask)
+        builder.store(new_idx, idx_ptr)
+        builder.branch(probe_loop)
+
+        builder.position_at_end(found_empty)
+        # Return first_deleted if valid, else current idx
+        first_deleted = builder.load(first_deleted_ptr)
+        is_neg1 = builder.icmp_signed("==", first_deleted, ir.Constant(i64, -1))
+        result_empty = builder.select(is_neg1, idx, first_deleted)
+        builder.ret(result_empty)
+
+        builder.position_at_end(found_match)
+        builder.ret(idx)
+
+    def _implement_map_set_string(self):
+        """Set value for string key, returning NEW map (value semantics)."""
+        func = self.map_set_string
+        func.args[0].name = "map"
+        func.args[1].name = "key"
+        func.args[2].name = "value"
+
+        entry = func.append_basic_block("entry")
+        check_grow = func.append_basic_block("check_grow")
+        do_grow = func.append_basic_block("do_grow")
+        after_grow = func.append_basic_block("after_grow")
+        do_set = func.append_basic_block("do_set")
+        check_new = func.append_basic_block("check_new")
+        inc_len = func.append_basic_block("inc_len")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        old_map = func.args[0]
+        key = func.args[1]
+        value = func.args[2]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Copy map first (value semantics)
+        new_map = builder.call(self.map_copy, [old_map])
+        builder.branch(check_grow)
+
+        builder.position_at_end(check_grow)
+        # Load len and cap
+        len_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        length = builder.load(len_ptr)
+        cap_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Check load factor (len * 2 >= cap means 50% full)
+        len_x2 = builder.mul(length, ir.Constant(i64, 2))
+        need_grow = builder.icmp_unsigned(">=", len_x2, cap)
+        builder.cbranch(need_grow, do_grow, do_set)
+
+        builder.position_at_end(do_grow)
+        builder.call(self.map_grow, [new_map])
+        builder.branch(after_grow)
+
+        builder.position_at_end(after_grow)
+        builder.branch(do_set)
+
+        builder.position_at_end(do_set)
+        # Find slot using string key
+        slot = builder.call(self.map_find_slot_string, [new_map, key])
+
+        # Get entries
+        entries_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_ptr)
+        e_ptr = builder.gep(entries, [slot])
+
+        # Check if this is a new entry
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_state = builder.load(state_ptr)
+        is_new = builder.icmp_unsigned("!=", old_state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_new, inc_len, check_new)
+
+        builder.position_at_end(inc_len)
+        # Increment length
+        len_ptr2 = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_ptr2)
+        new_len = builder.add(old_len, ir.Constant(i64, 1))
+        builder.store(new_len, len_ptr2)
+        builder.branch(check_new)
+
+        builder.position_at_end(check_new)
+        # Store key (as i64 pointer value), value, and set state to occupied
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        key_i64 = builder.ptrtoint(key, i64)
+        builder.store(key_i64, key_ptr)
+
+        value_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(value, value_ptr)
+
+        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret(new_map)
+
+    def _implement_map_get_string(self):
+        """Get value for string key (returns 0 if not found)."""
+        func = self.map_get_string
+        func.args[0].name = "map"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        check_found = func.append_basic_block("check_found")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        slot = builder.call(self.map_find_slot_string, [map_ptr, key])
+
+        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        e_ptr = builder.gep(entries, [slot])
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, check_found, not_found)
+
+        builder.position_at_end(check_found)
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_key_i64 = builder.load(key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.cbranch(keys_match, found, not_found)
+
+        builder.position_at_end(found)
+        value_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = builder.load(value_ptr)
+        builder.ret(value)
+
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(i64, 0))
+
+    def _implement_map_has_string(self):
+        """Check if string key exists in map."""
+        func = self.map_has_string
+        func.args[0].name = "map"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        check_found = func.append_basic_block("check_found")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        slot = builder.call(self.map_find_slot_string, [map_ptr, key])
+
+        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        e_ptr = builder.gep(entries, [slot])
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, check_found, not_found)
+
+        builder.position_at_end(check_found)
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_key_i64 = builder.load(key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.cbranch(keys_match, found, not_found)
+
+        builder.position_at_end(found)
+        builder.ret(ir.Constant(ir.IntType(1), 1))
+
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(ir.IntType(1), 0))
+
+    def _implement_map_keys(self):
+        """Return a List of all keys in the map (as i64 values)."""
+        func = self.map_keys
+        func.args[0].name = "map"
+
+        entry = func.append_basic_block("entry")
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        add_key = func.append_basic_block("add_key")
+        loop_inc = func.append_basic_block("loop_inc")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Create result list with 8-byte elements
+        elem_size = ir.Constant(i64, 8)
+        result_list = builder.call(self.list_new, [elem_size])
+
+        # Get entries and cap
+        entries_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_ptr)
+
+        cap_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Store result list pointer (may change with append)
+        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
+        builder.store(result_list, result_ptr)
+
+        # Loop through entries
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        done = builder.icmp_signed(">=", idx, cap)
+        builder.cbranch(done, loop_done, loop_body)
+
+        builder.position_at_end(loop_body)
+        e_ptr = builder.gep(entries, [idx])
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, add_key, loop_inc)
+
+        builder.position_at_end(add_key)
+        # Get key and add to list
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        key = builder.load(key_ptr)
+
+        # Allocate temp for key
+        temp = builder.alloca(i64, name="temp_key")
+        builder.store(key, temp)
+        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+        # Append to list
+        current_list = builder.load(result_ptr)
+        new_list = builder.call(self.list_append, [current_list, temp_i8, elem_size])
+        builder.store(new_list, result_ptr)
+        builder.branch(loop_inc)
+
+        builder.position_at_end(loop_inc)
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_list = builder.load(result_ptr)
+        builder.ret(final_list)
+
     def _register_map_methods(self):
         """Register Map as a type with methods."""
         self.type_registry["Map"] = self.map_struct
@@ -3053,8 +4744,9 @@ class CodeGenerator:
         set_has_ty = ir.FunctionType(i1, [set_ptr, i64])
         self.set_has = ir.Function(self.module, set_has_ty, name="coex_set_has")
         
-        # set_remove(set: Set*, key: i64) -> bool
-        set_remove_ty = ir.FunctionType(i1, [set_ptr, i64])
+        # set_remove(set: Set*, key: i64) -> Set*
+        # Returns a NEW set with element removed (value semantics)
+        set_remove_ty = ir.FunctionType(set_ptr, [set_ptr, i64])
         self.set_remove = ir.Function(self.module, set_remove_ty, name="coex_set_remove")
         
         # set_len(set: Set*) -> i64
@@ -3077,6 +4769,26 @@ class CodeGenerator:
         set_copy_ty = ir.FunctionType(set_ptr, [set_ptr])
         self.set_copy = ir.Function(self.module, set_copy_ty, name="coex_set_copy")
 
+        # set_to_list(set: Set*) -> List*  (for iteration - returns list of elements as i64)
+        list_ptr = self.list_struct.as_pointer()
+        set_to_list_ty = ir.FunctionType(list_ptr, [set_ptr])
+        self.set_to_list = ir.Function(self.module, set_to_list_ty, name="coex_set_to_list")
+
+        # String-specific Set operations
+        string_ptr = self.string_struct.as_pointer()
+
+        # set_find_slot_string(set: Set*, key: String*) -> i64  (internal)
+        set_find_slot_string_ty = ir.FunctionType(i64, [set_ptr, string_ptr])
+        self.set_find_slot_string = ir.Function(self.module, set_find_slot_string_ty, name="coex_set_find_slot_string")
+
+        # set_has_string(set: Set*, key: String*) -> bool
+        set_has_string_ty = ir.FunctionType(i1, [set_ptr, string_ptr])
+        self.set_has_string = ir.Function(self.module, set_has_string_ty, name="coex_set_has_string")
+
+        # set_add_string(set: Set*, key: String*) -> Set*
+        set_add_string_ty = ir.FunctionType(set_ptr, [set_ptr, string_ptr])
+        self.set_add_string = ir.Function(self.module, set_add_string_ty, name="coex_set_add_string")
+
         # Implement all set functions
         self._implement_set_new()
         self._implement_set_find_slot()
@@ -3087,6 +4799,10 @@ class CodeGenerator:
         self._implement_set_len()
         self._implement_set_size()
         self._implement_set_copy()
+        self._implement_set_to_list()
+        self._implement_set_find_slot_string()
+        self._implement_set_has_string()
+        self._implement_set_add_string()
         self._register_set_methods()
     
     def _implement_set_new(self):
@@ -3502,58 +5218,64 @@ class CodeGenerator:
         builder.ret(ir.Constant(ir.IntType(1), 0))
     
     def _implement_set_remove(self):
-        """Implement set_remove: remove key from set, return true if found."""
+        """Return a NEW set with element removed (value semantics).
+
+        This implements value semantics - original set is unchanged.
+        If element doesn't exist, returns a copy of the original set.
+        """
         func = self.set_remove
-        func.args[0].name = "set"
+        func.args[0].name = "old_set"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
+        check_key_block = func.append_basic_block("check_key")
+        remove_block = func.append_basic_block("remove")
+        not_found_block = func.append_basic_block("not_found")
+
         builder = ir.IRBuilder(entry)
-        
-        set_ptr = func.args[0]
+
+        old_set = func.args[0]
         key = func.args[1]
-        
-        # Find slot
-        slot = builder.call(self.set_find_slot, [set_ptr, key])
-        
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+
+        # First, create a copy of the old set (value semantics)
+        new_set = builder.call(self.set_copy, [old_set])
+
+        # Find slot in the new set
+        slot = builder.call(self.set_find_slot, [new_set, key])
+
+        entries_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         entries = builder.load(entries_field)
-        
+
         entry_ptr = builder.gep(entries, [slot], inbounds=True)
         state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         state = builder.load(state_ptr)
-        
+
         # Check if occupied
         is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
-        
-        check_key_block = func.append_basic_block("check_key")
-        ret_false_block = func.append_basic_block("ret_false")
-        
-        builder.cbranch(is_occupied, check_key_block, ret_false_block)
-        
+        builder.cbranch(is_occupied, check_key_block, not_found_block)
+
         # Check key matches
         builder = ir.IRBuilder(check_key_block)
         key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         entry_key = builder.load(key_ptr)
         key_matches = builder.icmp_signed("==", entry_key, key)
-        
-        remove_block = func.append_basic_block("remove")
-        builder.cbranch(key_matches, remove_block, ret_false_block)
-        
-        # Remove: set state to deleted (2), decrement len
+        builder.cbranch(key_matches, remove_block, not_found_block)
+
+        # Remove: set state to deleted (2), decrement len in the NEW set
         builder = ir.IRBuilder(remove_block)
         builder.store(ir.Constant(ir.IntType(8), 2), state_ptr)
-        
-        len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+
+        len_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
         new_len = builder.sub(length, ir.Constant(ir.IntType(64), 1))
         builder.store(new_len, len_field)
-        
-        builder.ret(ir.Constant(ir.IntType(1), 1))
-        
-        # Not found
-        builder = ir.IRBuilder(ret_false_block)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
+
+        # Return the new set with element removed
+        builder.ret(new_set)
+
+        # Not found - return the copy (same as original)
+        builder = ir.IRBuilder(not_found_block)
+        builder.ret(new_set)
     
     def _implement_set_len(self):
         """Implement set_len: return number of elements in set."""
@@ -3666,6 +5388,296 @@ class CodeGenerator:
         builder.call(self.memcpy, [new_entries_raw, src_entries_i8, entries_size])
 
         builder.ret(dst)
+
+    def _implement_set_to_list(self):
+        """Return a List of all elements in the set (as i64 values).
+
+        This is used for Set iteration: for x in set ...
+        """
+        func = self.set_to_list
+        func.args[0].name = "set"
+
+        entry = func.append_basic_block("entry")
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        add_elem = func.append_basic_block("add_elem")
+        loop_inc = func.append_basic_block("loop_inc")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder = ir.IRBuilder(entry)
+
+        set_ptr = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Create result list with 8-byte elements
+        elem_size = ir.Constant(i64, 8)
+        result_list = builder.call(self.list_new, [elem_size])
+
+        # Get entries and cap from the set
+        entries_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_ptr)
+
+        cap_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_ptr)
+
+        # Store result list pointer (may change with append)
+        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
+        builder.store(result_list, result_ptr)
+
+        # Loop through entries
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        done = builder.icmp_signed(">=", idx, cap)
+        builder.cbranch(done, loop_done, loop_body)
+
+        builder.position_at_end(loop_body)
+        e_ptr = builder.gep(entries, [idx])
+        # SetEntry: { i64 key, i8 state } - state is at offset 1
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, add_elem, loop_inc)
+
+        builder.position_at_end(add_elem)
+        # Get element (key at offset 0) and add to list
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        key = builder.load(key_ptr)
+
+        # Allocate temp for element
+        temp = builder.alloca(i64, name="temp_elem")
+        builder.store(key, temp)
+        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+        # Append to list
+        current_list = builder.load(result_ptr)
+        new_list = builder.call(self.list_append, [current_list, temp_i8, elem_size])
+        builder.store(new_list, result_ptr)
+        builder.branch(loop_inc)
+
+        builder.position_at_end(loop_inc)
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_list = builder.load(result_ptr)
+        builder.ret(final_list)
+
+    def _implement_set_find_slot_string(self):
+        """Find slot for string key using string hash and string equality."""
+        func = self.set_find_slot_string
+        func.args[0].name = "set"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        probe_loop = func.append_basic_block("probe_loop")
+        check_state = func.append_basic_block("check_state")
+        check_occupied = func.append_basic_block("check_occupied")
+        check_match = func.append_basic_block("check_match")
+        record_deleted = func.append_basic_block("record_deleted")
+        next_probe = func.append_basic_block("next_probe")
+        found_empty = func.append_basic_block("found_empty")
+        found_match = func.append_basic_block("found_match")
+
+        builder = ir.IRBuilder(entry)
+
+        set_ptr = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Get entries and cap
+        entries_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        cap_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_field)
+
+        # Use string_hash for hashing
+        hash_val = builder.call(self.string_hash, [key])
+        mask = builder.sub(cap, ir.Constant(i64, 1))
+        start_idx = builder.and_(hash_val, mask)
+
+        # Track first deleted slot
+        first_deleted_ptr = builder.alloca(i64, name="first_deleted")
+        builder.store(ir.Constant(i64, -1), first_deleted_ptr)
+
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(start_idx, idx_ptr)
+
+        builder.branch(probe_loop)
+
+        builder.position_at_end(probe_loop)
+        idx = builder.load(idx_ptr)
+        e_ptr = builder.gep(entries, [idx])
+        # SetEntry: { i64 key, i8 state } - state is at offset 1
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        state = builder.load(state_ptr)
+        builder.branch(check_state)
+
+        builder.position_at_end(check_state)
+        is_empty = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 0))
+        builder.cbranch(is_empty, found_empty, check_occupied)
+
+        builder.position_at_end(check_occupied)
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, check_match, record_deleted)
+
+        builder.position_at_end(check_match)
+        # SetEntry: key at offset 0
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_key_i64 = builder.load(key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.cbranch(keys_match, found_match, next_probe)
+
+        builder.position_at_end(record_deleted)
+        current_first = builder.load(first_deleted_ptr)
+        is_unset = builder.icmp_signed("==", current_first, ir.Constant(i64, -1))
+        with builder.if_then(is_unset):
+            builder.store(idx, first_deleted_ptr)
+        builder.branch(next_probe)
+
+        builder.position_at_end(next_probe)
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        wrapped_idx = builder.and_(new_idx, mask)
+        builder.store(wrapped_idx, idx_ptr)
+        builder.branch(probe_loop)
+
+        builder.position_at_end(found_empty)
+        first_deleted = builder.load(first_deleted_ptr)
+        use_deleted = builder.icmp_signed(">=", first_deleted, ir.Constant(i64, 0))
+        result_empty = builder.select(use_deleted, first_deleted, idx)
+        builder.ret(result_empty)
+
+        builder.position_at_end(found_match)
+        builder.ret(idx)
+
+    def _implement_set_has_string(self):
+        """Check if string key exists in set."""
+        func = self.set_has_string
+        func.args[0].name = "set"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        check_found = func.append_basic_block("check_found")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        set_ptr = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        slot = builder.call(self.set_find_slot_string, [set_ptr, key])
+
+        entries_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        e_ptr = builder.gep(entries, [slot])
+        # SetEntry: { i64 key, i8 state } - state is at offset 1
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_occupied, check_found, not_found)
+
+        builder.position_at_end(check_found)
+        # SetEntry: key at offset 0
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_key_i64 = builder.load(key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.cbranch(keys_match, found, not_found)
+
+        builder.position_at_end(found)
+        builder.ret(ir.Constant(ir.IntType(1), 1))
+
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(ir.IntType(1), 0))
+
+    def _implement_set_add_string(self):
+        """Add string element to set, returning NEW set (value semantics)."""
+        func = self.set_add_string
+        func.args[0].name = "old_set"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        check_grow = func.append_basic_block("check_grow")
+        do_grow = func.append_basic_block("do_grow")
+        do_insert = func.append_basic_block("do_insert")
+        new_entry_block = func.append_basic_block("new_entry")
+        store_entry = func.append_basic_block("store_entry")
+
+        builder = ir.IRBuilder(entry)
+
+        old_set = func.args[0]
+        key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # First, create a copy of the old set (value semantics)
+        new_set = builder.call(self.set_copy, [old_set])
+
+        builder.branch(check_grow)
+
+        # All operations below work on new_set, leaving old_set unchanged
+        builder.position_at_end(check_grow)
+        len_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        length = builder.load(len_field)
+        cap_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        cap = builder.load(cap_field)
+
+        len_times_4 = builder.mul(length, ir.Constant(i64, 4))
+        cap_times_3 = builder.mul(cap, ir.Constant(i64, 3))
+        need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
+        builder.cbranch(need_grow, do_grow, do_insert)
+
+        builder.position_at_end(do_grow)
+        builder.call(self.set_grow, [new_set])
+        builder.branch(do_insert)
+
+        builder.position_at_end(do_insert)
+        slot = builder.call(self.set_find_slot_string, [new_set, key])
+
+        entries_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        entries = builder.load(entries_field)
+
+        e_ptr = builder.gep(entries, [slot])
+        # SetEntry: { i64 key, i8 state } - state at offset 1
+        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        state = builder.load(state_ptr)
+
+        is_new = builder.icmp_unsigned("!=", state, ir.Constant(ir.IntType(8), 1))
+        builder.cbranch(is_new, new_entry_block, store_entry)
+
+        builder.position_at_end(new_entry_block)
+        len_field2 = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        current_len = builder.load(len_field2)
+        new_len = builder.add(current_len, ir.Constant(i64, 1))
+        builder.store(new_len, len_field2)
+        builder.branch(store_entry)
+
+        builder.position_at_end(store_entry)
+        # SetEntry: key at offset 0
+        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        key_i64 = builder.ptrtoint(key, i64)
+        builder.store(key_i64, key_ptr)
+        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
+
+        # Return the new set (old_set is unchanged)
+        builder.ret(new_set)
 
     def _register_set_methods(self):
         """Register Set as a type with methods."""
@@ -5089,7 +7101,18 @@ class CodeGenerator:
                 elem_type = self._infer_type_from_expr(expr.elements[0])
                 return ListType(elem_type)
             return ListType(PrimitiveType("int"))
-        
+        elif isinstance(expr, MapExpr):
+            if expr.entries:
+                key_type = self._infer_type_from_expr(expr.entries[0][0])
+                value_type = self._infer_type_from_expr(expr.entries[0][1])
+                return MapType(key_type, value_type)
+            return MapType(PrimitiveType("int"), PrimitiveType("int"))
+        elif isinstance(expr, SetExpr):
+            if expr.elements:
+                elem_type = self._infer_type_from_expr(expr.elements[0])
+                return SetType(elem_type)
+            return SetType(PrimitiveType("int"))
+
         # Default
         return PrimitiveType("int")
     
@@ -5368,8 +7391,9 @@ class CodeGenerator:
         if func.name == "main" and self.gc is not None:
             self.gc.inject_gc_init(self.builder)
 
-        # Clear locals
+        # Clear locals and moved variables for this function scope
         self.locals = {}
+        self.moved_vars = set()
         self.current_function = func
 
         # Allocate parameters with value semantics (deep copy heap-allocated types)
@@ -5451,6 +7475,11 @@ class CodeGenerator:
                     f"Formulas must be pure - use immutable bindings (without 'var') instead."
                 )
 
+        # Track if we need to mark source as moved AFTER reading
+        move_source_name = None
+        if stmt.is_move and isinstance(stmt.initializer, Identifier):
+            move_source_name = stmt.initializer.name
+
         if stmt.type_annotation:
             llvm_type = self._get_llvm_type(stmt.type_annotation)
             # Track Coex AST type for deep copy and nested collection support
@@ -5471,9 +7500,17 @@ class CodeGenerator:
                 var_name = stmt.initializer.name
                 if var_name in self.var_coex_types:
                     inferred_coex_type = self.var_coex_types[var_name]
+            elif isinstance(stmt.initializer, (MapExpr, ListExpr, SetExpr)):
+                # Infer type from literal expression
+                inferred_coex_type = self._infer_type_from_expr(stmt.initializer)
+                self.var_coex_types[stmt.name] = inferred_coex_type
 
             if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
-                init_value = self._generate_deep_copy(init_value, inferred_coex_type)
+                # Use move semantics for := operator, deep copy for =
+                if stmt.is_move:
+                    init_value = self._generate_move_or_eager_copy(init_value, inferred_coex_type)
+                else:
+                    init_value = self._generate_deep_copy(init_value, inferred_coex_type)
                 # Track the inferred type for this variable too
                 self.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(init_value.type, ir.PointerType):
@@ -5489,7 +7526,11 @@ class CodeGenerator:
                     elif pointee.name == "struct.String":
                         init_value = self.builder.call(self.string_copy, [init_value])
                     elif pointee.name == "struct.Array":
-                        init_value = self.builder.call(self.array_copy, [init_value])
+                        # Use move semantics for := on Array
+                        if stmt.is_move:
+                            init_value = self._generate_move_or_eager_copy(init_value, ArrayType(PrimitiveType("int")))
+                        else:
+                            init_value = self.builder.call(self.array_copy, [init_value])
 
             self.builder.store(init_value, alloca)
             self.locals[stmt.name] = alloca
@@ -5498,6 +7539,10 @@ class CodeGenerator:
             tuple_info = self._infer_tuple_info(stmt.initializer)
             if tuple_info:
                 self.tuple_field_info[stmt.name] = tuple_info
+
+            # Mark source as moved AFTER we've read its value
+            if move_source_name:
+                self.moved_vars.add(move_source_name)
             return
         
         alloca = self.builder.alloca(llvm_type, name=stmt.name)
@@ -5508,17 +7553,28 @@ class CodeGenerator:
         # Cast if needed
         init_value = self._cast_value(init_value, llvm_type)
 
-        # Value semantics: deep copy collections on assignment to prevent aliasing
-        # We have the Coex type annotation, so use it for proper deep copy
+        # Value semantics: deep copy or move collections on assignment to prevent aliasing
+        # We have the Coex type annotation, so use it for proper copy
         if self._is_collection_coex_type(stmt.type_annotation):
-            init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+            # Use move semantics for := operator, deep copy for =
+            if stmt.is_move:
+                init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
+            else:
+                init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
         elif isinstance(init_value.type, ir.PointerType):
             # User-defined types may need deep copy too
             if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in self.type_fields:
-                init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+                if stmt.is_move:
+                    init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
+                else:
+                    init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
 
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
+
+        # Mark source as moved AFTER we've read its value
+        if move_source_name:
+            self.moved_vars.add(move_source_name)
 
     def _infer_tuple_info(self, expr: Expr) -> Optional[PyList[tuple]]:
         """Infer tuple field info from an expression"""
@@ -5597,8 +7653,19 @@ class CodeGenerator:
     
     def _generate_assignment(self, stmt: Assignment):
         """Generate an assignment"""
+        # Track if we need to mark source as moved AFTER reading
+        move_source_name = None
+        if stmt.op == AssignOp.MOVE_ASSIGN and isinstance(stmt.value, Identifier):
+            move_source_name = stmt.value.name
+
+        # Clear moved status when target is reassigned (allows reuse after move)
+        if isinstance(stmt.target, Identifier):
+            target_name = stmt.target.name
+            if target_name in self.moved_vars:
+                self.moved_vars.discard(target_name)
+
         value = self._generate_expression(stmt.value)
-        
+
         # Handle tuple destructuring: (a, b) = expr
         if isinstance(stmt.target, TupleExpr):
             self._generate_tuple_assignment(stmt.target, value)
@@ -5631,8 +7698,8 @@ class CodeGenerator:
                     self.builder.call(func, args)
                     return
         
-        # Handle compound assignment
-        if stmt.op != AssignOp.ASSIGN:
+        # Handle compound assignment (not for MOVE_ASSIGN or ASSIGN)
+        if stmt.op not in (AssignOp.ASSIGN, AssignOp.MOVE_ASSIGN):
             old_value = self._generate_expression(stmt.target)
             if stmt.op == AssignOp.PLUS_ASSIGN:
                 if isinstance(value.type, ir.DoubleType):
@@ -5696,12 +7763,26 @@ class CodeGenerator:
                 # Track for target too
                 if isinstance(stmt.target, Identifier):
                     self.var_coex_types[stmt.target.name] = coex_type
+        # If source is a literal collection, infer the type
+        if coex_type is None and isinstance(stmt.value, (MapExpr, ListExpr, SetExpr)):
+            coex_type = self._infer_type_from_expr(stmt.value)
+            if isinstance(stmt.target, Identifier):
+                self.var_coex_types[stmt.target.name] = coex_type
+
+        # Determine whether to use move or copy semantics
+        is_move = stmt.op == AssignOp.MOVE_ASSIGN
 
         if coex_type and self._is_collection_coex_type(coex_type):
-            value = self._generate_deep_copy(value, coex_type)
+            if is_move:
+                value = self._generate_move_or_eager_copy(value, coex_type)
+            else:
+                value = self._generate_deep_copy(value, coex_type)
         elif coex_type and isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
             # User-defined types need deep copy to handle collection fields
-            value = self._generate_deep_copy(value, coex_type)
+            if is_move:
+                value = self._generate_move_or_eager_copy(value, coex_type)
+            else:
+                value = self._generate_deep_copy(value, coex_type)
         elif isinstance(value.type, ir.PointerType):
             # Fallback to shallow copy for unknown collection types
             pointee = value.type.pointee
@@ -5715,10 +7796,17 @@ class CodeGenerator:
                 elif pointee.name == "struct.String":
                     value = self.builder.call(self.string_copy, [value])
                 elif pointee.name == "struct.Array":
-                    value = self.builder.call(self.array_copy, [value])
+                    if is_move:
+                        value = self._generate_move_or_eager_copy(value, ArrayType(PrimitiveType("int")))
+                    else:
+                        value = self.builder.call(self.array_copy, [value])
 
         if ptr:
             self.builder.store(value, ptr)
+
+        # Mark source as moved AFTER we've read its value
+        if move_source_name:
+            self.moved_vars.add(move_source_name)
 
     def _generate_tuple_assignment(self, target: TupleExpr, value: ir.Value):
         """Generate code for tuple destructuring: (a, b) = value"""
@@ -5974,8 +8062,8 @@ class CodeGenerator:
             self._generate_range_expr_for(stmt)
             return
         
-        # Check if iterable is a list or array
-        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr)):
+        # Check if iterable is a list, array, or map
+        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr, MapExpr)):
             # Generate the iterable expression
             iterable = self._generate_expression(stmt.iterable)
             if isinstance(iterable.type, ir.PointerType):
@@ -5985,6 +8073,12 @@ class CodeGenerator:
                     return
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     self._generate_array_for(stmt, iterable)
+                    return
+                if hasattr(pointee, 'name') and pointee.name == "struct.Map":
+                    self._generate_map_for(stmt, iterable)
+                    return
+                if hasattr(pointee, 'name') and pointee.name == "struct.Set":
+                    self._generate_set_for(stmt, iterable)
                     return
 
         # For other iterables, we need iterator protocol
@@ -6263,6 +8357,174 @@ class CodeGenerator:
 
         # Bind pattern variables (supports destructuring)
         self._bind_pattern(stmt.pattern, elem_val)
+
+        # Generate body statements
+        for s in stmt.body:
+            self._generate_statement(s)
+            if self.builder.block.is_terminated:
+                break
+        if not self.builder.block.is_terminated:
+            self.builder.branch(inc_block)
+
+        # Increment index
+        self.builder.position_at_end(inc_block)
+        current_idx = self.builder.load(index_var)
+        next_idx = self.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
+        self.builder.store(next_idx, index_var)
+        self.builder.branch(cond_block)
+
+        # Exit
+        self.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        self.loop_exit_block = old_exit
+        self.loop_continue_block = old_continue
+
+    def _generate_map_for(self, stmt: ForStmt, map_ptr: ir.Value):
+        """Generate for key in map - iterates over keys"""
+        func = self.builder.function
+
+        # Get keys as a list
+        keys_list = self.builder.call(self.map_keys, [map_ptr])
+
+        # Get list length
+        list_len = self.builder.call(self.list_len, [keys_list])
+
+        # PRE-ALLOCATE all local variables used in the loop body
+        local_vars = self._collect_local_variables(stmt.body)
+        for lv_name in local_vars:
+            if lv_name not in self.locals:
+                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
+                self.locals[lv_name] = lv_alloca
+
+        # Allocate index variable
+        index_var = self.builder.alloca(ir.IntType(64), name="map_idx")
+        self.builder.store(ir.Constant(ir.IntType(64), 0), index_var)
+
+        # Create blocks
+        cond_block = func.append_basic_block("map_for_cond")
+        body_block = func.append_basic_block("map_for_body")
+        inc_block = func.append_basic_block("map_for_inc")
+        exit_block = func.append_basic_block("map_for_exit")
+
+        # Save loop blocks
+        old_exit = self.loop_exit_block
+        old_continue = self.loop_continue_block
+        self.loop_exit_block = exit_block
+        self.loop_continue_block = inc_block
+
+        # Jump to condition
+        self.builder.branch(cond_block)
+
+        # Condition: index < len
+        self.builder.position_at_end(cond_block)
+        current_idx = self.builder.load(index_var)
+        cond = self.builder.icmp_signed("<", current_idx, list_len)
+        self.builder.cbranch(cond, body_block, exit_block)
+
+        # Body
+        self.builder.position_at_end(body_block)
+
+        # Get key from list: keys_list[index]
+        current_idx = self.builder.load(index_var)
+        elem_ptr = self.builder.call(self.list_get, [keys_list, current_idx])
+
+        # Keys are stored as i64 - load and bind
+        typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+        key_val = self.builder.load(typed_ptr)
+
+        # Get variable name from pattern
+        var_name = stmt.var_name if stmt.var_name else "__loop_key"
+
+        # Allocate and store key variable
+        if var_name not in self.locals:
+            key_alloca = self.builder.alloca(ir.IntType(64), name=var_name)
+            self.locals[var_name] = key_alloca
+        self.builder.store(key_val, self.locals[var_name])
+
+        # Generate body statements
+        for s in stmt.body:
+            self._generate_statement(s)
+            if self.builder.block.is_terminated:
+                break
+        if not self.builder.block.is_terminated:
+            self.builder.branch(inc_block)
+
+        # Increment index
+        self.builder.position_at_end(inc_block)
+        current_idx = self.builder.load(index_var)
+        next_idx = self.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
+        self.builder.store(next_idx, index_var)
+        self.builder.branch(cond_block)
+
+        # Exit
+        self.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        self.loop_exit_block = old_exit
+        self.loop_continue_block = old_continue
+
+    def _generate_set_for(self, stmt: ForStmt, set_ptr: ir.Value):
+        """Generate for elem in set - iterates over elements"""
+        func = self.builder.function
+
+        # Get elements as a list
+        elems_list = self.builder.call(self.set_to_list, [set_ptr])
+
+        # Get list length
+        list_len = self.builder.call(self.list_len, [elems_list])
+
+        # PRE-ALLOCATE all local variables used in the loop body
+        local_vars = self._collect_local_variables(stmt.body)
+        for lv_name in local_vars:
+            if lv_name not in self.locals:
+                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
+                self.locals[lv_name] = lv_alloca
+
+        # Allocate index variable
+        index_var = self.builder.alloca(ir.IntType(64), name="set_idx")
+        self.builder.store(ir.Constant(ir.IntType(64), 0), index_var)
+
+        # Create blocks
+        cond_block = func.append_basic_block("set_for_cond")
+        body_block = func.append_basic_block("set_for_body")
+        inc_block = func.append_basic_block("set_for_inc")
+        exit_block = func.append_basic_block("set_for_exit")
+
+        # Save loop blocks
+        old_exit = self.loop_exit_block
+        old_continue = self.loop_continue_block
+        self.loop_exit_block = exit_block
+        self.loop_continue_block = inc_block
+
+        # Jump to condition
+        self.builder.branch(cond_block)
+
+        # Condition: index < len
+        self.builder.position_at_end(cond_block)
+        current_idx = self.builder.load(index_var)
+        cond = self.builder.icmp_signed("<", current_idx, list_len)
+        self.builder.cbranch(cond, body_block, exit_block)
+
+        # Body
+        self.builder.position_at_end(body_block)
+
+        # Get element from list: elems_list[index]
+        current_idx = self.builder.load(index_var)
+        elem_ptr = self.builder.call(self.list_get, [elems_list, current_idx])
+
+        # Elements are stored as i64 - load and bind
+        typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+        elem_val = self.builder.load(typed_ptr)
+
+        # Get variable name from pattern
+        var_name = stmt.var_name if stmt.var_name else "__loop_elem"
+
+        # Allocate and store element variable
+        if var_name not in self.locals:
+            elem_alloca = self.builder.alloca(ir.IntType(64), name=var_name)
+            self.locals[var_name] = elem_alloca
+        self.builder.store(elem_val, self.locals[var_name])
 
         # Generate body statements
         for s in stmt.body:
@@ -6659,7 +8921,14 @@ class CodeGenerator:
     def _generate_identifier(self, expr: Identifier) -> ir.Value:
         """Generate code for identifier reference"""
         name = expr.name
-        
+
+        # Check for use-after-move
+        if name in self.moved_vars:
+            raise RuntimeError(
+                f"Use of moved variable '{name}': variable was moved and can no longer be used. "
+                f"Assign a new value to '{name}' before using it again."
+            )
+
         if name in self.locals:
             return self.builder.load(self.locals[name], name=name)
         elif name in self.globals:
@@ -7263,10 +9532,52 @@ class CodeGenerator:
         # Instance method call: obj.method()
         obj = self._generate_expression(expr.object)
         method = expr.method
-        
+
         # Try to determine the type from the pointer
         type_name = self._get_type_name_from_ptr(obj.type)
-        
+
+        # Special handling for Map with string keys
+        if type_name == "Map" and method in ("get", "has", "set") and expr.args:
+            # Check if key is string type
+            key_arg = self._generate_expression(expr.args[0])
+            is_string_key = (isinstance(key_arg.type, ir.PointerType) and
+                            hasattr(key_arg.type.pointee, 'name') and
+                            key_arg.type.pointee.name == "struct.String")
+
+            if is_string_key:
+                if method == "get":
+                    result = self.builder.call(self.map_get_string, [obj, key_arg])
+                    # Convert result to proper type if value is a pointer
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, MapType):
+                                value_llvm_type = self._get_llvm_type(coex_type.value_type)
+                                if isinstance(value_llvm_type, ir.PointerType):
+                                    return self.builder.inttoptr(result, value_llvm_type)
+                    return result
+                elif method == "has":
+                    return self.builder.call(self.map_has_string, [obj, key_arg])
+                elif method == "set":
+                    value_arg = self._generate_expression(expr.args[1])
+                    value_i64 = self._cast_value(value_arg, ir.IntType(64))
+                    return self.builder.call(self.map_set_string, [obj, key_arg, value_i64])
+
+        # Special handling for Set with string elements
+        if type_name == "Set" and method in ("has", "add") and expr.args:
+            # Check if element is string type
+            elem_arg = self._generate_expression(expr.args[0])
+            is_string_elem = (isinstance(elem_arg.type, ir.PointerType) and
+                            hasattr(elem_arg.type.pointee, 'name') and
+                            elem_arg.type.pointee.name == "struct.String")
+
+            if is_string_elem:
+                if method == "has":
+                    return self.builder.call(self.set_has_string, [obj, elem_arg])
+                elif method == "add":
+                    return self.builder.call(self.set_add_string, [obj, elem_arg])
+
         if type_name and type_name in self.type_methods:
             method_map = self.type_methods[type_name]
             if method in method_map:
@@ -7414,9 +9725,46 @@ class CodeGenerator:
             return ir.Constant(ir.IntType(64), 0)
 
         if method == "set":
-            # array.set(index, value) - returns a NEW array with element at index replaced
+            # list.set(index, value) or array.set(index, value) - returns a NEW collection with element at index replaced
             if len(expr.args) >= 2 and isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
+
+                # List.set(index, value) - returns NEW list with path copying
+                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                    index = self._generate_expression(expr.args[0])
+                    elem_val = self._generate_expression(expr.args[1])
+                    elem_type = elem_val.type
+
+                    # Calculate element size
+                    if isinstance(elem_type, ir.IntType):
+                        size = elem_type.width // 8
+                    elif isinstance(elem_type, ir.DoubleType):
+                        size = 8
+                    elif isinstance(elem_type, ir.PointerType):
+                        size = 8
+                    elif isinstance(elem_type, ir.LiteralStructType):
+                        size = sum(
+                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            for e in elem_type.elements
+                        )
+                    else:
+                        size = 8
+
+                    elem_size = ir.Constant(ir.IntType(64), size)
+
+                    # Store element to temp and get pointer
+                    temp = self.builder.alloca(elem_type, name="list_set_elem")
+                    self.builder.store(elem_val, temp)
+                    temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+                    # Cast index to i64 if needed
+                    if index.type != ir.IntType(64):
+                        index = self.builder.sext(index, ir.IntType(64))
+
+                    # Call list_set which returns a NEW list with path copying
+                    return self.builder.call(self.list_set, [obj, index, temp_ptr, elem_size])
+
+                # Array.set(index, value) - returns NEW array
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     index = self._generate_expression(expr.args[0])
                     elem_val = self._generate_expression(expr.args[1])
@@ -7471,8 +9819,8 @@ class CodeGenerator:
             # atomic.fetch_add(delta)
             return obj
 
-        if method == "packed":
-            # List.packed() -> Array or Set.packed() -> Array
+        if method == "packed" or method == "toArray":
+            # List.toArray() -> Array or Set.toArray() -> Array
             # Convert collection to dense Array
             if isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
@@ -7482,13 +9830,22 @@ class CodeGenerator:
                     return self._set_to_array(obj)
             return ir.Constant(ir.IntType(64), 0)
 
-        if method == "unpacked":
-            # Array.unpacked() -> List
+        if method == "unpacked" or method == "toList":
+            # Array.toList() -> List
             # Convert Array to persistent List
             if isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     return self._array_to_list(obj)
+            return ir.Constant(ir.IntType(64), 0)
+
+        if method == "toSet":
+            # Array.toSet() -> Set
+            # Convert Array to Set (deduplicates)
+            if isinstance(obj.type, ir.PointerType):
+                pointee = obj.type.pointee
+                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                    return self._array_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
         # Generic method lookup failed
@@ -7783,11 +10140,22 @@ class CodeGenerator:
         for key_expr, value_expr in expr.entries:
             key = self._generate_expression(key_expr)
             value = self._generate_expression(value_expr)
-            # Cast to i64 for map storage
-            key_i64 = self._cast_value(key, ir.IntType(64))
-            value_i64 = self._cast_value(value, ir.IntType(64))
-            # map_set returns a NEW map; update our reference
-            map_ptr = self.builder.call(self.map_set, [map_ptr, key_i64, value_i64])
+
+            # Check if key is a string pointer
+            is_string_key = (isinstance(key.type, ir.PointerType) and
+                            hasattr(key.type.pointee, 'name') and
+                            key.type.pointee.name == "struct.String")
+
+            if is_string_key:
+                # Use string-aware map_set
+                value_i64 = self._cast_value(value, ir.IntType(64))
+                map_ptr = self.builder.call(self.map_set_string, [map_ptr, key, value_i64])
+            else:
+                # Cast to i64 for map storage
+                key_i64 = self._cast_value(key, ir.IntType(64))
+                value_i64 = self._cast_value(value, ir.IntType(64))
+                # map_set returns a NEW map; update our reference
+                map_ptr = self.builder.call(self.map_set, [map_ptr, key_i64, value_i64])
 
         return map_ptr
 
@@ -7799,10 +10167,20 @@ class CodeGenerator:
         # Add each element (set_add returns a new set with value semantics)
         for elem_expr in expr.elements:
             elem = self._generate_expression(elem_expr)
-            # Cast to i64 for set storage
-            elem_i64 = self._cast_value(elem, ir.IntType(64))
-            # set_add returns a NEW set; update our reference
-            set_ptr = self.builder.call(self.set_add, [set_ptr, elem_i64])
+
+            # Check if element is a string
+            is_string_elem = (isinstance(elem.type, ir.PointerType) and
+                            hasattr(elem.type.pointee, 'name') and
+                            elem.type.pointee.name == "struct.String")
+
+            if is_string_elem:
+                # Use string-aware set_add
+                set_ptr = self.builder.call(self.set_add_string, [set_ptr, elem])
+            else:
+                # Cast to i64 for set storage
+                elem_i64 = self._cast_value(elem, ir.IntType(64))
+                # set_add returns a NEW set; update our reference
+                set_ptr = self.builder.call(self.set_add, [set_ptr, elem_i64])
 
         return set_ptr
     

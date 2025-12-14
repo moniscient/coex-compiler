@@ -251,7 +251,8 @@ llvmTypeHint
     ;
 
 varDeclStmt
-    : VAR IDENTIFIER COLON typeExpr ASSIGN expression
+    : VAR IDENTIFIER COLON typeExpr (ASSIGN | MOVE_ASSIGN) expression
+    | VAR IDENTIFIER (ASSIGN | MOVE_ASSIGN) expression
     ;
 
 // Tuple destructuring: (a, b) = expr
@@ -261,6 +262,7 @@ tupleDestructureStmt
 
 assignOp
     : ASSIGN
+    | MOVE_ASSIGN
     | PLUS_ASSIGN
     | MINUS_ASSIGN
     | STAR_ASSIGN
@@ -724,6 +726,7 @@ SLASH       : '/' ;
 PERCENT     : '%' ;
 LT          : '<' ;
 GT          : '>' ;
+MOVE_ASSIGN : ':=' ;  // Move/eager assign (must come before ASSIGN)
 ASSIGN      : '=' ;
 QUESTION    : '?' ;
 SEMI        : ';' ;

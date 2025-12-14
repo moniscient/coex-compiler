@@ -386,11 +386,11 @@ func main() -> int
 ''', "20\n")
 
     def test_map_remove(self, expect_output):
-        """Remove key from map."""
+        """Remove key from map (value semantics - returns new map)."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10, 2: 20}
-    m.remove(1)
+    var m = {1: 10, 2: 20}
+    m = m.remove(1)
     print(m.len())
     return 0
 ~
@@ -437,11 +437,11 @@ func main() -> int
 ''', "3\n")
 
     def test_set_remove(self, expect_output):
-        """Remove element from set."""
+        """Remove element from set (value semantics - returns new set)."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 2, 3}
-    s.remove(2)
+    var s = {1, 2, 3}
+    s = s.remove(2)
     print(s.len())
     return 0
 ~
@@ -618,51 +618,52 @@ class TestCollectionSize:
     """
 
     def test_list_size_empty(self, expect_output):
-        """Empty list size (header + initial capacity * elem_size)."""
-        # List header: 32 bytes, initial cap=8, elem_size=8 for int
-        # Size = 32 + 8 * 8 = 96
+        """Empty list size (header + tail buffer)."""
+        # Persistent Vector: header 48 bytes + tail buffer 32*8 = 256 bytes
+        # Size = 48 + 256 = 304
         expect_output('''
 func main() -> int
     var lst: List<int> = []
     print(lst.size())
     return 0
 ~
-''', "96\n")
+''', "304\n")
 
     def test_list_size_with_elements(self, expect_output):
-        """List size with some elements (still within initial capacity)."""
-        # Same as empty - cap doesn't change until it's exceeded
+        """List size with some elements (still within tail)."""
+        # Persistent Vector: header 48 bytes + tail buffer 32*8 = 256 bytes
+        # Size = 48 + 256 = 304 (same as empty - tail buffer is fixed size)
         expect_output('''
 func main() -> int
     var lst: List<int> = [1, 2, 3]
     print(lst.size())
     return 0
 ~
-''', "96\n")
+''', "304\n")
 
     def test_string_size(self, expect_output):
-        """String size (header + byte length)."""
-        # String header: 16 bytes, "hello" = 5 bytes
-        # Size = 16 + 5 = 21
+        """String size (struct + data bytes)."""
+        # String struct: 40 bytes (5 x 8-byte fields with COW), "hello" = 5 bytes
+        # Size = 40 + 5 = 45
         expect_output('''
 func main() -> int
     var s: string = "hello"
     print(s.size())
     return 0
 ~
-''', "21\n")
+''', "45\n")
 
     def test_string_size_empty(self, expect_output):
         """Empty string size."""
-        # String header: 16 bytes, empty = 0 bytes
-        # Size = 16 + 0 = 16
+        # String struct: 40 bytes, empty = 0 bytes
+        # Size = 40 + 0 = 40
         expect_output('''
 func main() -> int
     var s: string = ""
     print(s.size())
     return 0
 ~
-''', "16\n")
+''', "40\n")
 
     def test_map_size_empty(self, expect_output):
         """Empty map size (header + initial capacity * entry size)."""
@@ -707,7 +708,7 @@ func main() -> int
     print(lst.size())
     return 0
 ~
-''', "3\n96\n")
+''', "3\n304\n")
 
 
 class TestParameterValueSemantics:

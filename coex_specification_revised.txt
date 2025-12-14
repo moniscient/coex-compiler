@@ -1,0 +1,2184 @@
+Coex Language Specification
+Matthew Strebe
+1. Introduction
+Coex is a programming language designed for safe, efficient concurrent and parallel computation. The language enforces correctness through a minimal set of function kinds with clear semantics, enabling the compiler to automatically parallelize pure computations while providing explicit primitives for coordination and I/O.
+1.1 Design Philosophy
+Coex makes concurrency simple by separating three concerns:
+•	Pure computation (formula) — Deterministic, parallelizable, GPU-eligible
+•	Concurrent work (task) — Channels, atomics, and async I/O
+•	Orchestration (func) — Entry points, file I/O, FFI
+The programmer declares intent through function kinds. The compiler handles scheduling, synchronization barriers, and optimization.
+1.2 Structured Concurrency
+All concurrent execution in Coex follows structured concurrency principles. Tasks spawned within a scope complete before that scope exits:
+task worker(item: Item) -> Result
+  return process(item)
+~
+
+func main()
+  results = for i in range(0, 10)
+    worker(items[i])
+  ~
+  # Implicit barrier - all workers complete here
+  # results[0] through results[9] now available
+~
+There is no “fire and forget.” Every concurrent operation has a defined lifetime and completion point.
+ 
+2. Function Kinds
+Coex has three function kinds, each with distinct capabilities and restrictions.
+2.1 Overview
+Kind	Can Use	Can Call	Purpose
+formula	Pure computation only	formula	Parallelizable, GPU-eligible
+task	Channels, atomics, await	formula, task	Concurrent work
+func	Anything	Anything	Entry points, orchestration
+2.2 Formulas
+This document contains proposed revisions to strengthen the theoretical foundations of the formula specification in Coex.
+2.2.1 Overview
+Formulas are pure functions: deterministic, side-effect free, and referentially transparent. The compiler may execute them in parallel, offload them to GPU, or memoize their results.
+formula sum_squares(numbers: List<int>) -> int
+  total = 0
+  for n in numbers
+    total += n * n
+  ~
+  return total
+~
+
+formula distance(p1: Point, p2: Point) -> float
+  dx = p1.x - p2.x
+  dy = p1.y - p2.y
+  return sqrt(dx * dx + dy * dy)
+~
+2.2.2 Theoretical Foundation
+Formulas implement a total functional language—every formula application is guaranteed to terminate and produce a value. This property enables the compiler to safely parallelize formula invocations, offload them to GPU hardware, or memoize results without risk of divergence.
+The computational model corresponds to the simply-typed lambda calculus extended with primitive recursion schemes (bounded iteration) and higher-order functions. This places formulas in a computational class equivalent to the primitive recursive functions extended with higher-order capabilities. While this class excludes certain theoretical constructs (notably the Ackermann function and general fixed-point recursion), it encompasses the vast majority of practical numeric, data-processing, and scientific computing algorithms.
+The key properties guaranteed by this model are:
+Referential Transparency. Any formula application may be replaced with its result without changing program behavior. If f(x) evaluates to v, then f(x) and v are interchangeable in all contexts.
+Determinism. Given identical arguments, a formula always produces identical results. There is no observable nondeterminism within formulas.
+Termination. Every formula application completes in finite time. The compiler statically verifies this property through call graph analysis and loop bound checking.
+Independence. Formula applications with disjoint inputs may execute in any order, or simultaneously, without affecting results. This property enables automatic parallelization.
+2.2.3 Restrictions
+Formulas are subject to the following restrictions, each of which serves the goal of maintaining the properties above:
+No channels, atomics, or await. These constructs introduce synchronization dependencies and potential nondeterminism that would violate the independence property.
+No calls to task or func. These function kinds may perform I/O or coordination, which would compromise referential transparency.
+No I/O operations. Input and output are inherently side-effecting and would destroy purity.
+No recursion. Self-recursion and mutual recursion are prohibited because they can express non-terminating computations. Use bounded iteration instead.
+Bounded iteration only. Loops must iterate over finite collections or explicitly bounded ranges. Unbounded loop constructs are not permitted in formulas.
+2.2.4 Termination Guarantee
+The compiler enforces termination through two mechanisms:
+Call Graph Acyclicity. The compiler constructs an interprocedural call graph that includes edges for both direct calls and potential invocations through function-typed parameters. Any cycle in this graph—whether direct self-recursion, mutual recursion between formulas, or indirect recursion through higher-order function application—results in a compilation error.
+Loop Bound Verification. All iteration within formulas must have statically manifest bounds. The for loop construct iterating over a collection or a range(start, end) expression satisfies this requirement because the iteration count is determined by the collection size or range extent. The unbounded loop construct is not permitted within formulas.
+A formula is accepted if and only if both conditions are satisfied. Together, these ensure that formula execution time is bounded by a function of input size.
+2.2.5 Iteration Instead of Recursion
+Traditional recursive algorithms must be reformulated as bounded iterations:
+# REJECTED: Direct self-recursion creates a cycle in the call graph
+formula factorial(n: int) -> int
+  if n <= 1
+    return 1
+  ~
+  return n * factorial(n - 1)  # ERROR: Cycle in call graph
+~
+
+# ACCEPTED: Bounded iteration with manifest termination
+formula factorial(n: int) -> int
+  result = 1
+  for i in range(1, n + 1)
+    result *= i
+  ~
+  return result
+~
+This restriction reflects a fundamental design choice: formulas trade the full expressiveness of general recursion for the guarantee of termination. In practice, this trade-off is favorable—the overwhelming majority of parallel algorithms are naturally expressible with bounded iteration, and the termination guarantee enables aggressive compiler optimizations that would be unsound in the presence of potentially non-terminating code.
+2.2.6 Local Variable Semantics
+Formulas may use assignment syntax for local variables, as shown in the sum_squares example. This syntax is provided for readability and familiarity, but the semantics are purely functional: each assignment conceptually produces a new binding that shadows the previous one, rather than mutating a memory location.
+formula sum_squares(numbers: List<int>) -> int
+  total = 0              # Binding 1: total₀ = 0
+  for n in numbers
+    total += n * n       # Binding 2, 3, ...: totalᵢ = totalᵢ₋₁ + n²
+  ~
+  return total           # Returns final binding
+~
+This interpretation ensures that formulas remain pure even when written in an imperative style. The compiler may optimize these semantics to in-place mutation when analysis proves this is safe (which it always is for local variables that do not escape), but the observable behavior is equivalent to functional state threading.
+Crucially, mutable variables (var declarations) are not permitted within formulas. The var keyword is reserved for persistent state in tasks and methods that require true mutation.
+2.2.7 Higher-Order Formulas
+Formulas may accept other formulas as parameters, enabling functional programming patterns:
+formula map(f: formula(int) -> int, data: List<int>) -> List<int>
+  result = []
+  for x in data
+    result.append(f(x))
+  ~
+  return result
+~
+
+formula filter(pred: formula(int) -> bool, data: List<int>) -> List<int>
+  result = []
+  for x in data
+    if pred(x)
+      result.append(x)
+    ~
+  ~
+  return result
+~
+
+formula compose(f: formula(int) -> int, g: formula(int) -> int) -> formula(int) -> int
+  return formula(_ x: int) => f(g(x))
+~
+The termination guarantee extends to higher-order usage. The call graph analysis accounts for potential invocations through function parameters by including edges from any call site that invokes a function parameter to all formulas that could flow into that parameter position. This conservative analysis ensures that even indirect recursion through higher-order functions is detected and rejected:
+# REJECTED: Indirect self-recursion through higher-order function
+formula sneaky_recursion(n: int) -> int
+  apply_to_pred = formula(f: formula(int) -> int, x: int) => f(x - 1)
+  if n <= 0
+    return 1
+  ~
+  return n * apply_to_pred(sneaky_recursion, n)  # ERROR: Cycle detected
+~
+The call graph includes an edge from apply_to_pred's invocation of f back to sneaky_recursion, revealing the cycle.
+ 
+2.2.8: Relationship to Lambda Calculus
+For readers familiar with the theoretical foundations of functional programming, this section clarifies the relationship between Coex formulas and Church's lambda calculus.
+Formulas correspond semantically to lambda abstractions. The formula definition:
+formula add(a: int, b: int) -> int
+  return a + b
+~
+has the mathematical meaning λa.λb.(a + b), where the body expression may include the primitive operations and control structures defined by the language.
+However, Coex formulas deliberately occupy a restricted subset of the lambda calculus:
+No Fixed-Point Combinators. The untyped lambda calculus achieves Turing-completeness through fixed-point combinators such as Y = λf.(λx.f(x x))(λx.f(x x)), which enable arbitrary recursion. Coex formulas prohibit the self-application pattern (x x) that such combinators require, both syntactically (through the type system) and through call graph analysis. This restriction is essential for the termination guarantee.
+Strongly Normalizing. In lambda calculus terminology, formulas are strongly normalizing: every reduction sequence reaches a normal form (a value) in finite steps. This property holds for the simply-typed lambda calculus but not for the untyped calculus. Coex achieves strong normalization through the combination of typing, acyclic call graphs, and bounded iteration.
+Primitive Recursion, Not General Recursion. The iteration constructs in formulas (for over bounded ranges and collections) correspond to the primitive recursion scheme in computability theory, not to general recursion. Primitive recursive functions can compute any function whose running time is bounded by a tower of exponentials in the input size—an enormous class that includes virtually all practical algorithms—but cannot express unbounded search or the Ackermann function.
+Extended with Higher-Order Functions. Unlike the original primitive recursive functions, which operate only on natural numbers, Coex formulas support higher-order functions (functions that take or return other functions). This extension preserves the termination guarantee while enabling powerful abstraction patterns like map, filter, and fold.
+The theoretical positioning of Coex formulas is thus closest to System T (Gödel's simply-typed lambda calculus with primitive recursion) or the computational fragment of proof assistants like Agda and Coq. This foundation provides exactly the right balance for safe parallel computation: sufficient expressiveness for real-world algorithms, with ironclad guarantees that enable aggressive optimization.
+Section 2.6: Educational Error Messages
+The compiler provides clear guidance when formula restrictions are violated:
+Example 1: Using channels in a formula
+formula process(data: List<int>, results: Channel<int>) -> int
+  sum = 0
+  for item in data
+    sum += item
+  ~
+  results.send(sum)  # ERROR
+  return sum
+~
+Error: Channel operation in formula
+
+  results.send(sum)
+  ^^^^^^^^^^^^^^^^
+
+Formulas must be pure—they cannot use channels, atomics, or await.
+These operations introduce synchronization dependencies that would
+prevent safe parallel execution.
+
+Consider: Change 'formula' to 'task' if you need channel operations,
+or return the value and let the caller handle channel communication.
+Example 2: Direct recursion
+formula factorial(n: int) -> int
+  if n <= 1
+    return 1
+  ~
+  return n * factorial(n - 1)  # ERROR
+~
+Error: Recursive call creates cycle in formula call graph
+
+  return n * factorial(n - 1)
+             ^^^^^^^^^
+
+Formulas must terminate, which requires an acyclic call graph.
+Self-recursion would allow unbounded computation.
+
+Consider: Reformulate using bounded iteration:
+
+  formula factorial(n: int) -> int
+    result = 1
+    for i in range(1, n + 1)
+      result *= i
+    ~
+    return result
+  ~
+Example 3: Mutual recursion
+formula is_even(n: int) -> bool
+  if n == 0
+    return true
+  ~
+  return is_odd(n - 1)  # ERROR: Cycle with is_odd
+~
+
+formula is_odd(n: int) -> bool
+  if n == 0
+    return false
+  ~
+  return is_even(n - 1)
+~
+Error: Mutual recursion creates cycle in formula call graph
+
+  return is_odd(n - 1)
+         ^^^^^^
+
+The call graph contains a cycle: is_even → is_odd → is_even
+
+Formulas must have acyclic call graphs to guarantee termination.
+
+Consider: Reformulate using iteration:
+
+  formula is_even(n: int) -> bool
+    return n % 2 == 0
+  ~
+Example 4: Indirect recursion through higher-order function
+formula apply(f: formula(int) -> int, x: int) -> int
+  return f(x)
+~
+
+formula countdown(n: int) -> int
+  if n <= 0
+    return 0
+  ~
+  return apply(countdown, n - 1)  # ERROR
+~
+Error: Higher-order call creates potential cycle in formula call graph
+
+  return apply(countdown, n - 1)
+         ^^^^^
+
+The formula 'countdown' is passed to 'apply', which invokes its
+function parameter. This creates an indirect recursive cycle:
+countdown → apply → (invokes parameter) → countdown
+
+Formulas must have acyclic call graphs even through higher-order calls.
+
+Consider: Reformulate using direct iteration rather than recursion
+through function passing.
+Example 5: Unbounded loop in formula
+formula find_zero(data: List<int>) -> int
+  i = 0
+  loop  # ERROR
+    if data[i] == 0
+      return i
+    ~
+    i += 1
+    if i >= len(data)
+      break
+    ~
+  ~
+  return -1
+~
+Error: Unbounded loop in formula
+
+  loop
+  ^^^^
+
+Formulas must provably terminate. The 'loop' construct has no
+static bound, so the compiler cannot verify termination.
+
+Consider: Use 'for' with explicit bounds:
+
+  formula find_zero(data: List<int>) -> int
+    for i in range(0, len(data))
+      if data[i] == 0
+        return i
+      ~
+    ~
+    return -1
+  ~
+Example 6: Mutable variable in formula
+formula accumulate(data: List<int>) -> int
+  var total: int = 0  # ERROR
+  for n in data
+    total += n
+  ~
+  return total
+~
+Error: Mutable variable 'var' in formula
+
+  var total: int = 0
+  ^^^
+
+Formulas use functional semantics where each assignment creates a
+new binding. The 'var' keyword declares persistent mutable state,
+which is only permitted in tasks and funcs.
+
+Consider: Remove 'var'—assignment in formulas already works correctly:
+
+  formula accumulate(data: List<int>) -> int
+    total = 0
+    for n in data
+      total += n
+    ~
+    return total
+  ~
+ 
+Additional Notes for Implementation
+Call Graph Construction
+The call graph for termination analysis should be constructed as follows:
+1.	Direct edges: For each formula F containing a call to formula G, add edge F → G.
+2.	Higher-order edges: For each formula F containing a call through a function-typed parameter P, add edges from F to every formula that could flow into P. This requires interprocedural dataflow analysis to track which formulas are passed as arguments.
+3.	Conservative approximation: When precise dataflow is infeasible (e.g., function values stored in data structures), the analysis should conservatively add edges to all formulas with matching signatures. This may reject some valid programs but never accepts invalid ones.
+4.	Lambda analysis: Lambdas defined within a formula are analyzed as part of that formula's call graph. A lambda that captures and invokes the enclosing formula creates a cycle.
+Loop Analysis
+The loop bound analysis should accept:
+•	for x in collection where collection is finite (all collection types are finite)
+•	for i in range(start, end) where start and end are expressions
+•	for i in range(start, end, step) with explicit step
+The analysis should reject:
+•	loop constructs (unbounded)
+•	while condition constructs (condition may never become false)
+Note that for loops with early break or return are acceptable—the bound is still manifest, and early exit only reduces iterations.
+Optimization Implications
+The termination guarantee enables several optimizations that would be unsound otherwise:
+•	Speculative execution: The compiler can execute formula calls speculatively, knowing they will terminate.
+•	Parallel mapping: When formulas are mapped over collections, all invocations can execute in parallel without deadlock risk.
+•	GPU offloading: Formulas can be compiled to GPU kernels with confidence that no thread will diverge infinitely.
+•	Memoization: Results can be cached freely since formulas are pure and terminating.
+
+2.3 Tasks (Concurrent Functions)
+Tasks perform concurrent work using channels, atomics, and async I/O. They can coordinate with other tasks and perform network operations.
+task fetch_and_process(url: string, output: Channel<Result>)
+  response = await http.get(url)
+  result = parse(response)
+  output.send(result)
+~
+
+task worker(tasks: Channel<Task>, results: Channel<Result>)
+  loop
+    task = tasks.receive()
+    if task == nil
+      break
+    else
+      result = await process(task)
+      results.send(result)
+    ~
+  ~
+~
+Capabilities:
+•	Channel send/receive
+•	Atomic operations
+•	Async I/O (await)
+•	Calling formulas (for pure computation)
+•	Calling other tasks
+Thread-local state with var:
+Tasks can maintain persistent local state using var:
+task worker(tasks: Channel<Task>)
+  var processed_count: int = 0
+  var cache: Map<string, Result> = {}
+  loop
+    task = tasks.receive()
+    if task == nil
+      break
+    ~
+    processed_count += 1
+    if cache.has(task.key)
+      result = cache[task.key]
+    else
+      result = compute(task)
+      cache[task.key] = result
+    ~
+    send_result(result)
+  ~
+  print("Processed " + str(processed_count) + " tasks")
+~
+2.4 Funcs (Sequential Functions)
+Funcs are unrestricted functions for orchestration, I/O, and program entry points. They can call any function kind and perform any operation.
+func main()
+  config = read_file("config.json")
+  settings = parse_json(config)
+
+  task_chan = Channel<Task>.new(buffer: 100)
+  result_chan = Channel<Result>.new()
+
+  for i in range(0, settings.worker_count)
+    worker(task_chan, result_chan)
+  ~
+
+  file = open(settings.input_file)
+  loop
+    line = file.readline()
+    if line == nil
+      break
+    ~
+    task = parse_line(line)
+    task_chan.send(task)
+  ~
+  task_chan.close()
+
+  output_file = open(settings.output_file, "w")
+  loop
+    result = result_chan.receive()
+    if result == nil
+      break
+    ~
+    output_file.write(result.to_string())
+  ~
+  output_file.close()
+~
+2.5 Task Returns and Barriers
+When tasks are spawned from a func, their return values are collected at an implicit barrier. Results are indexed by spawn order:
+Parallel map:
+task enhance(img: Image) -> Image
+  return apply_filters(img)
+~
+
+func process_album(images: List<Image>) -> List<Image>
+  results = for img in images
+    enhance(img)
+  ~
+  # Barrier: all tasks complete
+  # results[0] is enhance(images[0]), etc.
+  return results
+~
+Scatter-gather:
+task fetch_user(id: int) -> User
+  return await http.get("/users/" + str(id))
+~
+
+task fetch_orders(id: int) -> List<Order>
+  return await http.get("/orders?user=" + str(id))
+~
+
+task fetch_preferences(id: int) -> Preferences
+  return await http.get("/prefs/" + str(id))
+~
+
+func build_profile(id: int) -> Profile
+  user = fetch_user(id)
+  orders = fetch_orders(id)
+  prefs = fetch_preferences(id)
+  # Barrier: all three complete
+  return Profile(user, orders, prefs)
+~
+Reduction:
+task partial_sum(chunk: List<int>) -> int
+  total = 0
+  for n in chunk
+    total += n
+  ~
+  return total
+~
+
+func parallel_sum(data: List<int>, chunk_size: int) -> int
+  chunks = partition(data, chunk_size)
+  partial_sums = for chunk in chunks
+    partial_sum(chunk)
+  ~
+  return sum(partial_sums)
+~
+Fire and forget:
+If you don’t capture the return, it’s discarded:
+func log_events(events: List<Event>)
+  for event in events
+    log_to_analytics(event)  # Returns discarded
+  ~
+  # Barrier still applies - all logging completes
+~
+2.6 Educational Error Messages
+The compiler provides clear guidance when function kind rules are violated:
+Example 1: Using channels in a formula
+formula process(data: List<int>, results: Channel<int>) -> int
+  sum = 0
+  for item in data
+    sum += item
+  ~
+  results.send(sum)  # ERROR
+  return sum
+~
+Error: Channel operation in formula
+
+  results.send(sum)
+  ^^^^^^^^^^^^^^^^
+
+Formulas must be pure - they cannot use channels, atomics, or await.
+
+Consider: Change 'formula' to 'task' if you need channel operations,
+or return the value and let the caller handle channel communication.
+Example 2: Using await in a formula
+formula fetch_data(url: string) -> Data
+  response = await http.get(url)  # ERROR
+  return parse(response)
+~
+Error: Await in formula
+
+  response = await http.get(url)
+             ^^^^^
+
+Formulas must be pure - they cannot perform I/O.
+
+Consider: Change 'formula' to 'task' for async operations.
+Example 3: Non-terminating loop in a formula
+formula compute(x: int) -> int
+  loop  # ERROR
+    x = x + 1
+    if x > 1000000
+      break
+    ~
+  ~
+  return x
+~
+Error: Potentially unbounded loop in formula
+
+  loop
+  ^^^^
+
+Formulas must provably terminate. The compiler cannot verify
+that this loop will complete in bounded time.
+
+Consider: Use a 'for' loop with explicit bounds, or change to 'task'.
+ 
+3. Concurrency Primitives
+3.1 Channels
+Channels are typed, optionally-buffered communication primitives for coordination between tasks.
+Creating channels:
+unbuffered = Channel<int>.new()
+buffered = Channel<int>.new(buffer: 100)
+Operations:
+channel.send(value)      # Send value (blocks if full/unbuffered)
+value = channel.receive() # Receive value (blocks if empty), returns nil if closed
+channel.close()          # Close channel (no more sends)
+Pipeline pattern:
+task parse(input: Channel<string>, output: Channel<Message>)
+  loop
+    line = input.receive()
+    if line == nil
+      break
+    ~
+    msg = parse_message(line)
+    output.send(msg)
+  ~
+  output.close()
+~
+
+task validate(input: Channel<Message>, output: Channel<Message>)
+  loop
+    msg = input.receive()
+    if msg == nil
+      break
+    ~
+    if is_valid(msg)
+      output.send(msg)
+    ~
+  ~
+  output.close()
+~
+
+task process(input: Channel<Message>, output: Channel<Result>)
+  loop
+    msg = input.receive()
+    if msg == nil
+      break
+    ~
+    result = compute(msg)
+    output.send(result)
+  ~
+  output.close()
+~
+
+func main()
+  raw = Channel<string>.new(buffer: 100)
+  parsed = Channel<Message>.new(buffer: 100)
+  validated = Channel<Message>.new(buffer: 100)
+  results = Channel<Result>.new()
+
+  parse(raw, parsed)
+  validate(parsed, validated)
+  process(validated, results)
+
+  file = open("input.dat")
+  loop
+    line = file.readline()
+    if line == nil
+      break
+    ~
+    raw.send(line)
+  ~
+  raw.close()
+
+  output = open("output.dat", "w")
+  loop
+    result = results.receive()
+    if result == nil
+      break
+    ~
+    output.write(result.to_string())
+  ~
+  output.close()
+~
+Worker pool pattern:
+task worker(id: int, tasks: Channel<Task>, results: Channel<Result>)
+  loop
+    task = tasks.receive()
+    if task == nil
+      break
+    ~
+    result = execute(task)
+    results.send(result)
+  ~
+~
+
+func main()
+  tasks = Channel<Task>.new(buffer: 100)
+  results = Channel<Result>.new(buffer: 100)
+
+  for i in range(0, 10)
+    worker(i, tasks, results)
+  ~
+
+  for i in range(0, 1000)
+    tasks.send(Task(id: i, data: "task_" + str(i)))
+  ~
+  tasks.close()
+
+  for i in range(0, 1000)
+    result = results.receive()
+    print("Result: " + str(result.id))
+  ~
+~
+3.2 Channel Selection (select)
+The select statement waits on multiple channels simultaneously.
+Default strategy (checks in order, takes first ready):
+task worker(tasks: Channel<Task>, control: Channel<Command>)
+  loop
+    select
+      case task <- tasks
+        process(task)
+      ~
+      case cmd <- control
+        handle(cmd)
+      ~
+    ~
+  ~
+~
+Fair strategy (round-robin to prevent starvation):
+task balanced(high: Channel<Task>, low: Channel<Task>)
+  loop
+    select fair
+      case task <- high
+        process(task)
+      ~
+      case task <- low
+        process(task)
+      ~
+    ~
+  ~
+~
+Random strategy (randomized selection):
+task worker(a: Channel<Task>, b: Channel<Task>)
+  loop
+    select random
+      case task <- a
+        process(task)
+      ~
+      case task <- b
+        process(task)
+      ~
+    ~
+  ~
+~
+Priority strategy (strict ordering):
+task handler(requests: Channel<Request>, control: Channel<Command>)
+  loop
+    select priority
+      case cmd <- control
+        if cmd == Shutdown
+          break
+        ~
+        handle(cmd)
+      ~
+      case req <- requests
+        process(req)
+      ~
+    ~
+  ~
+~
+Timeout:
+task monitor(data: Channel<Data>, heartbeat: Channel<Ping>)
+  loop
+    select timeout 5 * time.second
+      case d <- data
+        record(d)
+      ~
+      case p <- heartbeat
+        update_status()
+      ~
+    ~
+  ~
+~
+3.3 Temporal Constraints (within)
+The within construct enforces time bounds on operations:
+Basic timeout:
+within 5 * time.second
+  result = expensive_computation(data)
+else
+  result = fallback_value()
+~
+Task with timeout:
+task fetch_with_deadline(url: string) -> Response
+  within 10 * time.second
+    response = await http.get(url)
+    data = await response.read_body()
+    return Response.ok(data)
+  else
+    return Response.timeout("Request exceeded deadline")
+  ~
+~
+Retry with exponential backoff:
+task fetch_with_retry(url: string, max_attempts: int) -> Result<Response>
+  var attempt: int = 0
+  var delay: int = 1 * time.second
+  loop
+    attempt += 1
+    within delay * attempt
+      response = await http.get(url)
+      return Result.ok(response)
+    else
+      if attempt >= max_attempts
+        return Result.error("Max retries exceeded")
+      ~
+      await sleep(delay * attempt)
+    ~
+  ~
+~
+Graceful degradation:
+task enrich_data(base: Data, enrichment_url: string) -> EnrichedData
+  within 2 * time.second
+    extra = await http.get(enrichment_url)
+    return EnrichedData.combine(base, extra)
+  else
+    return EnrichedData.from_base(base)
+  ~
+~
+Circuit breaker:
+task monitored_service(
+  requests: Channel<Request>,
+  service_url: string
+) -> Response
+  var consecutive_timeouts: int = 0
+  loop
+    req = requests.receive()
+    if req == nil
+      break
+    ~
+    within 3 * time.second
+      response = await http.post(service_url, req.data)
+      consecutive_timeouts = 0
+      return response
+    else
+      consecutive_timeouts += 1
+      if consecutive_timeouts >= 5
+        return Response.circuit_open()
+      ~
+      return Response.timeout()
+    ~
+  ~
+~
+Nested constraints:
+task complex_operation(config: Config) -> Result
+  within 60 * time.second
+    phase1 = within 20 * time.second
+      await initialize(config)
+    else
+      return Result.error("Initialization timeout")
+    ~
+
+    phase2 = within 30 * time.second
+      await process(phase1)
+    else
+      return Result.error("Processing timeout")
+    ~
+
+    return await finalize(phase2)
+  else
+    return Result.error("Total operation timeout")
+  ~
+~
+3.4 Atomic Operations
+Atomic types provide lock-free synchronization primitives that map directly to hardware instructions.
+Types:
+atomic_int    # 64-bit atomic integer
+atomic_float  # 64-bit atomic float
+atomic_bool   # Atomic boolean
+Operations:
+# atomic_int
+var counter: atomic_int = 0
+counter.load() -> int
+counter.store(value: int)
+counter.compare_and_swap(expected: int, new: int) -> bool
+counter.increment() -> int    # Returns old value
+counter.decrement() -> int    # Returns old value
+counter.fetch_add(delta: int) -> int
+counter.fetch_sub(delta: int) -> int
+
+# atomic_float
+var measurement: atomic_float = 0.0
+measurement.load() -> float
+measurement.store(value: float)
+measurement.compare_and_swap(expected: float, new: float) -> bool
+
+# atomic_bool
+var flag: atomic_bool = false
+flag.load() -> bool
+flag.store(value: bool)
+flag.compare_and_swap(expected: bool, new: bool) -> bool
+flag.swap(new: bool) -> bool  # Returns old value
+Counter example:
+var global_counter: atomic_int = 0
+
+task increment_many(iterations: int)
+  for i in range(0, iterations)
+    global_counter.increment()
+  ~
+~
+
+func main()
+  for i in range(0, 10)
+    increment_many(iterations: 1000)
+  ~
+  print("Final: " + str(global_counter.load()))
+~
+Lock-free stack:
+type Node<T>:
+  value: T
+  next_index: atomic_int
+~
+
+type LockFreeStack<T>:
+  head_index: atomic_int
+
+  task push(value: T)
+    new_node = Node(value: value, next_index: 0)
+    loop
+      old_head = head_index.load()
+      new_node.next_index.store(old_head)
+      if head_index.compare_and_swap(expected: old_head, new: new_node)
+        break
+      ~
+    ~
+  ~
+
+  task pop() -> T?
+    loop
+      old_head = head_index.load()
+      if old_head == nil
+        return nil
+      ~
+      new_head = old_head.next_index.load()
+      if head_index.compare_and_swap(expected: old_head, new: new_head)
+        return old_head.value
+      ~
+    ~
+  ~
+~
+ 
+3.5 Atomic Refs
+Atomic References
+Overview
+The atomic_ref<T> type provides atomic operations on references to heap-allocated values. This primitive enables the implementation of lock-free data structures and advanced synchronization patterns.
+Atomic references are an advanced feature intended for library authors implementing concurrent data structures. Incorrect use can violate program invariants and cause subtle, difficult-to-diagnose bugs. Most programmers should use the concurrent collections in the standard library rather than building custom lock-free structures.
+Type Definition
+atomic_ref<T>    # Atomic reference to a value of type T (or nil)
+An atomic_ref<T> holds either a reference to a value of type T or nil. All operations are atomic with sequentially-consistent memory ordering, meaning that all atomic operations across all threads appear to occur in a single global order consistent with program order on each thread.
+Operations
+# Construction
+var ref: atomic_ref<T> = nil                    # Initialize to nil
+var ref: atomic_ref<T> = atomic_ref.new(value)  # Initialize with value
+
+# Load - returns current value
+ref.load() -> T?
+
+# Store - sets new value
+ref.store(value: T?)
+
+# Compare and swap - atomically updates if current value matches expected
+# Returns true if swap occurred, false otherwise
+ref.compare_and_swap(expected: T?, new: T?) -> bool
+
+# Unconditional swap - atomically replaces and returns old value
+ref.swap(new: T?) -> T?
+Memory Model
+Coex uses garbage collection for memory management. References remain valid as long as any thread holds a reference to the object. This eliminates use-after-free bugs that plague lock-free programming in manually-managed languages, but programmers must still reason carefully about the logical consistency of their data structures.
+All atomic_ref operations use sequentially-consistent ordering. This provides the strongest guarantees and simplest reasoning model at some performance cost. The compiler and runtime may not reorder atomic operations, and all threads observe atomic operations in a consistent global order.
+Compiler Warnings
+The compiler emits warnings when atomic_ref is used. These warnings appear as compiler commentary that can be suppressed through the standard #@ mechanism.
+Warning on declaration:
+#@ atomic-ref: atomic_ref<T> is an advanced primitive for lock-free programming.
+#@ Incorrect use can cause subtle concurrency bugs. Consider using standard
+#@ library concurrent collections unless you need a custom lock-free structure.~
+var head: atomic_ref<Node<T>> = nil
+Warning on first operation in a function:
+#@ atomic-ref: compare_and_swap requires careful reasoning about concurrent
+#@ interleavings. Ensure all possible thread interleavings maintain invariants.~
+if head.compare_and_swap(expected: old, new: node)
+Suppressing Warnings
+Warnings can be suppressed at the instance level, or disabled for an entire file.
+Instance suppression — Acknowledge a specific warning:
+#@ atomic-ref: ignore
+#@ Implementing lock-free stack per standard pattern~
+var head: atomic_ref<Node<T>> = nil
+File-level opt-out — Disable atomic-ref warnings throughout the file:
+#@ atomic-ref: off~
+
+type LockFreeStack<T>:
+  head: atomic_ref<Node<T>>
+  
+  task push(value: T)
+    # ... implementation
+  ~
+~
+Standard library modules that implement concurrent collections will include #@ atomic-ref: off~ at the top, so users of ConcurrentQueue<T> and similar types never see these warnings.
+Example: Lock-Free Stack
+The following example demonstrates correct implementation of a lock-free stack. This pattern is provided in the standard library as ConcurrentStack<T>; this implementation is shown for educational purposes.
+#@ atomic-ref: off~
+
+type Node<T>:
+  value: T
+  next: atomic_ref<Node<T>>
+~
+
+type LockFreeStack<T>:
+  head: atomic_ref<Node<T>>
+
+  func new() -> LockFreeStack<T>
+    return LockFreeStack(head: atomic_ref.new(nil))
+  ~
+
+  task push(value: T)
+    new_node = Node(value: value, next: atomic_ref.new(nil))
+    loop
+      old_head = head.load()
+      new_node.next.store(old_head)
+      if head.compare_and_swap(expected: old_head, new: new_node)
+        break
+      ~
+    ~
+  ~
+
+  task pop() -> T?
+    loop
+      old_head = head.load()
+      if old_head == nil
+        return nil
+      ~
+      new_head = old_head.next.load()
+      if head.compare_and_swap(expected: old_head, new: new_head)
+        return old_head.value
+      ~
+    ~
+  ~
+~
+Why this is correct:
+The push operation constructs a new node, reads the current head, links the new node to point to the current head, and atomically updates the head only if it hasn't changed. If another thread modified the head between our read and our CAS, the CAS fails and we retry with the new head value.
+The pop operation reads the current head, reads its successor, and atomically updates the head to the successor only if the head hasn't changed. Garbage collection ensures that old_head remains valid even if another thread pops it concurrently—the object won't be reclaimed until our reference goes out of scope.
+What can still go wrong:
+Even with garbage collection eliminating memory safety issues, logical errors remain possible. Forgetting to update new_node.next before the CAS could link a node incorrectly. Reading old_head.next before checking for nil would cause a null pointer error. Omitting the retry loop would silently drop pushes or return incorrect values.
+Lock-free programming requires reasoning about all possible interleavings of concurrent operations. The compiler cannot verify logical correctness of lock-free algorithms.
+When to Use atomic_ref
+Appropriate uses:
+Implementing concurrent data structures for the standard library is the primary intended use. Building specialized lock-free structures when standard library collections don't meet specific performance requirements is another valid case, as is implementing custom synchronization primitives not covered by channels and existing atomics.
+Inappropriate uses:
+General application code should use channels and standard library collections instead. Cases where a simple mutex would suffice don't warrant atomic references—Coex's task system handles contention efficiently. Premature "optimization" without profiling evidence that synchronization is a bottleneck leads to complexity without benefit.
+The standard library provides ConcurrentQueue<T>, ConcurrentStack<T>, ConcurrentMap<K, V>, and other collections that cover the vast majority of use cases. Reach for atomic_ref only when you have specific requirements that these cannot meet and you're prepared to invest in careful correctness reasoning.
+Interaction with Function Kinds
+atomic_ref operations are permitted only in task and func contexts, not in formula. This follows from the existing restriction that formulas cannot use atomics—atomic operations are inherently about coordination between concurrent executions, which contradicts the pure, parallelizable nature of formulas.
+formula bad_example(ref: atomic_ref<int>) -> int
+  return ref.load()  # ERROR: atomic operation in formula
+~
+
+task good_example(ref: atomic_ref<int>) -> int
+  return ref.load()  # OK: tasks can use atomics
+~
+Summary
+atomic_ref<T> completes Coex's concurrency primitive set, enabling implementation of arbitrary lock-free data structures without relying on runtime magic or unsafe foreign function interfaces. The combination of garbage collection (eliminating memory reclamation hazards) and sequential consistency (simplifying reasoning about operation ordering) makes the primitive more approachable than equivalents in systems languages, while compiler warnings ensure that its complexity is not encountered accidentally.
+Most Coex programmers will never use atomic_ref directly. Those who do should approach it with the respect due to any sharp tool: immensely capable in skilled hands, dangerous otherwise.
+
+3.6 No thread local state
+Without TLS, tasks become pure units of work with no thread affinity. The runtime can schedule them anywhere, migrate them freely, and multiplex thousands of tasks onto a small thread pool without concern for hidden per-thread state.
+This enables:
+M:N scheduling — Many tasks onto few OS threads. Tasks suspend at await, receive, send, and within boundaries, yielding to the scheduler. The scheduler runs the next ready task on whatever thread is available.
+Work stealing — Idle threads can steal tasks from busy threads' queues. Since tasks have no thread-local dependencies, stealing is always safe.
+Coroutine-based implementation — Tasks are stackless (or stackful) coroutines that capture their continuation at suspension points. No OS thread is blocked waiting; suspension just enqueues the continuation.
+Transparent thread pooling — The user writes task definitions, the runtime decides how many OS threads to use. Could be one per core, could adapt dynamically to load.
+This is exactly why languages with pervasive TLS (or implicit thread-local allocators, or thread-local caches) struggle with efficient async runtimes. Go went to great lengths to make goroutine migration work despite some TLS-like features. Rust's async ecosystem has ongoing friction around thread-local assumptions.
+Coex sidesteps all of it by design.
+Coex does not provide thread-local storage. Tasks have no implicit per-task persistent state beyond their explicit parameters and any atomics they reference.
+This is intentional. A task's behavior is determined entirely by:
+•	Its parameters (values received at invocation)
+•	Atomics and channels it accesses (explicit in type signatures or module scope)
+•	Its local var bindings (which exist only within the task's execution)
+There is no current_task(), no implicit context, no ambient state. If a task needs context, it receives that context as a parameter:
+task handle_request(ctx: RequestContext, req: Request) -> Response
+    user = authenticate(ctx, req.token)
+    data = fetch_data(ctx, user, req.query)
+    return format_response(ctx, data)
+~
+This verbosity is a feature: data flow is visible in signatures, and any function can be understood by examining its parameters.
+Idiomatic Context Passing
+When context must traverse many call layers, bundle related values into a context type:
+type ServiceContext:
+    db: DatabaseHandle
+    logger: Logger
+    config: Config
+    trace_id: string
+~
+
+task process(ctx: ServiceContext, work: WorkItem) -> Result
+    ctx.logger.info("Processing: " + work.id)
+    # ctx flows to all callees that need it
+~
+Traditional TLS Patterns and Their Coex Equivalents
+Programs using thread-local storage in other languages should translate to explicit patterns in Coex:
+Per-task random number generation: Pass RNG state as a parameter, or use a pure formula deriving randomness from an explicit seed. For concurrent random generation, use an atomic seed with fetch-add to generate independent streams.
+Current transaction or connection: Pass the transaction handle explicitly. This makes transaction boundaries visible in the code structure.
+Error context (errno): Use result types. Functions that can fail return Result<T, E> rather than setting implicit error state.
+Per-task caching: Use local var bindings within the task scope for short-lived caches, or explicit cache parameters for shared caches.
+Runtime Scheduling Freedom
+The absence of thread-local state grants the runtime complete freedom in task scheduling. Tasks may be:
+•	Executed on any OS thread in a pool
+•	Migrated between threads at suspension points
+•	Multiplexed via coroutines with minimal overhead
+•	Stolen by idle threads for load balancing
+The programmer writes sequential-looking task code. The runtime transparently schedules across available cores. A program with thousands of concurrent tasks might execute on a thread pool sized to the CPU core count, with tasks suspending and resuming as their I/O or synchronization operations complete.
+This scheduling model is only possible because tasks carry no hidden thread-affine state. The design choices—value semantics by default, atomics as the only shared mutation, explicit context passing—combine to enable an efficient, flexible runtime without programmer intervention.
+4. Cellular Automata (Matrices)
+Matrices are grid-based data structures with built-in support for parallel cell updates.
+4.1 Basic Syntax
+matrix Name[width, height]:
+  type: T
+  init: initial_value
+  formula method_name() -> T
+    # cell access and computation
+  ~
+~
+4.2 Cell Access
+Within matrix formulas:
+•	cell — Current cell’s value
+•	cell[x, y] — Relative neighbor access (offset from current cell)
+•	self — The entire matrix
+•	self[x, y] — Absolute cell access by coordinates
+•	self.width, self.height — Matrix dimensions
+Outside matrix (in func/task):
+•	matrix_name[x, y] — Absolute access
+4.3 Conway’s Game of Life
+matrix Life[200, 200]:
+  type: bool
+  init: false
+
+  formula evolve() -> bool
+    count = 0
+    for dx in [-1, 0, 1]
+      for dy in [-1, 0, 1]
+        if dx == 0 and dy == 0
+          continue
+        ~
+        neighbor = cell[dx, dy]
+        if neighbor != nil and neighbor
+          count += 1
+        ~
+      ~
+    ~
+    if cell
+      return count == 2 or count == 3
+    else
+      return count == 3
+    ~
+  ~
+~
+
+func main()
+  life = Life.new()
+  life.load_pattern("glider_gun.txt")
+  loop
+    life.evolve()
+    display(life)
+    sleep(100)
+    if life.generation() > 1000
+      break
+    ~
+  ~
+~
+4.4 Heat Diffusion
+matrix HeatGrid[100, 100]:
+  type: float
+  init: 0.0
+
+  formula diffuse() -> float
+    left = cell[-1, 0] ?? cell
+    right = cell[1, 0] ?? cell
+    up = cell[0, -1] ?? cell
+    down = cell[0, 1] ?? cell
+    return (left + right + up + down) / 4.0
+  ~
+~
+
+func main()
+  heat = HeatGrid.new()
+  heat.set(50, 50, 100.0)
+  for i in range(0, 1000)
+    heat.diffuse()
+  ~
+  heat.save_image("diffusion.png")
+~
+4.5 Self Reference
+Within a matrix formula, self refers to the entire matrix. This is useful for absolute positioning and accessing matrix-level properties:
+matrix Gradient[100, 100]:
+  type: float
+  init: 0.0
+
+  formula initialize() -> float
+    # Use absolute position to create gradient
+    return self[self.width / 2, self.height / 2]
+  ~
+
+  formula distance_from_center() -> float
+    # Access matrix dimensions via self
+    cx = self.width / 2
+    cy = self.height / 2
+    # Would need current position - design consideration
+    return 0.0
+  ~
+~
+ 
+5. Compiler Parallelization
+The compiler automatically parallelizes pure computations.
+5.1 Loop Parallelization
+When a formula is called in a loop with independent iterations, the compiler may parallelize:
+formula square(x: int) -> int
+  return x * x
+~
+
+func process()
+  numbers = range(1, 1000000)
+  results = []
+  for n in numbers
+    results.append(square(n))
+  ~
+~
+5.2 Matrix Parallelization
+Matrix formula applications are inherently parallel—all cells can be updated simultaneously:
+matrix Numbers[1000000]:
+  type: int
+  init: 0
+
+  formula square() -> int
+    return cell * cell
+  ~
+~
+
+func main()
+  nums = Numbers.new()
+  nums.load(range(1, 1000000))
+  nums.square()  # All cells computed in parallel
+~
+5.3 Reduction Recognition
+The compiler recognizes associative operations and generates parallel reductions:
+# Compiler parallelizes via tree reduction
+sum = 0
+for n in numbers
+  sum += n  # Associative - can parallelize
+~
+
+# Sequential when dependencies exist
+running_sum = 0
+for i in range(0, n)
+  running_sum = running_sum * 2 + nums[i]  # Dependent - stays sequential
+~
+ 
+6. Concurrency Patterns
+6.1 Fork-Join
+formula compute_partition(data: List<int>, start: int, end: int) -> int
+  sum = 0
+  for i in range(start, end)
+    sum += expensive_computation(data[i])
+  ~
+  return sum
+~
+
+func parallel_sum(data: List<int>) -> int
+  mid = len(data) / 2
+  result1 = compute_partition(data, 0, mid)
+  result2 = compute_partition(data, mid, len(data))
+  # Implicit barrier
+  return result1 + result2
+~
+6.2 Producer-Consumer
+task producer(output: Channel<int>)
+  for i in range(0, 100)
+    output.send(i)
+  ~
+  output.close()
+~
+
+task consumer(input: Channel<int>)
+  loop
+    value = input.receive()
+    if value == nil
+      break
+    ~
+    print("Consumed: " + str(value))
+  ~
+~
+
+func main()
+  chan = Channel<int>.new(buffer: 10)
+  producer(chan)
+  consumer(chan)
+~
+6.3 Resource Pool
+type ConnectionPool:
+  connections: Channel<Connection>
+
+  func new(size: int) -> ConnectionPool
+    pool = ConnectionPool(connections: Channel<Connection>.new(size))
+    for i in range(0, size)
+      pool.connections.send(create_connection())
+    ~
+    return pool
+  ~
+
+  task acquire() -> Connection
+    return connections.receive()
+  ~
+
+  task release(conn: Connection)
+    connections.send(conn)
+  ~
+~
+
+task api_request(req: Request, pool: ConnectionPool) -> Response
+  conn = pool.acquire()
+  result = await conn.query(req.sql)
+  pool.release(conn)
+  return result
+~
+
+func main()
+  pool = ConnectionPool.new(100)
+  for req in requests
+    api_request(req, pool)
+  ~
+~
+6.4 Request Batching
+type BatchRequest<T, R>:
+  input: T
+  response: Channel<R>
+~
+
+task batch_processor(requests: Channel<BatchRequest<T, R>>)
+  var batch: List<BatchRequest<T, R>> = []
+  loop
+    for i in range(0, BATCH_SIZE)
+      req = await requests.receive_timeout(10 * time.millisecond)
+      if req != nil
+        batch.append(req)
+      ~
+    ~
+
+    if len(batch) == 0
+      continue
+    ~
+
+    inputs = []
+    for req in batch
+      inputs.append(req.input)
+    ~
+
+    results = await bulk_query(inputs)
+
+    for i in range(0, len(batch))
+      batch[i].response.send(results[i])
+    ~
+
+    batch.clear()
+  ~
+~
+
+task make_request(input: T, batcher: Channel<BatchRequest<T, R>>) -> R
+  response = Channel<R>.new(buffer: 1)
+  batcher.send(BatchRequest(input: input, response: response))
+  return await response.receive()
+~
+6.5 Deadline Propagation
+task orchestrate_request(req: Request, deadline: int) -> Response
+  remaining = deadline
+  within remaining
+    auth_deadline = remaining * 0.2
+    user = within auth_deadline
+      await authenticate(req.token)
+    else
+      return Response.auth_timeout()
+    ~
+
+    remaining = remaining * 0.8
+
+    fetch_deadline = remaining * 0.5
+    data = within fetch_deadline
+      await fetch_user_data(user.id)
+    else
+      return Response.fetch_timeout()
+    ~
+
+    result = await process_response(data)
+    return result
+  else
+    return Response.deadline_exceeded()
+  ~
+~
+6.6 Speculative Execution
+task speculative_fetch(endpoints: List<string>) -> Result<Data>
+  results = Channel<Result<Data>>.new(buffer: len(endpoints))
+
+  for endpoint in endpoints
+    fetch_one(endpoint, results)
+  ~
+
+  within 10 * time.second
+    loop
+      result = results.receive()
+      if result != nil and result.is_ok()
+        return result
+      ~
+    ~
+  else
+    return Result.timeout("No endpoint responded in time")
+  ~
+~
+
+task fetch_one(endpoint: string, results: Channel<Result<Data>>)
+  within 8 * time.second
+    data = await http.get(endpoint)
+    results.send(Result.ok(data))
+  else
+    results.send(Result.error("Endpoint timeout: " + endpoint))
+  ~
+~
+6.7 Rate Limiting
+task rate_limited_processor(
+  requests: Channel<Request>,
+  min_interval: int
+)
+  var last_process_time: Time = Time.now()
+  loop
+    req = requests.receive()
+    if req == nil
+      break
+    ~
+
+    elapsed = Time.now() - last_process_time
+    if elapsed < min_interval
+      wait_time = min_interval - elapsed
+      await sleep(wait_time)
+    ~
+
+    within 30 * time.second
+      process_request(req)
+    else
+      log_timeout(req)
+    ~
+
+    last_process_time = Time.now()
+  ~
+~
+ 
+7. Type System
+7.1 Value Semantics-Immutability by Default
+All types in Coex have value semantics. Assignment always produces a logically independent copy of the value. This applies uniformly to primitive types, user-defined types, and collections.
+a = [1, 2, 3]
+b = a           # b is an independent copy
+var c = a       # c is an independent copy, rebindable
+c.append(4)     # c is now [1, 2, 3, 4]; a and b unchanged
+There is no aliasing in Coex. Two bindings never refer to "the same" mutable storage such that modifications through one are visible through the other. This guarantee is foundational to Coex's concurrency safety: a task that receives a value as a parameter owns that value exclusively and cannot observe modifications from other tasks.
+The compiler may implement value semantics through copy-on-write, structural sharing, or other optimizations, but the observable behavior is always as if a full copy occurred at assignment.
+The "var" keyword is then syntactic sugar for rebinding a new value to a name. Without it, a compiler error is thrown.
+The Two Kinds of Mutability
+Coex distinguishes between rebinding and shared mutation.
+Rebinding is purely local. A var declaration creates a name that can be bound to different values over time within its scope. The values themselves are never shared; rebinding one variable cannot affect any other binding anywhere in the program.
+var x = 1
+x = 2      # Rebinding: x now refers to the value 2
+Rebinding is available in task and func contexts. It provides the ergonomics of imperative programming while preserving local reasoning—you need only consider the current scope to understand what a var can become.
+Shared mutation requires atomic types. When multiple tasks must coordinate through shared state, they do so through atomic_int, atomic_float, atomic_bool, or atomic_ref<T>. These are the only mechanism for shared mutable state in Coex.
+var counter: atomic_int = 0    # Module-level shared state
+
+task increment()
+    counter.increment()        # Shared mutation
+~
+There are no global mutable variables, no mutable references passed between functions, and no out-parameters. Functions receive values and return values. If a function must mutate shared state, it receives an atomic handle and the mutation is explicit in both the type signature and the call site.
+This design makes sharing visible. Code that contains no atomic types cannot exhibit data races, and the presence of atomics signals "concurrent coordination happens here."
+Variables are immutable unless declared with var:
+x = 5
+x = 10  # Compile error
+
+var counter: int = 0
+counter += 1  # OK
+7.2 Type Inference
+Types are inferred where unambiguous:
+x = 5          # int
+y = 3.14       # float
+z = "hello"    # string
+
+# Explicit when needed
+func process(data: List<int>) -> Result
+  # ...
+~
+7.3 Primitive Types
+int           # 64-bit signed integer
+float         # 64-bit floating point
+bool          # Boolean
+string        # UTF-8 string
+byte          # 8-bit unsigned
+char          # 32-bit Unicode codepoint used to return string[element]
+
+atomic_int    # 64-bit atomic integer
+atomic_float  # 64-bit atomic float
+atomic_bool   # Atomic boolean
+7.4 Collection Families and Memory Layout
+Coex provides two families of collections with fundamentally different memory layouts and performance characteristics. The choice between them is semantically meaningful and reflects the programmer's intended usage pattern.
+Dense Collections
+Dense collections store elements in contiguous memory, providing O(1) indexed access and optimal cache locality. They are suitable for numerical computation, GPU offloading, and interoperation with external systems that expect specific memory layouts.
+Array<T>    # Contiguous sequence of elements
+String      # Contiguous UTF-8 encoded text
+Because dense collections guarantee contiguous layout, structural modifications require copying the entire backing storage. Appending, inserting, or removing elements is an O(n) operation.
+Persistent Collections
+Persistent collections use tree-based internal structures with node sharing. Individual access is O(log n), but structural modifications create new trees that share most nodes with the original, making transformations efficient regardless of collection size.
+List<T>     # Persistent sequence
+Map<K, V>   # Persistent key-value mapping
+Set<T>      # Persistent unordered unique elements
+Persistent collections are well-suited to functional programming patterns, incremental construction, and contexts where collections are frequently transformed.
+Conversion Between Families
+Explicit conversion methods allow programmers to choose when to pay the cost of changing representations.
+The packed() method converts persistent collections to dense form:
+List<T>.packed() -> Array<T>
+Set<T>.packed() -> Array<T>
+Map<K, V>.packed() -> (Array<K>, Array<V>)
+The unpacked() method converts dense collections to persistent form:
+Array<T>.unpacked() -> List<T>
+Both operations are O(n) and produce independent values—modifications to the result do not affect the source.
+# Build up results efficiently with persistent structure
+var result: List<float> = []
+for item in source
+    result = result.appended(transform(item))
+~
+
+# Convert to dense form for GPU computation
+dense = result.packed()
+gpu_compute(dense)
+The ordering of elements in Set<T>.packed() is unspecified. Programs requiring a particular order should sort before packing:
+sorted_array = my_set.sorted().packed()
+For Map<K, V>.packed(), the returned arrays maintain correspondence: keys[i] is associated with values[i] for all valid indices. Element ordering is unspecified.
+Matrices
+The matrix construct is a specialized dense structure for cellular automata and parallel grid computation. It maintains a double-buffered layout optimized for GPU offloading and does not participate in the pack/unpack system. See Section 4 for matrix semantics.
+Compiler Warnings for Dense Mutation
+The compiler emits warnings when transformation methods are called on dense collections, since these operations copy the entire backing storage.
+var data: Array<int> = load_data()
+data = data.appended(42)
+Warning:
+#@ dense-mutation: Transforming Array<T> copies all elements (O(n)).
+#@ Consider converting to List<T> for multiple transformations:
+#@     var working = data.unpacked()
+#@     working = working.appended(42)
+#@     data = working.packed()
+~
+data = data.appended(42)
+A single transformation may be intentional and appropriate. The warning ensures programmers are aware of the cost, particularly in loops:
+var arr: Array<int> = []
+for i in range(0, 1000)
+    arr = arr.appended(i)  # WARNING: O(n) inside loop = O(n²) total
+~
+Suppressing Warnings
+Warnings can be acknowledged or disabled using the standard #@ mechanism:
+#@ dense-mutation: ignore
+#@ Single append after batch processing is acceptable here~
+data = data.appended(final_element)
+File-level suppression:
+#@ dense-mutation: off~
+
+List<T>            # Dynamic array
+Map<K, V>          # Hash map
+Set<T>             # Hash set
+Channel<T>         # Typed channel
+7.5 Optional Types
+T?                 # Optional (T or nil)
+
+value = map.get(key)  # Returns T?
+if value != nil
+  process(value)
+~
+7.6 Result Types
+type Result<T, E>:
+  value: T?
+  error: E?
+~
+
+formula divide(a: int, b: int) -> Result<int, string>
+  if b == 0
+    return Result(error: "Division by zero")
+  ~
+  return Result(value: a / b)
+~
+
+func main()
+  result = divide(10, 0)
+  if result.error != nil
+    print("Error: " + result.error)
+  else
+    print("Result: " + str(result.value))
+  ~
+~
+7.7 Time Durations
+All time durations are integers in nanoseconds. The time module provides constants:
+time.nanosecond   # 1
+time.microsecond  # 1000
+time.millisecond  # 1000000
+time.second       # 1000000000
+time.minute       # 60000000000
+time.hour         # 3600000000000
+
+# Usage
+timeout = 5 * time.second
+interval = 100 * time.millisecond
+ 
+8. Object Model
+8.1 Type Definitions
+Types are defined with fields and methods:
+type Vector3:
+  x: float
+  y: float
+  z: float
+
+  formula magnitude() -> float
+    return sqrt(x*x + y*y + z*z)
+  ~
+
+  formula dot(other: Vector3) -> float
+    return x*other.x + y*other.y + z*other.z
+  ~
+
+  formula normalized() -> Vector3
+    mag = magnitude()
+    return Vector3(x: x/mag, y: y/mag, z: z/mag)
+  ~
+~
+8.2 Field and Method Access
+Within methods:
+•	Fields are directly in scope: x, y, z
+•	Sibling methods are directly callable: magnitude()
+•	self refers to the instance (rarely needed)
+•	Field shadowing is forbidden (compile error)
+type Point:
+  x: float
+  y: float
+
+  formula distance_to(other: Point) -> float
+    dx = x - other.x  # x is this.x
+    dy = y - other.y
+    return sqrt(dx*dx + dy*dy)
+  ~
+
+  formula scale(x: float) -> Point  # ERROR: shadows field
+    return Point(x: x * x, y: y * x)
+  ~
+~
+8.3 Traits
+Traits define interfaces for static polymorphism:
+trait Geometry:
+  formula area() -> float
+  formula perimeter() -> float
+~
+
+type Circle:
+  radius: float
+
+  formula area() -> float
+    return 3.14159 * radius * radius
+  ~
+
+  formula perimeter() -> float
+    return 2.0 * 3.14159 * radius
+  ~
+~
+
+type Rectangle:
+  width: float
+  height: float
+
+  formula area() -> float
+    return width * height
+  ~
+
+  formula perimeter() -> float
+    return 2.0 * (width + height)
+  ~
+~
+8.4 Generic Functions with Trait Bounds
+formula total_area<T: Geometry>(shapes: List<T>) -> float
+  sum = 0.0
+  for shape in shapes
+    sum += shape.area()
+  ~
+  return sum
+~
+All polymorphism is through monomorphization—the compiler generates specialized versions. There is no dynamic dispatch.
+8.5 Enums for Heterogeneous Collections
+For collections of different types, use enums:
+type Shape:
+  case Circle(radius: float)
+  case Rectangle(width: float, height: float)
+
+  formula area() -> float
+    match self
+      case Circle(r):
+        return 3.14159 * r * r
+      ~
+      case Rectangle(w, h):
+        return w * h
+      ~
+    ~
+  ~
+~
+
+formula total_area(shapes: List<Shape>) -> float
+  sum = 0.0
+  for shape in shapes
+    sum += shape.area()
+  ~
+  return sum
+~
+8.6 Factory Functions
+type Matrix4x4:
+  data: List<float>
+
+  formula identity() -> Matrix4x4
+    return Matrix4x4(data: [
+      1.0, 0.0, 0.0, 0.0,
+      0.0, 1.0, 0.0, 0.0,
+      0.0, 0.0, 1.0, 0.0,
+      0.0, 0.0, 0.0, 1.0
+    ])
+  ~
+~
+
+mat = Matrix4x4.identity()
+8.7 Types with Concurrent Methods
+type Counter:
+  value: atomic_int
+
+  task increment()
+    value.increment()
+  ~
+
+  task get() -> int
+    return value.load()
+  ~
+~
+8.8 Actor-Style Types
+type AccountManager:
+  requests: Channel<AccountRequest>
+
+  task deposit(account_id: int, amount: float)
+    requests.send(DepositRequest(account_id, amount))
+  ~
+
+  task process_requests()
+    var balances: Map<int, float> = {}
+    loop
+      req = requests.receive()
+      if req == nil
+        break
+      ~
+      match req
+        case DepositRequest(id, amount):
+          balances[id] = balances.get(id, 0.0) + amount
+        ~
+      ~
+    ~
+  ~
+~
+ 
+9. Function Calls and Returns
+9.1 Named Parameters
+Parameters are named by default:
+formula clamp(value: float, min: float, max: float) -> float
+  if value < min
+    return min
+  ~
+  if value > max
+    return max
+  ~
+  return value
+~
+
+result = clamp(value: x, min: 0.0, max: 1.0)
+9.2 Positional Parameters
+Use underscore prefix for positional parameters:
+formula sin(_ angle: float) -> float
+  return intrinsic_sin(angle)
+~
+
+formula sqrt(_ value: float) -> float
+  return intrinsic_sqrt(value)
+~
+
+y = sin(x) + cos(x)
+magnitude = sqrt(dx*dx + dy*dy)
+9.3 Mixed Parameters
+formula clamp(_ value: float, min: float, max: float) -> float
+  # value is positional, min/max are named
+~
+
+result = clamp(x, min: 0.0, max: 1.0)
+9.4 Tuple Returns
+formula divide(_ a: int, _ b: int) -> (quotient: int, remainder: int)
+  return (quotient: a / b, remainder: a % b)
+~
+
+(q, r) = divide(17, 5)
+# q = 3, r = 2
+
+# Or access by name
+result = divide(17, 5)
+print(result.quotient)
+9.5 Tuple Chaining
+formula get_credentials() -> (username: string, password: string)
+  return (username: "admin", password: "secret")
+~
+
+func connect(host: string, port: int, username: string, password: string)
+  # ...
+~
+
+# Tuple fields match parameter names
+get_credentials().connect(host: "localhost", port: 5432)
+ 
+10. Lambda Expressions
+10.1 Syntax
+Lambdas specify their function kind:
+formula(_ x: int) => x * x
+task(_ msg: Message) => output.send(transform(msg))
+10.2 Higher-Order Functions
+formula map(_ f: formula(int) -> int, _ data: List<int>) -> List<int>
+  result = []
+  for x in data
+    result.append(f(x))
+  ~
+  return result
+~
+
+formula filter(_ pred: formula(int) -> bool, _ data: List<int>) -> List<int>
+  result = []
+  for x in data
+    if pred(x)
+      result.append(x)
+    ~
+  ~
+  return result
+~
+
+squared = map(formula(_ x: int) => x * x, numbers)
+positive = filter(formula(_ x: int) => x > 0, numbers)
+10.3 Conditional Expressions
+absolute = map(formula(_ x: int) => x >= 0 ? x ; -x, numbers)
+
+clamped = map(
+  formula(_ x: int) => x < 0 ? 0 ; x > 100 ? 100 ; x,
+  numbers
+)
+ 
+Comprehensions
+destructuring patterns and comprehensions provide expressive, declarative syntax for common iteration patterns. They reduce boilerplate, improve readability, and most importantly, make parallelization opportunities explicit to the compiler. The implementation follows natural desugaring strategies, allowing correctness to be established before optimization work begins.
+This document specifies two related features for implementation in the Coex compiler:
+1.	Comprehension expressions — Declarative syntax for constructing lists, sets, and maps from iteration and filtering
+2.	Destructuring patterns — Pattern matching in binding positions within for loops and comprehensions
+These features work together: comprehensions use the same binding syntax as loops, and both now support destructuring.
+Part 1: Destructuring Patterns
+Destructuring allows binding multiple variables from a structured value in a single operation, rather than binding the whole value and extracting components separately.
+Without destructuring:
+for p in points
+  x = p.0
+  y = p.1
+  process(x, y)
+~
+With destructuring:
+for (x, y) in points
+  process(x, y)
+~
+Pattern Syntax
+A pattern can be:
+Simple variable — Binds the entire value to a name:
+x
+Tuple pattern — Matches tuple structure, binding components to nested patterns:
+(a, b)
+(x, y, z)
+((a, b), (c, d))
+Wildcard — Matches any value without binding:
+_
+(x, _)
+(_, _, z)
+Grammar Additions
+pattern
+    : IDENTIFIER                              # VariablePattern
+    | '_'                                     # WildcardPattern
+    | '(' pattern (',' pattern)+ ')'          # TuplePattern
+    ;
+
+forLoop
+    : 'for' pattern 'in' expression block
+    ;
+Note: A tuple pattern requires at least two elements. Single-element parenthesized patterns are just grouping, not tuple construction.
+Type Checking
+The compiler must verify that the pattern structure matches the element type of the collection being iterated:
+points: List<(int, int)>
+
+for (x, y) in points    # Valid: pattern (x, y) matches element type (int, int)
+  ...
+~
+
+for (a, b, c) in points  # Error: pattern has 3 elements, element type has 2
+  ...
+~
+Nested patterns must match nested structure:
+data: List<((int, int), string)>
+
+for ((x, y), name) in data   # Valid
+  ...
+~
+Code Generation
+Destructuring desugars to component extraction. The pattern (x, y) binding a value v of type (T, U) generates:
+x = v.0
+y = v.1
+Nested patterns desugar recursively:
+for ((a, b), c) in data
+  ...
+~
+Becomes:
+for __temp in data
+  __temp_0 = __temp.0
+  a = __temp_0.0
+  b = __temp_0.1
+  c = __temp.1
+  ...
+~
+Wildcards generate no binding.
+ 
+Part 2: Comprehension Expressions
+Comprehensions express collection construction declaratively, making parallelization and fusion opportunities lexically apparent. The compiler can optimize:
+[f(x) for x in data if p(x)]
+more aggressively than the equivalent loop because the intent is explicit.
+List Comprehensions
+Basic form:
+[expression for pattern in iterable]
+With filter:
+[expression for pattern in iterable if condition]
+Examples:
+[x * 2 for x in numbers]
+[x * 2 for x in numbers if x > 0]
+[(x, y) for (x, y) in points if x > y]
+Nested Iteration
+Multiple for clauses produce Cartesian products:
+[expression for pattern1 in iterable1 for pattern2 in iterable2]
+Clauses bind left to right. Later clauses can reference variables bound by earlier clauses:
+[(x, y) for x in xs for y in ys]           # All pairs
+[(x, y) for x in xs for y in ys if y > x]  # Pairs where y > x
+[(x, y) for x in xs if x > 0 for y in ys]  # Filter x first
+Arbitrary nesting depth is permitted.
+Conditional Expression in Body
+The body expression may use the conditional expression syntax condition ? true_expr ; false_expr:
+[x > 0 ? x ; -x for x in numbers]          # Absolute values
+[x > 0 ? "positive" ; "non-positive" for x in numbers]
+Set Comprehensions
+Set comprehensions use braces with a single expression:
+{expression for pattern in iterable}
+{expression for pattern in iterable if condition}
+Examples:
+{x * 2 for x in numbers}
+{name for (name, _) in entries if len(name) > 3}
+Map Comprehensions
+Map comprehensions use braces with a key-value pair separated by colon:
+{key_expr: value_expr for pattern in iterable}
+{key_expr: value_expr for pattern in iterable if condition}
+Examples:
+{k: v * 2 for (k, v) in pairs}
+{name: score for (name, score) in results if score > 0}
+{x: x * x for x in range(1, 10)}
+Grammar Additions
+comprehension
+    : '[' expression comprehensionClauses ']'              # ListComprehension
+    | '{' expression comprehensionClauses '}'              # SetComprehension
+    | '{' expression ':' expression comprehensionClauses '}'  # MapComprehension
+    ;
+
+comprehensionClauses
+    : comprehensionClause+
+    ;
+
+comprehensionClause
+    : 'for' pattern 'in' expression ('if' expression)?
+    ;
+Desugaring
+Comprehensions desugar to loops for initial implementation. Later optimization passes can recognize the comprehension origin and apply fusion and parallelization.
+List comprehension:
+[f(x) for x in data if p(x)]
+Desugars to:
+__result = []
+for x in data
+  if p(x)
+    __result.append(f(x))
+  ~
+~
+__result
+Nested comprehension:
+[(x, y) for x in xs if p(x) for y in ys if q(x, y)]
+Desugars to:
+__result = []
+for x in xs
+  if p(x)
+    for y in ys
+      if q(x, y)
+        __result.append((x, y))
+      ~
+    ~
+  ~
+~
+__result
+Map comprehension:
+{k: v for (k, v) in pairs if v > 0}
+Desugars to:
+__result = {}
+for (k, v) in pairs
+  if v > 0
+    __result[k] = v
+  ~
+~
+__result
+Type Inference
+The result type of a comprehension is inferred from its structure:
+•	[expr for ...] produces List<T> where T is the type of expr
+•	{expr for ...} produces Set<T> where T is the type of expr
+•	{k: v for ...} produces Map<K, V> where K is the type of k and V is the type of v
+The types of pattern variables are inferred from the element type of the iterable.
+ 
+Part 3: Comprehensions in Formulas
+Comprehensions are the preferred iteration construct in formulas because they make parallelization opportunities explicit.
+When a comprehension appears in a formula:
+1.	The compiler knows the result is a new collection (no mutation of existing data)
+2.	Each iteration is independent (body cannot affect other iterations)
+3.	Filter predicates are pure (no side effects determine inclusion)
+This enables several optimizations:
+Parallel mapping: Each element can be processed on a separate thread or GPU core.
+Fusion: Nested comprehensions or chained operations can be fused into a single pass:
+[g(y) for y in [f(x) for x in data] if p(y)]
+Fuses to: for each x, compute y = f(x), if p(y), emit g(y). No intermediate list.
+Vectorization: Arithmetic in comprehension bodies can be vectorized across elements.
+The compiler commentary system will suggest converting loops to comprehensions when it detects equivalent patterns, using the comprehension-suggestion category.
+ 
+Part 4: Implementation Checklist
+Lexer Changes
+No new tokens required. The grammar uses existing tokens: [, ], {, }, for, in, if, :, (, ), ,, _.
+Verify that _ is recognized as a valid identifier or add it as a special wildcard token if needed.
+Parser Changes
+1.	Add pattern rule with variable, wildcard, and tuple alternatives
+2.	Modify forLoop to use pattern instead of IDENTIFIER in binding position
+3.	Add comprehension rule for list, set, and map forms
+4.	Add comprehensionClauses and comprehensionClause rules
+5.	Integrate comprehension into the primary or atom expression rule
+AST Node Additions
+PatternNode (abstract)
+  ├── VariablePattern(name: string)
+  ├── WildcardPattern()
+  └── TuplePattern(elements: List<PatternNode>)
+
+ComprehensionNode (abstract)
+  ├── ListComprehension(body: ExprNode, clauses: List<CompClause>)
+  ├── SetComprehension(body: ExprNode, clauses: List<CompClause>)
+  └── MapComprehension(key: ExprNode, value: ExprNode, clauses: List<CompClause>)
+
+CompClause(pattern: PatternNode, iterable: ExprNode, condition: ExprNode?)
+Type Checker Changes
+1.	Implement pattern type matching: given an expected type and a pattern, bind variables to their types
+2.	For comprehensions, infer element type from iterable, use it to type-check the pattern, then type-check body/condition in the extended environment
+3.	For nested clauses, each clause extends the environment for subsequent clauses
+4.	Infer result type from comprehension form and body type
+Code Generator Changes
+1.	Implement pattern code generation: emit extractions and bindings
+2.	Implement comprehension desugaring to loops with result accumulation
+3.	Mark desugared comprehensions with metadata for later optimization passes
+Testing
+Suggested test cases:
+# Basic list comprehension
+assert [x * 2 for x in [1, 2, 3]] == [2, 4, 6]
+
+# With filter
+assert [x for x in [1, 2, 3, 4, 5] if x > 2] == [3, 4, 5]
+
+# Destructuring
+assert [x + y for (x, y) in [(1, 2), (3, 4)]] == [3, 7]
+
+# Nested iteration
+assert [(x, y) for x in [1, 2] for y in [3, 4]] == [(1, 3), (1, 4), (2, 3), (2, 4)]
+
+# Wildcard
+assert [x for (x, _) in [(1, 2), (3, 4)]] == [1, 3]
+
+# Conditional expression in body
+assert [x > 0 ? x ; 0 for x in [-1, 2, -3, 4]] == [0, 2, 0, 4]
+
+# Set comprehension
+assert {x for x in [1, 2, 2, 3]} == {1, 2, 3}
+
+# Map comprehension
+assert {x: x * x for x in [1, 2, 3]} == {1: 1, 2: 4, 3: 9}
+
+# Nested destructuring
+assert [a + c for ((a, b), (c, d)) in [((1, 2), (3, 4))]] == [4]
+
+# Destructuring in regular for loop
+total = 0
+for (x, y) in [(1, 2), (3, 4)]
+  total += x + y
+~
+assert total == 10
+ 
+11. Indexing
+11.1 Index Traits
+trait Index<I, R>:
+  formula get(_ index: I) -> R
+~
+
+trait IndexMut<I, V>:
+  task set(_ index: I, _ value: V)
+~
+11.2 String Indexing
+type string:
+  formula get(_ i: int) -> char
+    return char_at_position(i)
+  ~
+
+  formula get(_ r: Range) -> string
+    return substring(r.start, r.end_exclusive)
+  ~
+~
+
+c = text[5]        # char
+sub = text[0..10]  # string
+11.3 Custom Indexing
+type SparseMatrix<T>:
+  data: Map<(int, int), T>
+  default_value: T
+
+  formula get(_ row: int, _ col: int) -> T
+    key = (row, col)
+    return data.has(key) ? data.get(key) ; default_value
+  ~
+
+  task set(_ row: int, _ col: int, _ value: T)
+    key = (row, col)
+    data.set(key, value)
+  ~
+~
+
+sparse = SparseMatrix<float>.new(default_value: 0.0)
+value = sparse[100, 200]
+sparse[100, 200] = 3.14
+ 
+12. Syntax
+Comments
+# This is a comment.
+##
+This is a block comment
+##
+Compiler comments
+The Coex compiler can annotate source files with suggestions, warnings, and optimization hints directly in the code. This mechanism enables an interactive relationship between programmer and compiler: the compiler leaves notes about potential improvements, and the programmer either implements them, causing the compiler to remove its notes, or explicitly declines them, causing the compiler to remember the decision.
+Reserved Comment Syntax
+Lines beginning with #@ are reserved for compiler use. The compiler may freely add, modify, or remove any such line. Programmers may also write #@ lines to communicate decisions back to the compiler, but should understand that these lines exist in a shared namespace where the compiler has modification rights.
+#@ opt-001: This loop could be written as a comprehension
+#@ Consider: [x * 2 for x in data if x > 0]~
+result = []
+for x in data
+  if x > 0
+    result.append(x * 2)
+  ~
+~
+Consecutive #@ lines form a logical block. A tilde at the end of a line explicitly terminates the block, which is useful when multiple unrelated suggestions appear adjacently:
+#@ opt-001: Consider comprehension syntax~
+#@ opt-002: Parameter 'data' could use a more specific type~
+result = []
+Without the tildes, these would be ambiguous as to whether they form one block or two.
+Suggestion Lifecycle
+When the compiler identifies an optimization opportunity or stylistic improvement, it emits a suggestion with a unique identifier. On subsequent compilations, if the code has changed such that the suggestion no longer applies, the compiler removes its commentary automatically.
+For example, if the programmer rewrites the loop above as a comprehension:
+result = [x * 2 for x in data if x > 0]
+The compiler recognizes that opt-001 is resolved and removes the associated #@ lines on the next compilation pass.
+Suppressing Suggestions
+Programmers can respond to suggestions in two ways.
+The ignore keyword suppresses a specific suggestion instance. The compiler will not regenerate this suggestion at this location, but will continue to suggest the same pattern elsewhere in the file:
+#@ opt-001: ignore
+#@ Keeping explicit loop because early-exit logic
+#@ does not translate cleanly to comprehension form~
+for x in data
+  if should_stop(x)
+    break
+  ~
+  result.append(transform(x))
+~
+The off keyword disables an entire suggestion category for the current file. The compiler will not generate any suggestions of this type anywhere in the file:
+#@ comprehension-suggestion: off~
+This remains in the source as documentation of the decision. If the programmer later changes their mind, they remove the line.
+Opting Out Entirely
+Placing #@ none at the top of a file disables all compiler commentary for that file:
+#@ none
+
+formula compute(data: List<int>) -> int
+  total = 0
+  for n in data
+    total += n
+  ~
+  return total
+~
+The compiler will neither add suggestions nor modify any existing #@ lines in a file marked with #@ none. This is appropriate for generated code, legacy files undergoing gradual migration, or programmers who prefer an unadorned editing experience.
+Suggestion Categories
+The compiler organizes suggestions into categories. Each category has a kebab-case identifier used with the off keyword. The initial categories include:
+comprehension-suggestion — Loops that could be expressed as comprehensions, enabling fusion and parallelization optimizations.
+purity-suggestion — Functions declared as task or func that could be downgraded to formula because they use no impure operations.
+type-annotation — Places where explicit type annotations would enable better optimization or improve readability.
+parallelization-hint — Code patterns where restructuring would unlock automatic parallelization.
+Additional categories will be defined as the compiler's analysis capabilities expand.
+Design Rationale
+Traditional compilers emit warnings to a separate stream—standard error, a log file, or an IDE panel. This separation means warnings are often ignored, lost across compilation sessions, or disconnected from the code they reference. Programmers must maintain mental mappings between warning messages and source locations.
+Embedding suggestions directly in source code addresses these problems. Suggestions appear exactly where they apply. They persist across sessions until resolved. The decision to ignore a suggestion is documented in the code itself, visible to other programmers and to version control. The compiler's analytical capabilities become a form of automated code review that improves code incrementally over time.
+The #@ prefix ensures that compiler commentary is syntactically distinct from programmer comments and cannot be confused with code. Because the compiler has explicit permission to modify these lines, there is no risk of the compiler accidentally altering programmer intent—the boundary between compiler-managed and programmer-managed content is lexically unambiguous.
+Understand that the compiler maintains full control of #@ lines and has explicit permission to remove them.
+Literals 
+0xAE	hex literal
+0b0011	binary literal
+No octal.
+1.5e10	float literal.
+No underscores in numerical literals.
+.. is a range literal, as in [1..10] to return elements 1 through 10.
+? ; is the complete ternary syntax for conditional expressions. They can nest without parenthesis and ; (else) is optional.
+Escape sequences in String Literals
+"this" + '\n'+"is a two-line string literal"
+Quote and apostrophe are equivalent and can be used to capture the other as a string literal. Escape characters are as per UNIX norms. No string interpolation, use concat.
+Modules
+Import "library"	# allows dotted access (e.g., time.second)
+From "time" import "second"	#puts second in the namespace.
+From "time" import "second" as "s"	# used to resolve namespace conflicts or for convenience.
+Block Terminators
+Coex uses two block terminators:
+•	~ — Lightweight terminator for single statements and short blocks
+•	end — Explicit terminator for complex nested structures
+Both are valid; use whichever improves readability:
+# Using ~
+formula square(x: int) -> int
+  return x * x
+~
+
+# Using end
+matrix Life[200, 200]:
+  type: bool
+  init: false
+  formula evolve() -> bool
+    count = 0
+    for dx in [-1, 0, 1]
+      for dy in [-1, 0, 1]
+        if dx == 0 and dy == 0
+          continue
+        ~
+        if cell[dx, dy]
+          count += 1
+        ~
+      ~
+    ~
+    if cell
+      return count == 2 or count == 3
+    ~
+    return count == 3
+  end
+end

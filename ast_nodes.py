@@ -50,6 +50,7 @@ class UnaryOp(Enum):
 
 class AssignOp(Enum):
     ASSIGN = "="
+    MOVE_ASSIGN = ":="
     PLUS_ASSIGN = "+="
     MINUS_ASSIGN = "-="
     STAR_ASSIGN = "*="
@@ -458,6 +459,7 @@ class VarDecl(Stmt):
     type_annotation: Optional[Type]
     initializer: Expr
     is_mutable: bool = True  # var = mutable, no var = immutable
+    is_move: bool = False  # True if := was used
 
 
 @dataclass
