@@ -148,6 +148,13 @@ class CodeGenerator:
                                       ir.IntType(64)])
         self.memcpy = ir.Function(self.module, memcpy_ty, name="memcpy")
 
+        # memset
+        memset_ty = ir.FunctionType(ir.IntType(8).as_pointer(),
+                                     [ir.IntType(8).as_pointer(),
+                                      ir.IntType(8),
+                                      ir.IntType(64)])
+        self.memset = ir.Function(self.module, memset_ty, name="memset")
+
         # Initialize garbage collector (must be before struct helpers that use gc_alloc)
         self.gc = GarbageCollector(self.module, self)
         self.gc.generate_gc_runtime()
@@ -509,48 +516,250 @@ class CodeGenerator:
         # Add to tree block: existing tree, need to add leaf at correct position
         builder.position_at_end(add_to_tree_block)
 
-        # For depth 1, leaves_in_tree tells us which slot to use (it's the next index)
-        # We need to copy the root node (path copying for immutability)
+        # Full persistent vector append with support for depth > 1
+        # Algorithm:
+        # 1. Check if tree is full at current depth (leaves_in_tree >= 32^depth)
+        # 2. If full, increase depth by creating new root with old root at children[0]
+        # 3. Path-copy from root to insertion point
+        #
+        # Max leaves at depth d = 32^d = 1 << (5*d)
+        # leaves_in_tree is the index where we want to insert the new leaf
 
-        # Copy old root node
-        new_root_raw_add = builder.call(self.malloc, [pv_node_size])
-        new_root_add = builder.bitcast(new_root_raw_add, self.pv_node_struct.as_pointer())
+        # Calculate max_leaves at current depth = 1 << (5 * old_depth)
+        depth_times_5 = builder.mul(old_depth, ir.Constant(i32, 5))
+        max_leaves = builder.shl(ir.Constant(i32, 1), depth_times_5)
+
+        # Check if we need to increase depth
+        need_depth_increase = builder.icmp_unsigned(">=", leaves_in_tree, max_leaves)
+        depth_increase_block = func.append_basic_block("depth_increase")
+        path_copy_block = func.append_basic_block("path_copy")
+        builder.cbranch(need_depth_increase, depth_increase_block, path_copy_block)
+
+        # --- Depth increase: create new root with old root at children[0] ---
+        builder.position_at_end(depth_increase_block)
+
+        # Create new root node
+        new_uber_root_raw = builder.call(self.malloc, [pv_node_size])
+        new_uber_root = builder.bitcast(new_uber_root_raw, self.pv_node_struct.as_pointer())
 
         # Initialize refcount = 1
+        uber_refcount_ptr = builder.gep(new_uber_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), uber_refcount_ptr)
+
+        # Zero out children array first
+        uber_children_ptr = builder.gep(new_uber_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        uber_children_i8 = builder.bitcast(uber_children_ptr, ir.IntType(8).as_pointer())
+        children_array_size = ir.Constant(i64, 32 * 8)
+        builder.call(self.memset, [uber_children_i8, ir.Constant(ir.IntType(8), 0), children_array_size])
+
+        # Put old root at children[0]
+        uber_child0_ptr = builder.gep(new_uber_root, [ir.Constant(i32, 0), ir.Constant(i32, 1), ir.Constant(i32, 0)], inbounds=True)
+        old_root_as_i8ptr = builder.bitcast(old_root, ir.IntType(8).as_pointer())
+        builder.store(old_root_as_i8ptr, uber_child0_ptr)
+
+        # Increment old root's refcount
+        old_root_refcount_ptr = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root_refcount = builder.load(old_root_refcount_ptr)
+        new_old_root_refcount = builder.add(old_root_refcount, ir.Constant(i64, 1))
+        builder.store(new_old_root_refcount, old_root_refcount_ptr)
+
+        # New depth = old_depth + 1
+        increased_depth = builder.add(old_depth, ir.Constant(i32, 1))
+        builder.branch(path_copy_block)
+
+        # --- Path copy: insert leaf at correct position ---
+        builder.position_at_end(path_copy_block)
+
+        # PHI nodes for working root and depth
+        working_root = builder.phi(self.pv_node_struct.as_pointer(), name="working_root")
+        working_root.add_incoming(new_uber_root, depth_increase_block)
+        working_root.add_incoming(old_root, add_to_tree_block)
+
+        working_depth = builder.phi(i32, name="working_depth")
+        working_depth.add_incoming(increased_depth, depth_increase_block)
+        working_depth.add_incoming(old_depth, add_to_tree_block)
+
+        # Now do path-copy insertion
+        # For inserting leaf at leaf_idx in depth d:
+        # - Allocate path array on stack (max depth ~6 for billions of elements)
+        # - Descend from root, copying nodes at each level
+        # - Insert leaf at bottom level
+        # - Return new root
+
+        # Allocate space for path (array of node pointers, max 8 levels should be enough)
+        path_alloca = builder.alloca(ir.ArrayType(self.pv_node_struct.as_pointer(), 8), name="path")
+
+        # Allocate level counter
+        level_alloca = builder.alloca(i32, name="level")
+        start_level = builder.sub(working_depth, ir.Constant(i32, 1))
+        builder.store(start_level, level_alloca)
+
+        # Allocate current node pointer
+        current_alloca = builder.alloca(self.pv_node_struct.as_pointer(), name="current")
+        builder.store(working_root, current_alloca)
+
+        # Copy the root node first (we always need a new root)
+        new_root_raw_add = builder.call(self.malloc, [pv_node_size])
+        new_root_add = builder.bitcast(new_root_raw_add, self.pv_node_struct.as_pointer())
         add_refcount_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(ir.Constant(i64, 1), add_refcount_ptr)
 
-        # Copy all 32 children pointers from old root to new root
-        # (This is a simplified approach - we copy all slots)
-        old_children_ptr = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Copy root's children
+        old_children_ptr = builder.gep(working_root, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         new_children_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_array_size = ir.Constant(i64, 32 * 8)  # 32 pointers * 8 bytes
         old_children_i8 = builder.bitcast(old_children_ptr, ir.IntType(8).as_pointer())
         new_children_i8 = builder.bitcast(new_children_ptr, ir.IntType(8).as_pointer())
         builder.call(self.memcpy, [new_children_i8, old_children_i8, children_array_size])
 
-        # Add new leaf at position leaves_in_tree
-        # Note: For depth > 1 this would need to be a recursive path copy, but for depth 1 it's direct
-        new_child_slot_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaves_in_tree], inbounds=True)
-        builder.store(leaf_data, new_child_slot_ptr)
+        # Store new root in path[depth-1]
+        path_slot = builder.gep(path_alloca, [ir.Constant(i32, 0), start_level], inbounds=True)
+        builder.store(new_root_add, path_slot)
 
-        # For depth 1, we don't need to increment depth unless we've filled all 32 slots
-        # But for simplicity now, keep depth the same (this limits us to 1024 elements + 32 in tail)
-        # Full support for depth > 1 will come in Session 5
-        new_depth_add = old_depth
+        # Check if depth is 1 (simple case: just insert leaf directly)
+        is_depth_1 = builder.icmp_signed("==", working_depth, ir.Constant(i32, 1))
+        depth_1_insert_block = func.append_basic_block("depth_1_insert")
+        multi_level_block = func.append_basic_block("multi_level")
+        builder.cbranch(is_depth_1, depth_1_insert_block, multi_level_block)
+
+        # --- Depth 1: simple direct insertion ---
+        builder.position_at_end(depth_1_insert_block)
+        leaf_slot_d1 = builder.and_(leaves_in_tree, ir.Constant(i32, 0x1F))
+        leaf_ptr_d1 = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaf_slot_d1], inbounds=True)
+        builder.store(leaf_data, leaf_ptr_d1)
         builder.branch(merge_block)
+
+        # --- Multi-level: path copy down the tree ---
+        builder.position_at_end(multi_level_block)
+
+        # Loop to descend and copy nodes
+        descend_cond = func.append_basic_block("descend_cond")
+        descend_body = func.append_basic_block("descend_body")
+        descend_done = func.append_basic_block("descend_done")
+
+        # Initialize: start at level depth-2 (we already copied root at depth-1)
+        level_minus_2 = builder.sub(working_depth, ir.Constant(i32, 2))
+        builder.store(level_minus_2, level_alloca)
+
+        # Parent node is new_root_add
+        parent_alloca = builder.alloca(self.pv_node_struct.as_pointer(), name="parent")
+        builder.store(new_root_add, parent_alloca)
+
+        builder.branch(descend_cond)
+
+        # Loop condition: level >= 0
+        builder.position_at_end(descend_cond)
+        current_level = builder.load(level_alloca)
+        continue_descend = builder.icmp_signed(">=", current_level, ir.Constant(i32, 0))
+        builder.cbranch(continue_descend, descend_body, descend_done)
+
+        # Loop body: copy or create node at this level
+        builder.position_at_end(descend_body)
+
+        parent_node = builder.load(parent_alloca)
+        level_for_calc = builder.load(level_alloca)
+
+        # Calculate child index: (leaf_idx >> ((level+1) * 5)) & 0x1F
+        level_plus_1 = builder.add(level_for_calc, ir.Constant(i32, 1))
+        shift_amt = builder.mul(level_plus_1, ir.Constant(i32, 5))
+        shifted_idx = builder.lshr(leaves_in_tree, shift_amt)
+        child_idx = builder.and_(shifted_idx, ir.Constant(i32, 0x1F))
+
+        # Get child pointer from parent
+        parent_children = builder.gep(parent_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        child_ptr_ptr = builder.gep(parent_children, [ir.Constant(i32, 0), child_idx], inbounds=True)
+        old_child_i8 = builder.load(child_ptr_ptr)
+
+        # Check if child exists
+        child_is_null = builder.icmp_unsigned("==", old_child_i8, ir.Constant(ir.IntType(8).as_pointer(), None))
+        create_child_block = func.append_basic_block("create_child")
+        copy_child_block = func.append_basic_block("copy_child")
+        child_done_block = func.append_basic_block("child_done")
+        builder.cbranch(child_is_null, create_child_block, copy_child_block)
+
+        # Create new child node (branch didn't exist before)
+        builder.position_at_end(create_child_block)
+        new_child_raw_create = builder.call(self.malloc, [pv_node_size])
+        new_child_create = builder.bitcast(new_child_raw_create, self.pv_node_struct.as_pointer())
+        create_child_refcount = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), create_child_refcount)
+        # Zero out children
+        create_child_children = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        create_child_children_i8 = builder.bitcast(create_child_children, ir.IntType(8).as_pointer())
+        builder.call(self.memset, [create_child_children_i8, ir.Constant(ir.IntType(8), 0), children_array_size])
+        builder.branch(child_done_block)
+
+        # Copy existing child node
+        builder.position_at_end(copy_child_block)
+        old_child_node = builder.bitcast(old_child_i8, self.pv_node_struct.as_pointer())
+        new_child_raw_copy = builder.call(self.malloc, [pv_node_size])
+        new_child_copy = builder.bitcast(new_child_raw_copy, self.pv_node_struct.as_pointer())
+        copy_child_refcount = builder.gep(new_child_copy, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i64, 1), copy_child_refcount)
+        # Copy children from old node
+        old_child_children = builder.gep(old_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_child_children = builder.gep(new_child_copy, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_child_children_i8 = builder.bitcast(old_child_children, ir.IntType(8).as_pointer())
+        new_child_children_i8 = builder.bitcast(new_child_children, ir.IntType(8).as_pointer())
+        builder.call(self.memcpy, [new_child_children_i8, old_child_children_i8, children_array_size])
+        builder.branch(child_done_block)
+
+        # Merge: get the new child node
+        builder.position_at_end(child_done_block)
+        new_child_phi = builder.phi(self.pv_node_struct.as_pointer(), name="new_child")
+        new_child_phi.add_incoming(new_child_create, create_child_block)
+        new_child_phi.add_incoming(new_child_copy, copy_child_block)
+
+        # Update parent's child pointer
+        new_child_as_i8 = builder.bitcast(new_child_phi, ir.IntType(8).as_pointer())
+        builder.store(new_child_as_i8, child_ptr_ptr)
+
+        # Store in path array
+        current_level_reload = builder.load(level_alloca)
+        path_slot_loop = builder.gep(path_alloca, [ir.Constant(i32, 0), current_level_reload], inbounds=True)
+        builder.store(new_child_phi, path_slot_loop)
+
+        # Update parent for next iteration
+        builder.store(new_child_phi, parent_alloca)
+
+        # Decrement level
+        new_level = builder.sub(current_level_reload, ir.Constant(i32, 1))
+        builder.store(new_level, level_alloca)
+
+        builder.branch(descend_cond)
+
+        # Loop done: insert leaf at bottom level
+        builder.position_at_end(descend_done)
+
+        # The bottom node is in parent_alloca (it's the level-0 node)
+        bottom_node = builder.load(parent_alloca)
+
+        # Calculate leaf slot: leaves_in_tree & 0x1F
+        leaf_slot_multi = builder.and_(leaves_in_tree, ir.Constant(i32, 0x1F))
+
+        # Insert leaf
+        leaf_ptr_multi = builder.gep(bottom_node, [ir.Constant(i32, 0), ir.Constant(i32, 1), leaf_slot_multi], inbounds=True)
+        builder.store(leaf_data, leaf_ptr_multi)
+
+        # New root is new_root_add, new depth is working_depth
+        builder.branch(merge_block)
+
+        # Update merge block PHI nodes
+        new_depth_add = working_depth
 
         # Merge block: finalize new list
         builder.position_at_end(merge_block)
 
         # PHI nodes for new_root and new_depth
+        # Incoming from: create_root_block, depth_1_insert_block, descend_done
         new_root_phi = builder.phi(self.pv_node_struct.as_pointer(), name="new_root")
         new_root_phi.add_incoming(new_root_create, create_root_block)
-        new_root_phi.add_incoming(new_root_add, add_to_tree_block)
+        new_root_phi.add_incoming(new_root_add, depth_1_insert_block)
+        new_root_phi.add_incoming(new_root_add, descend_done)
 
         new_depth_phi = builder.phi(i32, name="new_depth")
         new_depth_phi.add_incoming(new_depth_create, create_root_block)
-        new_depth_phi.add_incoming(new_depth_add, add_to_tree_block)
+        new_depth_phi.add_incoming(working_depth, depth_1_insert_block)
+        new_depth_phi.add_incoming(working_depth, descend_done)
 
         # Set new list's root
         new_list_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)

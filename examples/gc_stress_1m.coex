@@ -1,0 +1,13 @@
+# GC Stress Test: 1 million elements
+# Stretch goal - should work after GC fix
+
+func main() -> int
+    var arr: List<int> = []
+    var i: int = 0
+    for i in 0..1000000
+        arr = arr.append(i)
+    ~
+    print(arr.len())
+    print(arr.get(999999))
+    return 0
+~

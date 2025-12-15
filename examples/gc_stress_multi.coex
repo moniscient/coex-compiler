@@ -1,0 +1,25 @@
+# GC Stress Test: Multiple medium lists
+# Tests whether GC properly reclaims memory between function calls
+
+func test_size(_ size: int) -> int
+    var arr: List<int> = []
+    var i: int = 0
+    for i in 0..size
+        arr = arr.append(i)
+    ~
+    return arr.len()
+~
+
+func main() -> int
+    # Each call creates and discards a large list
+    # GC should reclaim memory between calls
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    print(test_size(100000))
+    return 0
+~

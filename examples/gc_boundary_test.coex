@@ -1,0 +1,23 @@
+# GC Boundary Test: Incremental growth to find failure point
+# Works at 500k, fails at 750k
+
+func main() -> int
+    var arr: List<int> = []
+    var i: int = 0
+
+    # Phase 1: Build to 500k (should work)
+    for i in 0..500000
+        arr = arr.append(i)
+    ~
+    print(arr.len())
+    print(arr.get(499999))
+
+    # Phase 2: Continue to 750k (currently fails)
+    for i in 500000..750000
+        arr = arr.append(i)
+    ~
+    print(arr.len())
+    print(arr.get(749999))
+
+    return 0
+~

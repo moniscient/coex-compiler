@@ -16,7 +16,7 @@ class GarbageCollector:
     """Generates LLVM IR for garbage collection runtime"""
 
     # Constants
-    HEAP_SIZE = 1024 * 1024  # 1MB initial heap (easily modifiable)
+    HEAP_SIZE = 256 * 1024 * 1024  # 256MB initial heap (easily modifiable)
     HEADER_SIZE = 16         # 8-byte size + 4-byte type_id + 4-byte flags
     MIN_BLOCK_SIZE = 24      # Minimum block: header(16) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
