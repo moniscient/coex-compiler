@@ -11748,11 +11748,10 @@ class CodeGenerator:
         elem_type = self._get_llvm_type(matrix_decl.element_type)
         
         # Create matrix struct type
-        # struct Matrix_Name { 
-        #   i64 width, i64 height, 
+        # struct Matrix_Name {
+        #   i64 width, i64 height,
         #   elem_type* read_buffer,   # Current state (read from)
         #   elem_type* write_buffer,  # Next state (write to)
-        #   i64 generation
         # }
         struct_name = f"struct.Matrix_{name}"
         matrix_struct = ir.global_context.get_identified_type(struct_name)
@@ -11761,7 +11760,6 @@ class CodeGenerator:
             ir.IntType(64),           # height
             elem_type.as_pointer(),   # read_buffer
             elem_type.as_pointer(),   # write_buffer
-            ir.IntType(64),           # generation
         )
         self.matrix_structs[name] = matrix_struct
         
@@ -11815,7 +11813,7 @@ class CodeGenerator:
             height_val = builder.zext(height_val, ir.IntType(64))
         
         # Allocate matrix struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 40)  # 5 * 8 bytes
+        struct_size = ir.Constant(ir.IntType(64), 32)  # 4 * 8 bytes
         matrix_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_UNKNOWN)
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, matrix_type_id])
         matrix_ptr = builder.bitcast(raw_ptr, matrix_ptr_type)
@@ -11856,14 +11854,7 @@ class CodeGenerator:
             ir.Constant(ir.IntType(32), 3)
         ], inbounds=True)
         builder.store(write_buffer, write_field)
-        
-        # Initialize generation to 0
-        gen_field = builder.gep(matrix_ptr, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 4)
-        ], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), gen_field)
-        
+
         # Initialize all cells to init_value
         # for i in range(total_cells): buffer[i] = init_val
         idx_ptr = builder.alloca(ir.IntType(64), name="init_idx")
@@ -12230,16 +12221,7 @@ class CodeGenerator:
         current_write = self.builder.load(write_field)
         self.builder.store(current_write, read_field)
         self.builder.store(current_read, write_field)
-        
-        # Increment generation
-        gen_field = self.builder.gep(self_ptr, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 4)
-        ], inbounds=True)
-        gen = self.builder.load(gen_field)
-        next_gen = self.builder.add(gen, ir.Constant(i64, 1))
-        self.builder.store(next_gen, gen_field)
-        
+
         self.builder.ret_void()
         
         # Restore state
