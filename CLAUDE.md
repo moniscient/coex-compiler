@@ -15,6 +15,14 @@ python3 coexc.py source.coex -o output
 antlr -Dlanguage=Python3 -visitor Coex.g4
 ```
 
+## Directives
+
+Always use a test-first methodology when implementing a feature or troubleshooting a bug. Develop a test that expresses the bug as a failure or shows the feature lacking generating an erorr, and then work towards a solution that resolves the test. 
+
+Write simple tests for bug completion and feature implementation. Then write stress-tests that show the bug or feature continuing to operate at large-scale, defined as millions of units and gigabytes of memory consumption.
+
+Write benchmarks that show the possibility of pathologically long run time compared to reasonable expectation from other langauges. Ask about long run times to determine whether they should be investigated as bugs or architectural immprovements.
+
 ## Architecture
 
 ```
@@ -179,12 +187,3 @@ ternaryExpr → orExpr → andExpr → notExpr → nullCoalesceExpr
 statement: varDeclStmt | ifStmt | forStmt | loopStmt | matchStmt
          | selectStmt | withinStmt | returnStmt | breakStmt | continueStmt
 ```
-
-## Not Yet Implemented (from grammar)
-
-- `while` loops (keyword exists, no codegen)
-- `select` statement (channel multiplexing - stub)
-- `within`/`else` (temporal constraints - stub)
-- `await` (returns value immediately)
-- Parallel matrix execution
-- True concurrency

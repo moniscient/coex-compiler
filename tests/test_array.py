@@ -251,11 +251,11 @@ func main() -> int
     var list: List<int> = [1, 2, 3]
     var arr: Array<int> = list.packed()
     var s: int = arr.size()
-    # Size should be 40 (header: 5 x 8-byte fields) + 3 * 8 (data) = 64
+    # Size should be 32 (header: 4 x 8-byte fields) + 3 * 8 (data) = 56
     print(s)
     return 0
 ~
-''', "64\n")
+''', "56\n")
 
 
 class TestArrayValueSemantics:

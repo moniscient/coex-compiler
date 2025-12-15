@@ -19,8 +19,8 @@ class GarbageCollector:
     HEAP_SIZE = 256 * 1024 * 1024  # 256MB initial heap segment
     MAX_HEAP_SIZE = 8 * 1024 * 1024 * 1024  # 8GB maximum total heap
     GC_TRIGGER_INTERVAL = 100000   # Trigger GC every 100k allocations
-    HEADER_SIZE = 16         # 8-byte size + 4-byte type_id + 4-byte flags
-    MIN_BLOCK_SIZE = 24      # Minimum block: header(16) + alignment padding
+    HEADER_SIZE = 24         # 8-byte size + 4-byte type_id + 4-byte flags + 8-byte finalizer
+    MIN_BLOCK_SIZE = 32      # Minimum block: header(24) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
 
     # Flag bits in header
@@ -53,6 +53,9 @@ class GarbageCollector:
 
     # Context stack configuration
     MAX_CONTEXT_DEPTH = 16   # Maximum nested context depth
+
+    # Root registry configuration
+    MAX_ROOTS = 1024         # Maximum number of registered roots
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -112,6 +115,51 @@ class GarbageCollector:
         self.gc_pop_context = None
         self.gc_alloc_in_context = None
 
+        # Finalizer support
+        self.gc_set_finalizer = None
+
+        # pthread functions
+        self.pthread_create = None
+        self.pthread_join = None
+        self.pthread_mutex_init = None
+        self.pthread_mutex_lock = None
+        self.pthread_mutex_unlock = None
+        self.pthread_mutex_destroy = None
+        self.pthread_cond_init = None
+        self.pthread_cond_wait = None
+        self.pthread_cond_signal = None
+        self.pthread_cond_broadcast = None
+        self.pthread_cond_destroy = None
+
+        # GC thread globals
+        self.gc_thread = None           # pthread_t for GC thread
+        self.gc_running = None          # i32: 0=stopped, 1=running
+        self.gc_phase = None            # i32: 0=idle, 1=mark, 2=sweep
+        self.gc_request = None          # i32: request collection flag
+        self.heap_mutex = None          # pthread_mutex_t for heap protection
+        self.gc_cond = None             # pthread_cond_t for signaling GC thread
+
+        # GC thread functions
+        self.gc_thread_main = None
+        self.gc_shutdown = None
+
+        # Root registry globals
+        self.gc_roots = None            # i8**[MAX_ROOTS] - array of root pointer slots
+        self.gc_root_count = None       # i32 - number of registered roots
+        self.gc_roots_mutex = None      # pthread_mutex_t for root registry protection
+
+        # Root registry functions
+        self.gc_register_root = None    # gc_register_root(ptr**) -> i32 (returns handle)
+        self.gc_unregister_root = None  # gc_unregister_root(handle) -> void
+
+        # Write barrier function
+        self.gc_write_barrier = None    # gc_write_barrier(old_ptr: i8*) -> void
+
+        # GC phase constants
+        self.GC_PHASE_IDLE = 0
+        self.GC_PHASE_MARK = 1
+        self.GC_PHASE_SWEEP = 2
+
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
         self._create_types()
@@ -134,16 +182,27 @@ class GarbageCollector:
         self._implement_gc_push_context()
         self._implement_gc_pop_context()
         self._implement_gc_alloc_in_context()
+        # Finalizer support
+        self._implement_gc_set_finalizer()
+        # Root registry functions
+        self._implement_gc_register_root()
+        self._implement_gc_unregister_root()
+        # GC thread functions
+        self._implement_gc_thread_main()
+        self._implement_gc_shutdown()
+        # Write barrier for concurrent mark phase
+        self._implement_gc_write_barrier()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
-        # Object header: { i64 size, i32 type_id, i32 flags }
+        # Object header: { i64 size, i32 type_id, i32 flags, i8* finalizer }
         # Size is preserved from allocation so sweep can traverse the heap.
         # Placed immediately before the user data (at negative offset)
         self.header_type = ir.LiteralStructType([
-            self.i64,  # block size (including header) - preserved for sweep
-            self.i32,  # type_id (index into type table)
-            self.i32,  # flags (bit 0 = mark, bits 1-31 reserved)
+            self.i64,      # block size (including header) - preserved for sweep
+            self.i32,      # type_id (index into type table)
+            self.i32,      # flags (bit 0 = mark, bit 1 = pinned, bit 2 = has_finalizer)
+            self.i8_ptr,   # finalizer function pointer (null if none)
         ])
 
         # Free list node: { i64 size, i8* next }
@@ -169,6 +228,20 @@ class GarbageCollector:
             self.i64,       # heap_size - size of this context's heap
             self.i32,       # context_type (MAIN=0, NURSERY=1, LARGE=2, IMMORTAL=3)
         ])
+
+        # pthread types - sizes vary by platform, use opaque arrays
+        # pthread_t is typically 8 bytes on 64-bit systems
+        self.pthread_t_type = self.i64
+
+        # pthread_mutex_t is typically 40-64 bytes, use 64 for safety
+        # On macOS: 64 bytes, on Linux: 40 bytes
+        self.pthread_mutex_type = ir.ArrayType(self.i8, 64)
+
+        # pthread_cond_t is typically 48 bytes
+        self.pthread_cond_type = ir.ArrayType(self.i8, 48)
+
+        # pthread_attr_t - used as null pointer typically
+        self.pthread_attr_ptr_type = self.i8_ptr
 
     def _create_globals(self):
         """Create GC global variables"""
@@ -221,6 +294,57 @@ class GarbageCollector:
         self.main_context = ir.GlobalVariable(self.module, self.heap_context_type.as_pointer(), name="gc_main_context")
         self.main_context.initializer = ir.Constant(self.heap_context_type.as_pointer(), None)
         self.main_context.linkage = 'internal'
+
+        # GC thread handle
+        self.gc_thread = ir.GlobalVariable(self.module, self.pthread_t_type, name="gc_thread_handle")
+        self.gc_thread.initializer = ir.Constant(self.pthread_t_type, 0)
+        self.gc_thread.linkage = 'internal'
+
+        # GC running flag: 0=stopped, 1=running
+        self.gc_running = ir.GlobalVariable(self.module, self.i32, name="gc_running")
+        self.gc_running.initializer = ir.Constant(self.i32, 0)
+        self.gc_running.linkage = 'internal'
+
+        # GC phase: 0=idle, 1=mark, 2=sweep
+        self.gc_phase = ir.GlobalVariable(self.module, self.i32, name="gc_phase")
+        self.gc_phase.initializer = ir.Constant(self.i32, 0)
+        self.gc_phase.linkage = 'internal'
+
+        # GC request flag: set to 1 to request collection
+        self.gc_request = ir.GlobalVariable(self.module, self.i32, name="gc_request")
+        self.gc_request.initializer = ir.Constant(self.i32, 0)
+        self.gc_request.linkage = 'internal'
+
+        # Mutex for protecting heap during concurrent access
+        self.heap_mutex = ir.GlobalVariable(self.module, self.pthread_mutex_type, name="gc_heap_mutex")
+        self.heap_mutex.initializer = ir.Constant(self.pthread_mutex_type, None)
+        self.heap_mutex.linkage = 'internal'
+
+        # Condition variable for signaling GC thread
+        self.gc_cond = ir.GlobalVariable(self.module, self.pthread_cond_type, name="gc_cond")
+        self.gc_cond.initializer = ir.Constant(self.pthread_cond_type, None)
+        self.gc_cond.linkage = 'internal'
+
+        # Root registry - array of pointer-to-pointers (each entry points to a root variable)
+        # When a root is registered, we store the address of the pointer variable itself,
+        # so that when the pointer is updated, GC sees the new value automatically.
+        # Each slot holds i8** (address of an i8* root variable)
+        root_slot_type = self.i8_ptr.as_pointer()  # i8**
+        roots_array_type = ir.ArrayType(root_slot_type, self.MAX_ROOTS)
+        self.gc_roots = ir.GlobalVariable(self.module, roots_array_type, name="gc_roots")
+        self.gc_roots.initializer = ir.Constant(roots_array_type,
+            [ir.Constant(root_slot_type, None)] * self.MAX_ROOTS)
+        self.gc_roots.linkage = 'internal'
+
+        # Number of currently registered roots
+        self.gc_root_count = ir.GlobalVariable(self.module, self.i32, name="gc_root_count")
+        self.gc_root_count.initializer = ir.Constant(self.i32, 0)
+        self.gc_root_count.linkage = 'internal'
+
+        # Mutex for protecting root registry during concurrent access
+        self.gc_roots_mutex = ir.GlobalVariable(self.module, self.pthread_mutex_type, name="gc_roots_mutex")
+        self.gc_roots_mutex.initializer = ir.Constant(self.pthread_mutex_type, None)
+        self.gc_roots_mutex.linkage = 'internal'
 
     def _declare_intrinsics(self):
         """Declare LLVM intrinsics for stack access"""
@@ -286,6 +410,101 @@ class GarbageCollector:
         # gc_alloc_in_context(ctx: HeapContext*, size: i64, type_id: i32) -> i8*
         gc_alloc_ctx_ty = ir.FunctionType(self.i8_ptr, [self.heap_context_type.as_pointer(), self.i64, self.i32])
         self.gc_alloc_in_context = ir.Function(self.module, gc_alloc_ctx_ty, name="coex_gc_alloc_in_context")
+
+        # gc_set_finalizer(obj: i8*, finalizer: i8*) -> void
+        # Finalizer type: void (*)(i8*) - called with user pointer when object is swept
+        gc_set_finalizer_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i8_ptr])
+        self.gc_set_finalizer = ir.Function(self.module, gc_set_finalizer_ty, name="coex_gc_set_finalizer")
+
+        # gc_register_root(root_ptr: i8**) -> i32
+        # Register a root pointer for GC tracing. Returns a handle for unregistration.
+        # root_ptr is the address of the pointer variable (not the object pointer itself)
+        gc_register_root_ty = ir.FunctionType(self.i32, [self.i8_ptr.as_pointer()])
+        self.gc_register_root = ir.Function(self.module, gc_register_root_ty, name="coex_gc_register_root")
+
+        # gc_unregister_root(handle: i32) -> void
+        # Unregister a previously registered root by its handle
+        gc_unregister_root_ty = ir.FunctionType(self.void, [self.i32])
+        self.gc_unregister_root = ir.Function(self.module, gc_unregister_root_ty, name="coex_gc_unregister_root")
+
+        # ========== pthread declarations ==========
+        # pthread_create(thread*, attr*, start_routine, arg) -> int
+        # start_routine: i8* (*)(i8*)
+        thread_fn_type = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
+        pthread_create_ty = ir.FunctionType(self.i32, [
+            self.pthread_t_type.as_pointer(),  # pthread_t*
+            self.pthread_attr_ptr_type,         # const pthread_attr_t*
+            thread_fn_type.as_pointer(),        # void* (*)(void*)
+            self.i8_ptr                         # void* arg
+        ])
+        self.pthread_create = ir.Function(self.module, pthread_create_ty, name="pthread_create")
+
+        # pthread_join(thread, retval*) -> int
+        pthread_join_ty = ir.FunctionType(self.i32, [
+            self.pthread_t_type,                # pthread_t
+            self.i8_ptr.as_pointer()            # void** retval
+        ])
+        self.pthread_join = ir.Function(self.module, pthread_join_ty, name="pthread_join")
+
+        # pthread_mutex_init(mutex*, attr*) -> int
+        pthread_mutex_init_ty = ir.FunctionType(self.i32, [
+            self.pthread_mutex_type.as_pointer(),
+            self.i8_ptr  # const pthread_mutexattr_t*
+        ])
+        self.pthread_mutex_init = ir.Function(self.module, pthread_mutex_init_ty, name="pthread_mutex_init")
+
+        # pthread_mutex_lock(mutex*) -> int
+        pthread_mutex_lock_ty = ir.FunctionType(self.i32, [self.pthread_mutex_type.as_pointer()])
+        self.pthread_mutex_lock = ir.Function(self.module, pthread_mutex_lock_ty, name="pthread_mutex_lock")
+
+        # pthread_mutex_unlock(mutex*) -> int
+        pthread_mutex_unlock_ty = ir.FunctionType(self.i32, [self.pthread_mutex_type.as_pointer()])
+        self.pthread_mutex_unlock = ir.Function(self.module, pthread_mutex_unlock_ty, name="pthread_mutex_unlock")
+
+        # pthread_mutex_destroy(mutex*) -> int
+        pthread_mutex_destroy_ty = ir.FunctionType(self.i32, [self.pthread_mutex_type.as_pointer()])
+        self.pthread_mutex_destroy = ir.Function(self.module, pthread_mutex_destroy_ty, name="pthread_mutex_destroy")
+
+        # pthread_cond_init(cond*, attr*) -> int
+        pthread_cond_init_ty = ir.FunctionType(self.i32, [
+            self.pthread_cond_type.as_pointer(),
+            self.i8_ptr  # const pthread_condattr_t*
+        ])
+        self.pthread_cond_init = ir.Function(self.module, pthread_cond_init_ty, name="pthread_cond_init")
+
+        # pthread_cond_wait(cond*, mutex*) -> int
+        pthread_cond_wait_ty = ir.FunctionType(self.i32, [
+            self.pthread_cond_type.as_pointer(),
+            self.pthread_mutex_type.as_pointer()
+        ])
+        self.pthread_cond_wait = ir.Function(self.module, pthread_cond_wait_ty, name="pthread_cond_wait")
+
+        # pthread_cond_signal(cond*) -> int
+        pthread_cond_signal_ty = ir.FunctionType(self.i32, [self.pthread_cond_type.as_pointer()])
+        self.pthread_cond_signal = ir.Function(self.module, pthread_cond_signal_ty, name="pthread_cond_signal")
+
+        # pthread_cond_broadcast(cond*) -> int
+        pthread_cond_broadcast_ty = ir.FunctionType(self.i32, [self.pthread_cond_type.as_pointer()])
+        self.pthread_cond_broadcast = ir.Function(self.module, pthread_cond_broadcast_ty, name="pthread_cond_broadcast")
+
+        # pthread_cond_destroy(cond*) -> int
+        pthread_cond_destroy_ty = ir.FunctionType(self.i32, [self.pthread_cond_type.as_pointer()])
+        self.pthread_cond_destroy = ir.Function(self.module, pthread_cond_destroy_ty, name="pthread_cond_destroy")
+
+        # ========== GC thread functions ==========
+        # gc_thread_main(arg: i8*) -> i8* (pthread thread entry)
+        gc_thread_main_ty = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
+        self.gc_thread_main = ir.Function(self.module, gc_thread_main_ty, name="coex_gc_thread_main")
+
+        # gc_shutdown() -> void
+        gc_shutdown_ty = ir.FunctionType(self.void, [])
+        self.gc_shutdown = ir.Function(self.module, gc_shutdown_ty, name="coex_gc_shutdown")
+
+        # gc_write_barrier(old_ptr: i8*) -> void
+        # Called before overwriting a pointer field during MARK phase
+        # Marks the old value to prevent premature collection
+        gc_write_barrier_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_write_barrier = ir.Function(self.module, gc_write_barrier_ty, name="coex_gc_write_barrier")
 
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
@@ -419,6 +638,40 @@ class GarbageCollector:
 
         # Reset allocation counter
         builder.store(ir.Constant(self.i64, 0), self.alloc_count)
+
+        # Initialize pthread mutex for heap protection
+        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
+        builder.call(self.pthread_mutex_init, [mutex_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # Initialize pthread condition variable for GC signaling
+        cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
+        builder.call(self.pthread_cond_init, [cond_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # Initialize roots mutex for root registry protection
+        roots_mutex_ptr = builder.bitcast(self.gc_roots_mutex, self.pthread_mutex_type.as_pointer())
+        builder.call(self.pthread_mutex_init, [roots_mutex_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # Initialize root count to 0
+        builder.store(ir.Constant(self.i32, 0), self.gc_root_count)
+
+        # Set GC running flag
+        builder.store(ir.Constant(self.i32, 1), self.gc_running)
+
+        # Set GC phase to idle
+        builder.store(ir.Constant(self.i32, self.GC_PHASE_IDLE), self.gc_phase)
+
+        # Clear GC request flag
+        builder.store(ir.Constant(self.i32, 0), self.gc_request)
+
+        # Start GC background thread
+        # pthread_create(&gc_thread, NULL, gc_thread_main, NULL)
+        thread_ptr = builder.bitcast(self.gc_thread, self.pthread_t_type.as_pointer())
+        builder.call(self.pthread_create, [
+            thread_ptr,
+            ir.Constant(self.pthread_attr_ptr_type, None),
+            self.gc_thread_main,
+            ir.Constant(self.i8_ptr, None)
+        ])
 
         builder.ret_void()
 
@@ -785,9 +1038,19 @@ class GarbageCollector:
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(type_id, type_id_ptr)
 
-        # Store flags (0 = not marked) at offset 2
+        # Store flags at offset 2 (set mark bit if in MARK phase for snapshot-at-beginning)
+        # Objects allocated during MARK phase are born "marked" so they survive this collection
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr)
+        current_phase = builder.load(self.gc_phase)
+        is_mark_phase = builder.icmp_unsigned("==", current_phase, ir.Constant(self.i32, self.GC_PHASE_MARK))
+        initial_flags = builder.select(is_mark_phase,
+            ir.Constant(self.i32, self.FLAG_MARK_BIT),
+            ir.Constant(self.i32, 0))
+        builder.store(initial_flags, flags_ptr)
+
+        # Store finalizer (null) at offset 3
+        finalizer_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), finalizer_ptr)
 
         # Return pointer to user data (after header)
         block_int = builder.ptrtoint(block, self.i64)
@@ -822,8 +1085,17 @@ class GarbageCollector:
         type_id_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(type_id, type_id_ptr2)
 
+        # Set mark bit if in MARK phase for snapshot-at-beginning
         flags_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr2)
+        current_phase2 = builder.load(self.gc_phase)
+        is_mark_phase2 = builder.icmp_unsigned("==", current_phase2, ir.Constant(self.i32, self.GC_PHASE_MARK))
+        initial_flags2 = builder.select(is_mark_phase2,
+            ir.Constant(self.i32, self.FLAG_MARK_BIT),
+            ir.Constant(self.i32, 0))
+        builder.store(initial_flags2, flags_ptr2)
+
+        finalizer_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), finalizer_ptr2)
 
         block2_int = builder.ptrtoint(block2, self.i64)
         user_ptr2_int = builder.add(block2_int, header_size)
@@ -859,8 +1131,17 @@ class GarbageCollector:
         type_id_ptr3 = builder.gep(header3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(type_id, type_id_ptr3)
 
+        # Set mark bit if in MARK phase for snapshot-at-beginning
         flags_ptr3 = builder.gep(header3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr3)
+        current_phase3 = builder.load(self.gc_phase)
+        is_mark_phase3 = builder.icmp_unsigned("==", current_phase3, ir.Constant(self.i32, self.GC_PHASE_MARK))
+        initial_flags3 = builder.select(is_mark_phase3,
+            ir.Constant(self.i32, self.FLAG_MARK_BIT),
+            ir.Constant(self.i32, 0))
+        builder.store(initial_flags3, flags_ptr3)
+
+        finalizer_ptr3 = builder.gep(header3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), finalizer_ptr3)
 
         block3_int = builder.ptrtoint(block3, self.i64)
         user_ptr3_int = builder.add(block3_int, header_size)
@@ -1038,7 +1319,70 @@ class GarbageCollector:
         builder.store(next_ptr, curr)
         builder.branch(loop_start)
 
+        # After stack scan completes, scan registered roots
         builder.position_at_end(done)
+
+        # Create blocks for root scanning loop
+        roots_loop_start = func.append_basic_block("roots_loop_start")
+        roots_check = func.append_basic_block("roots_check")
+        roots_mark = func.append_basic_block("roots_mark")
+        roots_next = func.append_basic_block("roots_next")
+        roots_done = func.append_basic_block("roots_done")
+
+        builder.branch(roots_loop_start)
+
+        # Initialize root index
+        builder.position_at_end(roots_loop_start)
+        root_idx = builder.alloca(self.i32, name="root_idx")
+        builder.store(ir.Constant(self.i32, 0), root_idx)
+        builder.branch(roots_check)
+
+        # Check if we've processed all roots
+        builder.position_at_end(roots_check)
+        idx = builder.load(root_idx)
+        root_count = builder.load(self.gc_root_count)
+        at_end_roots = builder.icmp_unsigned(">=", idx, root_count)
+        builder.cbranch(at_end_roots, roots_done, roots_mark)
+
+        # Mark the object pointed to by this root
+        builder.position_at_end(roots_mark)
+        # Get gc_roots[idx]
+        idx_64 = builder.zext(idx, self.i64)
+        root_slot_ptr = builder.gep(self.gc_roots, [
+            ir.Constant(self.i64, 0),
+            idx_64
+        ], inbounds=True)
+        root_slot = builder.load(root_slot_ptr)  # This is i8** (pointer to root variable)
+
+        # Check if slot is non-null (could be unregistered)
+        root_slot_type = self.i8_ptr.as_pointer()
+        root_slot_null = ir.Constant(root_slot_type, None)
+        slot_is_null = builder.icmp_unsigned("==", root_slot, root_slot_null)
+        root_valid = func.append_basic_block("root_valid")
+        builder.cbranch(slot_is_null, roots_next, root_valid)
+
+        builder.position_at_end(root_valid)
+        # Load the actual pointer from the root variable
+        obj_ptr = builder.load(root_slot)  # This is i8* (the actual heap pointer)
+
+        # Check if the object pointer is non-null
+        obj_is_null = builder.icmp_unsigned("==", obj_ptr, ir.Constant(self.i8_ptr, None))
+        obj_valid = func.append_basic_block("obj_valid")
+        builder.cbranch(obj_is_null, roots_next, obj_valid)
+
+        builder.position_at_end(obj_valid)
+        # Mark the object
+        builder.call(self.gc_mark_object, [obj_ptr])
+        builder.branch(roots_next)
+
+        # Advance to next root
+        builder.position_at_end(roots_next)
+        curr_idx = builder.load(root_idx)
+        next_idx = builder.add(curr_idx, ir.Constant(self.i32, 1))
+        builder.store(next_idx, root_idx)
+        builder.branch(roots_check)
+
+        builder.position_at_end(roots_done)
         builder.ret_void()
 
     def _implement_gc_sweep(self):
@@ -1101,14 +1445,59 @@ class GarbageCollector:
         # Block is marked - clear mark bit for next cycle, then continue
         # (already in next_block path via cbranch)
 
-        # Block is unmarked - add to free list
+        # Block is unmarked - check for finalizer, then add to free list
         builder.position_at_end(block_unmarked)
+
+        # Check if FLAG_FINALIZER bit is set
+        has_finalizer_bit = builder.and_(flags, ir.Constant(self.i32, self.FLAG_FINALIZER))
+        has_finalizer = builder.icmp_unsigned("!=", has_finalizer_bit, ir.Constant(self.i32, 0))
+
+        # Branch to finalizer call or directly to free
+        call_finalizer = func.append_basic_block("call_finalizer")
+        add_to_free = func.append_basic_block("add_to_free")
+        builder.cbranch(has_finalizer, call_finalizer, add_to_free)
+
+        # Call finalizer if present
+        builder.position_at_end(call_finalizer)
+
+        # Load finalizer function pointer from header offset 3
+        finalizer_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        finalizer_fn = builder.load(finalizer_ptr)
+
+        # Check if finalizer is non-null (defensive, should always be non-null if FLAG_FINALIZER is set)
+        finalizer_is_null = builder.icmp_unsigned("==", finalizer_fn, ir.Constant(self.i8_ptr, None))
+        do_call = func.append_basic_block("do_call")
+        builder.cbranch(finalizer_is_null, add_to_free, do_call)
+
+        builder.position_at_end(do_call)
+
+        # Calculate user pointer (header + HEADER_SIZE)
+        block_int_for_finalize = builder.ptrtoint(curr_val, self.i64)
+        user_ptr_int = builder.add(block_int_for_finalize, ir.Constant(self.i64, self.HEADER_SIZE))
+        user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
+
+        # Create finalizer function type: void (*)(i8*)
+        finalizer_fn_type = ir.FunctionType(self.void, [self.i8_ptr])
+        finalizer_fn_ptr = builder.bitcast(finalizer_fn, finalizer_fn_type.as_pointer())
+
+        # Call the finalizer with user pointer
+        builder.call(finalizer_fn_ptr, [user_ptr])
+
+        # Clear the finalizer pointer and FLAG_FINALIZER bit to prevent double-finalization
+        builder.store(ir.Constant(self.i8_ptr, None), finalizer_ptr)
+        cleared_finalizer_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_FINALIZER & 0xFFFFFFFF))
+        builder.store(cleared_finalizer_flags, flags_ptr)
+
+        builder.branch(add_to_free)
+
+        # Add to free list
+        builder.position_at_end(add_to_free)
         builder.call(self.gc_add_to_free_list, [curr_val, block_size])
         builder.branch(next_block)
 
         # Move to next block
         builder.position_at_end(next_block)
-        # Clear mark bit if it was set
+        # Clear mark bit if it was set (for marked blocks continuing to next cycle)
         cleared_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_MARK_BIT & 0xFFFFFFFF))
         builder.store(cleared_flags, flags_ptr)
 
@@ -1560,9 +1949,18 @@ class GarbageCollector:
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(type_id, type_id_ptr)
 
-        # Flags at offset 2 (0 = not marked)
+        # Flags at offset 2 (set mark bit if in MARK phase for snapshot-at-beginning)
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr)
+        current_phase_ctx = builder.load(self.gc_phase)
+        is_mark_phase_ctx = builder.icmp_unsigned("==", current_phase_ctx, ir.Constant(self.i32, self.GC_PHASE_MARK))
+        initial_flags_ctx = builder.select(is_mark_phase_ctx,
+            ir.Constant(self.i32, self.FLAG_MARK_BIT),
+            ir.Constant(self.i32, 0))
+        builder.store(initial_flags_ctx, flags_ptr)
+
+        # Finalizer at offset 3 (null)
+        finalizer_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), finalizer_ptr)
 
         # Return pointer to user data
         block_int = builder.ptrtoint(block_phi, self.i64)
@@ -1574,3 +1972,382 @@ class GarbageCollector:
         # Not found
         builder.position_at_end(not_found)
         builder.ret(ir.Constant(self.i8_ptr, None))
+
+    def _implement_gc_set_finalizer(self):
+        """Set a finalizer function for an object.
+
+        gc_set_finalizer(obj: i8*, finalizer: i8*) -> void
+
+        The finalizer is a function pointer with signature: void (*)(i8*)
+        It will be called with the user pointer when the object is swept.
+        Sets FLAG_FINALIZER bit in flags if finalizer is non-null.
+        """
+        func = self.gc_set_finalizer
+        func.args[0].name = "obj_ptr"
+        func.args[1].name = "finalizer"
+
+        entry = func.append_basic_block("entry")
+        valid = func.append_basic_block("valid")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        obj_ptr = func.args[0]
+        finalizer = func.args[1]
+
+        # Null check on object pointer
+        is_null = builder.icmp_unsigned("==", obj_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, valid)
+
+        builder.position_at_end(valid)
+        # Get header (HEADER_SIZE bytes before user pointer)
+        obj_int = builder.ptrtoint(obj_ptr, self.i64)
+        header_int = builder.sub(obj_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr = builder.inttoptr(header_int, self.i8_ptr)
+        header = builder.bitcast(header_ptr, self.header_type.as_pointer())
+
+        # Store finalizer at offset 3
+        finalizer_field = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(finalizer, finalizer_field)
+
+        # Set FLAG_FINALIZER bit if finalizer is non-null
+        finalizer_is_null = builder.icmp_unsigned("==", finalizer, ir.Constant(self.i8_ptr, None))
+        set_flag = func.append_basic_block("set_flag")
+        clear_flag = func.append_basic_block("clear_flag")
+        merge = func.append_basic_block("merge")
+
+        builder.cbranch(finalizer_is_null, clear_flag, set_flag)
+
+        # Set the FLAG_FINALIZER bit
+        builder.position_at_end(set_flag)
+        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_ptr)
+        new_flags = builder.or_(old_flags, ir.Constant(self.i32, self.FLAG_FINALIZER))
+        builder.store(new_flags, flags_ptr)
+        builder.branch(merge)
+
+        # Clear the FLAG_FINALIZER bit
+        builder.position_at_end(clear_flag)
+        flags_ptr2 = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        old_flags2 = builder.load(flags_ptr2)
+        new_flags2 = builder.and_(old_flags2, ir.Constant(self.i32, ~self.FLAG_FINALIZER & 0xFFFFFFFF))
+        builder.store(new_flags2, flags_ptr2)
+        builder.branch(merge)
+
+        builder.position_at_end(merge)
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_register_root(self):
+        """Register a root pointer for GC tracing.
+
+        gc_register_root(root_ptr: i8**) -> i32
+
+        Registers the address of a pointer variable as a GC root.
+        Returns a handle (index) for later unregistration.
+        Returns -1 if registry is full.
+        """
+        func = self.gc_register_root
+        func.args[0].name = "root_ptr"
+
+        entry = func.append_basic_block("entry")
+        acquire_lock = func.append_basic_block("acquire_lock")
+        check_full = func.append_basic_block("check_full")
+        registry_full = func.append_basic_block("registry_full")
+        do_register = func.append_basic_block("do_register")
+        release_and_return = func.append_basic_block("release_and_return")
+
+        builder = ir.IRBuilder(entry)
+        root_ptr = func.args[0]
+
+        # Allocate return value
+        result = builder.alloca(self.i32, name="result")
+        builder.store(ir.Constant(self.i32, -1), result)
+
+        builder.branch(acquire_lock)
+
+        # Acquire roots mutex
+        builder.position_at_end(acquire_lock)
+        roots_mutex_ptr = builder.bitcast(self.gc_roots_mutex, self.pthread_mutex_type.as_pointer())
+        builder.call(self.pthread_mutex_lock, [roots_mutex_ptr])
+        builder.branch(check_full)
+
+        # Check if registry is full
+        builder.position_at_end(check_full)
+        count = builder.load(self.gc_root_count)
+        max_roots = ir.Constant(self.i32, self.MAX_ROOTS)
+        is_full = builder.icmp_unsigned(">=", count, max_roots)
+        builder.cbranch(is_full, registry_full, do_register)
+
+        # Registry is full - release lock and return -1
+        builder.position_at_end(registry_full)
+        builder.store(ir.Constant(self.i32, -1), result)
+        builder.branch(release_and_return)
+
+        # Do the registration
+        builder.position_at_end(do_register)
+        # Get the current count as the handle/index
+        handle = builder.load(self.gc_root_count)
+
+        # Cast root_ptr to the element type expected by gc_roots array
+        root_slot_type = self.i8_ptr.as_pointer()
+        root_ptr_cast = builder.bitcast(root_ptr, root_slot_type)
+
+        # Store root pointer at gc_roots[handle]
+        handle_64 = builder.zext(handle, self.i64)
+        slot_ptr = builder.gep(self.gc_roots, [
+            ir.Constant(self.i64, 0),
+            handle_64
+        ], inbounds=True)
+        builder.store(root_ptr_cast, slot_ptr)
+
+        # Increment root count
+        new_count = builder.add(handle, ir.Constant(self.i32, 1))
+        builder.store(new_count, self.gc_root_count)
+
+        # Store handle as result
+        builder.store(handle, result)
+        builder.branch(release_and_return)
+
+        # Release lock and return result
+        builder.position_at_end(release_and_return)
+        builder.call(self.pthread_mutex_unlock, [roots_mutex_ptr])
+        final_result = builder.load(result)
+        builder.ret(final_result)
+
+    def _implement_gc_unregister_root(self):
+        """Unregister a previously registered root.
+
+        gc_unregister_root(handle: i32) -> void
+
+        Sets the root slot to null. The slot can be reused by a future registration
+        if we implement a more sophisticated scheme, but for now we just null it out.
+        """
+        func = self.gc_unregister_root
+        func.args[0].name = "handle"
+
+        entry = func.append_basic_block("entry")
+        check_bounds = func.append_basic_block("check_bounds")
+        valid_handle = func.append_basic_block("valid_handle")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        handle = func.args[0]
+        builder.branch(check_bounds)
+
+        # Check handle is within bounds
+        builder.position_at_end(check_bounds)
+        count = builder.load(self.gc_root_count)
+        is_negative = builder.icmp_signed("<", handle, ir.Constant(self.i32, 0))
+        is_too_large = builder.icmp_unsigned(">=", handle, count)
+        is_invalid = builder.or_(is_negative, is_too_large)
+        builder.cbranch(is_invalid, done, valid_handle)
+
+        # Valid handle - acquire lock and clear slot
+        builder.position_at_end(valid_handle)
+        roots_mutex_ptr = builder.bitcast(self.gc_roots_mutex, self.pthread_mutex_type.as_pointer())
+        builder.call(self.pthread_mutex_lock, [roots_mutex_ptr])
+
+        # Set gc_roots[handle] = null
+        root_slot_type = self.i8_ptr.as_pointer()
+        handle_64 = builder.zext(handle, self.i64)
+        slot_ptr = builder.gep(self.gc_roots, [
+            ir.Constant(self.i64, 0),
+            handle_64
+        ], inbounds=True)
+        builder.store(ir.Constant(root_slot_type, None), slot_ptr)
+
+        # Release lock
+        builder.call(self.pthread_mutex_unlock, [roots_mutex_ptr])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_thread_main(self):
+        """Implement the GC background thread main loop.
+
+        gc_thread_main(arg: i8*) -> i8*
+
+        Thread waits for gc_request flag, then runs mark-sweep cycle.
+        Uses snapshot-at-the-beginning: objects allocated during mark are marked live.
+        """
+        func = self.gc_thread_main
+        func.args[0].name = "arg"
+
+        entry = func.append_basic_block("entry")
+        loop_start = func.append_basic_block("loop_start")
+        check_running = func.append_basic_block("check_running")
+        wait_for_request = func.append_basic_block("wait_for_request")
+        check_request = func.append_basic_block("check_request")
+        do_collection = func.append_basic_block("do_collection")
+        exit_thread = func.append_basic_block("exit_thread")
+
+        builder = ir.IRBuilder(entry)
+        builder.branch(loop_start)
+
+        # Main loop: while gc_running == 1
+        builder.position_at_end(loop_start)
+        builder.branch(check_running)
+
+        builder.position_at_end(check_running)
+        running = builder.load(self.gc_running)
+        is_running = builder.icmp_unsigned("==", running, ir.Constant(self.i32, 1))
+        builder.cbranch(is_running, wait_for_request, exit_thread)
+
+        # Wait for gc_request using condition variable
+        builder.position_at_end(wait_for_request)
+        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
+        cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
+
+        # Lock mutex
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Check request flag
+        builder.branch(check_request)
+
+        builder.position_at_end(check_request)
+        request = builder.load(self.gc_request)
+        has_request = builder.icmp_unsigned("==", request, ir.Constant(self.i32, 1))
+
+        wait_block = func.append_basic_block("wait_block")
+        builder.cbranch(has_request, do_collection, wait_block)
+
+        # Wait on condition variable
+        builder.position_at_end(wait_block)
+        # Check if still running before waiting
+        running2 = builder.load(self.gc_running)
+        still_running = builder.icmp_unsigned("==", running2, ir.Constant(self.i32, 1))
+
+        do_wait = func.append_basic_block("do_wait")
+        unlock_exit = func.append_basic_block("unlock_exit")
+        builder.cbranch(still_running, do_wait, unlock_exit)
+
+        builder.position_at_end(do_wait)
+        builder.call(self.pthread_cond_wait, [cond_ptr, mutex_ptr])
+        builder.branch(check_request)
+
+        builder.position_at_end(unlock_exit)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.branch(exit_thread)
+
+        # Perform collection
+        builder.position_at_end(do_collection)
+        # Set phase to MARK
+        builder.store(ir.Constant(self.i32, self.GC_PHASE_MARK), self.gc_phase)
+
+        # Unlock mutex during marking (allow allocations)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        # Call mark phase (scan_stack marks all reachable objects)
+        builder.call(self.gc_scan_stack, [])
+
+        # Lock mutex for sweep phase
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Set phase to SWEEP
+        builder.store(ir.Constant(self.i32, self.GC_PHASE_SWEEP), self.gc_phase)
+
+        # Unlock for sweep (sweep doesn't need exclusive access with conservative approach)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        # Call sweep phase
+        builder.call(self.gc_sweep, [])
+
+        # Lock to update state
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Set phase to IDLE
+        builder.store(ir.Constant(self.i32, self.GC_PHASE_IDLE), self.gc_phase)
+
+        # Clear request flag
+        builder.store(ir.Constant(self.i32, 0), self.gc_request)
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        # Loop back
+        builder.branch(loop_start)
+
+        # Exit thread
+        builder.position_at_end(exit_thread)
+        builder.ret(ir.Constant(self.i8_ptr, None))
+
+    def _implement_gc_shutdown(self):
+        """Shutdown the GC background thread gracefully.
+
+        gc_shutdown() -> void
+
+        Signals the GC thread to stop and waits for it to exit.
+        """
+        func = self.gc_shutdown
+        entry = func.append_basic_block("entry")
+
+        builder = ir.IRBuilder(entry)
+
+        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
+        cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
+
+        # Lock mutex
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Set gc_running = 0
+        builder.store(ir.Constant(self.i32, 0), self.gc_running)
+
+        # Signal condition variable to wake up thread
+        builder.call(self.pthread_cond_signal, [cond_ptr])
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        # Wait for thread to exit
+        thread_handle = builder.load(self.gc_thread)
+        builder.call(self.pthread_join, [
+            thread_handle,
+            ir.Constant(self.i8_ptr.as_pointer(), None)
+        ])
+
+        # Destroy mutex and condition variable
+        builder.call(self.pthread_mutex_destroy, [mutex_ptr])
+        builder.call(self.pthread_cond_destroy, [cond_ptr])
+
+        builder.ret_void()
+
+    def _implement_gc_write_barrier(self):
+        """Implement write barrier for concurrent mark phase.
+
+        gc_write_barrier(old_ptr: i8*) -> void
+
+        Called BEFORE overwriting a pointer field. If we're in MARK phase,
+        marks the old value to prevent premature collection (snapshot-at-the-beginning).
+        This ensures that objects reachable at the start of collection remain live.
+        """
+        func = self.gc_write_barrier
+        func.args[0].name = "old_ptr"
+
+        entry = func.append_basic_block("entry")
+        check_phase = func.append_basic_block("check_phase")
+        do_mark = func.append_basic_block("do_mark")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        old_ptr = func.args[0]
+
+        # Quick null check - no need to mark null
+        is_null = builder.icmp_unsigned("==", old_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, check_phase)
+
+        # Check if we're in MARK phase
+        builder.position_at_end(check_phase)
+        phase = builder.load(self.gc_phase)
+        is_mark_phase = builder.icmp_unsigned("==", phase, ir.Constant(self.i32, self.GC_PHASE_MARK))
+        builder.cbranch(is_mark_phase, do_mark, done)
+
+        # In MARK phase - mark the old value before it's overwritten
+        builder.position_at_end(do_mark)
+        builder.call(self.gc_mark_object, [old_ptr])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()

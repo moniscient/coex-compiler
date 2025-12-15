@@ -64,13 +64,10 @@ func main() -> int
 ''', "1\n99\n")
 
     def test_eager_copy_gives_sole_ownership(self, expect_output):
-        """Verify := gives sole ownership even when source was shared.
+        """Verify := with mutation returns new value.
 
-        This is the critical test: after c := a (where a was shared),
-        c must have refcount = 1. We verify this by calling set() WITHOUT
-        capturing the result - this only works if refcount = 1 (in-place mutation).
-        If c shared data with a/b (bug), refcount > 1 would trigger COW,
-        the copy would be discarded, and c.get(0) would return 1 not 99.
+        With GC-based memory (no refcounting), all mutations return new arrays.
+        You must capture the result to see the change.
         """
         expect_output('''
 func main() -> int
@@ -78,7 +75,7 @@ func main() -> int
     var a: Array<int> = list.packed()
     var b: Array<int> = a
     var c := a
-    c.set(0, 99)
+    c = c.set(0, 99)
     print(c.get(0))
     print(b.get(0))
     return 0
@@ -90,7 +87,7 @@ func main() -> int
         expect_output('''
 func process(data: Array<int>) -> int
     var local := data
-    local.set(0, 100)
+    local = local.set(0, 100)
     return local.get(0)
 ~
 
@@ -128,26 +125,30 @@ func main() -> int
     var b := a
     var c := b
     var d := c
-    d.set(0, 99)
+    d = d.set(0, 99)
     print(d.get(0))
     return 0
 ~
 ''', "99\n")
 
     def test_lazy_vs_eager_comparison(self, expect_output):
-        """Compare = and := behavior."""
+        """Compare = and := behavior.
+
+        With GC-based memory, both = and := share pointers.
+        All mutations return new arrays, so you must capture the result.
+        """
         expect_output('''
 func main() -> int
     var list1: List<int> = [1, 2, 3]
     var a1: Array<int> = list1.packed()
     var b1: Array<int> = a1
-    b1.set(0, 10)
+    b1 = b1.set(0, 10)
     print(a1.get(0))
 
     var list2: List<int> = [1, 2, 3]
     var a2: Array<int> = list2.packed()
     var b2 := a2
-    b2.set(0, 10)
+    b2 = b2.set(0, 10)
     print(b2.get(0))
     return 0
 ~

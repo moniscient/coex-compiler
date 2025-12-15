@@ -643,27 +643,27 @@ func main() -> int
 
     def test_string_size(self, expect_output):
         """String size (struct + data bytes)."""
-        # String struct: 40 bytes (5 x 8-byte fields with COW), "hello" = 5 bytes
-        # Size = 40 + 5 = 45
+        # String struct: 24 bytes (3 x 8-byte fields: data, len, size), "hello" = 5 bytes
+        # Size = 24 + 5 = 29
         expect_output('''
 func main() -> int
     var s: string = "hello"
     print(s.size())
     return 0
 ~
-''', "45\n")
+''', "29\n")
 
     def test_string_size_empty(self, expect_output):
         """Empty string size."""
-        # String struct: 40 bytes, empty = 0 bytes
-        # Size = 40 + 0 = 40
+        # String struct: 24 bytes, empty = 0 bytes
+        # Size = 24 + 0 = 24
         expect_output('''
 func main() -> int
     var s: string = ""
     print(s.size())
     return 0
 ~
-''', "40\n")
+''', "24\n")
 
     def test_map_size_empty(self, expect_output):
         """Empty map size (header + initial capacity * entry size)."""
