@@ -1,0 +1,13 @@
+# Stress Test: Array with 1M elements
+# Tests array allocation and mutation with nursery optimization
+
+func main() -> int
+    var arr: Array<int> = Array(1000000, 0)
+    for i in 0..1000000
+        arr = arr.set(i, i * 2)
+    ~
+    print(arr.len())
+    print(arr.get(500000))
+    print(arr.get(999999))
+    return 0
+~

@@ -1,0 +1,13 @@
+# Stress Test: Set with 3000 elements
+# Note: Set has a pre-existing scalability issue above ~3000 elements
+
+func main() -> int
+    var s: Set<int> = {}
+    for i in 0..3000
+        s = s.add(i)
+    ~
+    print(s.len())
+    print(s.has(2999))
+    print(s.has(3000))
+    return 0
+~

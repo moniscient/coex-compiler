@@ -1,0 +1,13 @@
+# Stress Test: Map with 2500 entries
+# Note: Map has a pre-existing scalability issue above ~2700 elements
+
+func main() -> int
+    var m: Map<int, int> = {}
+    for i in 0..2500
+        m = m.set(i, i * 3)
+    ~
+    print(m.len())
+    print(m.get(0))
+    print(m.get(2499))
+    return 0
+~

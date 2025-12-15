@@ -7790,7 +7790,15 @@ class CodeGenerator:
         alloca = self.builder.alloca(llvm_type, name=stmt.name)
 
         # Generate initializer
-        init_value = self._generate_expression(stmt.initializer)
+        # Handle empty {} which parses as MapExpr but might need to be Set based on type annotation
+        if isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
+            if isinstance(stmt.type_annotation, SetType):
+                # Empty {} with Set type annotation -> generate empty set
+                init_value = self.builder.call(self.set_new, [])
+            else:
+                init_value = self._generate_expression(stmt.initializer)
+        else:
+            init_value = self._generate_expression(stmt.initializer)
 
         # Cast if needed
         init_value = self._cast_value(init_value, llvm_type)
@@ -8547,7 +8555,7 @@ class CodeGenerator:
 
     def _has_collection_mutations(self, stmts: PyList[Stmt]) -> bool:
         """Check if statements contain collection mutation patterns."""
-        mutation_methods = ('append', 'set', 'push', 'insert', 'remove', 'pop')
+        mutation_methods = ('append', 'add', 'set', 'push', 'insert', 'remove', 'pop')
 
         for stmt in stmts:
             if isinstance(stmt, Assignment):
@@ -8575,12 +8583,12 @@ class CodeGenerator:
 
             elif isinstance(stmt, VarDecl):
                 # Check for var x = x.append(...) patterns with rebinding
-                if stmt.value:
-                    if isinstance(stmt.value, MethodCallExpr):
-                        if stmt.value.method in mutation_methods:
+                if stmt.initializer:
+                    if isinstance(stmt.initializer, MethodCallExpr):
+                        if stmt.initializer.method in mutation_methods:
                             return True
-                    elif isinstance(stmt.value, CallExpr) and isinstance(stmt.value.callee, MemberExpr):
-                        if stmt.value.callee.member in mutation_methods:
+                    elif isinstance(stmt.initializer, CallExpr) and isinstance(stmt.initializer.callee, MemberExpr):
+                        if stmt.initializer.callee.member in mutation_methods:
                             return True
 
             elif isinstance(stmt, IfStmt):
