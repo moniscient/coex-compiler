@@ -16,7 +16,9 @@ class GarbageCollector:
     """Generates LLVM IR for garbage collection runtime"""
 
     # Constants
-    HEAP_SIZE = 256 * 1024 * 1024  # 256MB initial heap (easily modifiable)
+    HEAP_SIZE = 256 * 1024 * 1024  # 256MB initial heap segment
+    MAX_HEAP_SIZE = 8 * 1024 * 1024 * 1024  # 8GB maximum total heap
+    GC_TRIGGER_INTERVAL = 100000   # Trigger GC every 100k allocations
     HEADER_SIZE = 16         # 8-byte size + 4-byte type_id + 4-byte flags
     MIN_BLOCK_SIZE = 24      # Minimum block: header(16) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
@@ -36,7 +38,21 @@ class GarbageCollector:
     TYPE_SET_ENTRY = 6
     TYPE_CHANNEL = 7
     TYPE_ARRAY = 8
-    TYPE_FIRST_USER = 9      # First ID for user-defined types
+    TYPE_LIST_TAIL = 9       # List tail buffer (element data)
+    TYPE_PV_NODE = 10        # Persistent vector tree node
+    TYPE_STRING_DATA = 11    # String character data buffer
+    TYPE_CHANNEL_BUFFER = 12 # Channel data buffer
+    TYPE_ARRAY_DATA = 13     # Array element data buffer
+    TYPE_FIRST_USER = 14     # First ID for user-defined types
+
+    # Heap context types
+    CONTEXT_MAIN = 0         # Long-lived objects, precise GC with roots
+    CONTEXT_NURSERY = 1      # Short-lived temps, bulk-free on scope exit
+    CONTEXT_LARGE = 2        # Objects > 1MB, separate tracking
+    CONTEXT_IMMORTAL = 3     # Never freed (string literals, etc.)
+
+    # Context stack configuration
+    MAX_CONTEXT_DEPTH = 16   # Maximum nested context depth
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -59,6 +75,7 @@ class GarbageCollector:
         self.header_type = None
         self.free_node_type = None
         self.type_desc_type = None
+        self.heap_context_type = None
 
         # GC global variables (set in _create_globals)
         self.heap_start = None
@@ -67,6 +84,11 @@ class GarbageCollector:
         self.free_list_head = None
         self.stack_bottom = None
         self.type_table = None
+
+        # Context stack globals (set in _create_globals)
+        self.context_stack = None        # HeapContext*[16] - max nested contexts
+        self.context_stack_top = None    # i32 - current depth
+        self.main_context = None         # HeapContext* - the main heap context
 
         # LLVM intrinsics
         self.frameaddress = None
@@ -81,6 +103,14 @@ class GarbageCollector:
         self.gc_scan_stack = None
         self.gc_find_free_block = None
         self.gc_add_to_free_list = None
+        self.gc_expand_heap = None
+
+        # Context management functions
+        self.gc_create_context = None
+        self.gc_destroy_context = None
+        self.gc_push_context = None
+        self.gc_pop_context = None
+        self.gc_alloc_in_context = None
 
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
@@ -92,11 +122,18 @@ class GarbageCollector:
         self._implement_gc_init()
         self._implement_gc_find_free_block()
         self._implement_gc_add_to_free_list()
+        self._implement_gc_expand_heap()
         self._implement_gc_alloc()
         self._implement_gc_mark_object()
         self._implement_gc_scan_stack()
         self._implement_gc_sweep()
         self._implement_gc_collect()
+        # Context management functions
+        self._implement_gc_create_context()
+        self._implement_gc_destroy_context()
+        self._implement_gc_push_context()
+        self._implement_gc_pop_context()
+        self._implement_gc_alloc_in_context()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -123,9 +160,19 @@ class GarbageCollector:
             self.i32.as_pointer(),    # array of offsets to reference fields
         ])
 
+        # Heap context: { i8* heap_start, i8* heap_end, i8* free_list_head,
+        #                 i64 heap_size, i32 context_type }
+        self.heap_context_type = ir.LiteralStructType([
+            self.i8_ptr,    # heap_start - start of this context's heap region
+            self.i8_ptr,    # heap_end - end of this context's heap region
+            self.i8_ptr,    # free_list_head - this context's free list
+            self.i64,       # heap_size - size of this context's heap
+            self.i32,       # context_type (MAIN=0, NURSERY=1, LARGE=2, IMMORTAL=3)
+        ])
+
     def _create_globals(self):
         """Create GC global variables"""
-        # Heap region bounds
+        # Heap region bounds (min/max across all segments for conservative scanning)
         self.heap_start = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_heap_start")
         self.heap_start.initializer = ir.Constant(self.i8_ptr, None)
         self.heap_start.linkage = 'internal'
@@ -134,10 +181,15 @@ class GarbageCollector:
         self.heap_end.initializer = ir.Constant(self.i8_ptr, None)
         self.heap_end.linkage = 'internal'
 
-        # Current heap size (for tracking growth)
+        # Current heap size (total across all segments)
         self.heap_size_global = ir.GlobalVariable(self.module, self.i64, name="gc_heap_size")
         self.heap_size_global.initializer = ir.Constant(self.i64, 0)
         self.heap_size_global.linkage = 'internal'
+
+        # Maximum heap size limit
+        self.max_heap_size = ir.GlobalVariable(self.module, self.i64, name="gc_max_heap_size")
+        self.max_heap_size.initializer = ir.Constant(self.i64, self.MAX_HEAP_SIZE)
+        self.max_heap_size.linkage = 'internal'
 
         # Free list head pointer
         self.free_list_head = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_free_list")
@@ -153,6 +205,22 @@ class GarbageCollector:
         self.alloc_count = ir.GlobalVariable(self.module, self.i64, name="gc_alloc_count")
         self.alloc_count.initializer = ir.Constant(self.i64, 0)
         self.alloc_count.linkage = 'internal'
+
+        # Context stack for nested heap contexts (e.g., nursery inside loop)
+        context_stack_type = ir.ArrayType(self.heap_context_type.as_pointer(), self.MAX_CONTEXT_DEPTH)
+        self.context_stack = ir.GlobalVariable(self.module, context_stack_type, name="gc_context_stack")
+        self.context_stack.initializer = ir.Constant(context_stack_type, [ir.Constant(self.heap_context_type.as_pointer(), None)] * self.MAX_CONTEXT_DEPTH)
+        self.context_stack.linkage = 'internal'
+
+        # Current depth of context stack (0 = only main context)
+        self.context_stack_top = ir.GlobalVariable(self.module, self.i32, name="gc_context_stack_top")
+        self.context_stack_top.initializer = ir.Constant(self.i32, 0)
+        self.context_stack_top.linkage = 'internal'
+
+        # Main context pointer (initialized in gc_init)
+        self.main_context = ir.GlobalVariable(self.module, self.heap_context_type.as_pointer(), name="gc_main_context")
+        self.main_context.initializer = ir.Constant(self.heap_context_type.as_pointer(), None)
+        self.main_context.linkage = 'internal'
 
     def _declare_intrinsics(self):
         """Declare LLVM intrinsics for stack access"""
@@ -194,6 +262,30 @@ class GarbageCollector:
         # gc_add_to_free_list(block: i8*, size: i64) -> void
         gc_add_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i64])
         self.gc_add_to_free_list = ir.Function(self.module, gc_add_ty, name="coex_gc_add_to_free_list")
+
+        # gc_expand_heap(min_size: i64) -> i1 (returns true if expansion succeeded)
+        gc_expand_ty = ir.FunctionType(self.i1, [self.i64])
+        self.gc_expand_heap = ir.Function(self.module, gc_expand_ty, name="coex_gc_expand_heap")
+
+        # gc_create_context(size: i64, type: i32) -> HeapContext*
+        gc_create_ctx_ty = ir.FunctionType(self.heap_context_type.as_pointer(), [self.i64, self.i32])
+        self.gc_create_context = ir.Function(self.module, gc_create_ctx_ty, name="coex_gc_create_context")
+
+        # gc_destroy_context(ctx: HeapContext*) -> void
+        gc_destroy_ctx_ty = ir.FunctionType(self.void, [self.heap_context_type.as_pointer()])
+        self.gc_destroy_context = ir.Function(self.module, gc_destroy_ctx_ty, name="coex_gc_destroy_context")
+
+        # gc_push_context(ctx: HeapContext*) -> void
+        gc_push_ctx_ty = ir.FunctionType(self.void, [self.heap_context_type.as_pointer()])
+        self.gc_push_context = ir.Function(self.module, gc_push_ctx_ty, name="coex_gc_push_context")
+
+        # gc_pop_context() -> HeapContext* (returns the popped context)
+        gc_pop_ctx_ty = ir.FunctionType(self.heap_context_type.as_pointer(), [])
+        self.gc_pop_context = ir.Function(self.module, gc_pop_ctx_ty, name="coex_gc_pop_context")
+
+        # gc_alloc_in_context(ctx: HeapContext*, size: i64, type_id: i32) -> i8*
+        gc_alloc_ctx_ty = ir.FunctionType(self.i8_ptr, [self.heap_context_type.as_pointer(), self.i64, self.i32])
+        self.gc_alloc_in_context = ir.Function(self.module, gc_alloc_ctx_ty, name="coex_gc_alloc_in_context")
 
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
@@ -240,6 +332,28 @@ class GarbageCollector:
         # data field at offset 24 is a reference (same layout as List)
         self.type_info[self.TYPE_ARRAY] = {'size': 32, 'ref_offsets': [24]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
+
+        # Type 9: List tail buffer - raw element data, no references
+        # (element references are handled by the List struct itself)
+        self.type_info[self.TYPE_LIST_TAIL] = {'size': 0, 'ref_offsets': []}
+        self.type_descriptors['ListTail'] = self.TYPE_LIST_TAIL
+
+        # Type 10: Persistent Vector node - { i64 refcount, i8*[32] children }
+        # Children are references (either to other nodes or leaf data)
+        self.type_info[self.TYPE_PV_NODE] = {'size': 264, 'ref_offsets': []}
+        self.type_descriptors['PVNode'] = self.TYPE_PV_NODE
+
+        # Type 11: String data buffer - raw character data, no references
+        self.type_info[self.TYPE_STRING_DATA] = {'size': 0, 'ref_offsets': []}
+        self.type_descriptors['StringData'] = self.TYPE_STRING_DATA
+
+        # Type 12: Channel buffer - raw element data, no references
+        self.type_info[self.TYPE_CHANNEL_BUFFER] = {'size': 0, 'ref_offsets': []}
+        self.type_descriptors['ChannelBuffer'] = self.TYPE_CHANNEL_BUFFER
+
+        # Type 13: Array data buffer - raw element data, no references
+        self.type_info[self.TYPE_ARRAY_DATA] = {'size': 0, 'ref_offsets': []}
+        self.type_descriptors['ArrayData'] = self.TYPE_ARRAY_DATA
 
     def register_type(self, type_name: str, size: int, ref_offsets: PyList[int]) -> int:
         """Register a user-defined type and return its type_id"""
@@ -447,24 +561,177 @@ class GarbageCollector:
 
         builder.ret_void()
 
+    def _implement_gc_expand_heap(self):
+        """Expand heap by allocating a new segment when current heap is exhausted"""
+        func = self.gc_expand_heap
+        func.args[0].name = "min_size"
+
+        entry = func.append_basic_block("entry")
+        check_limit = func.append_basic_block("check_limit")
+        do_expand = func.append_basic_block("do_expand")
+        alloc_success = func.append_basic_block("alloc_success")
+        update_bounds = func.append_basic_block("update_bounds")
+        check_start = func.append_basic_block("check_start")
+        update_start = func.append_basic_block("update_start")
+        check_end = func.append_basic_block("check_end")
+        update_end = func.append_basic_block("update_end")
+        add_to_free = func.append_basic_block("add_to_free")
+        fail = func.append_basic_block("fail")
+
+        builder = ir.IRBuilder(entry)
+        min_size = func.args[0]
+
+        # Calculate segment size: max(HEAP_SIZE, min_size * 2)
+        default_segment = ir.Constant(self.i64, self.HEAP_SIZE)
+        double_min = builder.mul(min_size, ir.Constant(self.i64, 2))
+        use_default = builder.icmp_unsigned(">=", default_segment, double_min)
+        segment_size = builder.select(use_default, default_segment, double_min)
+
+        # Store segment_size for later use
+        segment_size_alloca = builder.alloca(self.i64, name="segment_size")
+        builder.store(segment_size, segment_size_alloca)
+
+        builder.branch(check_limit)
+
+        # Check if we've exceeded the maximum heap size
+        builder.position_at_end(check_limit)
+        current_size = builder.load(self.heap_size_global)
+        max_size = builder.load(self.max_heap_size)
+        new_total = builder.add(current_size, segment_size)
+        within_limit = builder.icmp_unsigned("<=", new_total, max_size)
+        builder.cbranch(within_limit, do_expand, fail)
+
+        # Allocate new segment using system malloc
+        builder.position_at_end(do_expand)
+        seg_size_val = builder.load(segment_size_alloca)
+        new_segment = builder.call(self.codegen.malloc, [seg_size_val])
+
+        # Check if malloc succeeded
+        is_null = builder.icmp_unsigned("==", new_segment, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, fail, alloc_success)
+
+        # Allocation succeeded
+        builder.position_at_end(alloc_success)
+        # Update total heap size
+        updated_size = builder.add(current_size, seg_size_val)
+        builder.store(updated_size, self.heap_size_global)
+
+        builder.branch(update_bounds)
+
+        # Update heap bounds (min/max addresses)
+        builder.position_at_end(update_bounds)
+        current_start = builder.load(self.heap_start)
+        current_end = builder.load(self.heap_end)
+
+        # Check if heap_start needs updating (new segment could be at lower address)
+        builder.branch(check_start)
+
+        builder.position_at_end(check_start)
+        # If heap_start is null (first expansion after init), or new_segment < heap_start
+        start_is_null = builder.icmp_unsigned("==", current_start, ir.Constant(self.i8_ptr, None))
+        new_is_lower = builder.icmp_unsigned("<", new_segment, current_start)
+        should_update_start = builder.or_(start_is_null, new_is_lower)
+        builder.cbranch(should_update_start, update_start, check_end)
+
+        builder.position_at_end(update_start)
+        builder.store(new_segment, self.heap_start)
+        builder.branch(check_end)
+
+        # Check if heap_end needs updating
+        builder.position_at_end(check_end)
+        # Calculate new segment end
+        new_segment_int = builder.ptrtoint(new_segment, self.i64)
+        seg_size_val2 = builder.load(segment_size_alloca)
+        new_segment_end_int = builder.add(new_segment_int, seg_size_val2)
+        new_segment_end = builder.inttoptr(new_segment_end_int, self.i8_ptr)
+
+        # If heap_end is null or new_segment_end > heap_end
+        end_is_null = builder.icmp_unsigned("==", current_end, ir.Constant(self.i8_ptr, None))
+        new_is_higher = builder.icmp_unsigned(">", new_segment_end, current_end)
+        should_update_end = builder.or_(end_is_null, new_is_higher)
+        builder.cbranch(should_update_end, update_end, add_to_free)
+
+        builder.position_at_end(update_end)
+        builder.store(new_segment_end, self.heap_end)
+        builder.branch(add_to_free)
+
+        # Add new segment to free list
+        builder.position_at_end(add_to_free)
+        seg_size_val3 = builder.load(segment_size_alloca)
+        builder.call(self.gc_add_to_free_list, [new_segment, seg_size_val3])
+
+        # Return success
+        builder.ret(ir.Constant(self.i1, 1))
+
+        # Expansion failed (either limit exceeded or malloc failed)
+        builder.position_at_end(fail)
+        builder.ret(ir.Constant(self.i1, 0))
+
     def _implement_gc_alloc(self):
-        """Allocate memory with GC header"""
+        """Allocate memory with GC header
+
+        If there's an active context on the stack (context_stack_top > 0),
+        allocate from that context. Otherwise, allocate from the main heap.
+        """
         func = self.gc_alloc
         func.args[0].name = "user_size"
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
+        check_context = func.append_basic_block("check_context")
+        use_context = func.append_basic_block("use_context")
+        use_main_heap = func.append_basic_block("use_main_heap")
         try_alloc = func.append_basic_block("try_alloc")
         alloc_success = func.append_basic_block("alloc_success")
         do_gc = func.append_basic_block("do_gc")
         retry_alloc = func.append_basic_block("retry_alloc")
         retry_success = func.append_basic_block("retry_success")
+        try_expand = func.append_basic_block("try_expand")
+        expand_retry = func.append_basic_block("expand_retry")
+        expand_success = func.append_basic_block("expand_success")
         oom = func.append_basic_block("oom")
 
         builder = ir.IRBuilder(entry)
 
         user_size = func.args[0]
         type_id = func.args[1]
+
+        # Check if there's an active context on the stack
+        builder.branch(check_context)
+
+        builder.position_at_end(check_context)
+        stack_top = builder.load(self.context_stack_top)
+        has_context = builder.icmp_signed(">", stack_top, ir.Constant(self.i32, 0))
+        builder.cbranch(has_context, use_context, use_main_heap)
+
+        # Allocate from the active context
+        builder.position_at_end(use_context)
+        # Get context at stack_top
+        ctx_slot_ptr = builder.gep(self.context_stack, [
+            ir.Constant(self.i32, 0),
+            stack_top
+        ], inbounds=True)
+        active_ctx = builder.load(ctx_slot_ptr)
+
+        # Call gc_alloc_in_context (returns user pointer directly)
+        ctx_result = builder.call(self.gc_alloc_in_context, [active_ctx, user_size, type_id])
+
+        # Check if context allocation succeeded
+        ctx_null = builder.icmp_unsigned("==", ctx_result, ir.Constant(self.i8_ptr, None))
+        # If context allocation failed, fall back to main heap
+        ctx_success = func.append_basic_block("ctx_success")
+        builder.cbranch(ctx_null, use_main_heap, ctx_success)
+
+        # Context allocation succeeded - return the result directly
+        builder.position_at_end(ctx_success)
+        # Increment allocation counter for context allocations too
+        ctx_count = builder.load(self.alloc_count)
+        ctx_new_count = builder.add(ctx_count, ir.Constant(self.i64, 1))
+        builder.store(ctx_new_count, self.alloc_count)
+        builder.ret(ctx_result)
+
+        # Main heap allocation path
+        builder.position_at_end(use_main_heap)
 
         # Total size = header (8) + user_size, aligned to 8 bytes
         header_size = ir.Constant(self.i64, self.HEADER_SIZE)
@@ -486,6 +753,18 @@ class GarbageCollector:
         final_size_alloca = builder.alloca(self.i64, name="final_size")
         builder.store(final_size, final_size_alloca)
 
+        # Proactive GC: check if we should collect before allocation
+        proactive_gc_block = func.append_basic_block("proactive_gc")
+
+        count_check = builder.load(self.alloc_count)
+        trigger_interval = ir.Constant(self.i64, self.GC_TRIGGER_INTERVAL)
+        should_gc = builder.icmp_unsigned(">=", count_check, trigger_interval)
+        builder.cbranch(should_gc, proactive_gc_block, try_alloc)
+
+        # Proactive GC: trigger collection and reset counter
+        builder.position_at_end(proactive_gc_block)
+        builder.call(self.gc_collect, [])
+        builder.store(ir.Constant(self.i64, 0), self.alloc_count)
         builder.branch(try_alloc)
 
         # Try to allocate from free list
@@ -533,7 +812,7 @@ class GarbageCollector:
         block2 = builder.call(self.gc_find_free_block, [final_size_val2])
 
         is_null2 = builder.icmp_unsigned("==", block2, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null2, oom, retry_success)
+        builder.cbranch(is_null2, try_expand, retry_success)
 
         # Retry succeeded
         builder.position_at_end(retry_success)
@@ -556,7 +835,44 @@ class GarbageCollector:
 
         builder.ret(user_ptr2)
 
-        # Out of memory - return null (caller should handle)
+        # Try heap expansion - GC didn't free enough memory
+        builder.position_at_end(try_expand)
+        final_size_val3 = builder.load(final_size_alloca)
+        expand_result = builder.call(self.gc_expand_heap, [final_size_val3])
+
+        # Check if expansion succeeded
+        expand_ok = builder.icmp_unsigned("==", expand_result, ir.Constant(self.i1, 1))
+        builder.cbranch(expand_ok, expand_retry, oom)
+
+        # Retry allocation after heap expansion
+        builder.position_at_end(expand_retry)
+        final_size_val4 = builder.load(final_size_alloca)
+        block3 = builder.call(self.gc_find_free_block, [final_size_val4])
+
+        is_null3 = builder.icmp_unsigned("==", block3, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null3, oom, expand_success)
+
+        # Expansion retry succeeded
+        builder.position_at_end(expand_success)
+        header3 = builder.bitcast(block3, self.header_type.as_pointer())
+
+        type_id_ptr3 = builder.gep(header3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(type_id, type_id_ptr3)
+
+        flags_ptr3 = builder.gep(header3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(ir.Constant(self.i32, 0), flags_ptr3)
+
+        block3_int = builder.ptrtoint(block3, self.i64)
+        user_ptr3_int = builder.add(block3_int, header_size)
+        user_ptr3 = builder.inttoptr(user_ptr3_int, self.i8_ptr)
+
+        count3 = builder.load(self.alloc_count)
+        new_count3 = builder.add(count3, ir.Constant(self.i64, 1))
+        builder.store(new_count3, self.alloc_count)
+
+        builder.ret(user_ptr3)
+
+        # Out of memory - heap expansion failed or reached limit
         builder.position_at_end(oom)
         builder.ret(ir.Constant(self.i8_ptr, None))
 
@@ -840,3 +1156,421 @@ class GarbageCollector:
         stack_marker = builder.alloca(self.i64, name="gc_stack_marker")
         stack_ptr = builder.bitcast(stack_marker, self.i8_ptr)
         builder.store(stack_ptr, self.stack_bottom)
+
+    def _implement_gc_create_context(self):
+        """Create a new heap context with given size and type
+
+        gc_create_context(size: i64, context_type: i32) -> HeapContext*
+
+        Allocates a new heap region and wraps it in a HeapContext struct.
+        For NURSERY contexts, the heap is allocated via system malloc.
+        Returns null if allocation fails.
+        """
+        func = self.gc_create_context
+        func.args[0].name = "size"
+        func.args[1].name = "context_type"
+
+        entry = func.append_basic_block("entry")
+        alloc_success = func.append_basic_block("alloc_success")
+        heap_success = func.append_basic_block("heap_success")
+        fail = func.append_basic_block("fail")
+
+        builder = ir.IRBuilder(entry)
+        size = func.args[0]
+        context_type = func.args[1]
+
+        # Allocate the HeapContext struct itself (small, fixed size)
+        ctx_size = ir.Constant(self.i64, 40)  # 3 pointers + i64 + i32 = 8+8+8+8+4 = 36, aligned to 40
+        ctx_mem = builder.call(self.codegen.malloc, [ctx_size])
+
+        is_null = builder.icmp_unsigned("==", ctx_mem, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, fail, alloc_success)
+
+        # Context struct allocated successfully
+        builder.position_at_end(alloc_success)
+        ctx_ptr = builder.bitcast(ctx_mem, self.heap_context_type.as_pointer())
+
+        # Allocate the heap region for this context
+        heap_mem = builder.call(self.codegen.malloc, [size])
+        is_heap_null = builder.icmp_unsigned("==", heap_mem, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_heap_null, fail, heap_success)
+
+        # Heap allocated successfully - initialize the context
+        builder.position_at_end(heap_success)
+
+        # Store heap_start (offset 0)
+        heap_start_ptr = builder.gep(ctx_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(heap_mem, heap_start_ptr)
+
+        # Calculate and store heap_end (offset 1)
+        heap_start_int = builder.ptrtoint(heap_mem, self.i64)
+        heap_end_int = builder.add(heap_start_int, size)
+        heap_end = builder.inttoptr(heap_end_int, self.i8_ptr)
+        heap_end_ptr = builder.gep(ctx_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(heap_end, heap_end_ptr)
+
+        # Initialize the free list: entire heap is one free block
+        free_node = builder.bitcast(heap_mem, self.free_node_type.as_pointer())
+
+        # Set free block size
+        free_size_ptr = builder.gep(free_node, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(size, free_size_ptr)
+
+        # Set next = null
+        free_next_ptr = builder.gep(free_node, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), free_next_ptr)
+
+        # Store free_list_head (offset 2)
+        free_list_ptr = builder.gep(ctx_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(heap_mem, free_list_ptr)
+
+        # Store heap_size (offset 3)
+        heap_size_ptr = builder.gep(ctx_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(size, heap_size_ptr)
+
+        # Store context_type (offset 4)
+        type_ptr = builder.gep(ctx_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        builder.store(context_type, type_ptr)
+
+        builder.ret(ctx_ptr)
+
+        # Failure path
+        builder.position_at_end(fail)
+        builder.ret(ir.Constant(self.heap_context_type.as_pointer(), None))
+
+    def _implement_gc_destroy_context(self):
+        """Destroy a heap context, freeing all its memory
+
+        gc_destroy_context(ctx: HeapContext*) -> void
+
+        For NURSERY contexts, this is a bulk-free operation - no scanning needed.
+        Simply frees the heap region and the context struct itself.
+        """
+        func = self.gc_destroy_context
+        func.args[0].name = "ctx"
+
+        entry = func.append_basic_block("entry")
+        do_free = func.append_basic_block("do_free")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        ctx = func.args[0]
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", ctx, ir.Constant(self.heap_context_type.as_pointer(), None))
+        builder.cbranch(is_null, done, do_free)
+
+        builder.position_at_end(do_free)
+
+        # Get heap_start and free it
+        heap_start_ptr = builder.gep(ctx, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        heap_start = builder.load(heap_start_ptr)
+        builder.call(self.codegen.free, [heap_start])
+
+        # Free the context struct itself
+        ctx_i8 = builder.bitcast(ctx, self.i8_ptr)
+        builder.call(self.codegen.free, [ctx_i8])
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_push_context(self):
+        """Push a context onto the stack, making it active for allocations
+
+        gc_push_context(ctx: HeapContext*) -> void
+
+        The pushed context becomes the active context for subsequent allocations.
+        """
+        func = self.gc_push_context
+        func.args[0].name = "ctx"
+
+        entry = func.append_basic_block("entry")
+        do_push = func.append_basic_block("do_push")
+        overflow = func.append_basic_block("overflow")
+
+        builder = ir.IRBuilder(entry)
+        ctx = func.args[0]
+
+        # Load current stack top
+        stack_top = builder.load(self.context_stack_top)
+        max_depth = ir.Constant(self.i32, self.MAX_CONTEXT_DEPTH - 1)
+
+        # Check for overflow
+        can_push = builder.icmp_signed("<", stack_top, max_depth)
+        builder.cbranch(can_push, do_push, overflow)
+
+        builder.position_at_end(do_push)
+
+        # Increment stack top
+        new_top = builder.add(stack_top, ir.Constant(self.i32, 1))
+        builder.store(new_top, self.context_stack_top)
+
+        # Store context at new position
+        # context_stack[new_top] = ctx
+        slot_ptr = builder.gep(self.context_stack, [
+            ir.Constant(self.i32, 0),
+            new_top
+        ], inbounds=True)
+        builder.store(ctx, slot_ptr)
+
+        builder.ret_void()
+
+        # Overflow - just ignore (could log error in debug mode)
+        builder.position_at_end(overflow)
+        builder.ret_void()
+
+    def _implement_gc_pop_context(self):
+        """Pop a context from the stack, restore previous as active
+
+        gc_pop_context() -> HeapContext*
+
+        Returns the popped context (caller is responsible for destroying it if needed).
+        Returns null if stack is empty.
+        """
+        func = self.gc_pop_context
+
+        entry = func.append_basic_block("entry")
+        do_pop = func.append_basic_block("do_pop")
+        empty = func.append_basic_block("empty")
+
+        builder = ir.IRBuilder(entry)
+
+        # Load current stack top
+        stack_top = builder.load(self.context_stack_top)
+
+        # Check if stack is empty (top == 0 means only main context)
+        is_empty = builder.icmp_signed("<=", stack_top, ir.Constant(self.i32, 0))
+        builder.cbranch(is_empty, empty, do_pop)
+
+        builder.position_at_end(do_pop)
+
+        # Get context at current top
+        slot_ptr = builder.gep(self.context_stack, [
+            ir.Constant(self.i32, 0),
+            stack_top
+        ], inbounds=True)
+        ctx = builder.load(slot_ptr)
+
+        # Clear the slot
+        builder.store(ir.Constant(self.heap_context_type.as_pointer(), None), slot_ptr)
+
+        # Decrement stack top
+        new_top = builder.sub(stack_top, ir.Constant(self.i32, 1))
+        builder.store(new_top, self.context_stack_top)
+
+        builder.ret(ctx)
+
+        # Empty stack
+        builder.position_at_end(empty)
+        builder.ret(ir.Constant(self.heap_context_type.as_pointer(), None))
+
+    def _implement_gc_alloc_in_context(self):
+        """Allocate memory within a specific heap context
+
+        gc_alloc_in_context(ctx: HeapContext*, size: i64, type_id: i32) -> i8*
+
+        Allocates from the given context's free list. Does NOT trigger GC or
+        expand heap - for nursery contexts, we want predictable behavior.
+        Returns null if allocation fails (caller can promote to main heap).
+        """
+        func = self.gc_alloc_in_context
+        func.args[0].name = "ctx"
+        func.args[1].name = "user_size"
+        func.args[2].name = "type_id"
+
+        entry = func.append_basic_block("entry")
+        null_check = func.append_basic_block("null_check")
+        try_alloc = func.append_basic_block("try_alloc")
+        loop_start = func.append_basic_block("loop_start")
+        check_size = func.append_basic_block("check_size")
+        found_block = func.append_basic_block("found_block")
+        split_check = func.append_basic_block("split_check")
+        do_split = func.append_basic_block("do_split")
+        no_split = func.append_basic_block("no_split")
+        next_block = func.append_basic_block("next_block")
+        init_header = func.append_basic_block("init_header")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+        ctx = func.args[0]
+        user_size = func.args[1]
+        type_id = func.args[2]
+
+        # Null check on context
+        is_ctx_null = builder.icmp_unsigned("==", ctx, ir.Constant(self.heap_context_type.as_pointer(), None))
+        builder.cbranch(is_ctx_null, not_found, null_check)
+
+        builder.position_at_end(null_check)
+
+        # Calculate needed size with header and alignment
+        header_size = ir.Constant(self.i64, self.HEADER_SIZE)
+        total_size = builder.add(user_size, header_size)
+
+        # Align to 8 bytes
+        seven = ir.Constant(self.i64, 7)
+        aligned_size = builder.and_(
+            builder.add(total_size, seven),
+            ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
+        )
+
+        # Ensure minimum block size
+        min_size = ir.Constant(self.i64, self.MIN_BLOCK_SIZE)
+        is_too_small = builder.icmp_unsigned("<", aligned_size, min_size)
+        final_size = builder.select(is_too_small, min_size, aligned_size)
+
+        # Store for later use
+        final_size_alloca = builder.alloca(self.i64, name="final_size")
+        builder.store(final_size, final_size_alloca)
+
+        builder.branch(try_alloc)
+
+        # Get context's free list head
+        builder.position_at_end(try_alloc)
+        free_list_ptr = builder.gep(ctx, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 2)
+        ], inbounds=True)
+
+        # prev_ptr points to location containing current block pointer
+        prev_ptr = builder.alloca(self.i8_ptr.as_pointer(), name="prev_ptr")
+        builder.store(free_list_ptr, prev_ptr)
+
+        # curr points to current block
+        curr = builder.alloca(self.i8_ptr, name="curr")
+        head = builder.load(free_list_ptr)
+        builder.store(head, curr)
+
+        builder.branch(loop_start)
+
+        # Loop: while curr != null
+        builder.position_at_end(loop_start)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, not_found, check_size)
+
+        # Check if current block is big enough
+        builder.position_at_end(check_size)
+        curr_node = builder.bitcast(curr_val, self.free_node_type.as_pointer())
+        size_ptr = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        block_size = builder.load(size_ptr)
+        needed = builder.load(final_size_alloca)
+
+        big_enough = builder.icmp_unsigned(">=", block_size, needed)
+        builder.cbranch(big_enough, found_block, next_block)
+
+        # Found suitable block
+        builder.position_at_end(found_block)
+        next_field = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        next_block_ptr = builder.load(next_field)
+        builder.branch(split_check)
+
+        # Check if we should split
+        builder.position_at_end(split_check)
+        remaining = builder.sub(block_size, needed)
+        min_block = ir.Constant(self.i64, self.MIN_BLOCK_SIZE)
+        should_split = builder.icmp_unsigned(">=", remaining, min_block)
+        builder.cbranch(should_split, do_split, no_split)
+
+        # Split the block
+        builder.position_at_end(do_split)
+        curr_int = builder.ptrtoint(curr_val, self.i64)
+        new_block_int = builder.add(curr_int, needed)
+        new_block_ptr2 = builder.inttoptr(new_block_int, self.i8_ptr)
+        new_block_node = builder.bitcast(new_block_ptr2, self.free_node_type.as_pointer())
+
+        # Set new block's size
+        new_size_ptr = builder.gep(new_block_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(remaining, new_size_ptr)
+
+        # Set new block's next
+        new_next_ptr = builder.gep(new_block_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(next_block_ptr, new_next_ptr)
+
+        # Update prev to point to new block
+        prev_loc = builder.load(prev_ptr)
+        builder.store(new_block_ptr2, prev_loc)
+
+        # Update size of allocated block
+        builder.store(needed, size_ptr)
+
+        # Store allocated values for init_header
+        allocated_block = builder.alloca(self.i8_ptr, name="allocated")
+        builder.store(curr_val, allocated_block)
+        allocated_size = builder.alloca(self.i64, name="alloc_size")
+        builder.store(needed, allocated_size)
+
+        builder.branch(init_header)
+
+        # Use entire block
+        builder.position_at_end(no_split)
+        prev_loc2 = builder.load(prev_ptr)
+        builder.store(next_block_ptr, prev_loc2)
+
+        # Store for init_header
+        allocated_block2 = builder.alloca(self.i8_ptr, name="allocated2")
+        builder.store(curr_val, allocated_block2)
+
+        builder.branch(init_header)
+
+        # Move to next block
+        builder.position_at_end(next_block)
+        next_field2 = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        next_field2_cast = builder.bitcast(next_field2, self.i8_ptr.as_pointer())
+        builder.store(next_field2_cast, prev_ptr)
+        next_val = builder.load(next_field2)
+        builder.store(next_val, curr)
+        builder.branch(loop_start)
+
+        # Initialize header and return user pointer
+        builder.position_at_end(init_header)
+        # Use phi to get the allocated block from either path
+        block_phi = builder.phi(self.i8_ptr, name="block_phi")
+        block_phi.add_incoming(curr_val, do_split)
+        block_phi.add_incoming(curr_val, no_split)
+
+        header = builder.bitcast(block_phi, self.header_type.as_pointer())
+
+        # Type ID at offset 1
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(type_id, type_id_ptr)
+
+        # Flags at offset 2 (0 = not marked)
+        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(ir.Constant(self.i32, 0), flags_ptr)
+
+        # Return pointer to user data
+        block_int = builder.ptrtoint(block_phi, self.i64)
+        user_ptr_int = builder.add(block_int, header_size)
+        user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
+
+        builder.ret(user_ptr)
+
+        # Not found
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(self.i8_ptr, None))

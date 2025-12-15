@@ -337,7 +337,8 @@ class CodeGenerator:
         # Initial allocation: 32 * elem_size bytes
         tail_capacity = ir.Constant(i64, 32)
         tail_size = builder.mul(tail_capacity, func.args[0])
-        tail_ptr = builder.call(self.malloc, [tail_size])
+        tail_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
+        tail_ptr = builder.call(self.gc.gc_alloc, [tail_size, tail_type_id])
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(tail_ptr, tail_field_ptr)
 
@@ -476,10 +477,12 @@ class CodeGenerator:
         # Max leaves at depth 1 = 32, so max elements in tree = 1024
 
         pv_node_size = ir.Constant(i64, 8 + 32 * 8)  # refcount + 32 pointers
+        pv_node_type_id = ir.Constant(i32, self.gc.TYPE_PV_NODE)
+        leaf_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
 
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
-        leaf_data = builder.call(self.malloc, [leaf_size])
+        leaf_data = builder.call(self.gc.gc_alloc, [leaf_size, leaf_type_id])
         builder.call(self.memcpy, [leaf_data, old_tail, leaf_size])
 
         # Calculate how many leaves are currently in the tree
@@ -499,7 +502,7 @@ class CodeGenerator:
         builder.position_at_end(create_root_block)
 
         # Create new root node
-        new_root_raw_create = builder.call(self.malloc, [pv_node_size])
+        new_root_raw_create = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_root_create = builder.bitcast(new_root_raw_create, self.pv_node_struct.as_pointer())
 
         # Initialize refcount = 1
@@ -539,7 +542,7 @@ class CodeGenerator:
         builder.position_at_end(depth_increase_block)
 
         # Create new root node
-        new_uber_root_raw = builder.call(self.malloc, [pv_node_size])
+        new_uber_root_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_uber_root = builder.bitcast(new_uber_root_raw, self.pv_node_struct.as_pointer())
 
         # Initialize refcount = 1
@@ -599,7 +602,7 @@ class CodeGenerator:
         builder.store(working_root, current_alloca)
 
         # Copy the root node first (we always need a new root)
-        new_root_raw_add = builder.call(self.malloc, [pv_node_size])
+        new_root_raw_add = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_root_add = builder.bitcast(new_root_raw_add, self.pv_node_struct.as_pointer())
         add_refcount_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(ir.Constant(i64, 1), add_refcount_ptr)
@@ -678,7 +681,7 @@ class CodeGenerator:
 
         # Create new child node (branch didn't exist before)
         builder.position_at_end(create_child_block)
-        new_child_raw_create = builder.call(self.malloc, [pv_node_size])
+        new_child_raw_create = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_child_create = builder.bitcast(new_child_raw_create, self.pv_node_struct.as_pointer())
         create_child_refcount = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(ir.Constant(i64, 1), create_child_refcount)
@@ -691,7 +694,7 @@ class CodeGenerator:
         # Copy existing child node
         builder.position_at_end(copy_child_block)
         old_child_node = builder.bitcast(old_child_i8, self.pv_node_struct.as_pointer())
-        new_child_raw_copy = builder.call(self.malloc, [pv_node_size])
+        new_child_raw_copy = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_child_copy = builder.bitcast(new_child_raw_copy, self.pv_node_struct.as_pointer())
         copy_child_refcount = builder.gep(new_child_copy, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(ir.Constant(i64, 1), copy_child_refcount)
@@ -1075,6 +1078,8 @@ class CodeGenerator:
         # For depth > 1, we have: root -> internal nodes -> ... -> leaf arrays
 
         pv_node_size = ir.Constant(i64, 8 + 32 * 8)  # refcount + 32 pointers
+        pv_node_type_id = ir.Constant(i32, self.gc.TYPE_PV_NODE)
+        leaf_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
 
         # Check if root is null (shouldn't happen if index is in tree, but handle it)
         root_null_check = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
@@ -1088,7 +1093,7 @@ class CodeGenerator:
         builder.position_at_end(root_exists)
 
         # Copy the root node
-        new_root_raw = builder.call(self.malloc, [pv_node_size])
+        new_root_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_root = builder.bitcast(new_root_raw, self.pv_node_struct.as_pointer())
 
         # Initialize new root refcount = 1
@@ -1137,7 +1142,7 @@ class CodeGenerator:
 
         # Create new leaf (copy of old leaf)
         leaf_size_d1 = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_d1 = builder.call(self.malloc, [leaf_size_d1])
+        new_leaf_d1 = builder.call(self.gc.gc_alloc, [leaf_size_d1, leaf_type_id])
         builder.call(self.memcpy, [new_leaf_d1, old_leaf_d1, leaf_size_d1])
 
         # Modify element in new leaf at position index & 0x1F
@@ -1200,7 +1205,7 @@ class CodeGenerator:
         old_child = builder.bitcast(old_child_raw, self.pv_node_struct.as_pointer())
 
         # Create new child node (copy of old)
-        new_child_raw = builder.call(self.malloc, [pv_node_size])
+        new_child_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
         new_child = builder.bitcast(new_child_raw, self.pv_node_struct.as_pointer())
 
         # Initialize refcount = 1
@@ -1243,7 +1248,7 @@ class CodeGenerator:
 
         # Create new leaf
         leaf_size_m = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_m = builder.call(self.malloc, [leaf_size_m])
+        new_leaf_m = builder.call(self.gc.gc_alloc, [leaf_size_m, leaf_type_id])
         builder.call(self.memcpy, [new_leaf_m, old_leaf_m, leaf_size_m])
 
         # Modify element in new leaf
@@ -1388,7 +1393,8 @@ class CodeGenerator:
         # For tail, we need to copy the data (tail is mutable in append operations)
         tail_capacity = ir.Constant(i64, 32)
         tail_size = builder.mul(tail_capacity, src_elem_size)
-        new_tail = builder.call(self.malloc, [tail_size])
+        tail_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
+        new_tail = builder.call(self.gc.gc_alloc, [tail_size, tail_type_id])
         dst_tail_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(new_tail, dst_tail_ptr)
 
@@ -1516,7 +1522,8 @@ class CodeGenerator:
 
         # Allocate data buffer first: cap * elem_size
         data_size = builder.mul(cap, elem_size)
-        data_ptr = builder.call(self.malloc, [data_size])
+        array_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY_DATA)
+        data_ptr = builder.call(self.gc.gc_alloc, [data_size, array_data_type_id])
 
         # Initialize fields with new layout
         # data (field 0)
@@ -2351,8 +2358,9 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Allocate data buffer: byte_len bytes via malloc
-        data_buf = builder.call(self.malloc, [byte_len])
+        # Allocate data buffer: byte_len bytes via GC
+        string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
+        data_buf = builder.call(self.gc.gc_alloc, [byte_len, string_data_type_id])
 
         # Copy source data to buffer
         builder.call(self.memcpy, [data_buf, data, byte_len])
@@ -2699,8 +2707,9 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Allocate data buffer: total_size bytes via malloc
-        dest_data = builder.call(self.malloc, [total_size])
+        # Allocate data buffer: total_size bytes via GC
+        string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
+        dest_data = builder.call(self.gc.gc_alloc, [total_size, string_data_type_id])
 
         # Copy a's data
         a_data_ptr_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
@@ -2985,8 +2994,9 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         dst = builder.bitcast(raw_ptr, string_ptr_type)
 
-        # Allocate new data buffer: src_size bytes via malloc
-        dst_data = builder.call(self.malloc, [src_size])
+        # Allocate new data buffer: src_size bytes via GC
+        string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        dst_data = builder.call(self.gc.gc_alloc, [src_size, string_data_type_id])
 
         # Copy data from src to dst
         builder.call(self.memcpy, [dst_data, src_data, src_size])
@@ -3100,10 +3110,7 @@ class CodeGenerator:
         builder.cbranch(was_one, do_free, done)
 
         builder.position_at_end(do_free)
-        # Free the data buffer (field 0)
-        data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
-        builder.call(self.free, [data_ptr])
+        # GC will reclaim the data buffer - no need for explicit free
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -3958,7 +3965,8 @@ class CodeGenerator:
         # Allocate entries array: 8 entries * 24 bytes each (aligned)
         entry_size = ir.Constant(ir.IntType(64), 24)
         entries_size = builder.mul(initial_cap, entry_size)
-        entries_raw = builder.call(self.malloc, [entries_size])
+        map_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP_ENTRY)
+        entries_raw = builder.call(self.gc.gc_alloc, [entries_size, map_entry_type_id])
         entries_ptr = builder.bitcast(entries_raw, self.map_entry_struct.as_pointer())
         
         # Initialize each entry's state to 0 (empty)
@@ -4130,7 +4138,8 @@ class CodeGenerator:
         # Allocate new entries
         entry_size = ir.Constant(ir.IntType(64), 24)
         new_size = builder.mul(new_cap, entry_size)
-        new_raw = builder.call(self.malloc, [new_size])
+        map_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP_ENTRY)
+        new_raw = builder.call(self.gc.gc_alloc, [new_size, map_entry_type_id])
         new_entries = builder.bitcast(new_raw, self.map_entry_struct.as_pointer())
         
         # Initialize new entries
@@ -4203,10 +4212,9 @@ class CodeGenerator:
         builder.branch(rehash_loop)
         
         builder.position_at_end(done)
-        old_raw = builder.bitcast(old_entries, ir.IntType(8).as_pointer())
-        builder.call(self.free, [old_raw])
+        # GC will reclaim old entries array - no need for explicit free
         builder.ret_void()
-    
+
     def _implement_map_set(self):
         """Return a NEW map with key-value pair set (value semantics).
 
@@ -4516,7 +4524,8 @@ class CodeGenerator:
         # Allocate new entries array: cap * 24 bytes (MapEntry size)
         entry_size = ir.Constant(i64, 24)
         entries_size = builder.mul(src_cap, entry_size)
-        new_entries_raw = builder.call(self.malloc, [entries_size])
+        map_entry_type_id = ir.Constant(i32, self.gc.TYPE_MAP_ENTRY)
+        new_entries_raw = builder.call(self.gc.gc_alloc, [entries_size, map_entry_type_id])
         new_entries = builder.bitcast(new_entries_raw, self.map_entry_struct.as_pointer())
 
         # Store entries pointer
@@ -5036,7 +5045,8 @@ class CodeGenerator:
         # Allocate entries array: 8 entries * 16 bytes each (i64 key + i8 state, padded)
         entry_size = ir.Constant(ir.IntType(64), 16)
         entries_size = builder.mul(initial_cap, entry_size)
-        entries_raw = builder.call(self.malloc, [entries_size])
+        set_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET_ENTRY)
+        entries_raw = builder.call(self.gc.gc_alloc, [entries_size, set_entry_type_id])
         entries_ptr = builder.bitcast(entries_raw, self.set_entry_struct.as_pointer())
         
         # Initialize each entry's state to 0 (empty) using a loop
@@ -5203,7 +5213,8 @@ class CodeGenerator:
         # Allocate new entries array
         entry_size = ir.Constant(ir.IntType(64), 16)
         new_entries_size = builder.mul(new_cap, entry_size)
-        new_entries_raw = builder.call(self.malloc, [new_entries_size])
+        set_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET_ENTRY)
+        new_entries_raw = builder.call(self.gc.gc_alloc, [new_entries_size, set_entry_type_id])
         new_entries = builder.bitcast(new_entries_raw, self.set_entry_struct.as_pointer())
         
         # Initialize new entries using a loop
@@ -5304,12 +5315,11 @@ class CodeGenerator:
         builder.store(next_idx, idx_alloca)
         builder.branch(loop_block)
         
-        # Done - free old entries
+        # Done - GC will reclaim old entries
         builder = ir.IRBuilder(done_block)
-        old_entries_raw = builder.bitcast(old_entries, ir.IntType(8).as_pointer())
-        builder.call(self.free, [old_entries_raw])
+        # GC will reclaim old entries array - no need for explicit free
         builder.ret_void()
-    
+
     def _implement_set_add(self):
         """Return a NEW set with key added (value semantics).
 
@@ -5588,7 +5598,8 @@ class CodeGenerator:
         # Allocate new entries array: cap * 16 bytes (SetEntry size)
         entry_size = ir.Constant(i64, 16)
         entries_size = builder.mul(src_cap, entry_size)
-        new_entries_raw = builder.call(self.malloc, [entries_size])
+        set_entry_type_id = ir.Constant(i32, self.gc.TYPE_SET_ENTRY)
+        new_entries_raw = builder.call(self.gc.gc_alloc, [entries_size, set_entry_type_id])
         new_entries = builder.bitcast(new_entries_raw, self.set_entry_struct.as_pointer())
 
         # Store entries pointer
@@ -5980,9 +5991,10 @@ class CodeGenerator:
         
         initial = func.args[0]
         
-        # Allocate AtomicRef struct (8 bytes)
+        # Allocate AtomicRef struct (8 bytes) via GC
         ref_size = ir.Constant(ir.IntType(64), 8)
-        raw_ptr = builder.call(self.malloc, [ref_size])
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_UNKNOWN)
+        raw_ptr = builder.call(self.gc.gc_alloc, [ref_size, type_id])
         ref_ptr = builder.bitcast(raw_ptr, self.atomic_ref_struct.as_pointer())
         
         # Get pointer to the value field
@@ -6239,7 +6251,8 @@ class CodeGenerator:
         actual_cap = builder.select(is_unbuffered, one, capacity)
         elem_size = ir.Constant(i64, 8)
         buffer_size = builder.mul(actual_cap, elem_size)
-        data_raw = builder.call(self.malloc, [buffer_size])
+        channel_buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL_BUFFER)
+        data_raw = builder.call(self.gc.gc_alloc, [buffer_size, channel_buffer_type_id])
         
         data_field = builder.gep(chan, [
             ir.Constant(ir.IntType(32), 0),
@@ -6329,14 +6342,14 @@ class CodeGenerator:
         # Allocate new buffer
         elem_size = ir.Constant(i64, 8)
         new_size = builder.mul(new_cap, elem_size)
-        new_data = builder.call(self.malloc, [new_size])
-        
+        channel_buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL_BUFFER)
+        new_data = builder.call(self.gc.gc_alloc, [new_size, channel_buffer_type_id])
+
         # Copy old data: memcpy(new_data, old_data, current_len * 8)
         copy_size = builder.mul(current_len, elem_size)
         builder.call(self.memcpy, [new_data, old_data, copy_size])
-        
-        # Free old buffer
-        builder.call(self.free, [old_data])
+
+        # Old buffer will be reclaimed by GC
         
         # Update channel fields
         builder.store(new_cap, cap_field)
@@ -8517,19 +8530,269 @@ class CodeGenerator:
             return self._cycle_context_stack[-1]
         return None
 
+    # ========================================================================
+    # Loop Nursery Support
+    # ========================================================================
+
+    def _loop_needs_nursery(self, stmt: ForStmt) -> bool:
+        """Detect if loop body has collection mutations that create garbage.
+
+        Returns True if the loop contains patterns like:
+          - var = var.append(x)
+          - var = var.set(i, x)
+        These patterns create new collections, making the old ones garbage.
+        A nursery can bulk-free these intermediate values efficiently.
+        """
+        return self._has_collection_mutations(stmt.body)
+
+    def _has_collection_mutations(self, stmts: PyList[Stmt]) -> bool:
+        """Check if statements contain collection mutation patterns."""
+        mutation_methods = ('append', 'set', 'push', 'insert', 'remove', 'pop')
+
+        for stmt in stmts:
+            if isinstance(stmt, Assignment):
+                # Check for pattern: var = var.method(...)
+                # where method is append, set, or similar mutation
+                if isinstance(stmt.target, Identifier):
+                    target_name = stmt.target.name
+
+                    # Pattern 1: MethodCallExpr (var = var.append(...))
+                    if isinstance(stmt.value, MethodCallExpr):
+                        method_obj = stmt.value.object
+                        method_name = stmt.value.method
+                        if isinstance(method_obj, Identifier) and method_obj.name == target_name:
+                            if method_name in mutation_methods:
+                                return True
+
+                    # Pattern 2: CallExpr with MemberExpr callee (arr.append parsed as CallExpr)
+                    elif isinstance(stmt.value, CallExpr) and isinstance(stmt.value.callee, MemberExpr):
+                        member_expr = stmt.value.callee
+                        method_obj = member_expr.object
+                        method_name = member_expr.member
+                        if isinstance(method_obj, Identifier) and method_obj.name == target_name:
+                            if method_name in mutation_methods:
+                                return True
+
+            elif isinstance(stmt, VarDecl):
+                # Check for var x = x.append(...) patterns with rebinding
+                if stmt.value:
+                    if isinstance(stmt.value, MethodCallExpr):
+                        if stmt.value.method in mutation_methods:
+                            return True
+                    elif isinstance(stmt.value, CallExpr) and isinstance(stmt.value.callee, MemberExpr):
+                        if stmt.value.callee.member in mutation_methods:
+                            return True
+
+            elif isinstance(stmt, IfStmt):
+                # Recurse into branches
+                if self._has_collection_mutations(stmt.then_body):
+                    return True
+                for _, body in stmt.else_if_clauses:
+                    if self._has_collection_mutations(body):
+                        return True
+                if stmt.else_body and self._has_collection_mutations(stmt.else_body):
+                    return True
+
+            elif isinstance(stmt, LoopStmt):
+                if self._has_collection_mutations(stmt.body):
+                    return True
+
+            elif isinstance(stmt, WhileStmt):
+                if self._has_collection_mutations(stmt.body):
+                    return True
+
+        return False
+
+    def _get_loop_carried_vars(self, stmt: ForStmt) -> PyList[str]:
+        """Find variables that are both read and written in loop body.
+
+        These are variables whose final values must survive the loop -
+        they need to be promoted out of the nursery at the end.
+        """
+        written: set = set()
+        read: set = set()
+
+        self._collect_var_usage(stmt.body, written, read)
+
+        # Loop-carried vars are those both read and written
+        # (they depend on previous iterations)
+        loop_carried = written & read
+
+        # Also include vars that are written and used after the loop
+        # For now, we conservatively include all written vars that existed before the loop
+        pre_existing = set(self.locals.keys()) | set(self.globals.keys())
+        escaping = written & pre_existing
+
+        return list(loop_carried | escaping)
+
+    def _collect_var_usage(self, stmts: PyList[Stmt], written: set, read: set):
+        """Collect variables that are written and read in statements."""
+        for stmt in stmts:
+            if isinstance(stmt, Assignment):
+                # Collect writes
+                if isinstance(stmt.target, Identifier):
+                    written.add(stmt.target.name)
+                # Collect reads from value expression
+                self._collect_expr_reads(stmt.value, read)
+
+            elif isinstance(stmt, VarDecl):
+                written.add(stmt.name)
+                if stmt.value:
+                    self._collect_expr_reads(stmt.value, read)
+
+            elif isinstance(stmt, ExprStmt):
+                self._collect_expr_reads(stmt.expr, read)
+
+            elif isinstance(stmt, ReturnStmt):
+                if stmt.value:
+                    self._collect_expr_reads(stmt.value, read)
+
+            elif isinstance(stmt, IfStmt):
+                self._collect_expr_reads(stmt.condition, read)
+                self._collect_var_usage(stmt.then_body, written, read)
+                for cond, body in stmt.else_if_clauses:
+                    self._collect_expr_reads(cond, read)
+                    self._collect_var_usage(body, written, read)
+                if stmt.else_body:
+                    self._collect_var_usage(stmt.else_body, written, read)
+
+            elif isinstance(stmt, ForStmt):
+                self._collect_expr_reads(stmt.iterable, read)
+                self._collect_var_usage(stmt.body, written, read)
+
+            elif isinstance(stmt, LoopStmt):
+                self._collect_var_usage(stmt.body, written, read)
+
+            elif isinstance(stmt, WhileStmt):
+                self._collect_expr_reads(stmt.condition, read)
+                self._collect_var_usage(stmt.body, written, read)
+
+    def _collect_expr_reads(self, expr: Expr, read: set):
+        """Collect variable reads from an expression."""
+        if isinstance(expr, Identifier):
+            read.add(expr.name)
+        elif isinstance(expr, BinaryExpr):
+            self._collect_expr_reads(expr.left, read)
+            self._collect_expr_reads(expr.right, read)
+        elif isinstance(expr, UnaryExpr):
+            self._collect_expr_reads(expr.operand, read)
+        elif isinstance(expr, TernaryExpr):
+            self._collect_expr_reads(expr.condition, read)
+            self._collect_expr_reads(expr.then_expr, read)
+            self._collect_expr_reads(expr.else_expr, read)
+        elif isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                # Don't count function names as variable reads
+                pass
+            else:
+                self._collect_expr_reads(expr.callee, read)
+            for arg in expr.args:
+                self._collect_expr_reads(arg, read)
+        elif isinstance(expr, MethodCallExpr):
+            self._collect_expr_reads(expr.object, read)
+            for arg in expr.args:
+                self._collect_expr_reads(arg, read)
+        elif isinstance(expr, MemberExpr):
+            self._collect_expr_reads(expr.object, read)
+        elif isinstance(expr, IndexExpr):
+            self._collect_expr_reads(expr.object, read)
+            for idx in expr.indices:
+                self._collect_expr_reads(idx, read)
+        elif isinstance(expr, ListExpr):
+            for elem in expr.elements:
+                self._collect_expr_reads(elem, read)
+        elif isinstance(expr, TupleExpr):
+            for elem in expr.elements:
+                self._collect_expr_reads(elem, read)
+        elif isinstance(expr, RangeExpr):
+            self._collect_expr_reads(expr.start, read)
+            self._collect_expr_reads(expr.end, read)
+        elif isinstance(expr, LambdaExpr):
+            # Lambda body is a separate scope, but captures are reads
+            self._collect_expr_reads(expr.body, read)
+
+    def _estimate_nursery_size(self, stmt: ForStmt, iteration_count: Optional[ir.Value]) -> ir.Value:
+        """Estimate the nursery size needed for a loop.
+
+        For range-based loops with known iteration count, we can estimate better.
+        Default: 64MB which should handle most collection mutation patterns.
+
+        For persistent vector appends, each operation creates:
+        - New List struct (~32 bytes + 16 byte GC header = 48 bytes)
+        - Path-copied tree nodes (~280 bytes per node, depth can be 4-6)
+        - Potentially new tail buffer (~256+ bytes)
+        Estimate ~1KB per iteration for safety.
+        """
+        # Default size: 64MB for typical collection operations
+        default_size = ir.Constant(ir.IntType(64), 64 * 1024 * 1024)
+
+        # If we have an iteration count, scale based on expected per-iteration allocation
+        # Persistent vector append creates ~1KB of garbage per iteration
+        if iteration_count is not None:
+            per_iteration = ir.Constant(ir.IntType(64), 1024)  # ~1KB per iteration for PV operations
+            estimated = self.builder.mul(iteration_count, per_iteration)
+            # Use max of default and estimated
+            use_estimated = self.builder.icmp_unsigned(">", estimated, default_size)
+            return self.builder.select(use_estimated, estimated, default_size)
+
+        return default_size
+
+    def _copy_collection_to_main_heap(self, var_name: str, var_ptr: ir.Value, elem_type: ir.Type) -> ir.Value:
+        """Copy a collection from nursery to main heap.
+
+        This is called when promoting loop-carried variables out of the nursery.
+        For List types, creates a fresh copy in the main heap using runtime copy functions.
+
+        var_ptr is typically an alloca of a pointer type (e.g., %struct.List**)
+        We need to load the pointer, copy the collection, and store the new pointer back.
+        """
+        # Load the collection pointer from the alloca
+        if isinstance(var_ptr.type, ir.PointerType):
+            loaded = self.builder.load(var_ptr)
+
+            # Check if the loaded value is a collection pointer
+            if isinstance(loaded.type, ir.PointerType):
+                pointee = loaded.type.pointee
+                if hasattr(pointee, 'name'):
+                    if 'List' in pointee.name:
+                        # Copy the list to main heap using runtime function
+                        copied = self.builder.call(self.list_copy, [loaded])
+                        self.builder.store(copied, var_ptr)
+                        return copied
+                    elif 'Array' in pointee.name:
+                        # Copy the array to main heap using runtime function
+                        copied = self.builder.call(self.array_copy, [loaded])
+                        self.builder.store(copied, var_ptr)
+                        return copied
+                    elif 'Map' in pointee.name:
+                        # Copy the map to main heap using runtime function
+                        copied = self.builder.call(self.map_copy, [loaded])
+                        self.builder.store(copied, var_ptr)
+                        return copied
+                    elif 'Set' in pointee.name:
+                        # Copy the set to main heap using runtime function
+                        copied = self.builder.call(self.set_copy, [loaded])
+                        self.builder.store(copied, var_ptr)
+                        return copied
+
+        return self.builder.load(var_ptr)
+
     def _generate_for(self, stmt: ForStmt):
-        """Generate a for loop"""
+        """Generate a for loop, optionally with nursery for collection mutations"""
         func = self.builder.function
-        
+
+        # Check if this loop needs a nursery for efficient garbage collection
+        use_nursery = self._loop_needs_nursery(stmt) and hasattr(self, 'gc') and self.gc is not None
+
         # Check if iterable is a range() call
         if isinstance(stmt.iterable, CallExpr) and isinstance(stmt.iterable.callee, Identifier):
             if stmt.iterable.callee.name == "range":
-                self._generate_range_for(stmt)
+                self._generate_range_for(stmt, use_nursery)
                 return
-        
+
         # Check if iterable is a RangeExpr (start..end)
         if isinstance(stmt.iterable, RangeExpr):
-            self._generate_range_expr_for(stmt)
+            self._generate_range_expr_for(stmt, use_nursery)
             return
         
         # Check if iterable is a list, array, or map
@@ -8556,11 +8819,15 @@ class CodeGenerator:
         for s in stmt.body:
             self._generate_statement(s)
     
-    def _generate_range_for(self, stmt: ForStmt):
-        """Generate for i in range(start, end)"""
+    def _generate_range_for(self, stmt: ForStmt, use_nursery: bool = False):
+        """Generate for i in range(start, end)
+
+        If use_nursery is True, creates a nursery context for intermediate allocations
+        and promotes loop-carried variables to main heap after the loop.
+        """
         func = self.builder.function
         args = stmt.iterable.args
-        
+
         if len(args) == 1:
             start = ir.Constant(ir.IntType(64), 0)
             end = self._generate_expression(args[0])
@@ -8569,16 +8836,16 @@ class CodeGenerator:
             end = self._generate_expression(args[1])
         else:
             return
-        
+
         # Ensure i64
         if start.type != ir.IntType(64):
             start = self._cast_value(start, ir.IntType(64))
         if end.type != ir.IntType(64):
             end = self._cast_value(end, ir.IntType(64))
-        
+
         # Get variable name from pattern
         var_name = stmt.var_name if stmt.var_name else "__loop_var"
-        
+
         # PRE-ALLOCATE all local variables used in the loop body
         # This prevents stack overflow from allocas inside the loop
         local_vars = self._collect_local_variables(stmt.body)
@@ -8586,33 +8853,67 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
-        
+
         # Allocate loop variable
         loop_var = self.builder.alloca(ir.IntType(64), name=var_name)
         self.builder.store(start, loop_var)
         self.locals[var_name] = loop_var
-        
+
+        # Get loop-carried variables before creating nursery
+        loop_carried_vars = []
+        nursery_ctx = None
+        nursery_active = None  # Track if nursery was successfully created
+        if use_nursery:
+            loop_carried_vars = self._get_loop_carried_vars(stmt)
+
+            # Calculate iteration count for nursery size estimation
+            iteration_count = self.builder.sub(end, start)
+            nursery_size = self._estimate_nursery_size(stmt, iteration_count)
+
+            # Create nursery context
+            nursery_type = ir.Constant(ir.IntType(32), 1)  # CONTEXT_NURSERY = 1
+            nursery_ctx = self.builder.call(self.gc.gc_create_context, [nursery_size, nursery_type])
+
+            # Check if nursery creation succeeded (malloc might fail for large sizes)
+            null_ctx = ir.Constant(self.gc.heap_context_type.as_pointer(), None)
+            nursery_ok = self.builder.icmp_unsigned("!=", nursery_ctx, null_ctx)
+
+            # Store whether nursery is active for cleanup later
+            nursery_active = self.builder.alloca(ir.IntType(1), name="nursery_active")
+            self.builder.store(nursery_ok, nursery_active)
+
+            # Only push nursery if it was created successfully
+            push_nursery = func.append_basic_block("push_nursery")
+            skip_nursery = func.append_basic_block("skip_nursery")
+            self.builder.cbranch(nursery_ok, push_nursery, skip_nursery)
+
+            self.builder.position_at_end(push_nursery)
+            self.builder.call(self.gc.gc_push_context, [nursery_ctx])
+            self.builder.branch(skip_nursery)
+
+            self.builder.position_at_end(skip_nursery)
+
         # Create blocks
         cond_block = func.append_basic_block("for_cond")
         body_block = func.append_basic_block("for_body")
         inc_block = func.append_basic_block("for_inc")
         exit_block = func.append_basic_block("for_exit")
-        
+
         # Save loop blocks
         old_exit = self.loop_exit_block
         old_continue = self.loop_continue_block
         self.loop_exit_block = exit_block
         self.loop_continue_block = inc_block
-        
+
         # Jump to condition
         self.builder.branch(cond_block)
-        
+
         # Condition
         self.builder.position_at_end(cond_block)
         current = self.builder.load(loop_var)
         cond = self.builder.icmp_signed("<", current, end)
         self.builder.cbranch(cond, body_block, exit_block)
-        
+
         # Body
         self.builder.position_at_end(body_block)
         for s in stmt.body:
@@ -8621,64 +8922,127 @@ class CodeGenerator:
                 break
         if not self.builder.block.is_terminated:
             self.builder.branch(inc_block)
-        
+
         # Increment
         self.builder.position_at_end(inc_block)
         current = self.builder.load(loop_var)
         next_val = self.builder.add(current, ir.Constant(ir.IntType(64), 1))
         self.builder.store(next_val, loop_var)
         self.builder.branch(cond_block)
-        
+
         # Exit
         self.builder.position_at_end(exit_block)
-        
+
+        # Clean up nursery if used
+        if use_nursery and nursery_ctx is not None and nursery_active is not None:
+            # Check if nursery was actually created successfully
+            was_active = self.builder.load(nursery_active)
+
+            cleanup_nursery = func.append_basic_block("cleanup_nursery")
+            after_cleanup = func.append_basic_block("after_cleanup")
+            self.builder.cbranch(was_active, cleanup_nursery, after_cleanup)
+
+            self.builder.position_at_end(cleanup_nursery)
+            # Pop nursery from context stack
+            self.builder.call(self.gc.gc_pop_context, [])
+
+            # Promote loop-carried variables to main heap
+            for lc_var in loop_carried_vars:
+                if lc_var in self.locals:
+                    var_ptr = self.locals[lc_var]
+                    self._copy_collection_to_main_heap(lc_var, var_ptr, ir.IntType(64))
+
+            # Destroy nursery (bulk-free all intermediate allocations)
+            self.builder.call(self.gc.gc_destroy_context, [nursery_ctx])
+            self.builder.branch(after_cleanup)
+
+            self.builder.position_at_end(after_cleanup)
+
         # Restore loop blocks
         self.loop_exit_block = old_exit
         self.loop_continue_block = old_continue
-    
-    def _generate_range_expr_for(self, stmt: ForStmt):
-        """Generate for i in start..end"""
+
+    def _generate_range_expr_for(self, stmt: ForStmt, use_nursery: bool = False):
+        """Generate for i in start..end
+
+        If use_nursery is True, creates a nursery context for intermediate allocations
+        and promotes loop-carried variables to main heap after the loop.
+        """
         func = self.builder.function
         range_expr = stmt.iterable
-        
+
         start = self._generate_expression(range_expr.start)
         end = self._generate_expression(range_expr.end)
-        
+
         # Ensure i64
         if start.type != ir.IntType(64):
             start = self._cast_value(start, ir.IntType(64))
         if end.type != ir.IntType(64):
             end = self._cast_value(end, ir.IntType(64))
-        
+
         # PRE-ALLOCATE all local variables used in the loop body
         local_vars = self._collect_local_variables(stmt.body)
         for lv_name in local_vars:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
-        
+
         # Same as range_for
         loop_var = self.builder.alloca(ir.IntType(64), name=stmt.var_name)
         self.builder.store(start, loop_var)
         self.locals[stmt.var_name] = loop_var
-        
+
+        # Get loop-carried variables before creating nursery
+        loop_carried_vars = []
+        nursery_ctx = None
+        nursery_active = None  # Track if nursery was successfully created
+        if use_nursery:
+            loop_carried_vars = self._get_loop_carried_vars(stmt)
+
+            # Calculate iteration count for nursery size estimation
+            iteration_count = self.builder.sub(end, start)
+            nursery_size = self._estimate_nursery_size(stmt, iteration_count)
+
+            # Create nursery context
+            nursery_type = ir.Constant(ir.IntType(32), 1)  # CONTEXT_NURSERY = 1
+            nursery_ctx = self.builder.call(self.gc.gc_create_context, [nursery_size, nursery_type])
+
+            # Check if nursery creation succeeded (malloc might fail for large sizes)
+            null_ctx = ir.Constant(self.gc.heap_context_type.as_pointer(), None)
+            nursery_ok = self.builder.icmp_unsigned("!=", nursery_ctx, null_ctx)
+
+            # Store whether nursery is active for cleanup later
+            nursery_active = self.builder.alloca(ir.IntType(1), name="nursery_active")
+            self.builder.store(nursery_ok, nursery_active)
+
+            # Only push nursery if it was created successfully
+            push_nursery = func.append_basic_block("push_nursery")
+            skip_nursery = func.append_basic_block("skip_nursery")
+            self.builder.cbranch(nursery_ok, push_nursery, skip_nursery)
+
+            self.builder.position_at_end(push_nursery)
+            self.builder.call(self.gc.gc_push_context, [nursery_ctx])
+            self.builder.branch(skip_nursery)
+
+            self.builder.position_at_end(skip_nursery)
+
         cond_block = func.append_basic_block("for_cond")
         body_block = func.append_basic_block("for_body")
         inc_block = func.append_basic_block("for_inc")
         exit_block = func.append_basic_block("for_exit")
-        
+
         old_exit = self.loop_exit_block
         old_continue = self.loop_continue_block
         self.loop_exit_block = exit_block
         self.loop_continue_block = inc_block
-        
+
         self.builder.branch(cond_block)
-        
+
         self.builder.position_at_end(cond_block)
         current = self.builder.load(loop_var)
         cond = self.builder.icmp_signed("<", current, end)
         self.builder.cbranch(cond, body_block, exit_block)
-        
+
         self.builder.position_at_end(body_block)
         for s in stmt.body:
             self._generate_statement(s)
@@ -8686,18 +9050,43 @@ class CodeGenerator:
                 break
         if not self.builder.block.is_terminated:
             self.builder.branch(inc_block)
-        
+
         self.builder.position_at_end(inc_block)
         current = self.builder.load(loop_var)
         next_val = self.builder.add(current, ir.Constant(ir.IntType(64), 1))
         self.builder.store(next_val, loop_var)
         self.builder.branch(cond_block)
-        
+
         self.builder.position_at_end(exit_block)
-        
+
+        # Clean up nursery if used
+        if use_nursery and nursery_ctx is not None and nursery_active is not None:
+            # Check if nursery was actually created successfully
+            was_active = self.builder.load(nursery_active)
+
+            cleanup_nursery = func.append_basic_block("cleanup_nursery")
+            after_cleanup = func.append_basic_block("after_cleanup")
+            self.builder.cbranch(was_active, cleanup_nursery, after_cleanup)
+
+            self.builder.position_at_end(cleanup_nursery)
+            # Pop nursery from context stack
+            self.builder.call(self.gc.gc_pop_context, [])
+
+            # Promote loop-carried variables to main heap
+            for lc_var in loop_carried_vars:
+                if lc_var in self.locals:
+                    var_ptr = self.locals[lc_var]
+                    self._copy_collection_to_main_heap(lc_var, var_ptr, ir.IntType(64))
+
+            # Destroy nursery (bulk-free all intermediate allocations)
+            self.builder.call(self.gc.gc_destroy_context, [nursery_ctx])
+            self.builder.branch(after_cleanup)
+
+            self.builder.position_at_end(after_cleanup)
+
         self.loop_exit_block = old_exit
         self.loop_continue_block = old_continue
-    
+
     def _generate_list_for(self, stmt: ForStmt, list_ptr: ir.Value):
         """Generate for item in list with destructuring support"""
         func = self.builder.function
@@ -9896,12 +10285,13 @@ class CodeGenerator:
         
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
-        
-        # Allocate
+
+        # Allocate via GC
         size = len(field_info) * 8 if field_info else 8  # Simplified size calculation
         size_val = ir.Constant(ir.IntType(64), size)
-        
-        raw_ptr = self.builder.call(self.malloc, [size_val])
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
+
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Zero-initialize all fields
@@ -10162,7 +10552,9 @@ class CodeGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     # Store element to temp and get pointer
-                    temp = self.builder.alloca(elem_type, name="append_elem")
+                    # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
+                    with self.builder.goto_entry_block():
+                        temp = self.builder.alloca(elem_type, name="append_elem")
                     self.builder.store(elem_val, temp)
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
@@ -10192,7 +10584,9 @@ class CodeGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     # Store element to temp and get pointer
-                    temp = self.builder.alloca(elem_type, name="array_append_elem")
+                    # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
+                    with self.builder.goto_entry_block():
+                        temp = self.builder.alloca(elem_type, name="array_append_elem")
                     self.builder.store(elem_val, temp)
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
@@ -10230,7 +10624,9 @@ class CodeGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     # Store element to temp and get pointer
-                    temp = self.builder.alloca(elem_type, name="list_set_elem")
+                    # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
+                    with self.builder.goto_entry_block():
+                        temp = self.builder.alloca(elem_type, name="list_set_elem")
                     self.builder.store(elem_val, temp)
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
@@ -10265,7 +10661,9 @@ class CodeGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     # Store element to temp and get pointer
-                    temp = self.builder.alloca(elem_type, name="array_set_elem")
+                    # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
+                    with self.builder.goto_entry_block():
+                        temp = self.builder.alloca(elem_type, name="array_set_elem")
                     self.builder.store(elem_val, temp)
                     temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
@@ -11408,9 +11806,10 @@ class CodeGenerator:
         if height_val.type != ir.IntType(64):
             height_val = builder.zext(height_val, ir.IntType(64))
         
-        # Allocate matrix struct
+        # Allocate matrix struct via GC
         struct_size = ir.Constant(ir.IntType(64), 40)  # 5 * 8 bytes
-        raw_ptr = builder.call(self.malloc, [struct_size])
+        matrix_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_UNKNOWN)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, matrix_type_id])
         matrix_ptr = builder.bitcast(raw_ptr, matrix_ptr_type)
         
         # Store width and height
@@ -11431,17 +11830,18 @@ class CodeGenerator:
         elem_size = self._get_type_size(elem_type)
         buffer_size = builder.mul(total_cells, ir.Constant(ir.IntType(64), elem_size))
         
-        # Allocate read buffer
-        read_raw = builder.call(self.malloc, [buffer_size])
+        # Allocate read buffer via GC
+        buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY_DATA)
+        read_raw = builder.call(self.gc.gc_alloc, [buffer_size, buffer_type_id])
         read_buffer = builder.bitcast(read_raw, elem_type.as_pointer())
         read_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),
             ir.Constant(ir.IntType(32), 2)
         ], inbounds=True)
         builder.store(read_buffer, read_field)
-        
-        # Allocate write buffer
-        write_raw = builder.call(self.malloc, [buffer_size])
+
+        # Allocate write buffer via GC
+        write_raw = builder.call(self.gc.gc_alloc, [buffer_size, buffer_type_id])
         write_buffer = builder.bitcast(write_raw, elem_type.as_pointer())
         write_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),
