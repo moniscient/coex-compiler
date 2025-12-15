@@ -494,6 +494,24 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#whileStmt.
+    def enterWhileStmt(self, ctx:CoexParser.WhileStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#whileStmt.
+    def exitWhileStmt(self, ctx:CoexParser.WhileStmtContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#cycleStmt.
+    def enterCycleStmt(self, ctx:CoexParser.CycleStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#cycleStmt.
+    def exitCycleStmt(self, ctx:CoexParser.CycleStmtContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#matchStmt.
     def enterMatchStmt(self, ctx:CoexParser.MatchStmtContext):
         pass

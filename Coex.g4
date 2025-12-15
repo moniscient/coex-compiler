@@ -216,6 +216,8 @@ controlFlowStmt
     | forStmt
     | forAssignStmt
     | loopStmt
+    | whileStmt
+    | cycleStmt
     | matchStmt
     | selectStmt
     | withinStmt
@@ -308,6 +310,17 @@ forAssignStmt
 // Infinite loop
 loopStmt
     : LOOP NEWLINE* block
+    ;
+
+// While loop (standard while condition)
+whileStmt
+    : WHILE expression NEWLINE* block
+    ;
+
+// Cycle statement (double-buffered synchronous iteration)
+// Condition is in outer scope; body variables are double-buffered
+cycleStmt
+    : WHILE expression CYCLE NEWLINE* block
     ;
 
 // Match statement (pattern matching)
@@ -628,6 +641,7 @@ FOR         : 'for' ;
 IN          : 'in' ;
 LOOP        : 'loop' ;
 WHILE       : 'while' ;
+CYCLE       : 'cycle' ;
 MATCH       : 'match' ;
 CASE        : 'case' ;
 SELECT      : 'select' ;

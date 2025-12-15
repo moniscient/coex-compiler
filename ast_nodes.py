@@ -544,6 +544,31 @@ class LoopStmt(Stmt):
 
 
 @dataclass
+class WhileStmt(Stmt):
+    """Standard while loop: while condition block"""
+    condition: Expr
+    body: List[Stmt]
+
+
+@dataclass
+class CycleStmt(Stmt):
+    """Cycle statement (double-buffered synchronous iteration)
+
+    while condition cycle
+      # body with double-buffered locals
+    ~
+
+    The condition is evaluated in outer scope after each generation.
+    Variables declared in the body are double-buffered:
+    - Reads see the previous generation's values
+    - Writes go to the current generation's buffer
+    - At iteration end, buffers swap
+    """
+    condition: Expr
+    body: List[Stmt]
+
+
+@dataclass
 class MatchStmt(Stmt):
     """Match statement (no return value)"""
     subject: Expr

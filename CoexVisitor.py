@@ -279,6 +279,16 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#whileStmt.
+    def visitWhileStmt(self, ctx:CoexParser.WhileStmtContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#cycleStmt.
+    def visitCycleStmt(self, ctx:CoexParser.CycleStmtContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#matchStmt.
     def visitMatchStmt(self, ctx:CoexParser.MatchStmtContext):
         return self.visitChildren(ctx)

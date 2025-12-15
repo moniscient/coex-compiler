@@ -586,6 +586,10 @@ class ASTBuilder:
             return self.visit_for_assign_stmt(child)
         elif isinstance(child, CoexParser.LoopStmtContext):
             return self.visit_loop_stmt(child)
+        elif isinstance(child, CoexParser.WhileStmtContext):
+            return self.visit_while_stmt(child)
+        elif isinstance(child, CoexParser.CycleStmtContext):
+            return self.visit_cycle_stmt(child)
         elif isinstance(child, CoexParser.MatchStmtContext):
             return self.visit_match_stmt(child)
         elif isinstance(child, CoexParser.SelectStmtContext):
@@ -648,7 +652,25 @@ class ASTBuilder:
         """Visit a loop statement"""
         body = self.visit_block(ctx.block())
         return LoopStmt(body)
-    
+
+    def visit_while_stmt(self, ctx: CoexParser.WhileStmtContext) -> WhileStmt:
+        """Visit a while statement: while condition block"""
+        condition = self.visit_expression(ctx.expression())
+        body = self.visit_block(ctx.block())
+        return WhileStmt(condition, body)
+
+    def visit_cycle_stmt(self, ctx: CoexParser.CycleStmtContext) -> CycleStmt:
+        """Visit a cycle statement: while condition cycle block
+
+        The cycle construct provides double-buffered semantics for
+        synchronous dataflow computation. Variables declared inside
+        the cycle block exist in two buffers - reads see the previous
+        generation's values, writes go to the current generation's buffer.
+        """
+        condition = self.visit_expression(ctx.expression())
+        body = self.visit_block(ctx.block())
+        return CycleStmt(condition, body)
+
     def visit_match_stmt(self, ctx: CoexParser.MatchStmtContext) -> MatchStmt:
         """Visit a match statement"""
         subject = self.visit_expression(ctx.expression())

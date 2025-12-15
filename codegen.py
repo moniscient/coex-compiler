@@ -75,7 +75,10 @@ class CodeGenerator:
         # Loop control flow
         self.loop_exit_block: Optional[ir.Block] = None
         self.loop_continue_block: Optional[ir.Block] = None
-        
+
+        # Cycle (double-buffer) context stack for cycle blocks
+        self._cycle_context_stack: PyList[Dict] = []
+
         # Current function for context
         self.current_function: Optional[FunctionDecl] = None
         self.current_type: Optional[str] = None  # For method generation
@@ -7446,6 +7449,10 @@ class CodeGenerator:
             self._generate_if(stmt)
         elif isinstance(stmt, LoopStmt):
             self._generate_loop(stmt)
+        elif isinstance(stmt, WhileStmt):
+            self._generate_while(stmt)
+        elif isinstance(stmt, CycleStmt):
+            self._generate_cycle(stmt)
         elif isinstance(stmt, ForStmt):
             self._generate_for(stmt)
         elif isinstance(stmt, ForAssignStmt):
@@ -7474,6 +7481,19 @@ class CodeGenerator:
                     f"Mutable variable 'var {stmt.name}' is not allowed in formula '{self.current_function.name}'. "
                     f"Formulas must be pure - use immutable bindings (without 'var') instead."
                 )
+
+        # Check if this is a cycle variable - write to write buffer
+        ctx = self._get_cycle_context()
+        if ctx and stmt.name in ctx['cycle_vars']:
+            # Initialize by writing to write buffer
+            init_value = self._generate_expression(stmt.initializer)
+            write_buf = ctx['write_buffers'][stmt.name]
+            # Cast to expected type if needed
+            expected_type = ctx['var_types'].get(stmt.name)
+            if expected_type:
+                init_value = self._cast_value(init_value, expected_type)
+            self.builder.store(init_value, write_buf)
+            return
 
         # Track if we need to mark source as moved AFTER reading
         move_source_name = None
@@ -7664,40 +7684,81 @@ class CodeGenerator:
             if target_name in self.moved_vars:
                 self.moved_vars.discard(target_name)
 
+        # Check if target is a cycle variable - write to write buffer
+        if isinstance(stmt.target, Identifier):
+            ctx = self._get_cycle_context()
+            if ctx and stmt.target.name in ctx['cycle_vars']:
+                name = stmt.target.name
+                value = self._generate_expression(stmt.value)
+
+                # Handle compound assignment - read from READ buffer, compute, write to WRITE buffer
+                if stmt.op != AssignOp.ASSIGN:
+                    old_val = self.builder.load(ctx['read_buffers'][name])
+                    if stmt.op == AssignOp.PLUS_ASSIGN:
+                        if isinstance(value.type, ir.DoubleType):
+                            value = self.builder.fadd(old_val, value)
+                        else:
+                            value = self.builder.add(old_val, value)
+                    elif stmt.op == AssignOp.MINUS_ASSIGN:
+                        if isinstance(value.type, ir.DoubleType):
+                            value = self.builder.fsub(old_val, value)
+                        else:
+                            value = self.builder.sub(old_val, value)
+                    elif stmt.op == AssignOp.STAR_ASSIGN:
+                        if isinstance(value.type, ir.DoubleType):
+                            value = self.builder.fmul(old_val, value)
+                        else:
+                            value = self.builder.mul(old_val, value)
+                    elif stmt.op == AssignOp.SLASH_ASSIGN:
+                        if isinstance(value.type, ir.DoubleType):
+                            value = self.builder.fdiv(old_val, value)
+                        else:
+                            value = self.builder.sdiv(old_val, value)
+                    elif stmt.op == AssignOp.PERCENT_ASSIGN:
+                        value = self.builder.srem(old_val, value)
+
+                # Write to write buffer
+                write_buf = ctx['write_buffers'][name]
+                expected_type = ctx['var_types'].get(name)
+                if expected_type:
+                    value = self._cast_value(value, expected_type)
+                self.builder.store(value, write_buf)
+                return
+
         value = self._generate_expression(stmt.value)
 
         # Handle tuple destructuring: (a, b) = expr
         if isinstance(stmt.target, TupleExpr):
             self._generate_tuple_assignment(stmt.target, value)
             return
-        
+
         # Handle indexed assignment for user-defined types: obj[idx] = value -> obj.set(idx, value)
         if isinstance(stmt.target, IndexExpr):
             obj = self._generate_expression(stmt.target.object)
             type_name = self._get_type_name_from_ptr(obj.type)
-            
+
             if type_name and type_name in self.type_methods:
                 method_map = self.type_methods[type_name]
                 if "set" in method_map:
                     mangled = method_map["set"]
                     func = self.functions[mangled]
-                    
+
                     # Build args: self, indices..., value
                     args = [obj]
                     for idx_expr in stmt.target.indices:
                         idx_val = self._generate_expression(idx_expr)
                         args.append(idx_val)
-                    
+
                     # Cast value to expected type
                     # value is the last parameter
                     if len(args) < len(func.args):
                         expected = func.args[len(args)].type
                         value = self._cast_value(value, expected)
                     args.append(value)
-                    
+
                     self.builder.call(func, args)
                     return
-        
+
         # Handle compound assignment (not for MOVE_ASSIGN or ASSIGN)
         if stmt.op not in (AssignOp.ASSIGN, AssignOp.MOVE_ASSIGN):
             old_value = self._generate_expression(stmt.target)
@@ -8042,11 +8103,211 @@ class CodeGenerator:
         
         # Continue after loop
         self.builder.position_at_end(exit_block)
-        
+
         # Restore loop blocks
         self.loop_exit_block = old_exit
         self.loop_continue_block = old_continue
-    
+
+    def _generate_while(self, stmt: WhileStmt):
+        """Generate a standard while loop: while condition block
+
+        Equivalent to other languages' while loop.
+        Note: 'while true' is equivalent to 'loop'.
+        """
+        func = self.builder.function
+
+        # PRE-ALLOCATE all local variables used in the loop body
+        local_vars = self._collect_local_variables(stmt.body)
+        for lv_name in local_vars:
+            if lv_name not in self.locals:
+                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
+                self.locals[lv_name] = lv_alloca
+
+        # Create basic blocks
+        cond_block = func.append_basic_block("while_cond")
+        body_block = func.append_basic_block("while_body")
+        exit_block = func.append_basic_block("while_exit")
+
+        # Save loop blocks for break/continue
+        old_exit = self.loop_exit_block
+        old_continue = self.loop_continue_block
+        self.loop_exit_block = exit_block
+        self.loop_continue_block = cond_block
+
+        # Jump to condition check
+        self.builder.branch(cond_block)
+
+        # Generate condition check
+        self.builder.position_at_end(cond_block)
+        cond_val = self._generate_expression(stmt.condition)
+        cond_bool = self._to_bool(cond_val)
+        self.builder.cbranch(cond_bool, body_block, exit_block)
+
+        # Generate loop body
+        self.builder.position_at_end(body_block)
+        for s in stmt.body:
+            self._generate_statement(s)
+            if self.builder.block.is_terminated:
+                break
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_block)
+
+        # Continue after loop
+        self.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        self.loop_exit_block = old_exit
+        self.loop_continue_block = old_continue
+
+    def _generate_cycle(self, stmt: CycleStmt):
+        """Generate a cycle statement with double-buffered semantics.
+
+        Syntax: while condition cycle block
+
+        Variables declared inside the cycle block exist in two buffers.
+        Reads see the 'read' buffer (previous generation).
+        Writes go to the 'write' buffer (current generation).
+        At iteration end, buffers swap and condition is checked in outer scope.
+        """
+        func = self.builder.function
+
+        # Phase 1: Analyze the body to find variables declared inside
+        cycle_vars = self._find_cycle_declared_vars(stmt.body)
+
+        # Phase 2: Create double-buffered storage for cycle variables
+        read_buffers: Dict[str, ir.AllocaInst] = {}   # var_name -> alloca for read buffer
+        write_buffers: Dict[str, ir.AllocaInst] = {}  # var_name -> alloca for write buffer
+        cycle_var_types: Dict[str, ir.Type] = {}      # var_name -> LLVM type
+
+        for var_name, var_type in cycle_vars.items():
+            if var_type:
+                llvm_type = self._get_llvm_type(var_type)
+            else:
+                llvm_type = ir.IntType(64)  # Default to i64 for unknown types
+            cycle_var_types[var_name] = llvm_type
+            read_buffers[var_name] = self.builder.alloca(llvm_type, name=f"{var_name}_read")
+            write_buffers[var_name] = self.builder.alloca(llvm_type, name=f"{var_name}_write")
+
+            # Initialize both buffers to zero/null
+            if isinstance(llvm_type, ir.IntType):
+                zero = ir.Constant(llvm_type, 0)
+            elif isinstance(llvm_type, ir.DoubleType):
+                zero = ir.Constant(llvm_type, 0.0)
+            elif isinstance(llvm_type, ir.PointerType):
+                zero = ir.Constant(llvm_type, None)
+            else:
+                zero = ir.Constant(llvm_type, None)
+            self.builder.store(zero, read_buffers[var_name])
+            self.builder.store(zero, write_buffers[var_name])
+
+        # Phase 3: Create basic blocks
+        body_block = func.append_basic_block("cycle_body")
+        swap_block = func.append_basic_block("cycle_swap")
+        cond_block = func.append_basic_block("cycle_cond")
+        exit_block = func.append_basic_block("cycle_exit")
+
+        # Save loop blocks for break/continue
+        old_exit = self.loop_exit_block
+        old_continue = self.loop_continue_block
+        self.loop_exit_block = exit_block
+        self.loop_continue_block = swap_block  # continue commits and checks condition
+
+        # Phase 4: Initial condition check (enter cycle only if condition true)
+        init_cond = self._generate_expression(stmt.condition)
+        init_cond_bool = self._to_bool(init_cond)
+        self.builder.cbranch(init_cond_bool, body_block, exit_block)
+
+        # Phase 5: Push cycle context and generate body
+        self.builder.position_at_end(body_block)
+
+        cycle_context = {
+            'read_buffers': read_buffers,
+            'write_buffers': write_buffers,
+            'cycle_vars': set(cycle_vars.keys()),
+            'var_types': cycle_var_types
+        }
+        self._cycle_context_stack.append(cycle_context)
+
+        # Generate body statements
+        for s in stmt.body:
+            self._generate_statement(s)
+            if self.builder.block.is_terminated:
+                break
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(swap_block)
+
+        # Pop cycle context before swap (condition is in outer scope)
+        self._cycle_context_stack.pop()
+
+        # Phase 6: Buffer swap - copy write buffer to read buffer
+        self.builder.position_at_end(swap_block)
+        for var_name in cycle_vars:
+            write_val = self.builder.load(write_buffers[var_name])
+            self.builder.store(write_val, read_buffers[var_name])
+        self.builder.branch(cond_block)
+
+        # Phase 7: Condition check (in outer scope, after swap)
+        self.builder.position_at_end(cond_block)
+        cond_val = self._generate_expression(stmt.condition)
+        cond_bool = self._to_bool(cond_val)
+        self.builder.cbranch(cond_bool, body_block, exit_block)
+
+        # Phase 8: Exit and cleanup
+        self.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        self.loop_exit_block = old_exit
+        self.loop_continue_block = old_continue
+
+    def _find_cycle_declared_vars(self, stmts: PyList[Stmt]) -> Dict[str, Optional[Type]]:
+        """Find all variables declared within a list of statements.
+
+        Returns dict of var_name -> type_annotation (or None if inferred).
+        Recursively scans into control flow but not into nested cycles.
+        """
+        declared: Dict[str, Optional[Type]] = {}
+
+        for stmt in stmts:
+            if isinstance(stmt, VarDecl):
+                declared[stmt.name] = stmt.type_annotation
+            elif isinstance(stmt, Assignment):
+                # Simple assignment to new identifier declares a var
+                if isinstance(stmt.target, Identifier) and stmt.op == AssignOp.ASSIGN:
+                    name = stmt.target.name
+                    # Only count as declaration if not already known
+                    if name not in declared and name not in self.locals and name not in self.globals:
+                        declared[name] = None
+            elif isinstance(stmt, IfStmt):
+                # Recurse into branches
+                declared.update(self._find_cycle_declared_vars(stmt.then_body))
+                for _, body in stmt.else_if_clauses:
+                    declared.update(self._find_cycle_declared_vars(body))
+                if stmt.else_body:
+                    declared.update(self._find_cycle_declared_vars(stmt.else_body))
+            elif isinstance(stmt, ForStmt):
+                # Do NOT count the for loop variable as a cycle variable
+                # For loop manages its own iteration variable
+                declared.update(self._find_cycle_declared_vars(stmt.body))
+            elif isinstance(stmt, LoopStmt):
+                declared.update(self._find_cycle_declared_vars(stmt.body))
+            elif isinstance(stmt, WhileStmt):
+                declared.update(self._find_cycle_declared_vars(stmt.body))
+            # Note: Don't recurse into nested CycleStmt - those have their own scope
+
+        return declared
+
+    def _in_cycle_context(self) -> bool:
+        """Check if currently generating code inside a cycle block."""
+        return len(self._cycle_context_stack) > 0
+
+    def _get_cycle_context(self) -> Optional[Dict]:
+        """Get the current cycle context, or None if not in a cycle."""
+        if self._cycle_context_stack:
+            return self._cycle_context_stack[-1]
+        return None
+
     def _generate_for(self, stmt: ForStmt):
         """Generate a for loop"""
         func = self.builder.function
@@ -8928,6 +9189,13 @@ class CodeGenerator:
                 f"Use of moved variable '{name}': variable was moved and can no longer be used. "
                 f"Assign a new value to '{name}' before using it again."
             )
+
+        # Check if we're in a cycle and this is a cycle variable
+        ctx = self._get_cycle_context()
+        if ctx and name in ctx['cycle_vars']:
+            # Read from read buffer (previous generation)
+            read_buf = ctx['read_buffers'][name]
+            return self.builder.load(read_buf, name=name)
 
         if name in self.locals:
             return self.builder.load(self.locals[name], name=name)
