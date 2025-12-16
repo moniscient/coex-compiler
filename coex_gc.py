@@ -639,34 +639,11 @@ class GarbageCollector:
         # Reset allocation counter
         builder.store(ir.Constant(self.i64, 0), self.alloc_count)
 
-        # Initialize pthread mutex for heap protection
-        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
-        builder.call(self.pthread_mutex_init, [mutex_ptr, ir.Constant(self.i8_ptr, None)])
-
-        # Initialize pthread condition variable for GC signaling
-        cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
-        builder.call(self.pthread_cond_init, [cond_ptr, ir.Constant(self.i8_ptr, None)])
-
-        # Initialize roots mutex for root registry protection
-        roots_mutex_ptr = builder.bitcast(self.gc_roots_mutex, self.pthread_mutex_type.as_pointer())
-        builder.call(self.pthread_mutex_init, [roots_mutex_ptr, ir.Constant(self.i8_ptr, None)])
-
         # Initialize root count to 0
         builder.store(ir.Constant(self.i32, 0), self.gc_root_count)
 
-        # Set GC running flag
-        builder.store(ir.Constant(self.i32, 1), self.gc_running)
-
-        # Set GC phase to idle
-        builder.store(ir.Constant(self.i32, self.GC_PHASE_IDLE), self.gc_phase)
-
-        # Clear GC request flag
-        builder.store(ir.Constant(self.i32, 0), self.gc_request)
-
-        # NOTE: Background GC thread disabled to fix Linux compatibility issues.
+        # NOTE: pthread initialization removed - background GC thread disabled.
         # All GC is now done synchronously via gc_collect().
-        # The thread infrastructure is kept for future use when we implement
-        # proper concurrent GC with write barriers.
 
         builder.ret_void()
 
@@ -2281,21 +2258,11 @@ class GarbageCollector:
 
         gc_shutdown() -> void
 
-        Destroys mutex and condition variable. No thread to join since
-        background GC thread is disabled for Linux compatibility.
+        Currently a no-op since background GC thread is disabled.
         """
         func = self.gc_shutdown
         entry = func.append_basic_block("entry")
-
         builder = ir.IRBuilder(entry)
-
-        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
-        cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
-
-        # Destroy mutex and condition variable
-        builder.call(self.pthread_mutex_destroy, [mutex_ptr])
-        builder.call(self.pthread_cond_destroy, [cond_ptr])
-
         builder.ret_void()
 
     def _implement_gc_write_barrier(self):
