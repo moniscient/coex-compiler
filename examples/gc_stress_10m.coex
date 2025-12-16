@@ -1,0 +1,12 @@
+# Stress Test: List with 10 million elements
+# Tests the new mark-sweep GC at scale
+
+func main() -> int
+    var arr: List<int> = []
+    for i in 0..10000000
+        arr = arr.append(i)
+    ~
+    print(arr.len())
+    print(arr.get(9999999))
+    return 0
+~
