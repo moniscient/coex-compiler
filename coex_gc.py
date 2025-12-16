@@ -663,15 +663,10 @@ class GarbageCollector:
         # Clear GC request flag
         builder.store(ir.Constant(self.i32, 0), self.gc_request)
 
-        # Start GC background thread
-        # pthread_create(&gc_thread, NULL, gc_thread_main, NULL)
-        thread_ptr = builder.bitcast(self.gc_thread, self.pthread_t_type.as_pointer())
-        builder.call(self.pthread_create, [
-            thread_ptr,
-            ir.Constant(self.pthread_attr_ptr_type, None),
-            self.gc_thread_main,
-            ir.Constant(self.i8_ptr, None)
-        ])
+        # NOTE: Background GC thread disabled to fix Linux compatibility issues.
+        # All GC is now done synchronously via gc_collect().
+        # The thread infrastructure is kept for future use when we implement
+        # proper concurrent GC with write barriers.
 
         builder.ret_void()
 
@@ -2327,11 +2322,12 @@ class GarbageCollector:
         builder.ret(ir.Constant(self.i8_ptr, None))
 
     def _implement_gc_shutdown(self):
-        """Shutdown the GC background thread gracefully.
+        """Cleanup GC resources.
 
         gc_shutdown() -> void
 
-        Signals the GC thread to stop and waits for it to exit.
+        Destroys mutex and condition variable. No thread to join since
+        background GC thread is disabled for Linux compatibility.
         """
         func = self.gc_shutdown
         entry = func.append_basic_block("entry")
@@ -2340,25 +2336,6 @@ class GarbageCollector:
 
         mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
         cond_ptr = builder.bitcast(self.gc_cond, self.pthread_cond_type.as_pointer())
-
-        # Lock mutex
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-
-        # Set gc_running = 0
-        builder.store(ir.Constant(self.i32, 0), self.gc_running)
-
-        # Signal condition variable to wake up thread
-        builder.call(self.pthread_cond_signal, [cond_ptr])
-
-        # Unlock mutex
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
-
-        # Wait for thread to exit
-        thread_handle = builder.load(self.gc_thread)
-        builder.call(self.pthread_join, [
-            thread_handle,
-            ir.Constant(self.i8_ptr.as_pointer(), None)
-        ])
 
         # Destroy mutex and condition variable
         builder.call(self.pthread_mutex_destroy, [mutex_ptr])
