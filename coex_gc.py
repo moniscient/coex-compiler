@@ -1507,67 +1507,22 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_collect(self):
-        """Run a garbage collection cycle with proper synchronization.
+        """Run a garbage collection cycle.
 
-        This function acquires the heap mutex to ensure exclusive access,
-        then runs mark and sweep phases synchronously. This prevents race
-        conditions with the background GC thread.
+        Since the background GC thread is disabled, this runs mark and sweep
+        synchronously without any mutex locking.
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
-        do_gc = func.append_basic_block("do_gc")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
-
-        # Get mutex pointer
-        mutex_ptr = builder.bitcast(self.heap_mutex, self.pthread_mutex_type.as_pointer())
-
-        # Lock mutex to get exclusive access
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-
-        # Check if GC is already running (gc_phase != IDLE)
-        # If another GC is in progress, skip this collection
-        current_phase = builder.load(self.gc_phase)
-        is_idle = builder.icmp_unsigned("==", current_phase, ir.Constant(self.i32, self.GC_PHASE_IDLE))
-        builder.cbranch(is_idle, do_gc, done)
-
-        # Perform GC synchronously
-        builder.position_at_end(do_gc)
-
-        # Set phase to MARK to prevent background thread from starting
-        builder.store(ir.Constant(self.i32, self.GC_PHASE_MARK), self.gc_phase)
-
-        # Unlock during mark phase (allows allocations with write barrier)
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
 
         # Phase 1: Mark - scan stack for roots
         builder.call(self.gc_scan_stack, [])
 
-        # Re-lock for sweep phase
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-
-        # Set phase to SWEEP
-        builder.store(ir.Constant(self.i32, self.GC_PHASE_SWEEP), self.gc_phase)
-
-        # Unlock during sweep
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
-
         # Phase 2: Sweep - reclaim unmarked objects
         builder.call(self.gc_sweep, [])
 
-        # Re-lock to update state
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-
-        # Set phase back to IDLE
-        builder.store(ir.Constant(self.i32, self.GC_PHASE_IDLE), self.gc_phase)
-
-        builder.branch(done)
-
-        # Unlock and return
-        builder.position_at_end(done)
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
         builder.ret_void()
 
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
