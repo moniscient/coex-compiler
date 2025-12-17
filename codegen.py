@@ -8082,13 +8082,11 @@ class CodeGenerator:
     def _loop_needs_nursery(self, stmt: ForStmt) -> bool:
         """Detect if loop body has collection mutations that create garbage.
 
-        Returns True if the loop contains patterns like:
-          - var = var.append(x)
-          - var = var.set(i, x)
-        These patterns create new collections, making the old ones garbage.
-        A nursery can bulk-free these intermediate values efficiently.
+        NOTE: Nursery support has been removed. This always returns False.
+        The simple mark-sweep GC handles garbage collection without the
+        heap context/nursery optimization.
         """
-        return self._has_collection_mutations(stmt.body)
+        return False
 
     def _has_collection_mutations(self, stmts: PyList[Stmt]) -> bool:
         """Check if statements contain collection mutation patterns."""
