@@ -8416,7 +8416,7 @@ class CodeGenerator:
             nursery_size = self._estimate_nursery_size(stmt, iteration_count)
 
             # Create nursery context
-            nursery_type = ir.Constant(ir.IntType(32), 1)  # CONTEXT_NURSERY = 1
+            nursery_type = ir.Constant(ir.IntType(64), 1)  # CONTEXT_NURSERY = 1
             nursery_ctx = self.builder.call(self.gc.gc_create_context, [nursery_size, nursery_type])
 
             # Check if nursery creation succeeded (malloc might fail for large sizes)
@@ -8549,7 +8549,7 @@ class CodeGenerator:
             nursery_size = self._estimate_nursery_size(stmt, iteration_count)
 
             # Create nursery context
-            nursery_type = ir.Constant(ir.IntType(32), 1)  # CONTEXT_NURSERY = 1
+            nursery_type = ir.Constant(ir.IntType(64), 1)  # CONTEXT_NURSERY = 1
             nursery_ctx = self.builder.call(self.gc.gc_create_context, [nursery_size, nursery_type])
 
             # Check if nursery creation succeeded (malloc might fail for large sizes)

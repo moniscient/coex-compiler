@@ -220,13 +220,15 @@ class GarbageCollector:
         ])
 
         # Heap context: { i8* heap_start, i8* heap_end, i8* free_list_head,
-        #                 i64 heap_size, i32 context_type }
+        #                 i64 heap_size, i64 context_type }
+        # NOTE: context_type is i64 (not i32) to ensure consistent 8-byte alignment
+        # across all platforms (Linux vs macOS struct padding differences)
         self.heap_context_type = ir.LiteralStructType([
             self.i8_ptr,    # heap_start - start of this context's heap region
             self.i8_ptr,    # heap_end - end of this context's heap region
             self.i8_ptr,    # free_list_head - this context's free list
             self.i64,       # heap_size - size of this context's heap
-            self.i32,       # context_type (MAIN=0, NURSERY=1, LARGE=2, IMMORTAL=3)
+            self.i64,       # context_type (MAIN=0, NURSERY=1, LARGE=2, IMMORTAL=3) - i64 for alignment
         ])
 
         # pthread types - sizes vary by platform, use opaque arrays
@@ -391,8 +393,8 @@ class GarbageCollector:
         gc_expand_ty = ir.FunctionType(self.i1, [self.i64])
         self.gc_expand_heap = ir.Function(self.module, gc_expand_ty, name="coex_gc_expand_heap")
 
-        # gc_create_context(size: i64, type: i32) -> HeapContext*
-        gc_create_ctx_ty = ir.FunctionType(self.heap_context_type.as_pointer(), [self.i64, self.i32])
+        # gc_create_context(size: i64, type: i64) -> HeapContext*
+        gc_create_ctx_ty = ir.FunctionType(self.heap_context_type.as_pointer(), [self.i64, self.i64])
         self.gc_create_context = ir.Function(self.module, gc_create_ctx_ty, name="coex_gc_create_context")
 
         # gc_destroy_context(ctx: HeapContext*) -> void
