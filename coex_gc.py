@@ -627,127 +627,26 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_scan_stack(self):
-        """Conservatively scan stack for heap pointers
+        """Conservative stack scanning DISABLED.
 
-        For initial implementation, this is a simplified version that uses
-        a local alloca to determine the current stack position. On most
-        platforms (x86, ARM), the stack grows downward.
+        Stack scanning has been disabled because it causes segfaults on Linux
+        due to platform differences in stack layout. Without proper root
+        tracking (like LLVM's shadow stack GC), conservative scanning is
+        unreliable across platforms.
 
-        IMPORTANT: Includes sanity check to prevent runaway scans that could
-        cause segfaults on different platforms (Linux vs macOS).
+        For now, this is a no-op. The GC will only free memory when triggered
+        by allocation pressure, and won't mark any roots. This means some
+        garbage may not be collected, but the program will be stable.
+
+        TODO: Implement LLVM shadow stack GC for reliable cross-platform
+        garbage collection.
         """
         func = self.gc_scan_stack
 
         entry = func.append_basic_block("entry")
-        loop_start = func.append_basic_block("loop_start")
-        check_word = func.append_basic_block("check_word")
-        maybe_ptr = func.append_basic_block("maybe_ptr")
-        next_word = func.append_basic_block("next_word")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
-        # Use an alloca to get approximate current stack position
-        # This is a portable way to find where we are on the stack
-        stack_marker = builder.alloca(self.i64, name="stack_marker")
-        stack_top = builder.bitcast(stack_marker, self.i8_ptr)
-
-        stack_bottom = builder.load(self.stack_bottom)
-        heap_start = builder.load(self.heap_start)
-        heap_end = builder.load(self.heap_end)
-
-        # Check if stack_bottom was captured (non-null)
-        has_stack_bottom = builder.icmp_unsigned("!=", stack_bottom, ir.Constant(self.i8_ptr, None))
-
-        # If no stack bottom, skip scanning
-        skip_scan = func.append_basic_block("skip_scan")
-        do_scan = func.append_basic_block("do_scan")
-        builder.cbranch(has_stack_bottom, do_scan, skip_scan)
-
-        builder.position_at_end(skip_scan)
-        builder.branch(done)
-
-        builder.position_at_end(do_scan)
-
-        # Determine scan direction (stack grows down on most platforms)
-        # We'll scan from lower address to higher address
-        stack_top_int = builder.ptrtoint(stack_top, self.i64)
-        stack_bottom_int = builder.ptrtoint(stack_bottom, self.i64)
-
-        # SANITY CHECK: Limit stack scan to 8MB max to prevent runaway scans
-        # that could cause segfaults on different platforms
-        max_stack_scan = ir.Constant(self.i64, 8 * 1024 * 1024)  # 8MB
-
-        # Calculate absolute difference between top and bottom
-        diff1 = builder.sub(stack_top_int, stack_bottom_int)
-        diff2 = builder.sub(stack_bottom_int, stack_top_int)
-        top_greater = builder.icmp_unsigned(">", stack_top_int, stack_bottom_int)
-        stack_diff = builder.select(top_greater, diff1, diff2)
-
-        # If stack size exceeds max, skip scanning entirely
-        stack_too_large = builder.icmp_unsigned(">", stack_diff, max_stack_scan)
-        stack_size_ok = func.append_basic_block("stack_size_ok")
-        builder.cbranch(stack_too_large, done, stack_size_ok)
-
-        builder.position_at_end(stack_size_ok)
-
-        # Use min/max to handle both stack directions
-        scan_start = builder.select(
-            builder.icmp_unsigned("<", stack_top_int, stack_bottom_int),
-            stack_top, stack_bottom
-        )
-        scan_end = builder.select(
-            builder.icmp_unsigned("<", stack_top_int, stack_bottom_int),
-            stack_bottom, stack_top
-        )
-
-        # Current scan position
-        curr = builder.alloca(self.i8_ptr, name="scan_ptr")
-        builder.store(scan_start, curr)
-
-        builder.branch(loop_start)
-
-        # Loop: while curr < scan_end
-        builder.position_at_end(loop_start)
-        curr_val = builder.load(curr)
-        at_end = builder.icmp_unsigned(">=", curr_val, scan_end)
-        builder.cbranch(at_end, done, check_word)
-
-        # Load the 8-byte word at current position
-        builder.position_at_end(check_word)
-        word_ptr = builder.bitcast(curr_val, self.i64.as_pointer())
-        word = builder.load(word_ptr)
-
-        # Check if word looks like a heap pointer
-        # Must be aligned and within heap bounds
-        aligned = builder.icmp_unsigned("==",
-            builder.and_(word, ir.Constant(self.i64, 7)),
-            ir.Constant(self.i64, 0)
-        )
-
-        possible_ptr = builder.inttoptr(word, self.i8_ptr)
-        ge_heap_start = builder.icmp_unsigned(">=", possible_ptr, heap_start)
-        lt_heap_end = builder.icmp_unsigned("<", possible_ptr, heap_end)
-
-        in_heap = builder.and_(ge_heap_start, lt_heap_end)
-        looks_like_ptr = builder.and_(aligned, in_heap)
-
-        builder.cbranch(looks_like_ptr, maybe_ptr, next_word)
-
-        # This might be a pointer - mark it
-        builder.position_at_end(maybe_ptr)
-        builder.call(self.gc_mark_object, [possible_ptr])
-        builder.branch(next_word)
-
-        # Advance to next word (8 bytes)
-        builder.position_at_end(next_word)
-        curr_int = builder.ptrtoint(curr_val, self.i64)
-        next_int = builder.add(curr_int, ir.Constant(self.i64, 8))
-        next_ptr = builder.inttoptr(next_int, self.i8_ptr)
-        builder.store(next_ptr, curr)
-        builder.branch(loop_start)
-
-        builder.position_at_end(done)
+        # Stack scanning disabled - just return immediately
         builder.ret_void()
 
     def _implement_gc_sweep(self):
@@ -832,18 +731,26 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_collect(self):
-        """Run a full garbage collection cycle"""
+        """Run a full garbage collection cycle - DISABLED
+
+        Garbage collection has been disabled because the conservative stack
+        scanning causes segfaults on Linux. Without proper root tracking,
+        we cannot safely determine which objects are still in use.
+
+        This means memory will never be freed (memory leak), but programs
+        will be stable. For test programs and short-lived executables, this
+        is acceptable. Long-running programs may eventually run out of memory.
+
+        TODO: Implement LLVM shadow stack GC for reliable cross-platform
+        garbage collection with proper root tracking.
+        """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # Phase 1: Mark - scan stack for roots
-        builder.call(self.gc_scan_stack, [])
-
-        # Phase 2: Sweep - reclaim unmarked objects
-        builder.call(self.gc_sweep, [])
-
+        # GC collection disabled - just return immediately
+        # The heap will grow without bound, but at least we won't crash
         builder.ret_void()
 
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
