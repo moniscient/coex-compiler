@@ -9510,7 +9510,12 @@ class CodeGenerator:
         if isinstance(expr.callee, Identifier):
             name = expr.callee.name
             explicit_type_args = expr.callee.type_args if hasattr(expr.callee, 'type_args') else []
-            
+
+            # Handle Array constructor specially: Array(capacity, initial_value)
+            # This needs special handling because Array is a built-in type
+            if name == "Array":
+                return self._generate_array_constructor(expr.args)
+
             # Check if this is a type constructor: Point(x: 1, y: 2)
             if name in self.type_registry:
                 return self._generate_type_constructor(name, expr.args, expr.named_args)
@@ -9737,7 +9742,101 @@ class CodeGenerator:
                     return self.builder.call(func_ptr, args)
         
         return ir.Constant(ir.IntType(64), 0)
-    
+
+    def _generate_array_constructor(self, args: PyList['Expr']) -> ir.Value:
+        """Generate code for Array(capacity, initial_value) constructor.
+
+        Creates an Array with the given capacity, initialized with the given value.
+        Array layout: { i8* data, i64 len, i64 cap, i64 elem_size }
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Parse arguments: Array(capacity, initial_value)
+        if len(args) < 2:
+            # Need at least capacity and initial value
+            return ir.Constant(ir.IntType(8).as_pointer(), None)
+
+        capacity = self._generate_expression(args[0])
+        initial_value = self._generate_expression(args[1])
+
+        # Determine element size (8 bytes for int/float, 1 for bool, etc.)
+        if isinstance(initial_value.type, ir.IntType):
+            if initial_value.type.width == 1:
+                elem_size = ir.Constant(i64, 1)  # bool
+            else:
+                elem_size = ir.Constant(i64, 8)  # int
+        elif isinstance(initial_value.type, ir.DoubleType):
+            elem_size = ir.Constant(i64, 8)  # float
+        elif isinstance(initial_value.type, ir.PointerType):
+            elem_size = ir.Constant(i64, 8)  # pointer
+        else:
+            elem_size = ir.Constant(i64, 8)  # default
+
+        # Call array_new to create the array
+        array_ptr = self.builder.call(self.array_new, [capacity, elem_size])
+
+        # Set len = capacity (we're initializing all elements)
+        len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        self.builder.store(capacity, len_ptr)
+
+        # Fill the array with the initial value
+        # Get data pointer
+        data_ptr_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        data_ptr = self.builder.load(data_ptr_ptr)
+
+        # Loop to initialize all elements
+        current_func = self.builder.block.parent
+        init_header = current_func.append_basic_block("array_init_header")
+        init_body = current_func.append_basic_block("array_init_body")
+        init_done = current_func.append_basic_block("array_init_done")
+
+        # Loop counter
+        counter = self.builder.alloca(i64, name="init_counter")
+        self.builder.store(ir.Constant(i64, 0), counter)
+        self.builder.branch(init_header)
+
+        # Header: check if counter < capacity
+        self.builder.position_at_end(init_header)
+        i = self.builder.load(counter)
+        done = self.builder.icmp_unsigned(">=", i, capacity)
+        self.builder.cbranch(done, init_done, init_body)
+
+        # Body: store initial_value at data[i]
+        self.builder.position_at_end(init_body)
+        i_val = self.builder.load(counter)
+        offset = self.builder.mul(i_val, elem_size)
+        elem_ptr = self.builder.gep(data_ptr, [offset], inbounds=True)
+
+        # Cast and store based on element type
+        if isinstance(initial_value.type, ir.IntType) and initial_value.type.width == 64:
+            typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
+            self.builder.store(initial_value, typed_ptr)
+        elif isinstance(initial_value.type, ir.DoubleType):
+            typed_ptr = self.builder.bitcast(elem_ptr, ir.DoubleType().as_pointer())
+            self.builder.store(initial_value, typed_ptr)
+        elif isinstance(initial_value.type, ir.IntType) and initial_value.type.width == 1:
+            typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(8).as_pointer())
+            val_i8 = self.builder.zext(initial_value, ir.IntType(8))
+            self.builder.store(val_i8, typed_ptr)
+        else:
+            # For pointers and other types, cast to i64
+            typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
+            if isinstance(initial_value.type, ir.PointerType):
+                val_i64 = self.builder.ptrtoint(initial_value, i64)
+            else:
+                val_i64 = self._cast_value(initial_value, i64)
+            self.builder.store(val_i64, typed_ptr)
+
+        # Increment counter
+        next_i = self.builder.add(i_val, ir.Constant(i64, 1))
+        self.builder.store(next_i, counter)
+        self.builder.branch(init_header)
+
+        # Done
+        self.builder.position_at_end(init_done)
+        return array_ptr
+
     def _generate_type_constructor(self, type_name: str, args: PyList[Expr], named_args: Dict[str, Expr]) -> ir.Value:
         """Generate code for type constructor: Point(x: 1, y: 2)"""
         struct_type = self.type_registry[type_name]
