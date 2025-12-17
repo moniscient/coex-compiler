@@ -8087,14 +8087,8 @@ class CodeGenerator:
           - var = var.set(i, x)
         These patterns create new collections, making the old ones garbage.
         A nursery can bulk-free these intermediate values efficiently.
-
-        TEMPORARILY DISABLED: The nursery/heap context system causes crashes
-        on Linux (GitHub Actions). Disabling until we can debug the platform
-        differences. This may cause performance degradation for large loops
-        with collection mutations.
         """
-        # TODO: Fix nursery implementation for cross-platform compatibility
-        return False
+        return self._has_collection_mutations(stmt.body)
 
     def _has_collection_mutations(self, stmts: PyList[Stmt]) -> bool:
         """Check if statements contain collection mutation patterns."""

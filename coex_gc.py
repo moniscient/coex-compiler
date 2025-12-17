@@ -923,35 +923,37 @@ class GarbageCollector:
         user_size = func.args[0]
         type_id = func.args[1]
 
-        # TEMPORARILY DISABLED: Context-based allocation causes crashes on Linux.
-        # Always use main heap until we can debug the platform differences.
-        # Skip directly to main heap allocation path.
-        builder.branch(use_main_heap)
+        # Check if there's an active context on the stack
+        builder.branch(check_context)
 
-        # NOTE: The following context allocation code is disabled but preserved
-        # for future re-enablement once we fix the Linux compatibility issue.
         builder.position_at_end(check_context)
         stack_top = builder.load(self.context_stack_top)
         has_context = builder.icmp_signed(">", stack_top, ir.Constant(self.i32, 0))
         builder.cbranch(has_context, use_context, use_main_heap)
 
+        # Allocate from the active context
         builder.position_at_end(use_context)
         ctx_slot_ptr = builder.gep(self.context_stack, [
             ir.Constant(self.i32, 0),
             stack_top
         ], inbounds=True)
         active_ctx = builder.load(ctx_slot_ptr)
+
+        # Call gc_alloc_in_context (returns user pointer directly)
         ctx_result = builder.call(self.gc_alloc_in_context, [active_ctx, user_size, type_id])
+
+        # Check if context allocation succeeded
         ctx_null = builder.icmp_unsigned("==", ctx_result, ir.Constant(self.i8_ptr, None))
+        # If context allocation failed, fall back to main heap
         ctx_success = func.append_basic_block("ctx_success")
         builder.cbranch(ctx_null, use_main_heap, ctx_success)
 
+        # Context allocation succeeded - return the result directly
         builder.position_at_end(ctx_success)
         ctx_count = builder.load(self.alloc_count)
         ctx_new_count = builder.add(ctx_count, ir.Constant(self.i64, 1))
         builder.store(ctx_new_count, self.alloc_count)
         builder.ret(ctx_result)
-        # END DISABLED CONTEXT CODE
 
         # Main heap allocation path
         builder.position_at_end(use_main_heap)
