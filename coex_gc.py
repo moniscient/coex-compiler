@@ -267,50 +267,16 @@ class GarbageCollector:
         return self.type_descriptors.get(type_name, self.TYPE_UNKNOWN)
 
     def _implement_gc_init(self):
-        """Initialize GC: allocate heap, set up free list"""
+        """Initialize GC - simplified to no-op.
+
+        Since gc_alloc now uses malloc directly, there's no need to
+        set up a custom heap or free list.
+        """
         func = self.gc_init
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        heap_size = ir.Constant(self.i64, self.HEAP_SIZE)
-
-        # Allocate heap from system malloc
-        raw_heap = builder.call(self.codegen.malloc, [heap_size])
-
-        # Store heap bounds
-        builder.store(raw_heap, self.heap_start)
-        builder.store(heap_size, self.heap_size_global)
-
-        # Calculate heap end: heap_start + heap_size
-        heap_start_int = builder.ptrtoint(raw_heap, self.i64)
-        heap_end_int = builder.add(heap_start_int, heap_size)
-        heap_end_ptr = builder.inttoptr(heap_end_int, self.i8_ptr)
-        builder.store(heap_end_ptr, self.heap_end)
-
-        # Initialize entire heap as one free block
-        # Free block format: { i64 size, i8* next }
-        free_node = builder.bitcast(raw_heap, self.free_node_type.as_pointer())
-
-        # Store block size (entire heap)
-        size_ptr = builder.gep(free_node, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        builder.store(heap_size, size_ptr)
-
-        # Store next = null (end of free list)
-        next_ptr = builder.gep(free_node, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i8_ptr, None), next_ptr)
-
-        # Set free list head to this block
-        builder.store(raw_heap, self.free_list_head)
-
-        # Reset allocation counter
-        builder.store(ir.Constant(self.i64, 0), self.alloc_count)
-
+        # No initialization needed - we use malloc directly
         builder.ret_void()
 
     def _implement_gc_find_free_block(self):
@@ -453,117 +419,26 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_alloc(self):
-        """Allocate memory with GC header"""
+        """Allocate memory - simplified to use malloc directly.
+
+        The custom free-list allocator caused segfaults on Linux.
+        This simplified version just uses malloc, which is reliable
+        but means memory is never freed (until process exit).
+        """
         func = self.gc_alloc
         func.args[0].name = "user_size"
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
-        try_alloc = func.append_basic_block("try_alloc")
-        alloc_success = func.append_basic_block("alloc_success")
-        do_gc = func.append_basic_block("do_gc")
-        retry_alloc = func.append_basic_block("retry_alloc")
-        retry_success = func.append_basic_block("retry_success")
-        oom = func.append_basic_block("oom")
-
         builder = ir.IRBuilder(entry)
 
         user_size = func.args[0]
-        type_id = func.args[1]
+        # type_id is ignored since we're not tracking types
 
-        # Total size = header (8) + user_size, aligned to 8 bytes
-        header_size = ir.Constant(self.i64, self.HEADER_SIZE)
-        total_size = builder.add(user_size, header_size)
-
-        # Align to 8 bytes: (size + 7) & ~7
-        seven = ir.Constant(self.i64, 7)
-        aligned_size = builder.and_(
-            builder.add(total_size, seven),
-            ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
-        )
-
-        # Ensure minimum block size
-        min_size = ir.Constant(self.i64, self.MIN_BLOCK_SIZE)
-        is_too_small = builder.icmp_unsigned("<", aligned_size, min_size)
-        final_size = builder.select(is_too_small, min_size, aligned_size)
-
-        # Store final_size for later use
-        final_size_alloca = builder.alloca(self.i64, name="final_size")
-        builder.store(final_size, final_size_alloca)
-
-        builder.branch(try_alloc)
-
-        # Try to allocate from free list
-        builder.position_at_end(try_alloc)
-        final_size_val = builder.load(final_size_alloca)
-        block = builder.call(self.gc_find_free_block, [final_size_val])
-
-        is_null = builder.icmp_unsigned("==", block, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, do_gc, alloc_success)
-
-        # Allocation succeeded
-        builder.position_at_end(alloc_success)
-        # Initialize header
-        # Note: size field at offset 0 is already set by gc_find_free_block
-        header = builder.bitcast(block, self.header_type.as_pointer())
-
-        # Store type_id at offset 1
-        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(type_id, type_id_ptr)
-
-        # Store flags (0 = not marked) at offset 2
-        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr)
-
-        # Return pointer to user data (after header)
-        block_int = builder.ptrtoint(block, self.i64)
-        user_ptr_int = builder.add(block_int, header_size)
-        user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
-
-        # Increment allocation counter
-        count = builder.load(self.alloc_count)
-        new_count = builder.add(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.alloc_count)
-
-        builder.ret(user_ptr)
-
-        # No suitable block - try GC
-        builder.position_at_end(do_gc)
-        builder.call(self.gc_collect, [])
-        builder.branch(retry_alloc)
-
-        # Retry allocation after GC
-        builder.position_at_end(retry_alloc)
-        final_size_val2 = builder.load(final_size_alloca)
-        block2 = builder.call(self.gc_find_free_block, [final_size_val2])
-
-        is_null2 = builder.icmp_unsigned("==", block2, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null2, oom, retry_success)
-
-        # Retry succeeded
-        builder.position_at_end(retry_success)
-        # Note: size field at offset 0 is already set by gc_find_free_block
-        header2 = builder.bitcast(block2, self.header_type.as_pointer())
-
-        type_id_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(type_id, type_id_ptr2)
-
-        flags_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr2)
-
-        block2_int = builder.ptrtoint(block2, self.i64)
-        user_ptr2_int = builder.add(block2_int, header_size)
-        user_ptr2 = builder.inttoptr(user_ptr2_int, self.i8_ptr)
-
-        count2 = builder.load(self.alloc_count)
-        new_count2 = builder.add(count2, ir.Constant(self.i64, 1))
-        builder.store(new_count2, self.alloc_count)
-
-        builder.ret(user_ptr2)
-
-        # Out of memory - return null (caller should handle)
-        builder.position_at_end(oom)
-        builder.ret(ir.Constant(self.i8_ptr, None))
+        # Just call malloc with the requested size
+        # No header needed since we're not doing GC
+        result = builder.call(self.codegen.malloc, [user_size])
+        builder.ret(result)
 
     def _implement_gc_mark_object(self):
         """Mark an object and recursively mark its references"""
