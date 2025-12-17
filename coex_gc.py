@@ -632,6 +632,9 @@ class GarbageCollector:
         For initial implementation, this is a simplified version that uses
         a local alloca to determine the current stack position. On most
         platforms (x86, ARM), the stack grows downward.
+
+        IMPORTANT: Includes sanity check to prevent runaway scans that could
+        cause segfaults on different platforms (Linux vs macOS).
         """
         func = self.gc_scan_stack
 
@@ -670,6 +673,23 @@ class GarbageCollector:
         # We'll scan from lower address to higher address
         stack_top_int = builder.ptrtoint(stack_top, self.i64)
         stack_bottom_int = builder.ptrtoint(stack_bottom, self.i64)
+
+        # SANITY CHECK: Limit stack scan to 8MB max to prevent runaway scans
+        # that could cause segfaults on different platforms
+        max_stack_scan = ir.Constant(self.i64, 8 * 1024 * 1024)  # 8MB
+
+        # Calculate absolute difference between top and bottom
+        diff1 = builder.sub(stack_top_int, stack_bottom_int)
+        diff2 = builder.sub(stack_bottom_int, stack_top_int)
+        top_greater = builder.icmp_unsigned(">", stack_top_int, stack_bottom_int)
+        stack_diff = builder.select(top_greater, diff1, diff2)
+
+        # If stack size exceeds max, skip scanning entirely
+        stack_too_large = builder.icmp_unsigned(">", stack_diff, max_stack_scan)
+        stack_size_ok = func.append_basic_block("stack_size_ok")
+        builder.cbranch(stack_too_large, done, stack_size_ok)
+
+        builder.position_at_end(stack_size_ok)
 
         # Use min/max to handle both stack directions
         scan_start = builder.select(
