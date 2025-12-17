@@ -274,3 +274,67 @@ func main() -> int
     return 0
 ~
 ''', "42\n")
+
+
+class TestGCShadowStack:
+    """Tests for shadow stack GC integration"""
+
+    def test_gc_shadow_stack_preserves_live_in_loop(self, expect_output):
+        """Test that shadow stack correctly tracks variables across loop iterations.
+
+        Creates garbage in a loop while keeping a live reference.
+        The live reference should survive multiple gc() calls.
+        """
+        expect_output('''
+func main() -> int
+    var live: List<int> = [1, 2, 3]
+
+    for i in 0..10
+        var garbage: List<int> = [i, i+1, i+2]
+        gc()
+    ~
+
+    print(live.len())
+    return 0
+~
+''', "3\n")
+
+    def test_gc_shadow_stack_with_nested_functions(self, expect_output):
+        """Test shadow stack frames are properly pushed/popped with nested calls."""
+        expect_output('''
+func inner(s: string) -> int
+    gc()
+    return s.len()
+~
+
+func middle(s: string) -> int
+    var prefix: string = ">"
+    gc()
+    return inner(s)
+~
+
+func main() -> int
+    var text: string = "hello"
+    var result: int = middle(text)
+    gc()
+    print(result)
+    return 0
+~
+''', "5\n")
+
+    def test_gc_shadow_stack_preserves_all_live_roots(self, expect_output):
+        """Test that all live variables in scope are preserved across gc()."""
+        expect_output('''
+func main() -> int
+    var a: List<int> = [1, 2, 3]
+    var b: Map<int, int> = {1: 10, 2: 20}
+    var c: Set<int> = {5, 6, 7}
+    var d: string = "test"
+
+    gc()
+
+    var total: int = a.len() + b.len() + c.len() + d.len()
+    print(total)
+    return 0
+~
+''', "12\n")

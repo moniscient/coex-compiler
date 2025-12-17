@@ -2192,8 +2192,8 @@ class CodeGenerator:
 
         Used for string literals in source code. Scans for byte length
         and UTF-8 codepoint count, then creates String struct with:
-        - data pointer pointing directly to literal (read-only memory)
-        - GC-managed (no refcount needed)
+        - GC-allocated data buffer (copy of literal data)
+        - GC-managed struct
 
         UTF-8 codepoint counting: A byte starts a new codepoint if it's NOT
         a continuation byte (10xxxxxx). So we count bytes where (byte & 0xC0) != 0x80.
@@ -2258,9 +2258,16 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Store data pointer at field 0 (points directly to literal in read-only memory)
+        # Allocate data buffer and copy literal data (for GC consistency)
+        # This ensures all string data pointers are GC-allocated, allowing
+        # the GC to mark them correctly during recursive marking
+        string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
+        data_buf = builder.call(self.gc.gc_alloc, [final_byte_len, string_data_type_id])
+        builder.call(self.memcpy, [data_buf, cstr, final_byte_len])
+
+        # Store data pointer at field 0
         data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(cstr, data_ptr_ptr)
+        builder.store(data_buf, data_ptr_ptr)
 
         # Store len (codepoint count) at field 1
         len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
@@ -2857,6 +2864,46 @@ class CodeGenerator:
             for _, elem_type in coex_type.elements:
                 if self._needs_parameter_copy(elem_type):
                     return True
+        return False
+
+    def _is_heap_type(self, coex_type: Type) -> bool:
+        """Check if a Coex type is heap-allocated and needs GC root tracking.
+
+        Heap types that need tracking:
+        - Collections (List, Set, Map, Array)
+        - String (heap-allocated)
+        - User-defined types (all heap-allocated)
+        - Channels
+
+        NOT tracked (stack types):
+        - int, float, bool, byte, char
+        - Tuples of primitives (value types)
+        """
+        if coex_type is None:
+            return False
+        if isinstance(coex_type, PrimitiveType):
+            # Primitives are stack-allocated
+            if coex_type.name in ("int", "float", "bool", "byte", "char"):
+                return False
+            # string is heap-allocated
+            if coex_type.name == "string":
+                return True
+        if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
+            return True
+        if isinstance(coex_type, NamedType):
+            # String and Channel are heap-allocated
+            if coex_type.name in ("string", "Channel"):
+                return True
+            # User-defined types are heap-allocated
+            if coex_type.name in self.type_fields:
+                return True
+            # Generic types that expand to collections
+            if coex_type.type_args:
+                return True
+        if isinstance(coex_type, TupleType):
+            # Tuples are stack values, but we don't track them as roots
+            # (their contents are copied at assignment)
+            return False
         return False
 
     def _is_collection_coex_type(self, coex_type: Type) -> bool:
@@ -6612,52 +6659,90 @@ class CodeGenerator:
     def _generate_method_body(self, type_name: str, mangled_method: str, method: FunctionDecl):
         """Generate body for a method"""
         llvm_func = self.functions[mangled_method]
-        
+
         # Save current state
         old_builder = self.builder
         old_locals = self.locals
         old_current_function = self.current_function
         old_current_type = self.current_type
-        
+        old_gc_frame = getattr(self, 'gc_frame', None)
+        old_gc_roots = getattr(self, 'gc_roots', None)
+        old_gc_root_indices = getattr(self, 'gc_root_indices', {})
+
         entry = llvm_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
-        
+
         self.locals = {}
         self.current_function = method
         self.current_type = type_name
-        
+
+        # Initialize GC state for this method
+        self.gc_frame = None
+        self.gc_roots = None
+        self.gc_root_indices = {}
+
+        # Collect heap variables for GC root tracking
+        heap_var_names = []
+
+        # Check parameters for heap types (skip 'self')
+        for param in method.params:
+            if param.type_annotation and self._is_heap_type(param.type_annotation):
+                heap_var_names.append(param.name)
+
+        # Analyze body for heap-typed var declarations
+        body_heap_vars = self._collect_heap_vars_from_body(method.body)
+        heap_var_names.extend(body_heap_vars)
+
+        # Create shadow stack frame if we have heap variables
+        if heap_var_names and self.gc is not None:
+            num_roots = len(heap_var_names)
+            self.gc_roots = self.gc.create_frame_roots(self.builder, num_roots)
+            self.gc_frame = self.gc.push_frame(self.builder, num_roots, self.gc_roots)
+            self.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+
         # Store self pointer
         self_alloca = self.builder.alloca(llvm_func.args[0].type, name="self")
         self.builder.store(llvm_func.args[0], self_alloca)
         self.locals["self"] = self_alloca
-        
+
         # Allocate other parameters
         for i, param in enumerate(method.params):
             llvm_param = llvm_func.args[i + 1]
             llvm_param.name = param.name
-            
+
             alloca = self.builder.alloca(llvm_param.type, name=param.name)
             self.builder.store(llvm_param, alloca)
             self.locals[param.name] = alloca
-        
+
+            # Register parameter as GC root if it's a heap type
+            if param.name in self.gc_root_indices and self.gc is not None:
+                self.gc.set_root(self.builder, self.gc_roots, self.gc_root_indices[param.name], llvm_param)
+
         # Generate body
         for stmt in method.body:
             self._generate_statement(stmt)
             if self.builder.block.is_terminated:
                 break
-        
+
         # Add implicit return if needed
         if not self.builder.block.is_terminated:
+            # Pop GC frame before implicit return
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
             if isinstance(llvm_func.return_value.type, ir.VoidType):
                 self.builder.ret_void()
             else:
                 self.builder.ret(ir.Constant(llvm_func.return_value.type, 0))
-        
+
         # Restore state
         self.builder = old_builder
         self.locals = old_locals
         self.current_function = old_current_function
         self.current_type = old_current_type
+        self.gc_frame = old_gc_frame
+        self.gc_roots = old_gc_roots
+        self.gc_root_indices = old_gc_root_indices
     
     def _monomorphize_function(self, name: str, type_args: PyList[Type]) -> str:
         """Monomorphize a generic function with concrete type arguments"""
@@ -6710,12 +6795,41 @@ class CodeGenerator:
         entry = llvm_func.append_basic_block(name="entry")
         old_builder = self.builder
         self.builder = ir.IRBuilder(entry)
-        
+
         old_locals = self.locals
         self.locals = {}
         old_current_function = self.current_function
         self.current_function = func_decl
-        
+
+        # Save and initialize GC state for this monomorphized function
+        old_gc_frame = getattr(self, 'gc_frame', None)
+        old_gc_roots = getattr(self, 'gc_roots', None)
+        old_gc_root_indices = getattr(self, 'gc_root_indices', {})
+
+        self.gc_frame = None
+        self.gc_roots = None
+        self.gc_root_indices = {}
+
+        # Collect heap variables for GC root tracking
+        heap_var_names = []
+
+        # Check parameters for heap types (using substituted types)
+        for param in func_decl.params:
+            param_type = self._substitute_type(param.type_annotation)
+            if param_type and self._is_heap_type(param_type):
+                heap_var_names.append(param.name)
+
+        # Analyze body for heap-typed var declarations
+        body_heap_vars = self._collect_heap_vars_from_body(func_decl.body)
+        heap_var_names.extend(body_heap_vars)
+
+        # Create shadow stack frame if we have heap variables
+        if heap_var_names and self.gc is not None:
+            num_roots = len(heap_var_names)
+            self.gc_roots = self.gc.create_frame_roots(self.builder, num_roots)
+            self.gc_frame = self.gc.push_frame(self.builder, num_roots, self.gc_roots)
+            self.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+
         # Allocate parameters with value semantics (deep copy heap-allocated types)
         for i, param in enumerate(func_decl.params):
             llvm_param = llvm_func.args[i]
@@ -6733,25 +6847,36 @@ class CodeGenerator:
             self.builder.store(param_value, alloca)
             self.locals[param.name] = alloca
 
+            # Register parameter as GC root if it's a heap type
+            if param.name in self.gc_root_indices and self.gc is not None:
+                self.gc.set_root(self.builder, self.gc_roots, self.gc_root_indices[param.name], param_value)
+
         # Generate body
         for stmt in func_decl.body:
             self._generate_statement(stmt)
             if self.builder.block.is_terminated:
                 break
-        
+
         # Add implicit return
         if not self.builder.block.is_terminated:
+            # Pop GC frame before implicit return
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
             if isinstance(llvm_ret, ir.VoidType):
                 self.builder.ret_void()
             else:
                 self.builder.ret(ir.Constant(llvm_ret, 0))
-        
+
         # Restore state
         self.builder = old_builder
         self.locals = old_locals
         self.current_function = old_current_function
         self.type_substitutions = old_subs
-        
+        self.gc_frame = old_gc_frame
+        self.gc_roots = old_gc_roots
+        self.gc_root_indices = old_gc_root_indices
+
         return mangled_name
     
     def _infer_type_args(self, func_name: str, args: PyList[Expr]) -> Optional[PyList[Type]]:
@@ -7137,14 +7262,45 @@ class CodeGenerator:
         llvm_func = ir.Function(self.module, func_type, name=func.name)
         self.functions[func.name] = llvm_func
     
+    def _collect_heap_vars_from_body(self, stmts: PyList[Stmt]) -> PyList[str]:
+        """Collect names of heap-typed variable declarations from function body.
+
+        Recursively traverses the AST to find all VarDecl statements with heap types.
+        Returns a list of variable names that need GC root tracking.
+        """
+        heap_vars = []
+
+        def visit_stmts(statements):
+            for stmt in statements:
+                if isinstance(stmt, VarDecl):
+                    if stmt.type_annotation and self._is_heap_type(stmt.type_annotation):
+                        heap_vars.append(stmt.name)
+                # Recurse into nested blocks
+                if isinstance(stmt, IfStmt):
+                    visit_stmts(stmt.then_body)
+                    for _, elif_body in stmt.else_if_clauses:
+                        visit_stmts(elif_body)
+                    if stmt.else_body:
+                        visit_stmts(stmt.else_body)
+                elif isinstance(stmt, (ForStmt, ForAssignStmt)):
+                    visit_stmts(stmt.body)
+                elif isinstance(stmt, (LoopStmt, WhileStmt)):
+                    visit_stmts(stmt.body)
+                elif isinstance(stmt, MatchStmt):
+                    for arm in stmt.arms:
+                        visit_stmts(arm.body)
+
+        visit_stmts(stmts)
+        return heap_vars
+
     def _generate_function(self, func: FunctionDecl):
         """Generate a function body"""
         # Skip generic functions (they're generated on demand)
         if func.type_params:
             return
-        
+
         llvm_func = self.functions[func.name]
-        
+
         # Create entry block
         entry = llvm_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
@@ -7157,6 +7313,35 @@ class CodeGenerator:
         self.locals = {}
         self.moved_vars = set()
         self.current_function = func
+
+        # ====================================================================
+        # GC Shadow Stack Integration
+        # ====================================================================
+        # Count heap pointer parameters and locals for GC root tracking
+        heap_var_names = []  # List of (var_name) in order
+
+        # Check parameters for heap types
+        for param in func.params:
+            if param.type_annotation and self._is_heap_type(param.type_annotation):
+                heap_var_names.append(param.name)
+
+        # Analyze body for heap-typed var declarations
+        body_heap_vars = self._collect_heap_vars_from_body(func.body)
+        heap_var_names.extend(body_heap_vars)
+
+        # Create shadow stack frame if we have heap variables and GC is enabled
+        self.gc_frame = None
+        self.gc_roots = None
+        self.gc_root_indices = {}
+
+        if heap_var_names and self.gc is not None:
+            num_roots = len(heap_var_names)
+            self.gc_roots = self.gc.create_frame_roots(self.builder, num_roots)
+            self.gc_frame = self.gc.push_frame(self.builder, num_roots, self.gc_roots)
+
+            # Store mapping of var_name -> root_index
+            self.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+        # ====================================================================
 
         # Allocate parameters with value semantics (deep copy heap-allocated types)
         for i, param in enumerate(func.params):
@@ -7173,19 +7358,32 @@ class CodeGenerator:
             self.builder.store(param_value, alloca)
             self.locals[param.name] = alloca
 
+            # Register parameter as GC root if it's a heap type
+            if param.name in self.gc_root_indices and self.gc is not None:
+                root_idx = self.gc_root_indices[param.name]
+                self.gc.set_root(self.builder, self.gc_roots, root_idx, param_value)
+
         # Generate body
         for stmt in func.body:
             self._generate_statement(stmt)
             if self.builder.block.is_terminated:
                 break
-        
+
         # Add implicit return if needed
         if not self.builder.block.is_terminated:
+            # Pop GC frame before implicit return
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
             if isinstance(llvm_func.return_value.type, ir.VoidType):
                 self.builder.ret_void()
             else:
                 self.builder.ret(ir.Constant(llvm_func.return_value.type, 0))
-        
+
+        # Clear GC state for this function
+        self.gc_frame = None
+        self.gc_roots = None
+        self.gc_root_indices = {}
         self.current_function = None
     
     # ========================================================================
@@ -7314,6 +7512,11 @@ class CodeGenerator:
             self.builder.store(init_value, alloca)
             self.locals[stmt.name] = alloca
 
+            # Register as GC root if this is a heap type
+            if stmt.name in self.gc_root_indices and self.gc is not None:
+                root_idx = self.gc_root_indices[stmt.name]
+                self.gc.set_root(self.builder, self.gc_roots, root_idx, init_value)
+
             # Try to infer tuple info from initializer
             tuple_info = self._infer_tuple_info(stmt.initializer)
             if tuple_info:
@@ -7358,6 +7561,11 @@ class CodeGenerator:
 
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
+
+        # Register as GC root if this is a heap type
+        if stmt.name in self.gc_root_indices and self.gc is not None:
+            root_idx = self.gc_root_indices[stmt.name]
+            self.gc.set_root(self.builder, self.gc_roots, root_idx, init_value)
 
         # Mark source as moved AFTER we've read its value
         if move_source_name:
@@ -7632,6 +7840,13 @@ class CodeGenerator:
         if ptr:
             self.builder.store(value, ptr)
 
+            # Update GC root if this is a tracked heap variable being reassigned
+            if isinstance(stmt.target, Identifier):
+                target_name = stmt.target.name
+                if target_name in self.gc_root_indices and self.gc is not None:
+                    root_idx = self.gc_root_indices[target_name]
+                    self.gc.set_root(self.builder, self.gc_roots, root_idx, value)
+
         # Mark source as moved AFTER we've read its value
         if move_source_name:
             self.moved_vars.add(move_source_name)
@@ -7694,7 +7909,7 @@ class CodeGenerator:
         """Generate a return statement"""
         if stmt.value:
             value = self._generate_expression(stmt.value)
-            
+
             # In matrix formula context, write to buffer and continue loop
             if self.current_matrix is not None:
                 self._generate_matrix_return(value)
@@ -7705,9 +7920,17 @@ class CodeGenerator:
                     if block.name == "x_loop_inc":
                         self.builder.branch(block)
                         return
-            
+
+            # Pop GC frame before returning
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
             self.builder.ret(value)
         else:
+            # Pop GC frame before returning
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
             self.builder.ret_void()
     
     def _generate_print(self, stmt: PrintStmt):

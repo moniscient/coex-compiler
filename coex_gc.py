@@ -413,13 +413,20 @@ class GarbageCollector:
         builder.ret(user_ptr)
 
     def _implement_gc_mark_object(self):
-        """Mark an object as live"""
+        """Mark an object as live and recursively mark referenced objects"""
         func = self.gc_mark_object
         func.args[0].name = "ptr"
 
         entry = func.append_basic_block("entry")
         get_header = func.append_basic_block("get_header")
         do_mark = func.append_basic_block("do_mark")
+        check_type = func.append_basic_block("check_type")
+        mark_map = func.append_basic_block("mark_map")
+        mark_list = func.append_basic_block("mark_list")
+        mark_array = func.append_basic_block("mark_array")
+        mark_set = func.append_basic_block("mark_set")
+        mark_string = func.append_basic_block("mark_string")
+        mark_channel = func.append_basic_block("mark_channel")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -449,9 +456,84 @@ class GarbageCollector:
         new_flags = builder.or_(flags_val, ir.Constant(self.i32, self.FLAG_MARK_BIT))
         builder.store(new_flags, flags_ptr)
 
-        # TODO: Recursively mark referenced objects based on type_id
-        # For now, we rely on the shadow stack having all roots
+        # Get type_id and check for types that need recursive marking
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+        builder.branch(check_type)
 
+        # Check type and branch to appropriate recursive marking
+        builder.position_at_end(check_type)
+
+        # Create a switch for type_id
+        switch = builder.switch(type_id, done)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_MAP), mark_map)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_LIST), mark_list)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_ARRAY), mark_array)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_SET), mark_set)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_STRING), mark_string)
+        switch.add_case(ir.Constant(self.i32, self.TYPE_CHANNEL), mark_channel)
+
+        # Mark Map: entries pointer at offset 0
+        # Map struct: { i8* entries, i64 len, i64 cap }
+        builder.position_at_end(mark_map)
+        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        map_typed = builder.bitcast(ptr, map_ptr_type)
+        entries_ptr_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        entries_ptr = builder.load(entries_ptr_ptr)
+        builder.call(func, [entries_ptr])  # Recursive call
+        builder.branch(done)
+
+        # Mark List: root (field 0) and tail (field 3) pointers
+        # List struct: { i8* root (0), i64 len (1), i32 depth (2), i8* tail (3), i32 tail_len (4), i64 elem_size (5) }
+        builder.position_at_end(mark_list)
+        list_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32, self.i8_ptr, self.i32, self.i64]).as_pointer()
+        list_typed = builder.bitcast(ptr, list_ptr_type)
+        # Mark root
+        root_ptr_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        root_ptr = builder.load(root_ptr_ptr)
+        builder.call(func, [root_ptr])  # Recursive call
+        # Mark tail
+        tail_ptr_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        tail_ptr = builder.load(tail_ptr_ptr)
+        builder.call(func, [tail_ptr])  # Recursive call
+        builder.branch(done)
+
+        # Mark Array: data pointer at field 0
+        # Array struct: { i8* data (0), i64 len (1), i64 cap (2), i64 elem_size (3) }
+        builder.position_at_end(mark_array)
+        array_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64]).as_pointer()
+        array_typed = builder.bitcast(ptr, array_ptr_type)
+        data_ptr_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+        builder.call(func, [data_ptr])  # Recursive call
+        builder.branch(done)
+
+        # Mark Set: entries pointer at offset 0 (same as Map)
+        builder.position_at_end(mark_set)
+        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        set_typed = builder.bitcast(ptr, set_ptr_type)
+        set_entries_ptr_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        set_entries_ptr = builder.load(set_entries_ptr_ptr)
+        builder.call(func, [set_entries_ptr])  # Recursive call
+        builder.branch(done)
+
+        # Mark String: data pointer at field 0
+        # String struct: { i8* data (0), i64 len (1), i64 size (2) }
+        builder.position_at_end(mark_string)
+        string_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        string_typed = builder.bitcast(ptr, string_ptr_type)
+        string_data_ptr_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        string_data_ptr = builder.load(string_data_ptr_ptr)
+        builder.call(func, [string_data_ptr])  # Recursive call
+        builder.branch(done)
+
+        # Mark Channel: buffer pointer at offset 32 (4th i64 field)
+        builder.position_at_end(mark_channel)
+        channel_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i8_ptr]).as_pointer()
+        channel_typed = builder.bitcast(ptr, channel_ptr_type)
+        buffer_ptr_ptr = builder.gep(channel_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        buffer_ptr = builder.load(buffer_ptr_ptr)
+        builder.call(func, [buffer_ptr])  # Recursive call
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -639,32 +721,28 @@ class GarbageCollector:
     def _implement_gc_collect(self):
         """Run a full garbage collection cycle
 
-        NOTE: Currently a no-op because shadow stack frames are not yet
-        integrated into codegen. Without root tracking, sweep would free
-        all live objects. Enable this once codegen pushes/pops GC frames
-        and sets roots properly.
+        Now that shadow stack frames are integrated into codegen, we can
+        safely perform mark-sweep collection. The shadow stack tracks all
+        heap roots, so sweep will only free unreachable objects.
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # TODO: Enable once shadow stack is integrated with codegen
-        # For now, just return without collecting to avoid freeing live objects
-        builder.ret_void()
+        # Disable GC during collection (prevent recursion)
+        builder.store(ir.Constant(self.i1, 0), self.gc_enabled)
 
-        # The full implementation (enable when root tracking is ready):
-        # # Disable GC during collection
-        # builder.store(ir.Constant(self.i1, 0), self.gc_enabled)
-        #
-        # # Mark phase: scan roots
-        # builder.call(self.gc_scan_roots, [])
-        #
-        # # Sweep phase: free unmarked
-        # builder.call(self.gc_sweep, [])
-        #
-        # # Re-enable GC
-        # builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+        # Mark phase: scan shadow stack and mark all reachable objects
+        builder.call(self.gc_scan_roots, [])
+
+        # Sweep phase: free unmarked objects
+        builder.call(self.gc_sweep, [])
+
+        # Re-enable GC
+        builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+
+        builder.ret_void()
 
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
         """Replace a malloc call with GC-tracked allocation."""
