@@ -219,19 +219,15 @@ func main() -> int
 class TestGCStringMapStress:
     """Stress tests for Maps with string keys (different HAMT path)."""
 
-    @pytest.mark.xfail(reason="String keys in HAMT leaves are pointers that need marking - requires type-aware HAMT traversal")
     def test_gc_string_key_map_stress(self, expect_output):
         """Stress test Map<string, int> with gc().
 
         String keys use different HAMT functions (hamt_insert_string).
         This verifies the string path also handles gc() correctly.
 
-        KNOWN LIMITATION: String keys are stored as pointers in HAMT leaves.
-        The gc_mark_hamt function marks HAMT nodes/leaves but doesn't know
-        to mark the String* stored in leaf.key. This requires either:
-        1. Storing key/value type flags in Map header
-        2. Monomorphizing GC marking code per Map<K,V> type
-        3. Conservative pointer scanning (unsafe)
+        Type-aware HAMT marking: Map/Set structs store flags indicating
+        whether keys/values are heap pointers. gc_mark_hamt uses these
+        flags to mark key/value contents appropriately.
         """
         expect_output('''
 func main() -> int

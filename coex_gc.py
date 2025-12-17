@@ -196,9 +196,10 @@ class GarbageCollector:
         gc_sweep_ty = ir.FunctionType(self.void, [])
         self.gc_sweep = ir.Function(self.module, gc_sweep_ty, name="coex_gc_sweep")
 
-        # gc_mark_hamt(root: i8*) -> void
+        # gc_mark_hamt(root: i8*, flags: i32) -> void
         # Recursively mark HAMT nodes/leaves (used by Map and Set marking)
-        gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        # flags: bit 0 = key is heap ptr, bit 1 = value is heap ptr
+        gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i32])
         self.gc_mark_hamt = ir.Function(self.module, gc_mark_hamt_ty, name="coex_gc_mark_hamt")
 
     def _register_builtin_types(self):
@@ -208,13 +209,13 @@ class GarbageCollector:
         self.type_descriptors['List'] = self.TYPE_LIST
         self.type_info[self.TYPE_STRING] = {'size': 8, 'ref_offsets': []}
         self.type_descriptors['String'] = self.TYPE_STRING
-        # Map/Set now use HAMT (16 bytes: root pointer + len)
-        # HAMT nodes are malloc'd not gc_alloc'd, so no ref_offsets
-        self.type_info[self.TYPE_MAP] = {'size': 16, 'ref_offsets': []}
+        # Map/Set now use HAMT (24 bytes: root pointer + len + flags)
+        # HAMT nodes are gc_alloc'd; we mark them via gc_mark_hamt
+        self.type_info[self.TYPE_MAP] = {'size': 24, 'ref_offsets': []}
         self.type_descriptors['Map'] = self.TYPE_MAP
         self.type_info[self.TYPE_MAP_ENTRY] = {'size': 17, 'ref_offsets': []}
         self.type_descriptors['MapEntry'] = self.TYPE_MAP_ENTRY
-        self.type_info[self.TYPE_SET] = {'size': 16, 'ref_offsets': []}
+        self.type_info[self.TYPE_SET] = {'size': 24, 'ref_offsets': []}
         self.type_descriptors['Set'] = self.TYPE_SET
         self.type_info[self.TYPE_SET_ENTRY] = {'size': 9, 'ref_offsets': []}
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
@@ -431,13 +432,22 @@ class GarbageCollector:
         HAMT leaf struct: { i64 hash, i64 key, i64 value }
 
         Both are allocated via gc_alloc, so we need to mark them.
+
+        flags parameter (from Map/Set struct):
+        - bit 0: key is a heap pointer (mark it)
+        - bit 1: value is a heap pointer (mark it)
         """
         func = self.gc_mark_hamt
         func.args[0].name = "root"
+        func.args[1].name = "flags"
 
         entry = func.append_basic_block("entry")
         check_tag = func.append_basic_block("check_tag")
         is_leaf = func.append_basic_block("is_leaf")
+        mark_key = func.append_basic_block("mark_key")
+        after_key = func.append_basic_block("after_key")
+        mark_value = func.append_basic_block("mark_value")
+        after_value = func.append_basic_block("after_value")
         is_internal = func.append_basic_block("is_internal")
         child_loop = func.append_basic_block("child_loop")
         child_body = func.append_basic_block("child_body")
@@ -445,6 +455,7 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
         root = func.args[0]
+        flags = func.args[1]
 
         # Null check
         is_null = builder.icmp_unsigned("==", root, ir.Constant(self.i8_ptr, None))
@@ -457,11 +468,50 @@ class GarbageCollector:
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(self.i64, 0))
         builder.cbranch(is_leaf_tag, is_leaf, is_internal)
 
-        # Handle leaf - untag and mark
+        # Handle leaf - untag and mark, plus mark key/value if flags indicate
         builder.position_at_end(is_leaf)
         untagged_int = builder.and_(ptr_as_int, ir.Constant(self.i64, ~1 & 0xFFFFFFFFFFFFFFFF))
         untagged_ptr = builder.inttoptr(untagged_int, self.i8_ptr)
         builder.call(self.gc_mark_object, [untagged_ptr])
+
+        # Leaf struct: { i64 hash, i64 key, i64 value }
+        leaf_type = ir.LiteralStructType([self.i64, self.i64, self.i64])
+        leaf_ptr = builder.bitcast(untagged_ptr, leaf_type.as_pointer())
+
+        # Check if key needs marking (flag bit 0)
+        key_is_ptr = builder.and_(flags, ir.Constant(self.i32, 1))
+        key_needs_mark = builder.icmp_unsigned("!=", key_is_ptr, ir.Constant(self.i32, 0))
+        builder.cbranch(key_needs_mark, mark_key, after_key)
+
+        # Mark key as heap object
+        builder.position_at_end(mark_key)
+        key_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        key_as_int = builder.load(key_ptr_ptr)
+        key_as_ptr = builder.inttoptr(key_as_int, self.i8_ptr)
+        # Null check for key
+        key_is_null = builder.icmp_unsigned("==", key_as_ptr, ir.Constant(self.i8_ptr, None))
+        with builder.if_then(builder.not_(key_is_null)):
+            builder.call(self.gc_mark_object, [key_as_ptr])
+        builder.branch(after_key)
+
+        # Check if value needs marking (flag bit 1)
+        builder.position_at_end(after_key)
+        value_is_ptr = builder.and_(flags, ir.Constant(self.i32, 2))
+        value_needs_mark = builder.icmp_unsigned("!=", value_is_ptr, ir.Constant(self.i32, 0))
+        builder.cbranch(value_needs_mark, mark_value, after_value)
+
+        # Mark value as heap object
+        builder.position_at_end(mark_value)
+        value_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        value_as_int = builder.load(value_ptr_ptr)
+        value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
+        # Null check for value
+        value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
+        with builder.if_then(builder.not_(value_is_null)):
+            builder.call(self.gc_mark_object, [value_as_ptr])
+        builder.branch(after_value)
+
+        builder.position_at_end(after_value)
         builder.branch(done)
 
         # Handle internal node
@@ -528,8 +578,8 @@ class GarbageCollector:
         idx_64 = builder.zext(idx, self.i64)
         child_ptr_ptr = builder.gep(children_ptr, [idx_64], inbounds=True)
         child_ptr = builder.load(child_ptr_ptr)
-        # Recursive call to mark child (could be node or leaf)
-        builder.call(func, [child_ptr])
+        # Recursive call to mark child (could be node or leaf), passing flags
+        builder.call(func, [child_ptr, flags])
         next_idx = builder.add(idx, ir.Constant(self.i32, 1))
         builder.store(next_idx, idx_ptr)
         builder.branch(child_loop)
@@ -599,14 +649,17 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i32, self.TYPE_CHANNEL), mark_channel)
 
         # Mark Map: HAMT-based, root at offset 0
-        # Map struct: { i8* root, i64 len }
+        # Map struct: { i8* root, i64 len, i32 flags }
         # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
+        # flags: bit 0 = key is ptr, bit 1 = value is ptr
         builder.position_at_end(mark_map)
-        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64]).as_pointer()
+        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32]).as_pointer()
         map_typed = builder.bitcast(ptr, map_ptr_type)
         map_root_ptr_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         map_root_ptr = builder.load(map_root_ptr_ptr)
-        builder.call(self.gc_mark_hamt, [map_root_ptr])
+        map_flags_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        map_flags = builder.load(map_flags_ptr)
+        builder.call(self.gc_mark_hamt, [map_root_ptr, map_flags])
         builder.branch(done)
 
         # Mark List: root (field 0) and tail (field 3) pointers
@@ -635,14 +688,17 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark Set: HAMT-based, root at offset 0
-        # Set struct: { i8* root, i64 len }
+        # Set struct: { i8* root, i64 len, i32 flags }
         # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
+        # flags: bit 0 = element is ptr
         builder.position_at_end(mark_set)
-        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64]).as_pointer()
+        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32]).as_pointer()
         set_typed = builder.bitcast(ptr, set_ptr_type)
         set_root_ptr_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         set_root_ptr = builder.load(set_root_ptr_ptr)
-        builder.call(self.gc_mark_hamt, [set_root_ptr])
+        set_flags_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        set_flags = builder.load(set_flags_ptr)
+        builder.call(self.gc_mark_hamt, [set_root_ptr, set_flags])
         builder.branch(done)
 
         # Mark String: data pointer at field 0

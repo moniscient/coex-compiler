@@ -133,7 +133,11 @@ class CodeGenerator:
         # printf
         printf_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
-        
+
+        # fflush for output synchronization (NULL argument flushes all output streams)
+        fflush_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()])
+        self.fflush = ir.Function(self.module, fflush_ty, name="fflush")
+
         # malloc/free for runtime allocations
         malloc_ty = ir.FunctionType(ir.IntType(8).as_pointer(), [ir.IntType(64)])
         self.malloc = ir.Function(self.module, malloc_ty, name="malloc")
@@ -1774,10 +1778,11 @@ class CodeGenerator:
     def _set_to_array(self, set_ptr: ir.Value) -> ir.Value:
         """Convert a Set to an Array (Set.packed() -> Array).
 
-        Creates a new Array with the occupied elements from the Set.
-        Elements are stored in iteration order (arbitrary).
+        Creates a new Array with the elements from the HAMT-based Set.
+        Uses set_to_list to collect keys, then copies to array.
         """
         func = self.builder.function
+        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
@@ -1788,89 +1793,24 @@ class CodeGenerator:
         elem_size = ir.Constant(i64, 8)
         array_ptr = self.builder.call(self.array_new, [set_len, elem_size])
 
-        # We need to iterate over Set entries and copy occupied ones to Array
-        # This requires a loop - for simplicity, use basic blocks
+        # Get list of keys from set using set_to_list (HAMT-based)
+        key_list = self.builder.call(self.set_to_list, [set_ptr])
 
-        # Get set capacity and entries pointer
-        set_cap_ptr = self.builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        set_cap = self.builder.load(set_cap_ptr)
+        # Get list data pointer (field 3 in List struct)
+        list_data_ptr = self.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        list_data = self.builder.load(list_data_ptr)
 
-        set_entries_ptr = self.builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        set_entries = self.builder.load(set_entries_ptr)
-
-        # Array data is field 0 (new layout)
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        # Get array data pointer (field 0 in Array struct)
+        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_data = self.builder.load(array_data_ptr)
 
-        # Loop variables
-        idx_alloca = self.builder.alloca(i64, name="set_idx")
-        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+        # Copy list data to array: len * 8 bytes
+        copy_size = self.builder.mul(set_len, elem_size)
+        self.builder.call(self.memcpy, [array_data, list_data, copy_size])
 
-        arr_idx_alloca = self.builder.alloca(i64, name="arr_idx")
-        self.builder.store(ir.Constant(i64, 0), arr_idx_alloca)
-
-        # Loop blocks
-        cond_block = func.append_basic_block("set_to_arr_cond")
-        body_block = func.append_basic_block("set_to_arr_body")
-        inc_block = func.append_basic_block("set_to_arr_inc")
-        exit_block = func.append_basic_block("set_to_arr_exit")
-
-        self.builder.branch(cond_block)
-
-        # Condition: idx < set_cap
-        self.builder.position_at_end(cond_block)
-        idx = self.builder.load(idx_alloca)
-        cond = self.builder.icmp_signed("<", idx, set_cap)
-        self.builder.cbranch(cond, body_block, exit_block)
-
-        # Body: check if entry is occupied, if so copy to array
-        self.builder.position_at_end(body_block)
-        idx = self.builder.load(idx_alloca)
-
-        # Get entry state (offset 8 in SetEntry: { i64 key, i8 state })
-        entry_ptr = self.builder.gep(set_entries, [idx], inbounds=True)
-        state_ptr = self.builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        state = self.builder.load(state_ptr)
-
-        # Check if state == 1 (occupied)
-        is_occupied = self.builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-
-        copy_block = func.append_basic_block("set_to_arr_copy")
-        skip_block = func.append_basic_block("set_to_arr_skip")
-        self.builder.cbranch(is_occupied, copy_block, skip_block)
-
-        # Copy block: copy key to array
-        self.builder.position_at_end(copy_block)
-        key_ptr = self.builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        key_val = self.builder.load(key_ptr)
-
-        arr_idx = self.builder.load(arr_idx_alloca)
-        offset = self.builder.mul(arr_idx, elem_size)
-        dest_ptr = self.builder.gep(array_data, [offset])
-        dest_typed = self.builder.bitcast(dest_ptr, i64.as_pointer())
-        self.builder.store(key_val, dest_typed)
-
-        # Increment array index
-        new_arr_idx = self.builder.add(arr_idx, ir.Constant(i64, 1))
-        self.builder.store(new_arr_idx, arr_idx_alloca)
-        self.builder.branch(skip_block)
-
-        # Skip/continue to increment
-        self.builder.position_at_end(skip_block)
-        self.builder.branch(inc_block)
-
-        # Increment set index
-        self.builder.position_at_end(inc_block)
-        idx = self.builder.load(idx_alloca)
-        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
-        self.builder.store(next_idx, idx_alloca)
-        self.builder.branch(cond_block)
-
-        # Exit: set array len (field 1 in Array layout)
-        self.builder.position_at_end(exit_block)
-        final_arr_idx = self.builder.load(arr_idx_alloca)
-        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        self.builder.store(final_arr_idx, arr_len_ptr)
+        # Set array len (field 1 in Array layout)
+        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        self.builder.store(set_len, arr_len_ptr)
 
         return array_ptr
 
@@ -1943,7 +1883,7 @@ class CodeGenerator:
         self.builder.position_at_end(end_block)
         return self.builder.load(list_alloca)
 
-    def _array_to_set(self, array_ptr: ir.Value) -> ir.Value:
+    def _array_to_set(self, array_ptr: ir.Value, elem_is_ptr: bool = False) -> ir.Value:
         """Convert an Array to a Set (Array.toSet() -> Set).
 
         Creates a new Set with the same elements as the Array.
@@ -1966,8 +1906,9 @@ class CodeGenerator:
         array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_data = self.builder.load(array_data_ptr)
 
-        # Create new empty Set
-        set_ptr = self.builder.call(self.set_new, [])
+        # Create new empty Set with flags indicating element type
+        flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
 
         # Store set_ptr in alloca since set_add returns new set
         set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="arr_to_set")
@@ -2906,6 +2847,31 @@ class CodeGenerator:
             return False
         return False
 
+    def _compute_map_flags(self, key_type: Type, value_type: Type) -> int:
+        """Compute the GC flags for a Map based on key and value types.
+
+        Returns an integer with:
+        - bit 0 set if key is a heap pointer
+        - bit 1 set if value is a heap pointer
+        """
+        flags = 0
+        if self._is_heap_type(key_type):
+            flags |= self.MAP_FLAG_KEY_IS_PTR
+        if self._is_heap_type(value_type):
+            flags |= self.MAP_FLAG_VALUE_IS_PTR
+        return flags
+
+    def _compute_set_flags(self, elem_type: Type) -> int:
+        """Compute the GC flags for a Set based on element type.
+
+        Returns an integer with:
+        - bit 0 set if element is a heap pointer
+        """
+        flags = 0
+        if self._is_heap_type(elem_type):
+            flags |= self.MAP_FLAG_KEY_IS_PTR  # Reuse same flag for set elements
+        return flags
+
     def _is_collection_coex_type(self, coex_type: Type) -> bool:
         """Check if a Coex type is a collection (List, Set, Map, Array, String)."""
         if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
@@ -2968,10 +2934,9 @@ class CodeGenerator:
             # Assignment just shares the pointer; GC handles memory
             return value
 
-        # Map<K,V>: with GC, assignment shares pointer; mutation ops create new maps
+        # Map<K,V>: mutation ops (map_set, map_remove) always return new maps
+        # Assignment just shares the pointer; GC handles memory
         if isinstance(coex_type, MapType):
-            # Mutation operations (map_set, map_remove) already return new maps
-            # Assignment just shares the pointer; GC handles memory
             return value
 
         # Array<T>: deep copy if T is a collection, shallow otherwise
@@ -3082,8 +3047,9 @@ class CodeGenerator:
         src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         src_cap = self.builder.load(src_cap_ptr)
 
-        # Create new set
-        initial_dst = self.builder.call(self.set_new, [])
+        # Create new set with appropriate flags
+        flags = self._compute_set_flags(elem_type)
+        initial_dst = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
 
         # Allocate pointer to track dst across loop iterations (value semantics)
         dst_ptr = self.builder.alloca(self.set_struct.as_pointer(), name="dst_set")
@@ -3170,8 +3136,9 @@ class CodeGenerator:
         src_cap_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         src_cap = self.builder.load(src_cap_ptr)
 
-        # Create new map
-        initial_dst = self.builder.call(self.map_new, [])
+        # Create new map with type flags
+        flags = self._compute_map_flags(key_type, value_type)
+        initial_dst = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
 
         # Allocate pointer to track dst across loop iterations (value semantics)
         dst_ptr = self.builder.alloca(self.map_struct.as_pointer(), name="dst_map")
@@ -3380,64 +3347,110 @@ class CodeGenerator:
         self.functions["coex_string_copy"] = self.string_copy
 
     def _create_map_type(self):
-        """Create the Map type and helper functions.
-        
-        Map uses a hash table with linear probing.
-        
-        MapEntry layout:
-            i64 key    - Key (int value or String pointer)
-            i64 value  - Value (int value or pointer)
-            i8  state  - 0=empty, 1=occupied, 2=deleted (tombstone)
-        
+        """Create the Map type and helper functions using HAMT (Hash Array Mapped Trie).
+
+        HAMT provides O(log32 n) operations with structural sharing for value semantics.
+        Each mutation only copies O(log32 n) nodes on the path to the leaf.
+
+        HAMTNode layout (internal nodes):
+            i32 bitmap   - 32-bit mask indicating which children are present
+            i8** children - array of child pointers (size = popcount(bitmap))
+            Children point to HAMTNode*, HAMTLeaf*, or HAMTCollision*
+
+        HAMTLeaf layout (single key-value entry):
+            i64 hash     - full hash for collision detection
+            i64 key      - key (int value or String pointer)
+            i64 value    - value (int value or pointer)
+
+        HAMTCollision layout (multiple entries with same hash):
+            i64 hash     - the shared hash
+            i32 count    - number of entries
+            i8* entries  - array of HAMTLeaf structs
+
         Map layout:
-            MapEntry* entries  - Array of entries
-            i64 len            - Number of occupied entries
-            i64 cap            - Total capacity (always power of 2)
-        
+            i8* root     - void pointer to root node (HAMTNode*, HAMTLeaf*, or null)
+            i64 len      - number of key-value pairs
+
         Keys and values are stored as i64 (for ints) or pointers cast to i64.
+        The HAMT uses 5-bit chunks of the hash at each level (32 children per node).
         """
-        # MapEntry struct: { i64 key, i64 value, i8 state }
+        # HAMTLeaf struct: { i64 hash, i64 key, i64 value }
+        self.hamt_leaf_struct = ir.global_context.get_identified_type("struct.HAMTLeaf")
+        self.hamt_leaf_struct.set_body(
+            ir.IntType(64),  # hash (field 0)
+            ir.IntType(64),  # key (field 1)
+            ir.IntType(64)   # value (field 2)
+        )
+
+        # HAMTNode struct: { i32 bitmap, i8** children }
+        # Children array is allocated separately with popcount(bitmap) elements
+        self.hamt_node_struct = ir.global_context.get_identified_type("struct.HAMTNode")
+        self.hamt_node_struct.set_body(
+            ir.IntType(32),  # bitmap (field 0)
+            ir.IntType(8).as_pointer().as_pointer()  # children (field 1)
+        )
+
+        # HAMTCollision struct: { i64 hash, i32 count, HAMTLeaf* entries }
+        self.hamt_collision_struct = ir.global_context.get_identified_type("struct.HAMTCollision")
+        self.hamt_collision_struct.set_body(
+            ir.IntType(64),  # hash (field 0)
+            ir.IntType(32),  # count (field 1)
+            self.hamt_leaf_struct.as_pointer()  # entries (field 2)
+        )
+
+        # Map struct: { i8* root, i64 len, i32 flags }
+        # Root can be null (empty), HAMTLeaf*, HAMTNode*, or HAMTCollision*
+        # flags: bit 0 = key is heap pointer, bit 1 = value is heap pointer
+        self.map_struct = ir.global_context.get_identified_type("struct.Map")
+        self.map_struct.set_body(
+            ir.IntType(8).as_pointer(),  # root (field 0) - void pointer
+            ir.IntType(64),              # len (field 1)
+            ir.IntType(32)               # flags (field 2) - type info for GC
+        )
+
+        # Flag constants for Map/Set type info
+        self.MAP_FLAG_KEY_IS_PTR = 0x01    # Key is a heap pointer (e.g., string)
+        self.MAP_FLAG_VALUE_IS_PTR = 0x02  # Value is a heap pointer
+
+        # Keep MapEntry for backward compatibility (used in some generated code)
         self.map_entry_struct = ir.global_context.get_identified_type("struct.MapEntry")
         self.map_entry_struct.set_body(
             ir.IntType(64),  # key
             ir.IntType(64),  # value
-            ir.IntType(8)    # state: 0=empty, 1=occupied, 2=deleted
-        )
-        
-        # Map struct: { MapEntry* entries, i64 len, i64 cap }
-        self.map_struct = ir.global_context.get_identified_type("struct.Map")
-        self.map_struct.set_body(
-            self.map_entry_struct.as_pointer(),  # entries
-            ir.IntType(64),   # len
-            ir.IntType(64)    # cap
+            ir.IntType(8)    # state (not used in HAMT, kept for compatibility)
         )
         
         map_ptr = self.map_struct.as_pointer()
         i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
         i1 = ir.IntType(1)
-        
-        # map_new() -> Map*
-        map_new_ty = ir.FunctionType(map_ptr, [])
+        void_ptr = ir.IntType(8).as_pointer()
+        hamt_node_ptr = self.hamt_node_struct.as_pointer()
+        hamt_leaf_ptr = self.hamt_leaf_struct.as_pointer()
+
+        # map_new(flags: i32) -> Map*
+        # flags: bit 0 = key is ptr, bit 1 = value is ptr
+        map_new_ty = ir.FunctionType(map_ptr, [i32])
         self.map_new = ir.Function(self.module, map_new_ty, name="coex_map_new")
-        
+
         # map_set(map: Map*, key: i64, value: i64) -> Map*
         # Returns a NEW map with the key-value pair set (value semantics)
         map_set_ty = ir.FunctionType(map_ptr, [map_ptr, i64, i64])
         self.map_set = ir.Function(self.module, map_set_ty, name="coex_map_set")
-        
+
         # map_get(map: Map*, key: i64) -> i64
         map_get_ty = ir.FunctionType(i64, [map_ptr, i64])
         self.map_get = ir.Function(self.module, map_get_ty, name="coex_map_get")
-        
+
         # map_has(map: Map*, key: i64) -> bool
         map_has_ty = ir.FunctionType(i1, [map_ptr, i64])
         self.map_has = ir.Function(self.module, map_has_ty, name="coex_map_has")
-        
+
         # map_remove(map: Map*, key: i64) -> Map*
         # Returns a NEW map with key removed (value semantics)
         map_remove_ty = ir.FunctionType(map_ptr, [map_ptr, i64])
         self.map_remove = ir.Function(self.module, map_remove_ty, name="coex_map_remove")
-        
+
         # map_len(map: Map*) -> i64
         map_len_ty = ir.FunctionType(i64, [map_ptr])
         self.map_len = ir.Function(self.module, map_len_ty, name="coex_map_len")
@@ -3450,20 +3463,67 @@ class CodeGenerator:
         map_hash_ty = ir.FunctionType(i64, [i64])
         self.map_hash = ir.Function(self.module, map_hash_ty, name="coex_map_hash")
 
-        # map_grow(map: Map*)  (internal resize function)
-        map_grow_ty = ir.FunctionType(ir.VoidType(), [map_ptr])
-        self.map_grow = ir.Function(self.module, map_grow_ty, name="coex_map_grow")
-
-        # map_find_slot(map: Map*, key: i64) -> i64  (internal: find slot for key)
-        map_find_slot_ty = ir.FunctionType(i64, [map_ptr, i64])
-        self.map_find_slot = ir.Function(self.module, map_find_slot_ty, name="coex_map_find_slot")
-
-        # map_copy(map: Map*) -> Map*  (deep copy for value semantics)
+        # map_copy(map: Map*) -> Map*  (shallow copy - HAMT uses structural sharing)
         map_copy_ty = ir.FunctionType(map_ptr, [map_ptr])
         self.map_copy = ir.Function(self.module, map_copy_ty, name="coex_map_copy")
 
-        # String-key variants - use string content for hashing and comparison
+        # HAMT internal helper: popcount(i32) -> i32
+        popcount_ty = ir.FunctionType(i32, [i32])
+        self.hamt_popcount = ir.Function(self.module, popcount_ty, name="coex_hamt_popcount")
+
+        # HAMT internal: hamt_node_new(bitmap: i32, child_count: i32) -> HAMTNode*
+        hamt_node_new_ty = ir.FunctionType(hamt_node_ptr, [i32, i32])
+        self.hamt_node_new = ir.Function(self.module, hamt_node_new_ty, name="coex_hamt_node_new")
+
+        # HAMT internal: hamt_leaf_new(hash: i64, key: i64, value: i64) -> HAMTLeaf*
+        hamt_leaf_new_ty = ir.FunctionType(hamt_leaf_ptr, [i64, i64, i64])
+        self.hamt_leaf_new = ir.Function(self.module, hamt_leaf_new_ty, name="coex_hamt_leaf_new")
+
+        # HAMT internal: hamt_insert(node: void*, hash: i64, key: i64, value: i64, shift: i32, added: i32*) -> void*
+        # Returns new root after inserting, sets added[0]=1 if new key, 0 if update
+        hamt_insert_ty = ir.FunctionType(void_ptr, [void_ptr, i64, i64, i64, i32, i32.as_pointer()])
+        self.hamt_insert = ir.Function(self.module, hamt_insert_ty, name="coex_hamt_insert")
+
+        # HAMT internal: hamt_lookup(node: void*, hash: i64, key: i64, shift: i32) -> i64
+        # Returns value if found, or 0 if not found
+        hamt_lookup_ty = ir.FunctionType(i64, [void_ptr, i64, i64, i32])
+        self.hamt_lookup = ir.Function(self.module, hamt_lookup_ty, name="coex_hamt_lookup")
+
+        # HAMT internal: hamt_contains(node: void*, hash: i64, key: i64, shift: i32) -> bool
+        hamt_contains_ty = ir.FunctionType(i1, [void_ptr, i64, i64, i32])
+        self.hamt_contains = ir.Function(self.module, hamt_contains_ty, name="coex_hamt_contains")
+
+        # HAMT internal: hamt_remove(node: void*, hash: i64, key: i64, shift: i32, removed: i32*) -> void*
+        # Returns new root after removing, sets removed[0]=1 if key was removed
+        hamt_remove_ty = ir.FunctionType(void_ptr, [void_ptr, i64, i64, i32, i32.as_pointer()])
+        self.hamt_remove = ir.Function(self.module, hamt_remove_ty, name="coex_hamt_remove")
+
+        # HAMT internal: hamt_collect_keys(node: void*, list: List*) -> List*
+        # Collect all keys into a list (for iteration)
+        list_ptr_type = self.list_struct.as_pointer()
+        hamt_collect_ty = ir.FunctionType(list_ptr_type, [void_ptr, list_ptr_type])
+        self.hamt_collect_keys = ir.Function(self.module, hamt_collect_ty, name="coex_hamt_collect_keys")
+
+        # HAMT string variants - use string_eq for key comparison
         string_ptr = self.string_struct.as_pointer()
+
+        # HAMT: hamt_insert_string(node: void*, hash: i64, key: String*, value: i64, shift: i32, added: i32*) -> void*
+        hamt_insert_string_ty = ir.FunctionType(void_ptr, [void_ptr, i64, string_ptr, i64, i32, i32.as_pointer()])
+        self.hamt_insert_string = ir.Function(self.module, hamt_insert_string_ty, name="coex_hamt_insert_string")
+
+        # HAMT: hamt_lookup_string(node: void*, hash: i64, key: String*, shift: i32) -> i64
+        hamt_lookup_string_ty = ir.FunctionType(i64, [void_ptr, i64, string_ptr, i32])
+        self.hamt_lookup_string = ir.Function(self.module, hamt_lookup_string_ty, name="coex_hamt_lookup_string")
+
+        # HAMT: hamt_contains_string(node: void*, hash: i64, key: String*, shift: i32) -> bool
+        hamt_contains_string_ty = ir.FunctionType(i1, [void_ptr, i64, string_ptr, i32])
+        self.hamt_contains_string = ir.Function(self.module, hamt_contains_string_ty, name="coex_hamt_contains_string")
+
+        # HAMT: hamt_remove_string(node: void*, hash: i64, key: String*, shift: i32, removed: i32*) -> void*
+        hamt_remove_string_ty = ir.FunctionType(void_ptr, [void_ptr, i64, string_ptr, i32, i32.as_pointer()])
+        self.hamt_remove_string = ir.Function(self.module, hamt_remove_string_ty, name="coex_hamt_remove_string")
+
+        # String-key map variants - use string content for hashing and comparison
 
         # map_set_string(map: Map*, key: String*, value: i64) -> Map*
         map_set_string_ty = ir.FunctionType(map_ptr, [map_ptr, string_ptr, i64])
@@ -3477,20 +3537,30 @@ class CodeGenerator:
         map_has_string_ty = ir.FunctionType(i1, [map_ptr, string_ptr])
         self.map_has_string = ir.Function(self.module, map_has_string_ty, name="coex_map_has_string")
 
-        # map_find_slot_string(map: Map*, key: String*) -> i64  (internal)
-        map_find_slot_string_ty = ir.FunctionType(i64, [map_ptr, string_ptr])
-        self.map_find_slot_string = ir.Function(self.module, map_find_slot_string_ty, name="coex_map_find_slot_string")
-
         # map_keys(map: Map*) -> List*  (for iteration - returns list of keys as i64)
         list_ptr = self.list_struct.as_pointer()
         map_keys_ty = ir.FunctionType(list_ptr, [map_ptr])
         self.map_keys = ir.Function(self.module, map_keys_ty, name="coex_map_keys")
 
-        # Implement all map functions
+        # Implement HAMT helper functions first
+        self._implement_hamt_popcount()
+        self._implement_hamt_node_new()
+        self._implement_hamt_leaf_new()
+        self._implement_hamt_lookup()
+        self._implement_hamt_contains()
+        self._implement_hamt_insert()
+        self._implement_hamt_remove()
+        self._implement_hamt_collect_keys()
+
+        # Implement HAMT string variants
+        self._implement_hamt_lookup_string()
+        self._implement_hamt_contains_string()
+        self._implement_hamt_insert_string()
+        self._implement_hamt_remove_string()
+
+        # Implement main Map functions
         self._implement_map_hash()
         self._implement_map_new()
-        self._implement_map_find_slot()
-        self._implement_map_grow()
         self._implement_map_set()
         self._implement_map_get()
         self._implement_map_has()
@@ -3498,7 +3568,6 @@ class CodeGenerator:
         self._implement_map_len()
         self._implement_map_size()
         self._implement_map_copy()
-        self._implement_map_find_slot_string()
         self._implement_map_set_string()
         self._implement_map_get_string()
         self._implement_map_has_string()
@@ -3506,7 +3575,1667 @@ class CodeGenerator:
 
         # Register Map methods
         self._register_map_methods()
-    
+
+    # ========================================================================
+    # HAMT (Hash Array Mapped Trie) Helper Functions
+    # ========================================================================
+
+    def _implement_hamt_popcount(self):
+        """Count the number of 1 bits in a 32-bit integer (population count)."""
+        func = self.hamt_popcount
+        func.args[0].name = "x"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        x = func.args[0]
+        i32 = ir.IntType(32)
+
+        # Brian Kernighan's algorithm for popcount
+        # count = 0; while (x) { x &= x - 1; count++; }
+        count_ptr = builder.alloca(i32, name="count")
+        x_ptr = builder.alloca(i32, name="x_ptr")
+        builder.store(ir.Constant(i32, 0), count_ptr)
+        builder.store(x, x_ptr)
+
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        curr_x = builder.load(x_ptr)
+        is_nonzero = builder.icmp_unsigned("!=", curr_x, ir.Constant(i32, 0))
+        builder.cbranch(is_nonzero, loop_body, loop_done)
+
+        builder.position_at_end(loop_body)
+        x_minus_1 = builder.sub(curr_x, ir.Constant(i32, 1))
+        new_x = builder.and_(curr_x, x_minus_1)
+        builder.store(new_x, x_ptr)
+        curr_count = builder.load(count_ptr)
+        new_count = builder.add(curr_count, ir.Constant(i32, 1))
+        builder.store(new_count, count_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_count = builder.load(count_ptr)
+        builder.ret(final_count)
+
+    def _implement_hamt_node_new(self):
+        """Create a new HAMT internal node with given bitmap and child count."""
+        func = self.hamt_node_new
+        func.args[0].name = "bitmap"
+        func.args[1].name = "child_count"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        bitmap = func.args[0]
+        child_count = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Allocate HAMTNode struct (4 + 8 = 16 bytes with padding)
+        node_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_HAMT_NODE if hasattr(self.gc, 'TYPE_HAMT_NODE') else 0)
+        raw_ptr = builder.call(self.gc.gc_alloc, [node_size, type_id])
+        node_ptr = builder.bitcast(raw_ptr, self.hamt_node_struct.as_pointer())
+
+        # Store bitmap (field 0)
+        bitmap_field = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(bitmap, bitmap_field)
+
+        # Allocate children array: child_count * 8 bytes (pointers)
+        child_count_64 = builder.zext(child_count, i64)
+        children_size = builder.mul(child_count_64, ir.Constant(i64, 8))
+
+        # Handle zero children case
+        zero_children = builder.icmp_unsigned("==", child_count, ir.Constant(i32, 0))
+        with builder.if_else(zero_children) as (then, otherwise):
+            with then:
+                # No children - store null pointer
+                children_field = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+                null_ptr = ir.Constant(void_ptr.as_pointer(), None)
+                builder.store(null_ptr, children_field)
+            with otherwise:
+                # Allocate children array
+                children_raw = builder.call(self.gc.gc_alloc, [children_size, ir.Constant(i32, 0)])
+                children_ptr = builder.bitcast(children_raw, void_ptr.as_pointer())
+                children_field2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+                builder.store(children_ptr, children_field2)
+
+        builder.ret(node_ptr)
+
+    def _implement_hamt_leaf_new(self):
+        """Create a new HAMT leaf node with hash, key, and value."""
+        func = self.hamt_leaf_new
+        func.args[0].name = "hash"
+        func.args[1].name = "key"
+        func.args[2].name = "value"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        hash_val = func.args[0]
+        key = func.args[1]
+        value = func.args[2]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate HAMTLeaf struct (8 + 8 + 8 = 24 bytes)
+        leaf_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_HAMT_LEAF if hasattr(self.gc, 'TYPE_HAMT_LEAF') else 0)
+        raw_ptr = builder.call(self.gc.gc_alloc, [leaf_size, type_id])
+        leaf_ptr = builder.bitcast(raw_ptr, self.hamt_leaf_struct.as_pointer())
+
+        # Store hash (field 0)
+        hash_field = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(hash_val, hash_field)
+
+        # Store key (field 1)
+        key_field = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(key, key_field)
+
+        # Store value (field 2)
+        value_field = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(value, value_field)
+
+        # Tag the pointer (bit 0 = 1 for leaf) for node/leaf discrimination
+        # Return as void* with tag bit set
+        void_ptr = ir.IntType(8).as_pointer()
+        leaf_void = builder.bitcast(leaf_ptr, void_ptr)
+        leaf_int = builder.ptrtoint(leaf_void, i64)
+        tagged_int = builder.or_(leaf_int, ir.Constant(i64, 1))
+        tagged_ptr = builder.inttoptr(tagged_int, self.hamt_leaf_struct.as_pointer())
+        builder.ret(tagged_ptr)
+
+    def _implement_hamt_lookup(self):
+        """Look up a value in the HAMT by hash and key.
+
+        Uses 5-bit chunks of the hash at each level.
+        Returns the value if found, or 0 if not found.
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_lookup
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"
+        func.args[3].name = "shift"
+
+        entry = func.append_basic_block("entry")
+        check_tag = func.append_basic_block("check_tag")
+        is_leaf = func.append_basic_block("is_leaf")
+        is_node = func.append_basic_block("is_node")
+        bit_set = func.append_basic_block("bit_set")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        shift = func.args[3]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Check if node is null
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        builder.cbranch(is_null, not_found, check_tag)
+
+        # Check low bit for leaf/node (bit 0 = 1 for leaf)
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+        builder.cbranch(is_leaf_tag, is_leaf, is_node)
+
+        # It's a leaf - clear tag and check if key matches
+        builder.position_at_end(is_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        leaf_key = builder.load(leaf_key_ptr)
+        keys_match = builder.icmp_signed("==", leaf_key, key)
+
+        found_block = func.append_basic_block("found_leaf")
+        builder.cbranch(keys_match, found_block, not_found)
+
+        builder.position_at_end(found_block)
+        leaf_value_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        leaf_value = builder.load(leaf_value_ptr)
+        builder.ret(leaf_value)
+
+        # It's a node - check bitmap and recurse
+        builder.position_at_end(is_node)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        # Extract 5 bits from hash at current shift level
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        hash_bits = builder.trunc(builder.and_(hash_shifted, ir.Constant(i64, 0x1F)), i32)
+
+        # Check if bit is set in bitmap
+        bit_mask = builder.shl(ir.Constant(i32, 1), hash_bits)
+        bit_and = builder.and_(bitmap, bit_mask)
+        bit_is_set = builder.icmp_unsigned("!=", bit_and, ir.Constant(i32, 0))
+        builder.cbranch(bit_is_set, bit_set, not_found)
+
+        # Bit is set - find child index using popcount of lower bits
+        builder.position_at_end(bit_set)
+        lower_mask = builder.sub(bit_mask, ir.Constant(i32, 1))
+        lower_bits = builder.and_(bitmap, lower_mask)
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+
+        # Get child pointer
+        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        # Recurse with shift + 5
+        new_shift = builder.add(shift, ir.Constant(i32, 5))
+        result = builder.call(self.hamt_lookup, [child_ptr, hash_val, key, new_shift])
+        builder.ret(result)
+
+        # Not found
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(i64, 0))
+
+    def _implement_hamt_contains(self):
+        """Check if a key exists in the HAMT.
+
+        Similar to lookup but returns bool instead of value.
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_contains
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"
+        func.args[3].name = "shift"
+
+        entry = func.append_basic_block("entry")
+        check_tag = func.append_basic_block("check_tag")
+        is_leaf = func.append_basic_block("is_leaf")
+        is_node = func.append_basic_block("is_node")
+        bit_set = func.append_basic_block("bit_set")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        shift = func.args[3]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i1 = ir.IntType(1)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Check if node is null
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        builder.cbranch(is_null, not_found, check_tag)
+
+        # Check low bit for leaf/node (bit 0 = 1 for leaf)
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+        builder.cbranch(is_leaf_tag, is_leaf, is_node)
+
+        # It's a leaf - clear tag and check if key matches
+        builder.position_at_end(is_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        leaf_key = builder.load(leaf_key_ptr)
+        keys_match = builder.icmp_signed("==", leaf_key, key)
+        builder.ret(keys_match)
+
+        # It's a node - get bitmap and index into children
+        builder.position_at_end(is_node)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        hash_bits = builder.trunc(builder.and_(hash_shifted, ir.Constant(i64, 0x1F)), i32)
+
+        bit_mask = builder.shl(ir.Constant(i32, 1), hash_bits)
+        bit_and = builder.and_(bitmap, bit_mask)
+        bit_is_set = builder.icmp_unsigned("!=", bit_and, ir.Constant(i32, 0))
+        builder.cbranch(bit_is_set, bit_set, not_found)
+
+        builder.position_at_end(bit_set)
+        lower_mask = builder.sub(bit_mask, ir.Constant(i32, 1))
+        lower_bits = builder.and_(bitmap, lower_mask)
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+
+        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        new_shift = builder.add(shift, ir.Constant(i32, 5))
+        result = builder.call(self.hamt_contains, [child_ptr, hash_val, key, new_shift])
+        builder.ret(result)
+
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(i1, 0))
+
+    def _implement_hamt_insert(self):
+        """Insert a key-value pair into the HAMT, returning a new root.
+
+        This implements path copying for structural sharing:
+        - Only nodes on the path from root to the insertion point are copied
+        - All other nodes are shared between old and new versions
+        - Sets added[0] = 1 if a new key was added, 0 if existing key was updated
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_insert
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"
+        func.args[3].name = "value"
+        func.args[4].name = "shift"
+        func.args[5].name = "added"
+
+        entry = func.append_basic_block("entry")
+        create_leaf_null = func.append_basic_block("create_leaf_null")
+        check_tag = func.append_basic_block("check_tag")
+        is_leaf = func.append_basic_block("is_leaf")
+        is_internal_node = func.append_basic_block("is_internal_node")
+        bit_exists = func.append_basic_block("bit_exists")
+        bit_not_exists = func.append_basic_block("bit_not_exists")
+
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        value = func.args[3]
+        shift = func.args[4]
+        added_ptr = func.args[5]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Case 1: Node is null - create new leaf
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        builder.cbranch(is_null, create_leaf_null, check_tag)
+
+        # Create new leaf for null case
+        builder.position_at_end(create_leaf_null)
+        new_leaf = builder.call(self.hamt_leaf_new, [hash_val, key, value])
+        builder.store(ir.Constant(i32, 1), added_ptr)  # New key added
+        new_leaf_void = builder.bitcast(new_leaf, void_ptr)
+        builder.ret(new_leaf_void)
+
+        # Check pointer tag to determine leaf vs node
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+        builder.cbranch(is_leaf_tag, is_leaf, is_internal_node)
+
+        # Handle leaf case - untag and process
+        builder.position_at_end(is_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+
+        leaf_hash_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        leaf_hash = builder.load(leaf_hash_ptr)
+        leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        leaf_key = builder.load(leaf_key_ptr)
+
+        # Check if same key - update in place
+        same_key = builder.icmp_signed("==", leaf_key, key)
+
+        update_leaf = func.append_basic_block("update_leaf")
+        expand_to_node = func.append_basic_block("expand_to_node")
+        builder.cbranch(same_key, update_leaf, expand_to_node)
+
+        # Update existing leaf with new value
+        builder.position_at_end(update_leaf)
+        updated_leaf = builder.call(self.hamt_leaf_new, [hash_val, key, value])
+        builder.store(ir.Constant(i32, 0), added_ptr)  # Existing key updated
+        updated_leaf_void = builder.bitcast(updated_leaf, void_ptr)
+        builder.ret(updated_leaf_void)
+
+        # Expand single leaf to a node (different keys)
+        builder.position_at_end(expand_to_node)
+        # Get the existing leaf's hash bits at this level
+        shift_64 = builder.zext(shift, i64)
+        old_hash_shifted = builder.lshr(leaf_hash, shift_64)
+        old_hash_bits = builder.trunc(builder.and_(old_hash_shifted, ir.Constant(i64, 0x1F)), i32)
+
+        # Get the new key's hash bits at this level
+        new_hash_shifted = builder.lshr(hash_val, shift_64)
+        new_hash_bits = builder.trunc(builder.and_(new_hash_shifted, ir.Constant(i64, 0x1F)), i32)
+
+        # Check if they have the same hash bits (need to go deeper)
+        same_bits = builder.icmp_unsigned("==", old_hash_bits, new_hash_bits)
+
+        recurse_deeper = func.append_basic_block("recurse_deeper")
+        create_split_node = func.append_basic_block("create_split_node")
+        builder.cbranch(same_bits, recurse_deeper, create_split_node)
+
+        # Same hash bits at this level - recurse deeper with the existing leaf
+        builder.position_at_end(recurse_deeper)
+        next_shift = builder.add(shift, ir.Constant(i32, 5))
+        # Pass the original tagged leaf pointer to the recursive call
+        sub_result = builder.call(self.hamt_insert, [node, hash_val, key, value, next_shift, added_ptr])
+
+        # Create a new node with single child at the hash_bits position
+        single_bit_mask = builder.shl(ir.Constant(i32, 1), old_hash_bits)
+        single_child_node = builder.call(self.hamt_node_new, [single_bit_mask, ir.Constant(i32, 1)])
+        single_children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        single_children_ptr = builder.load(single_children_ptr_ptr)
+        builder.store(sub_result, builder.gep(single_children_ptr, [ir.Constant(i64, 0)]))
+        single_child_node_void = builder.bitcast(single_child_node, void_ptr)
+        builder.ret(single_child_node_void)
+
+        # Different hash bits - create node with two children
+        builder.position_at_end(create_split_node)
+        new_leaf4 = builder.call(self.hamt_leaf_new, [hash_val, key, value])
+        builder.store(ir.Constant(i32, 1), added_ptr)
+
+        # Bitmap has both bits set
+        old_bit_mask = builder.shl(ir.Constant(i32, 1), old_hash_bits)
+        new_bit_mask = builder.shl(ir.Constant(i32, 1), new_hash_bits)
+        combined_bitmap = builder.or_(old_bit_mask, new_bit_mask)
+
+        split_node = builder.call(self.hamt_node_new, [combined_bitmap, ir.Constant(i32, 2)])
+        split_children_ptr_ptr = builder.gep(split_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        split_children_ptr = builder.load(split_children_ptr_ptr)
+
+        # Determine which child goes first based on bit positions
+        old_lower = builder.icmp_unsigned("<", old_hash_bits, new_hash_bits)
+
+        old_idx = builder.select(old_lower, ir.Constant(i32, 0), ir.Constant(i32, 1))
+        new_idx = builder.select(old_lower, ir.Constant(i32, 1), ir.Constant(i32, 0))
+
+        old_idx_64 = builder.zext(old_idx, i64)
+        new_idx_64 = builder.zext(new_idx, i64)
+
+        old_child_ptr = builder.gep(split_children_ptr, [old_idx_64])
+        new_child_ptr = builder.gep(split_children_ptr, [new_idx_64])
+
+        # Store existing leaf (keep its tag) and new leaf (already tagged)
+        new_leaf4_void = builder.bitcast(new_leaf4, void_ptr)
+        builder.store(node, old_child_ptr)  # node still has its tag
+        builder.store(new_leaf4_void, new_child_ptr)
+
+        split_node_void = builder.bitcast(split_node, void_ptr)
+        builder.ret(split_node_void)
+
+        # Handle internal node case (bit 0 = 0, no tag)
+        builder.position_at_end(is_internal_node)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        # Get hash bits for this level
+        shift_64_2 = builder.zext(shift, i64)
+        hash_shifted_2 = builder.lshr(hash_val, shift_64_2)
+        hash_bits_2 = builder.trunc(builder.and_(hash_shifted_2, ir.Constant(i64, 0x1F)), i32)
+
+        # Check if bit is set
+        bit_mask_2 = builder.shl(ir.Constant(i32, 1), hash_bits_2)
+        bit_and_2 = builder.and_(bitmap, bit_mask_2)
+        bit_is_set_2 = builder.icmp_unsigned("!=", bit_and_2, ir.Constant(i32, 0))
+        builder.cbranch(bit_is_set_2, bit_exists, bit_not_exists)
+
+        # Bit exists - update existing child
+        builder.position_at_end(bit_exists)
+        lower_mask_2 = builder.sub(bit_mask_2, ir.Constant(i32, 1))
+        lower_bits_2 = builder.and_(bitmap, lower_mask_2)
+        child_idx_2 = builder.call(self.hamt_popcount, [lower_bits_2])
+        old_count_2 = builder.call(self.hamt_popcount, [bitmap])
+
+        children_ptr_ptr_2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr_2 = builder.load(children_ptr_ptr_2)
+        child_idx_64_2 = builder.zext(child_idx_2, i64)
+        child_ptr_ptr_2 = builder.gep(children_ptr_2, [child_idx_64_2])
+        old_child = builder.load(child_ptr_ptr_2)
+
+        # Recurse
+        next_shift_2 = builder.add(shift, ir.Constant(i32, 5))
+        new_child = builder.call(self.hamt_insert, [old_child, hash_val, key, value, next_shift_2, added_ptr])
+
+        # Create new node with updated child (path copying)
+        new_node = builder.call(self.hamt_node_new, [bitmap, old_count_2])
+        new_children_ptr_ptr = builder.gep(new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_children_ptr = builder.load(new_children_ptr_ptr)
+
+        # Copy all children
+        copy_idx_ptr = builder.alloca(i32, name="copy_idx")
+        builder.store(ir.Constant(i32, 0), copy_idx_ptr)
+
+        copy_loop = func.append_basic_block("copy_loop")
+        copy_body = func.append_basic_block("copy_body")
+        copy_done_exists = func.append_basic_block("copy_done_exists")
+
+        builder.branch(copy_loop)
+
+        builder.position_at_end(copy_loop)
+        copy_idx = builder.load(copy_idx_ptr)
+        copy_done_cond = builder.icmp_signed(">=", copy_idx, old_count_2)
+        builder.cbranch(copy_done_cond, copy_done_exists, copy_body)
+
+        builder.position_at_end(copy_body)
+        copy_idx_64 = builder.zext(copy_idx, i64)
+        src_ptr = builder.gep(children_ptr_2, [copy_idx_64])
+        dst_ptr = builder.gep(new_children_ptr, [copy_idx_64])
+
+        # Check if this is the child being updated
+        is_updated_child = builder.icmp_signed("==", copy_idx, child_idx_2)
+        child_to_store = builder.select(is_updated_child, new_child, builder.load(src_ptr))
+        builder.store(child_to_store, dst_ptr)
+
+        next_copy_idx = builder.add(copy_idx, ir.Constant(i32, 1))
+        builder.store(next_copy_idx, copy_idx_ptr)
+        builder.branch(copy_loop)
+
+        builder.position_at_end(copy_done_exists)
+        new_node_void = builder.bitcast(new_node, void_ptr)
+        builder.ret(new_node_void)
+
+        # Bit doesn't exist - add new child
+        builder.position_at_end(bit_not_exists)
+        builder.store(ir.Constant(i32, 1), added_ptr)
+
+        old_count_3 = builder.call(self.hamt_popcount, [bitmap])
+        new_count_3 = builder.add(old_count_3, ir.Constant(i32, 1))
+        new_bitmap_3 = builder.or_(bitmap, bit_mask_2)
+
+        # Create new node with extra slot
+        new_node_3 = builder.call(self.hamt_node_new, [new_bitmap_3, new_count_3])
+        new_children_ptr_ptr_3 = builder.gep(new_node_3, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        new_children_ptr_3 = builder.load(new_children_ptr_ptr_3)
+
+        # Find insertion index
+        lower_mask_3 = builder.sub(bit_mask_2, ir.Constant(i32, 1))
+        lower_bits_3 = builder.and_(new_bitmap_3, lower_mask_3)
+        insert_idx = builder.call(self.hamt_popcount, [lower_bits_3])
+
+        # Copy children before insertion point
+        children_ptr_ptr_3 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr_3 = builder.load(children_ptr_ptr_3)
+
+        copy_idx_ptr_2 = builder.alloca(i32, name="copy_idx_2")
+        builder.store(ir.Constant(i32, 0), copy_idx_ptr_2)
+
+        copy_before = func.append_basic_block("copy_before")
+        copy_before_body = func.append_basic_block("copy_before_body")
+        insert_new = func.append_basic_block("insert_new")
+
+        builder.branch(copy_before)
+
+        builder.position_at_end(copy_before)
+        copy_idx_2 = builder.load(copy_idx_ptr_2)
+        copy_before_done = builder.icmp_signed(">=", copy_idx_2, insert_idx)
+        builder.cbranch(copy_before_done, insert_new, copy_before_body)
+
+        builder.position_at_end(copy_before_body)
+        copy_idx_2_64 = builder.zext(copy_idx_2, i64)
+        src_ptr_2 = builder.gep(children_ptr_3, [copy_idx_2_64])
+        dst_ptr_2 = builder.gep(new_children_ptr_3, [copy_idx_2_64])
+        builder.store(builder.load(src_ptr_2), dst_ptr_2)
+        next_copy_idx_2 = builder.add(copy_idx_2, ir.Constant(i32, 1))
+        builder.store(next_copy_idx_2, copy_idx_ptr_2)
+        builder.branch(copy_before)
+
+        # Insert new leaf (hamt_leaf_new returns tagged pointer)
+        builder.position_at_end(insert_new)
+        new_leaf_5 = builder.call(self.hamt_leaf_new, [hash_val, key, value])
+        new_leaf_5_void = builder.bitcast(new_leaf_5, void_ptr)
+        insert_idx_64 = builder.zext(insert_idx, i64)
+        insert_ptr = builder.gep(new_children_ptr_3, [insert_idx_64])
+        builder.store(new_leaf_5_void, insert_ptr)
+
+        # Copy children after insertion point
+        copy_after = func.append_basic_block("copy_after")
+        copy_after_body = func.append_basic_block("copy_after_body")
+        copy_done_not_exists = func.append_basic_block("copy_done_not_exists")
+
+        builder.branch(copy_after)
+
+        builder.position_at_end(copy_after)
+        copy_idx_3 = builder.load(copy_idx_ptr_2)
+        copy_after_done = builder.icmp_signed(">=", copy_idx_3, old_count_3)
+        builder.cbranch(copy_after_done, copy_done_not_exists, copy_after_body)
+
+        builder.position_at_end(copy_after_body)
+        copy_idx_3_64 = builder.zext(copy_idx_3, i64)
+        src_ptr_3 = builder.gep(children_ptr_3, [copy_idx_3_64])
+        dst_idx_64 = builder.add(copy_idx_3_64, ir.Constant(i64, 1))
+        dst_ptr_3 = builder.gep(new_children_ptr_3, [dst_idx_64])
+        builder.store(builder.load(src_ptr_3), dst_ptr_3)
+        next_copy_idx_3 = builder.add(copy_idx_3, ir.Constant(i32, 1))
+        builder.store(next_copy_idx_3, copy_idx_ptr_2)
+        builder.branch(copy_after)
+
+        builder.position_at_end(copy_done_not_exists)
+        new_node_3_void = builder.bitcast(new_node_3, void_ptr)
+        builder.ret(new_node_3_void)
+
+    def _implement_hamt_remove(self):
+        """Remove a key from the HAMT, returning a new root.
+
+        Implements path copying similar to insert.
+        Sets removed[0] = 1 if key was found and removed.
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_remove
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"
+        func.args[3].name = "shift"
+        func.args[4].name = "removed"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        shift = func.args[3]
+        removed_ptr = func.args[4]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Check null
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        not_found = func.append_basic_block("not_found")
+        check_tag = func.append_basic_block("check_tag")
+
+        builder.cbranch(is_null, not_found, check_tag)
+
+        builder.position_at_end(not_found)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(node)
+
+        # Check pointer tag
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        is_leaf_block = func.append_basic_block("is_leaf_block")
+        is_node_block = func.append_basic_block("is_node_block")
+        builder.cbranch(is_leaf_tag, is_leaf_block, is_node_block)
+
+        # Leaf case - untag and check key
+        builder.position_at_end(is_leaf_block)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        leaf_key = builder.load(leaf_key_ptr)
+        keys_match = builder.icmp_signed("==", leaf_key, key)
+
+        remove_leaf = func.append_basic_block("remove_leaf")
+        keep_leaf = func.append_basic_block("keep_leaf")
+        builder.cbranch(keys_match, remove_leaf, keep_leaf)
+
+        builder.position_at_end(remove_leaf)
+        builder.store(ir.Constant(i32, 1), removed_ptr)
+        builder.ret(ir.Constant(void_ptr, None))
+
+        builder.position_at_end(keep_leaf)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(node)
+
+        # Node case - no tag to clear
+        builder.position_at_end(is_node_block)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        hash_bits = builder.trunc(builder.and_(hash_shifted, ir.Constant(i64, 0x1F)), i32)
+
+        bit_mask = builder.shl(ir.Constant(i32, 1), hash_bits)
+        bit_and = builder.and_(bitmap, bit_mask)
+        bit_is_set = builder.icmp_unsigned("!=", bit_and, ir.Constant(i32, 0))
+
+        bit_not_set = func.append_basic_block("bit_not_set")
+        recurse_remove = func.append_basic_block("recurse_remove")
+        builder.cbranch(bit_is_set, recurse_remove, bit_not_set)
+
+        builder.position_at_end(bit_not_set)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(node)
+
+        builder.position_at_end(recurse_remove)
+        lower_mask = builder.sub(bit_mask, ir.Constant(i32, 1))
+        lower_bits = builder.and_(bitmap, lower_mask)
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+        old_count = builder.call(self.hamt_popcount, [bitmap])
+
+        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
+        old_child = builder.load(child_ptr_ptr)
+
+        next_shift = builder.add(shift, ir.Constant(i32, 5))
+        new_child = builder.call(self.hamt_remove, [old_child, hash_val, key, next_shift, removed_ptr])
+
+        was_removed = builder.load(removed_ptr)
+        key_was_removed = builder.icmp_unsigned("!=", was_removed, ir.Constant(i32, 0))
+
+        not_removed = func.append_basic_block("not_removed")
+        check_collapse = func.append_basic_block("check_collapse")
+        builder.cbranch(key_was_removed, check_collapse, not_removed)
+
+        builder.position_at_end(not_removed)
+        builder.ret(node)
+
+        # Check if child became null and we need to remove it from this node
+        builder.position_at_end(check_collapse)
+        child_is_null = builder.icmp_unsigned("==", new_child, ir.Constant(void_ptr, None))
+
+        remove_child = func.append_basic_block("remove_child")
+        keep_child = func.append_basic_block("keep_child")
+        builder.cbranch(child_is_null, remove_child, keep_child)
+
+        # Remove child from node
+        builder.position_at_end(remove_child)
+        new_count = builder.sub(old_count, ir.Constant(i32, 1))
+        new_bitmap = builder.xor(bitmap, bit_mask)
+
+        # Check if node becomes empty
+        node_empty = builder.icmp_unsigned("==", new_count, ir.Constant(i32, 0))
+
+        return_null = func.append_basic_block("return_null")
+        create_smaller_node = func.append_basic_block("create_smaller_node")
+        builder.cbranch(node_empty, return_null, create_smaller_node)
+
+        builder.position_at_end(return_null)
+        builder.ret(ir.Constant(void_ptr, None))
+
+        builder.position_at_end(create_smaller_node)
+        # Check if only one child remains - could collapse to leaf
+        only_one = builder.icmp_unsigned("==", new_count, ir.Constant(i32, 1))
+
+        try_collapse = func.append_basic_block("try_collapse")
+        no_collapse = func.append_basic_block("no_collapse")
+        builder.cbranch(only_one, try_collapse, no_collapse)
+
+        # For simplicity, don't collapse - just keep as single-child node
+        builder.position_at_end(try_collapse)
+        builder.branch(no_collapse)
+
+        builder.position_at_end(no_collapse)
+        smaller_node = builder.call(self.hamt_node_new, [new_bitmap, new_count])
+        smaller_children_ptr_ptr = builder.gep(smaller_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        smaller_children_ptr = builder.load(smaller_children_ptr_ptr)
+
+        # Copy children, skipping removed one
+        src_idx_ptr = builder.alloca(i32, name="src_idx")
+        dst_idx_ptr = builder.alloca(i32, name="dst_idx")
+        builder.store(ir.Constant(i32, 0), src_idx_ptr)
+        builder.store(ir.Constant(i32, 0), dst_idx_ptr)
+
+        copy_loop_remove = func.append_basic_block("copy_loop_remove")
+        copy_body_remove = func.append_basic_block("copy_body_remove")
+        copy_done_remove = func.append_basic_block("copy_done_remove")
+
+        builder.branch(copy_loop_remove)
+
+        builder.position_at_end(copy_loop_remove)
+        src_idx = builder.load(src_idx_ptr)
+        loop_done = builder.icmp_signed(">=", src_idx, old_count)
+        builder.cbranch(loop_done, copy_done_remove, copy_body_remove)
+
+        builder.position_at_end(copy_body_remove)
+        is_removed_child = builder.icmp_signed("==", src_idx, child_idx)
+
+        skip_block = func.append_basic_block("skip_block")
+        copy_block = func.append_basic_block("copy_block")
+        builder.cbranch(is_removed_child, skip_block, copy_block)
+
+        builder.position_at_end(skip_block)
+        next_src = builder.add(src_idx, ir.Constant(i32, 1))
+        builder.store(next_src, src_idx_ptr)
+        builder.branch(copy_loop_remove)
+
+        builder.position_at_end(copy_block)
+        src_idx_64 = builder.zext(src_idx, i64)
+        dst_idx = builder.load(dst_idx_ptr)
+        dst_idx_64 = builder.zext(dst_idx, i64)
+        src_child_ptr = builder.gep(children_ptr, [src_idx_64])
+        dst_child_ptr = builder.gep(smaller_children_ptr, [dst_idx_64])
+        builder.store(builder.load(src_child_ptr), dst_child_ptr)
+
+        next_src_2 = builder.add(src_idx, ir.Constant(i32, 1))
+        next_dst = builder.add(dst_idx, ir.Constant(i32, 1))
+        builder.store(next_src_2, src_idx_ptr)
+        builder.store(next_dst, dst_idx_ptr)
+        builder.branch(copy_loop_remove)
+
+        builder.position_at_end(copy_done_remove)
+        smaller_void = builder.bitcast(smaller_node, void_ptr)
+        builder.ret(smaller_void)
+
+        # Keep child (just update it)
+        builder.position_at_end(keep_child)
+        updated_node = builder.call(self.hamt_node_new, [bitmap, old_count])
+        updated_children_ptr_ptr = builder.gep(updated_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        updated_children_ptr = builder.load(updated_children_ptr_ptr)
+
+        # Copy all children, replacing the updated one
+        copy_idx_ptr_3 = builder.alloca(i32, name="copy_idx_3")
+        builder.store(ir.Constant(i32, 0), copy_idx_ptr_3)
+
+        copy_loop_keep = func.append_basic_block("copy_loop_keep")
+        copy_body_keep = func.append_basic_block("copy_body_keep")
+        copy_done_keep = func.append_basic_block("copy_done_keep")
+
+        builder.branch(copy_loop_keep)
+
+        builder.position_at_end(copy_loop_keep)
+        copy_idx_4 = builder.load(copy_idx_ptr_3)
+        loop_done_2 = builder.icmp_signed(">=", copy_idx_4, old_count)
+        builder.cbranch(loop_done_2, copy_done_keep, copy_body_keep)
+
+        builder.position_at_end(copy_body_keep)
+        copy_idx_4_64 = builder.zext(copy_idx_4, i64)
+        src_ptr_4 = builder.gep(children_ptr, [copy_idx_4_64])
+        dst_ptr_4 = builder.gep(updated_children_ptr, [copy_idx_4_64])
+        is_updated = builder.icmp_signed("==", copy_idx_4, child_idx)
+        to_store = builder.select(is_updated, new_child, builder.load(src_ptr_4))
+        builder.store(to_store, dst_ptr_4)
+
+        next_copy_4 = builder.add(copy_idx_4, ir.Constant(i32, 1))
+        builder.store(next_copy_4, copy_idx_ptr_3)
+        builder.branch(copy_loop_keep)
+
+        builder.position_at_end(copy_done_keep)
+        updated_void = builder.bitcast(updated_node, void_ptr)
+        builder.ret(updated_void)
+
+    def _implement_hamt_collect_keys(self):
+        """Collect all keys from the HAMT into a list (for iteration).
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_collect_keys
+        func.args[0].name = "node"
+        func.args[1].name = "list"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        list_ptr = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Check null
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        return_unchanged = func.append_basic_block("return_unchanged")
+        check_tag = func.append_basic_block("check_tag")
+        builder.cbranch(is_null, return_unchanged, check_tag)
+
+        builder.position_at_end(return_unchanged)
+        builder.ret(list_ptr)
+
+        # Check pointer tag
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Leaf - untag and add its key to list
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        key = builder.load(key_ptr)
+
+        # Create temp for key
+        temp = builder.alloca(i64, name="temp_key")
+        builder.store(key, temp)
+        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+        elem_size = ir.Constant(i64, 8)
+        new_list = builder.call(self.list_append, [list_ptr, temp_i8, elem_size])
+        builder.ret(new_list)
+
+        # Node - recurse through all children
+        builder.position_at_end(handle_node)
+        as_node = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+        popcount = builder.call(self.hamt_popcount, [bitmap])
+
+        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+
+        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
+        builder.store(list_ptr, result_ptr)
+
+        idx_ptr = builder.alloca(i32, name="idx")
+        builder.store(ir.Constant(i32, 0), idx_ptr)
+
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        done = builder.icmp_signed(">=", idx, popcount)
+        builder.cbranch(done, loop_done, loop_body)
+
+        builder.position_at_end(loop_body)
+        idx_64 = builder.zext(idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        current_list = builder.load(result_ptr)
+        updated_list = builder.call(self.hamt_collect_keys, [child_ptr, current_list])
+        builder.store(updated_list, result_ptr)
+
+        next_idx = builder.add(idx, ir.Constant(i32, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_list = builder.load(result_ptr)
+        builder.ret(final_list)
+
+    def _implement_hamt_lookup_string(self):
+        """Look up a string key in the HAMT. Uses string_eq for comparison.
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_lookup_string
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"  # String*
+        func.args[3].name = "shift"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]  # String pointer
+        shift = func.args[3]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        return_zero = func.append_basic_block("return_zero")
+        check_tag = func.append_basic_block("check_tag")
+        builder.cbranch(is_null, return_zero, check_tag)
+
+        builder.position_at_end(return_zero)
+        builder.ret(ir.Constant(i64, 0))
+
+        # Check pointer tag
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Leaf - untag and compare keys using string_eq
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+
+        stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        stored_key_i64 = builder.load(stored_key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+
+        return_value = func.append_basic_block("return_value")
+        return_not_found = func.append_basic_block("return_not_found")
+        builder.cbranch(keys_match, return_value, return_not_found)
+
+        builder.position_at_end(return_value)
+        value_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        value = builder.load(value_ptr)
+        builder.ret(value)
+
+        builder.position_at_end(return_not_found)
+        builder.ret(ir.Constant(i64, 0))
+
+        # Node - descend
+        builder.position_at_end(handle_node)
+        as_node = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        five = ir.Constant(i32, 5)
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        idx_in_level = builder.and_(builder.trunc(hash_shifted, i32), ir.Constant(i32, 31))
+
+        bit_pos = builder.shl(ir.Constant(i32, 1), idx_in_level)
+        has_child = builder.and_(bitmap, bit_pos)
+        is_present = builder.icmp_unsigned("!=", has_child, ir.Constant(i32, 0))
+
+        do_descend = func.append_basic_block("do_descend")
+        not_present = func.append_basic_block("not_present")
+        builder.cbranch(is_present, do_descend, not_present)
+
+        builder.position_at_end(not_present)
+        builder.ret(ir.Constant(i64, 0))
+
+        builder.position_at_end(do_descend)
+        lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+
+        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        new_shift = builder.add(shift, five)
+        result = builder.call(self.hamt_lookup_string, [child_ptr, hash_val, key, new_shift])
+        builder.ret(result)
+
+    def _implement_hamt_contains_string(self):
+        """Check if a string key exists in the HAMT. Uses string_eq for comparison.
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_contains_string
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"  # String*
+        func.args[3].name = "shift"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        shift = func.args[3]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i1 = ir.IntType(1)
+        void_ptr = ir.IntType(8).as_pointer()
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        return_false = func.append_basic_block("return_false")
+        check_tag = func.append_basic_block("check_tag")
+        builder.cbranch(is_null, return_false, check_tag)
+
+        builder.position_at_end(return_false)
+        builder.ret(ir.Constant(i1, 0))
+
+        # Check pointer tag
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Leaf - untag and compare keys
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        stored_key_i64 = builder.load(stored_key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+        builder.ret(keys_match)
+
+        # Node - descend
+        builder.position_at_end(handle_node)
+        as_node = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        five = ir.Constant(i32, 5)
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        idx_in_level = builder.and_(builder.trunc(hash_shifted, i32), ir.Constant(i32, 31))
+
+        bit_pos = builder.shl(ir.Constant(i32, 1), idx_in_level)
+        has_child = builder.and_(bitmap, bit_pos)
+        is_present = builder.icmp_unsigned("!=", has_child, ir.Constant(i32, 0))
+
+        do_descend = func.append_basic_block("do_descend")
+        not_present = func.append_basic_block("not_present")
+        builder.cbranch(is_present, do_descend, not_present)
+
+        builder.position_at_end(not_present)
+        builder.ret(ir.Constant(i1, 0))
+
+        builder.position_at_end(do_descend)
+        lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+
+        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        new_shift = builder.add(shift, five)
+        result = builder.call(self.hamt_contains_string, [child_ptr, hash_val, key, new_shift])
+        builder.ret(result)
+
+    def _implement_hamt_insert_string(self):
+        """Insert a string key-value pair into the HAMT. Uses string_eq for comparison.
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_insert_string
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"  # String*
+        func.args[3].name = "value"
+        func.args[4].name = "shift"
+        func.args[5].name = "added"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]  # String pointer
+        value = func.args[3]
+        shift = func.args[4]
+        added_ptr = func.args[5]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Convert string pointer to i64 for storage
+        key_i64 = builder.ptrtoint(key, i64)
+
+        # Check if node is null - create new leaf (tagged)
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        create_leaf_null = func.append_basic_block("create_leaf_null")
+        check_tag = func.append_basic_block("check_tag")
+        builder.cbranch(is_null, create_leaf_null, check_tag)
+
+        builder.position_at_end(create_leaf_null)
+        new_leaf = builder.call(self.hamt_leaf_new, [hash_val, key_i64, value])
+        new_leaf_void = builder.bitcast(new_leaf, void_ptr)
+        # Tag the leaf pointer (set bit 0 = 1)
+        new_leaf_int = builder.ptrtoint(new_leaf_void, i64)
+        new_leaf_tagged_int = builder.or_(new_leaf_int, ir.Constant(i64, 1))
+        new_leaf_tagged = builder.inttoptr(new_leaf_tagged_int, void_ptr)
+        builder.store(ir.Constant(i32, 1), added_ptr)
+        builder.ret(new_leaf_tagged)
+
+        # Check pointer tag to determine leaf vs node
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Handle leaf - untag pointer and compare keys
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+
+        stored_hash_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        stored_hash = builder.load(stored_hash_ptr)
+        stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        stored_key_i64 = builder.load(stored_key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+
+        update_leaf = func.append_basic_block("update_leaf")
+        split_leaf = func.append_basic_block("split_leaf")
+        builder.cbranch(keys_match, update_leaf, split_leaf)
+
+        # Same key - update value
+        builder.position_at_end(update_leaf)
+        updated_leaf = builder.call(self.hamt_leaf_new, [hash_val, key_i64, value])
+        updated_leaf_void = builder.bitcast(updated_leaf, void_ptr)
+        # Tag the leaf pointer (set bit 0 = 1)
+        updated_leaf_int = builder.ptrtoint(updated_leaf_void, i64)
+        updated_leaf_tagged_int = builder.or_(updated_leaf_int, ir.Constant(i64, 1))
+        updated_leaf_tagged = builder.inttoptr(updated_leaf_tagged_int, void_ptr)
+        builder.store(ir.Constant(i32, 0), added_ptr)
+        builder.ret(updated_leaf_tagged)
+
+        # Different key - need to split into node
+        builder.position_at_end(split_leaf)
+        builder.store(ir.Constant(i32, 1), added_ptr)
+
+        five = ir.Constant(i32, 5)
+        shift_64 = builder.zext(shift, i64)
+
+        # Get indices for both keys
+        old_hash_shifted = builder.lshr(stored_hash, shift_64)
+        old_idx = builder.and_(builder.trunc(old_hash_shifted, i32), ir.Constant(i32, 31))
+
+        new_hash_shifted = builder.lshr(hash_val, shift_64)
+        new_idx = builder.and_(builder.trunc(new_hash_shifted, i32), ir.Constant(i32, 31))
+
+        same_idx = builder.icmp_unsigned("==", old_idx, new_idx)
+
+        recurse_split = func.append_basic_block("recurse_split")
+        create_node = func.append_basic_block("create_node")
+        builder.cbranch(same_idx, recurse_split, create_node)
+
+        # Same index - need to recurse
+        builder.position_at_end(recurse_split)
+        next_shift = builder.add(shift, five)
+        sub_result = builder.call(self.hamt_insert_string, [node, hash_val, key, value, next_shift, added_ptr])
+        single_bit = builder.shl(ir.Constant(i32, 1), old_idx)
+        single_child_node = builder.call(self.hamt_node_new, [single_bit, ir.Constant(i32, 1)])
+        children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+        builder.store(sub_result, builder.gep(children_ptr, [ir.Constant(i64, 0)]))
+        single_node_void = builder.bitcast(single_child_node, void_ptr)
+        builder.ret(single_node_void)
+
+        # Different indices - create node with 2 children
+        builder.position_at_end(create_node)
+        old_bit = builder.shl(ir.Constant(i32, 1), old_idx)
+        new_bit = builder.shl(ir.Constant(i32, 1), new_idx)
+        combined_bitmap = builder.or_(old_bit, new_bit)
+
+        split_node = builder.call(self.hamt_node_new, [combined_bitmap, ir.Constant(i32, 2)])
+        split_children_ptr_ptr = builder.gep(split_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        split_children = builder.load(split_children_ptr_ptr)
+
+        # Create new leaf for new key (tagged)
+        new_key_leaf = builder.call(self.hamt_leaf_new, [hash_val, key_i64, value])
+        new_key_leaf_void = builder.bitcast(new_key_leaf, void_ptr)
+        # Tag the new leaf pointer (set bit 0 = 1)
+        new_key_leaf_int = builder.ptrtoint(new_key_leaf_void, i64)
+        new_key_leaf_tagged_int = builder.or_(new_key_leaf_int, ir.Constant(i64, 1))
+        new_key_leaf_tagged = builder.inttoptr(new_key_leaf_tagged_int, void_ptr)
+
+        # Determine order based on popcount
+        old_lower = builder.and_(combined_bitmap, builder.sub(old_bit, ir.Constant(i32, 1)))
+        old_pos = builder.call(self.hamt_popcount, [old_lower])
+        old_pos_64 = builder.zext(old_pos, i64)
+        new_lower = builder.and_(combined_bitmap, builder.sub(new_bit, ir.Constant(i32, 1)))
+        new_pos = builder.call(self.hamt_popcount, [new_lower])
+        new_pos_64 = builder.zext(new_pos, i64)
+
+        # node is already tagged (original leaf), new leaf is tagged above
+        builder.store(node, builder.gep(split_children, [old_pos_64]))
+        builder.store(new_key_leaf_tagged, builder.gep(split_children, [new_pos_64]))
+
+        split_node_void = builder.bitcast(split_node, void_ptr)
+        builder.ret(split_node_void)
+
+        # Handle internal node
+        builder.position_at_end(handle_node)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        n_bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        n_bitmap = builder.load(n_bitmap_ptr)
+
+        n_shift_64 = builder.zext(shift, i64)
+        n_hash_shifted = builder.lshr(hash_val, n_shift_64)
+        n_idx = builder.and_(builder.trunc(n_hash_shifted, i32), ir.Constant(i32, 31))
+        n_bit_pos = builder.shl(ir.Constant(i32, 1), n_idx)
+
+        n_has_child = builder.and_(n_bitmap, n_bit_pos)
+        n_is_present = builder.icmp_unsigned("!=", n_has_child, ir.Constant(i32, 0))
+
+        descend_existing = func.append_basic_block("descend_existing")
+        add_new_child = func.append_basic_block("add_new_child")
+        builder.cbranch(n_is_present, descend_existing, add_new_child)
+
+        # Descend into existing child
+        builder.position_at_end(descend_existing)
+        e_lower_bits = builder.and_(n_bitmap, builder.sub(n_bit_pos, ir.Constant(i32, 1)))
+        e_child_idx = builder.call(self.hamt_popcount, [e_lower_bits])
+        e_old_count = builder.call(self.hamt_popcount, [n_bitmap])
+
+        e_children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        e_children = builder.load(e_children_ptr_ptr)
+        e_child_idx_64 = builder.zext(e_child_idx, i64)
+        e_old_child = builder.load(builder.gep(e_children, [e_child_idx_64]))
+
+        e_next_shift = builder.add(shift, five)
+        e_new_child = builder.call(self.hamt_insert_string, [e_old_child, hash_val, key, value, e_next_shift, added_ptr])
+
+        e_new_node = builder.call(self.hamt_node_new, [n_bitmap, e_old_count])
+        e_new_children_ptr_ptr = builder.gep(e_new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        e_new_children = builder.load(e_new_children_ptr_ptr)
+
+        # Copy all children, replacing the updated one
+        e_i_ptr = builder.alloca(i32, name="e_i")
+        builder.store(ir.Constant(i32, 0), e_i_ptr)
+
+        e_loop_cond = func.append_basic_block("e_loop_cond")
+        e_loop_body = func.append_basic_block("e_loop_body")
+        e_loop_done = func.append_basic_block("e_loop_done")
+
+        builder.branch(e_loop_cond)
+
+        builder.position_at_end(e_loop_cond)
+        e_i = builder.load(e_i_ptr)
+        e_done = builder.icmp_signed(">=", e_i, e_old_count)
+        builder.cbranch(e_done, e_loop_done, e_loop_body)
+
+        builder.position_at_end(e_loop_body)
+        e_is_updated = builder.icmp_unsigned("==", e_i, e_child_idx)
+        e_i_64 = builder.zext(e_i, i64)
+        e_old_val = builder.load(builder.gep(e_children, [e_i_64]))
+        e_copy_val = builder.select(e_is_updated, e_new_child, e_old_val)
+        builder.store(e_copy_val, builder.gep(e_new_children, [e_i_64]))
+
+        e_next_i = builder.add(e_i, ir.Constant(i32, 1))
+        builder.store(e_next_i, e_i_ptr)
+        builder.branch(e_loop_cond)
+
+        builder.position_at_end(e_loop_done)
+        e_result = builder.bitcast(e_new_node, void_ptr)
+        builder.ret(e_result)
+
+        # Add new child to node
+        builder.position_at_end(add_new_child)
+        builder.store(ir.Constant(i32, 1), added_ptr)
+
+        a_old_count = builder.call(self.hamt_popcount, [n_bitmap])
+        a_new_count = builder.add(a_old_count, ir.Constant(i32, 1))
+        a_new_bitmap = builder.or_(n_bitmap, n_bit_pos)
+
+        a_new_node = builder.call(self.hamt_node_new, [a_new_bitmap, a_new_count])
+        a_new_children_ptr_ptr = builder.gep(a_new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        a_new_children = builder.load(a_new_children_ptr_ptr)
+
+        a_lower_bits = builder.and_(a_new_bitmap, builder.sub(n_bit_pos, ir.Constant(i32, 1)))
+        a_insert_idx = builder.call(self.hamt_popcount, [a_lower_bits])
+
+        # Create new leaf (tagged)
+        a_new_leaf = builder.call(self.hamt_leaf_new, [hash_val, key_i64, value])
+        a_new_leaf_void = builder.bitcast(a_new_leaf, void_ptr)
+        # Tag the leaf pointer (set bit 0 = 1)
+        a_new_leaf_int = builder.ptrtoint(a_new_leaf_void, i64)
+        a_new_leaf_tagged_int = builder.or_(a_new_leaf_int, ir.Constant(i64, 1))
+        a_new_leaf_tagged = builder.inttoptr(a_new_leaf_tagged_int, void_ptr)
+
+        # Copy children and insert new one
+        a_old_children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        a_old_children = builder.load(a_old_children_ptr_ptr)
+
+        a_src_i_ptr = builder.alloca(i32, name="a_src_i")
+        a_dst_i_ptr = builder.alloca(i32, name="a_dst_i")
+        builder.store(ir.Constant(i32, 0), a_src_i_ptr)
+        builder.store(ir.Constant(i32, 0), a_dst_i_ptr)
+
+        a_loop_cond = func.append_basic_block("a_loop_cond")
+        a_loop_body = func.append_basic_block("a_loop_body")
+        a_loop_done = func.append_basic_block("a_loop_done")
+
+        builder.branch(a_loop_cond)
+
+        builder.position_at_end(a_loop_cond)
+        a_dst_i = builder.load(a_dst_i_ptr)
+        a_dst_done = builder.icmp_signed(">=", a_dst_i, a_new_count)
+        builder.cbranch(a_dst_done, a_loop_done, a_loop_body)
+
+        builder.position_at_end(a_loop_body)
+        a_is_insert = builder.icmp_unsigned("==", a_dst_i, a_insert_idx)
+        a_dst_i_64 = builder.zext(a_dst_i, i64)
+
+        insert_new = func.append_basic_block("insert_new")
+        copy_old = func.append_basic_block("copy_old")
+        after_insert = func.append_basic_block("after_insert")
+
+        builder.cbranch(a_is_insert, insert_new, copy_old)
+
+        builder.position_at_end(insert_new)
+        builder.store(a_new_leaf_tagged, builder.gep(a_new_children, [a_dst_i_64]))
+        builder.branch(after_insert)
+
+        builder.position_at_end(copy_old)
+        a_src_i = builder.load(a_src_i_ptr)
+        a_src_i_64 = builder.zext(a_src_i, i64)
+        a_old_val = builder.load(builder.gep(a_old_children, [a_src_i_64]))
+        builder.store(a_old_val, builder.gep(a_new_children, [a_dst_i_64]))
+        a_next_src = builder.add(a_src_i, ir.Constant(i32, 1))
+        builder.store(a_next_src, a_src_i_ptr)
+        builder.branch(after_insert)
+
+        builder.position_at_end(after_insert)
+        a_next_dst = builder.add(a_dst_i, ir.Constant(i32, 1))
+        builder.store(a_next_dst, a_dst_i_ptr)
+        builder.branch(a_loop_cond)
+
+        builder.position_at_end(a_loop_done)
+        a_result = builder.bitcast(a_new_node, void_ptr)
+        builder.ret(a_result)
+
+    def _implement_hamt_remove_string(self):
+        """Remove a string key from the HAMT. Uses string_eq for comparison."""
+        func = self.hamt_remove_string
+        func.args[0].name = "node"
+        func.args[1].name = "hash"
+        func.args[2].name = "key"  # String*
+        func.args[3].name = "shift"
+        func.args[4].name = "removed"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        hash_val = func.args[1]
+        key = func.args[2]
+        shift = func.args[3]
+        removed_ptr = func.args[4]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+        string_ptr_type = self.string_struct.as_pointer()
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        return_null = func.append_basic_block("return_null")
+        check_type = func.append_basic_block("check_type")
+        builder.cbranch(is_null, return_null, check_type)
+
+        builder.position_at_end(return_null)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(ir.Constant(void_ptr, None))
+
+        # Check pointer tag to determine leaf vs node
+        builder.position_at_end(check_type)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Handle leaf - untag pointer first
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        stored_key_i64 = builder.load(stored_key_ptr)
+        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+
+        keys_match = builder.call(self.string_eq, [stored_key, key])
+
+        remove_leaf = func.append_basic_block("remove_leaf")
+        keep_leaf = func.append_basic_block("keep_leaf")
+        builder.cbranch(keys_match, remove_leaf, keep_leaf)
+
+        builder.position_at_end(remove_leaf)
+        builder.store(ir.Constant(i32, 1), removed_ptr)
+        builder.ret(ir.Constant(void_ptr, None))
+
+        builder.position_at_end(keep_leaf)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(node)
+
+        # Handle node (not tagged, use directly)
+        builder.position_at_end(handle_node)
+        node_ptr = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+
+        # Load bitmap from node
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        five = ir.Constant(i32, 5)
+        shift_64 = builder.zext(shift, i64)
+        hash_shifted = builder.lshr(hash_val, shift_64)
+        idx_in_level = builder.and_(builder.trunc(hash_shifted, i32), ir.Constant(i32, 31))
+
+        bit_pos = builder.shl(ir.Constant(i32, 1), idx_in_level)
+        has_child = builder.and_(bitmap, bit_pos)
+        is_present = builder.icmp_unsigned("!=", has_child, ir.Constant(i32, 0))
+
+        do_remove = func.append_basic_block("do_remove")
+        not_present = func.append_basic_block("not_present")
+        builder.cbranch(is_present, do_remove, not_present)
+
+        builder.position_at_end(not_present)
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+        builder.ret(node)
+
+        builder.position_at_end(do_remove)
+        lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
+        child_idx = builder.call(self.hamt_popcount, [lower_bits])
+        old_count = builder.call(self.hamt_popcount, [bitmap])
+
+        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children = builder.load(children_ptr_ptr)
+        child_idx_64 = builder.zext(child_idx, i64)
+        old_child = builder.load(builder.gep(children, [child_idx_64]))
+
+        next_shift = builder.add(shift, five)
+        new_child = builder.call(self.hamt_remove_string, [old_child, hash_val, key, next_shift, removed_ptr])
+
+        was_removed = builder.load(removed_ptr)
+        did_remove = builder.icmp_unsigned("!=", was_removed, ir.Constant(i32, 0))
+
+        update_node = func.append_basic_block("update_node")
+        return_unchanged = func.append_basic_block("return_unchanged")
+        builder.cbranch(did_remove, update_node, return_unchanged)
+
+        builder.position_at_end(return_unchanged)
+        builder.ret(node)
+
+        builder.position_at_end(update_node)
+        new_child_null = builder.icmp_unsigned("==", new_child, ir.Constant(void_ptr, None))
+
+        shrink_node = func.append_basic_block("shrink_node")
+        replace_child = func.append_basic_block("replace_child")
+        builder.cbranch(new_child_null, shrink_node, replace_child)
+
+        # Shrink node (remove child)
+        builder.position_at_end(shrink_node)
+        new_count = builder.sub(old_count, ir.Constant(i32, 1))
+        is_empty = builder.icmp_unsigned("==", new_count, ir.Constant(i32, 0))
+
+        return_null_node = func.append_basic_block("return_null_node")
+        create_smaller = func.append_basic_block("create_smaller")
+        builder.cbranch(is_empty, return_null_node, create_smaller)
+
+        builder.position_at_end(return_null_node)
+        builder.ret(ir.Constant(void_ptr, None))
+
+        builder.position_at_end(create_smaller)
+        new_bitmap = builder.and_(bitmap, builder.not_(bit_pos))
+        smaller_node = builder.call(self.hamt_node_new, [new_bitmap, new_count])
+        smaller_children_ptr_ptr = builder.gep(smaller_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        smaller_children = builder.load(smaller_children_ptr_ptr)
+
+        s_src_ptr = builder.alloca(i32, name="s_src")
+        s_dst_ptr = builder.alloca(i32, name="s_dst")
+        builder.store(ir.Constant(i32, 0), s_src_ptr)
+        builder.store(ir.Constant(i32, 0), s_dst_ptr)
+
+        s_loop_cond = func.append_basic_block("s_loop_cond")
+        s_loop_body = func.append_basic_block("s_loop_body")
+        s_loop_done = func.append_basic_block("s_loop_done")
+        builder.branch(s_loop_cond)
+
+        builder.position_at_end(s_loop_cond)
+        s_src = builder.load(s_src_ptr)
+        s_done = builder.icmp_signed(">=", s_src, old_count)
+        builder.cbranch(s_done, s_loop_done, s_loop_body)
+
+        builder.position_at_end(s_loop_body)
+        s_skip = builder.icmp_unsigned("==", s_src, child_idx)
+        s_src_64 = builder.zext(s_src, i64)
+
+        s_do_skip = func.append_basic_block("s_do_skip")
+        s_do_copy = func.append_basic_block("s_do_copy")
+        s_after = func.append_basic_block("s_after")
+        builder.cbranch(s_skip, s_do_skip, s_do_copy)
+
+        builder.position_at_end(s_do_skip)
+        builder.branch(s_after)
+
+        builder.position_at_end(s_do_copy)
+        s_dst = builder.load(s_dst_ptr)
+        s_dst_64 = builder.zext(s_dst, i64)
+        s_val = builder.load(builder.gep(children, [s_src_64]))
+        builder.store(s_val, builder.gep(smaller_children, [s_dst_64]))
+        s_next_dst = builder.add(s_dst, ir.Constant(i32, 1))
+        builder.store(s_next_dst, s_dst_ptr)
+        builder.branch(s_after)
+
+        builder.position_at_end(s_after)
+        s_next_src = builder.add(s_src, ir.Constant(i32, 1))
+        builder.store(s_next_src, s_src_ptr)
+        builder.branch(s_loop_cond)
+
+        builder.position_at_end(s_loop_done)
+        smaller_result = builder.bitcast(smaller_node, void_ptr)
+        builder.ret(smaller_result)
+
+        # Replace child with updated version
+        builder.position_at_end(replace_child)
+        updated_node = builder.call(self.hamt_node_new, [bitmap, old_count])
+        updated_children_ptr_ptr = builder.gep(updated_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        updated_children = builder.load(updated_children_ptr_ptr)
+
+        u_i_ptr = builder.alloca(i32, name="u_i")
+        builder.store(ir.Constant(i32, 0), u_i_ptr)
+
+        u_loop_cond = func.append_basic_block("u_loop_cond")
+        u_loop_body = func.append_basic_block("u_loop_body")
+        u_loop_done = func.append_basic_block("u_loop_done")
+        builder.branch(u_loop_cond)
+
+        builder.position_at_end(u_loop_cond)
+        u_i = builder.load(u_i_ptr)
+        u_done = builder.icmp_signed(">=", u_i, old_count)
+        builder.cbranch(u_done, u_loop_done, u_loop_body)
+
+        builder.position_at_end(u_loop_body)
+        u_is_updated = builder.icmp_unsigned("==", u_i, child_idx)
+        u_i_64 = builder.zext(u_i, i64)
+        u_old_val = builder.load(builder.gep(children, [u_i_64]))
+        u_copy_val = builder.select(u_is_updated, new_child, u_old_val)
+        builder.store(u_copy_val, builder.gep(updated_children, [u_i_64]))
+
+        u_next_i = builder.add(u_i, ir.Constant(i32, 1))
+        builder.store(u_next_i, u_i_ptr)
+        builder.branch(u_loop_cond)
+
+        builder.position_at_end(u_loop_done)
+        updated_result = builder.bitcast(updated_node, void_ptr)
+        builder.ret(updated_result)
+
     def _implement_map_hash(self):
         """Implement integer hash function (splitmix64-based)."""
         func = self.map_hash
@@ -3531,278 +5260,43 @@ class CodeGenerator:
         builder.ret(x)
     
     def _implement_map_new(self):
-        """Create a new empty map with initial capacity 8."""
+        """Create a new empty HAMT-based map with type flags."""
         func = self.map_new
-        
+        func.args[0].name = "flags"
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        # Allocate Map struct (8 + 8 + 8 = 24 bytes) via GC
-        map_size = ir.Constant(ir.IntType(64), 24)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP)
+
+        flags = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Allocate Map struct (8 + 8 + 4 = 24 bytes with padding) via GC
+        # Fields: root (void*), len (i64), flags (i32)
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         map_ptr = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
-        
-        # Initial capacity = 8
-        initial_cap = ir.Constant(ir.IntType(64), 8)
-        
-        # Allocate entries array: 8 entries * 24 bytes each (aligned)
-        entry_size = ir.Constant(ir.IntType(64), 24)
-        entries_size = builder.mul(initial_cap, entry_size)
-        map_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP_ENTRY)
-        entries_raw = builder.call(self.gc.gc_alloc, [entries_size, map_entry_type_id])
-        entries_ptr = builder.bitcast(entries_raw, self.map_entry_struct.as_pointer())
-        
-        # Initialize each entry's state to 0 (empty)
-        idx_ptr = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), idx_ptr)
-        
-        init_loop = func.append_basic_block("init_loop")
-        init_body = func.append_basic_block("init_body")
-        init_done = func.append_basic_block("init_done")
-        
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_loop)
-        idx = builder.load(idx_ptr)
-        done = builder.icmp_signed(">=", idx, initial_cap)
-        builder.cbranch(done, init_done, init_body)
-        
-        builder.position_at_end(init_body)
-        e_ptr = builder.gep(entries_ptr, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 0), state_ptr)
-        new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_idx, idx_ptr)
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_done)
-        
-        # Store entries pointer
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(entries_ptr, entries_field)
-        
-        # Store len = 0
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_field)
-        
-        # Store cap = 8
-        cap_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(initial_cap, cap_field)
-        
+
+        # Store root = null (field 0)
+        root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(void_ptr, None), root_field)
+
+        # Store len = 0 (field 1)
+        len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), len_field)
+
+        # Store flags (field 2)
+        flags_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(flags, flags_field)
+
         builder.ret(map_ptr)
-    
-    def _implement_map_find_slot(self):
-        """Find slot for key using linear probing."""
-        func = self.map_find_slot
-        func.args[0].name = "map"
-        func.args[1].name = "key"
-        
-        entry = func.append_basic_block("entry")
-        probe_loop = func.append_basic_block("probe_loop")
-        check_state = func.append_basic_block("check_state")
-        check_occupied = func.append_basic_block("check_occupied")
-        check_match = func.append_basic_block("check_match")
-        record_deleted = func.append_basic_block("record_deleted")
-        next_probe = func.append_basic_block("next_probe")
-        found_empty = func.append_basic_block("found_empty")
-        found_match = func.append_basic_block("found_match")
-        
-        builder = ir.IRBuilder(entry)
-        
-        map_ptr = func.args[0]
-        key = func.args[1]
-        
-        # Get entries and cap
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
-        
-        cap_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_field)
-        
-        # hash & mask
-        hash_val = builder.call(self.map_hash, [key])
-        mask = builder.sub(cap, ir.Constant(ir.IntType(64), 1))
-        start_idx = builder.and_(hash_val, mask)
-        
-        # Track first deleted slot
-        first_deleted_ptr = builder.alloca(ir.IntType(64), name="first_deleted")
-        builder.store(ir.Constant(ir.IntType(64), -1), first_deleted_ptr)
-        
-        idx_ptr = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(start_idx, idx_ptr)
-        
-        probe_count_ptr = builder.alloca(ir.IntType(64), name="probe_count")
-        builder.store(ir.Constant(ir.IntType(64), 0), probe_count_ptr)
-        
-        builder.branch(probe_loop)
-        
-        # Probe loop
-        builder.position_at_end(probe_loop)
-        probe_count = builder.load(probe_count_ptr)
-        max_probes = builder.icmp_signed(">=", probe_count, cap)
-        builder.cbranch(max_probes, found_empty, check_state)
-        
-        builder.position_at_end(check_state)
-        idx = builder.load(idx_ptr)
-        e_ptr = builder.gep(entries, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
-        
-        is_empty = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 0))
-        builder.cbranch(is_empty, found_empty, check_occupied)
-        
-        builder.position_at_end(check_occupied)
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_match, record_deleted)
-        
-        builder.position_at_end(check_match)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        stored_key = builder.load(key_ptr)
-        keys_match = builder.icmp_signed("==", stored_key, key)
-        builder.cbranch(keys_match, found_match, next_probe)
-        
-        builder.position_at_end(record_deleted)
-        # Record first deleted slot if not yet recorded
-        first_deleted = builder.load(first_deleted_ptr)
-        no_deleted_yet = builder.icmp_signed("==", first_deleted, ir.Constant(ir.IntType(64), -1))
-        new_first = builder.select(no_deleted_yet, idx, first_deleted)
-        builder.store(new_first, first_deleted_ptr)
-        builder.branch(next_probe)
-        
-        builder.position_at_end(next_probe)
-        idx = builder.load(idx_ptr)
-        next_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        next_idx = builder.and_(next_idx, mask)
-        builder.store(next_idx, idx_ptr)
-        probe_count = builder.load(probe_count_ptr)
-        new_count = builder.add(probe_count, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_count, probe_count_ptr)
-        builder.branch(probe_loop)
-        
-        builder.position_at_end(found_empty)
-        first_deleted = builder.load(first_deleted_ptr)
-        has_deleted = builder.icmp_signed("!=", first_deleted, ir.Constant(ir.IntType(64), -1))
-        idx = builder.load(idx_ptr)
-        result = builder.select(has_deleted, first_deleted, idx)
-        builder.ret(result)
-        
-        builder.position_at_end(found_match)
-        idx = builder.load(idx_ptr)
-        builder.ret(idx)
-    
-    def _implement_map_grow(self):
-        """Double the capacity and rehash all entries."""
-        func = self.map_grow
-        func.args[0].name = "map"
-        
-        entry = func.append_basic_block("entry")
-        init_loop = func.append_basic_block("init_loop")
-        init_body = func.append_basic_block("init_body")
-        init_done = func.append_basic_block("init_done")
-        rehash_loop = func.append_basic_block("rehash_loop")
-        rehash_body = func.append_basic_block("rehash_body")
-        rehash_insert = func.append_basic_block("rehash_insert")
-        rehash_next = func.append_basic_block("rehash_next")
-        done = func.append_basic_block("done")
-        
-        builder = ir.IRBuilder(entry)
-        
-        map_ptr = func.args[0]
-        
-        # Get old entries, cap
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_entries = builder.load(entries_field)
-        
-        cap_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        old_cap = builder.load(cap_field)
-        
-        new_cap = builder.mul(old_cap, ir.Constant(ir.IntType(64), 2))
-        
-        # Allocate new entries
-        entry_size = ir.Constant(ir.IntType(64), 24)
-        new_size = builder.mul(new_cap, entry_size)
-        map_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_MAP_ENTRY)
-        new_raw = builder.call(self.gc.gc_alloc, [new_size, map_entry_type_id])
-        new_entries = builder.bitcast(new_raw, self.map_entry_struct.as_pointer())
-        
-        # Initialize new entries
-        init_idx_ptr = builder.alloca(ir.IntType(64), name="init_idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), init_idx_ptr)
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_loop)
-        init_idx = builder.load(init_idx_ptr)
-        init_done_cond = builder.icmp_signed(">=", init_idx, new_cap)
-        builder.cbranch(init_done_cond, init_done, init_body)
-        
-        builder.position_at_end(init_body)
-        new_e_ptr = builder.gep(new_entries, [init_idx])
-        state_ptr = builder.gep(new_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 0), state_ptr)
-        new_init_idx = builder.add(init_idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_init_idx, init_idx_ptr)
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_done)
-        # Update map
-        builder.store(new_entries, entries_field)
-        builder.store(new_cap, cap_field)
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_field)
-        
-        # Rehash
-        idx_ptr = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), idx_ptr)
-        builder.branch(rehash_loop)
-        
-        builder.position_at_end(rehash_loop)
-        idx = builder.load(idx_ptr)
-        loop_done = builder.icmp_signed(">=", idx, old_cap)
-        builder.cbranch(loop_done, done, rehash_body)
-        
-        builder.position_at_end(rehash_body)
-        old_e_ptr = builder.gep(old_entries, [idx])
-        state_ptr = builder.gep(old_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, rehash_insert, rehash_next)
-        
-        builder.position_at_end(rehash_insert)
-        key_ptr = builder.gep(old_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        key = builder.load(key_ptr)
-        value_ptr = builder.gep(old_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        value = builder.load(value_ptr)
-        
-        new_slot = builder.call(self.map_find_slot, [map_ptr, key])
-        new_e_ptr = builder.gep(new_entries, [new_slot])
-        
-        new_key_ptr = builder.gep(new_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(key, new_key_ptr)
-        new_value_ptr = builder.gep(new_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(value, new_value_ptr)
-        new_state_ptr = builder.gep(new_e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 1), new_state_ptr)
-        
-        current_len = builder.load(len_field)
-        new_len = builder.add(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field)
-        builder.branch(rehash_next)
-        
-        builder.position_at_end(rehash_next)
-        idx = builder.load(idx_ptr)
-        new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_idx, idx_ptr)
-        builder.branch(rehash_loop)
-        
-        builder.position_at_end(done)
-        # GC will reclaim old entries array - no need for explicit free
-        builder.ret_void()
 
     def _implement_map_set(self):
-        """Return a NEW map with key-value pair set (value semantics).
+        """Return a NEW map with key-value pair set using HAMT.
 
-        This implements value semantics - original map is unchanged.
+        Uses structural sharing - only copies O(log n) nodes on the path.
         """
         func = self.map_set
         func.args[0].name = "old_map"
@@ -3810,207 +5304,174 @@ class CodeGenerator:
         func.args[2].name = "value"
 
         entry = func.append_basic_block("entry")
-        check_grow = func.append_basic_block("check_grow")
-        do_grow = func.append_basic_block("do_grow")
-        do_insert = func.append_basic_block("do_insert")
-        new_entry = func.append_basic_block("new_entry")
-        store_values = func.append_basic_block("store_values")
-
         builder = ir.IRBuilder(entry)
 
         old_map = func.args[0]
         key = func.args[1]
         value = func.args[2]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # First, create a copy of the old map (value semantics)
-        new_map = builder.call(self.map_copy, [old_map])
+        # Compute hash of key
+        hash_val = builder.call(self.map_hash, [key])
 
-        builder.branch(check_grow)
+        # Get old root
+        root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(root_field)
 
-        # All operations below work on new_map, leaving old_map unchanged
-        builder.position_at_end(check_grow)
-        len_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        length = builder.load(len_field)
-        cap_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_field)
+        # Get old len
+        len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_field)
 
-        len_times_4 = builder.mul(length, ir.Constant(ir.IntType(64), 4))
-        cap_times_3 = builder.mul(cap, ir.Constant(ir.IntType(64), 3))
-        need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
-        builder.cbranch(need_grow, do_grow, do_insert)
+        # Get old flags
+        flags_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_field)
 
-        builder.position_at_end(do_grow)
-        builder.call(self.map_grow, [new_map])
-        builder.branch(do_insert)
+        # Allocate added flag
+        added_ptr = builder.alloca(i32, name="added")
+        builder.store(ir.Constant(i32, 0), added_ptr)
 
-        builder.position_at_end(do_insert)
-        slot = builder.call(self.map_find_slot, [new_map, key])
+        # Insert into HAMT
+        new_root = builder.call(self.hamt_insert, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
 
-        entries_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Create new Map with new root
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
+        # Store new root
+        new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_field)
 
-        is_new = builder.icmp_unsigned("!=", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_new, new_entry, store_values)
+        # Update len if new key was added
+        added = builder.load(added_ptr)
+        added_bool = builder.icmp_unsigned("!=", added, ir.Constant(i32, 0))
+        new_len = builder.select(added_bool,
+                                  builder.add(old_len, ir.Constant(i64, 1)),
+                                  old_len)
+        new_len_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_field)
 
-        builder.position_at_end(new_entry)
-        len_field2 = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        current_len = builder.load(len_field2)
-        new_len = builder.add(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field2)
-        builder.branch(store_values)
+        # Copy flags from old map
+        new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_field)
 
-        builder.position_at_end(store_values)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(key, key_ptr)
-        value_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(value, value_ptr)
-        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-
-        # Return the new map (old_map is unchanged)
         builder.ret(new_map)
     
     def _implement_map_get(self):
-        """Get value for key (returns 0 if not found)."""
+        """Get value for key using HAMT lookup (returns 0 if not found)."""
         func = self.map_get
         func.args[0].name = "map"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-        
         builder = ir.IRBuilder(entry)
-        
+
         map_ptr = func.args[0]
         key = func.args[1]
-        
-        slot = builder.call(self.map_find_slot, [map_ptr, key])
-        
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
-        
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
-        
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
-        
-        builder.position_at_end(check_found)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        stored_key = builder.load(key_ptr)
-        keys_match = builder.icmp_signed("==", stored_key, key)
-        builder.cbranch(keys_match, found, not_found)
-        
-        builder.position_at_end(found)
-        value_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        value = builder.load(value_ptr)
-        builder.ret(value)
-        
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(ir.IntType(64), 0))
-    
+        i32 = ir.IntType(32)
+
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
+
+        # Get root
+        root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_field)
+
+        # Lookup in HAMT
+        result = builder.call(self.hamt_lookup, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
+
     def _implement_map_has(self):
-        """Check if key exists in map."""
+        """Check if key exists in map using HAMT."""
         func = self.map_has
         func.args[0].name = "map"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-        
         builder = ir.IRBuilder(entry)
-        
+
         map_ptr = func.args[0]
         key = func.args[1]
-        
-        slot = builder.call(self.map_find_slot, [map_ptr, key])
-        
-        entries_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
-        
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
-        
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
-        
-        builder.position_at_end(check_found)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        stored_key = builder.load(key_ptr)
-        keys_match = builder.icmp_signed("==", stored_key, key)
-        builder.cbranch(keys_match, found, not_found)
-        
-        builder.position_at_end(found)
-        builder.ret(ir.Constant(ir.IntType(1), 1))
-        
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
-    
-    def _implement_map_remove(self):
-        """Return a NEW map with key removed (value semantics).
+        i32 = ir.IntType(32)
 
-        This implements value semantics - original map is unchanged.
-        If key doesn't exist, returns a copy of the original map.
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
+
+        # Get root
+        root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_field)
+
+        # Check in HAMT
+        result = builder.call(self.hamt_contains, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
+
+    def _implement_map_remove(self):
+        """Return a NEW map with key removed using HAMT.
+
+        Uses structural sharing - only copies O(log n) nodes on the path.
         """
         func = self.map_remove
         func.args[0].name = "old_map"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-
         builder = ir.IRBuilder(entry)
 
         old_map = func.args[0]
         key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        # First, create a copy of the old map (value semantics)
-        new_map = builder.call(self.map_copy, [old_map])
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
 
-        # Find the slot for this key in the new map
-        slot = builder.call(self.map_find_slot, [new_map, key])
+        # Get old root
+        root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(root_field)
 
-        entries_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Get old len
+        len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_field)
 
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        state = builder.load(state_ptr)
+        # Get old flags
+        flags_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_field)
 
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
+        # Allocate removed flag
+        removed_ptr = builder.alloca(i32, name="removed")
+        builder.store(ir.Constant(i32, 0), removed_ptr)
 
-        builder.position_at_end(check_found)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        stored_key = builder.load(key_ptr)
-        keys_match = builder.icmp_signed("==", stored_key, key)
-        builder.cbranch(keys_match, found, not_found)
+        # Remove from HAMT
+        new_root = builder.call(self.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
-        builder.position_at_end(found)
-        # Mark slot as deleted in the NEW map
-        builder.store(ir.Constant(ir.IntType(8), 2), state_ptr)
-        len_field = builder.gep(new_map, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        current_len = builder.load(len_field)
-        new_len = builder.sub(current_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field)
-        # Return the new map with key removed
+        # Create new Map with new root
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
+
+        # Store new root
+        new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_field)
+
+        # Update len if key was removed
+        removed = builder.load(removed_ptr)
+        removed_bool = builder.icmp_unsigned("!=", removed, ir.Constant(i32, 0))
+        new_len = builder.select(removed_bool,
+                                  builder.sub(old_len, ir.Constant(i64, 1)),
+                                  old_len)
+        new_len_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_field)
+
+        # Copy flags from old map
+        new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_field)
+
         builder.ret(new_map)
 
-        builder.position_at_end(not_found)
-        # Key not found - return the copy (same as original)
-        builder.ret(new_map)
-    
     def _implement_map_len(self):
         """Return number of entries in map."""
         func = self.map_len
@@ -4020,15 +5481,18 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         map_ptr = func.args[0]
-        len_field = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        i32 = ir.IntType(32)
+
+        # len is field 1
+        len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         length = builder.load(len_field)
         builder.ret(length)
 
     def _implement_map_size(self):
-        """Return total memory footprint of map in bytes.
+        """Return approximate memory footprint of HAMT map in bytes.
 
-        Size = 24 (header) + cap * 24 (MapEntry array)
-        MapEntry is {i64 key, i64 value, i8 state} = 24 bytes with padding
+        For HAMT: 16 (header) + estimated tree size based on len.
+        Rough estimate: len * 32 bytes per entry (including tree overhead).
         """
         func = self.map_size
         func.args[0].name = "map"
@@ -4037,22 +5501,24 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         map_ptr = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        # Get cap field (field 2)
-        cap_ptr = builder.gep(map_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_ptr)
+        # Get len field (field 1)
+        len_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        length = builder.load(len_ptr)
 
-        # Size = 24 (header) + cap * 24 (each MapEntry is 24 bytes)
-        entry_array_size = builder.mul(cap, ir.Constant(ir.IntType(64), 24))
-        total_size = builder.add(ir.Constant(ir.IntType(64), 24), entry_array_size)
+        # Estimate: 16 (header) + len * 32 (entries + tree overhead)
+        entry_size = builder.mul(length, ir.Constant(i64, 32))
+        total_size = builder.add(ir.Constant(i64, 16), entry_size)
 
         builder.ret(total_size)
 
     def _implement_map_copy(self):
-        """Implement map_copy: create a deep copy of a map for value semantics.
+        """HAMT map copy is a shallow copy - the tree structure is shared.
 
-        This ensures that assignment `b = a` creates an independent copy,
-        so mutations to `b` do not affect `a`.
+        Due to structural sharing, we just copy the root pointer and len.
+        This is O(1) instead of O(n) - a key benefit of HAMT!
         """
         func = self.map_copy
         func.args[0].name = "src"
@@ -4077,404 +5543,172 @@ class CodeGenerator:
 
         builder.position_at_end(do_copy)
 
-        # Load source fields
-        # entries (field 0)
-        src_entries_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_entries = builder.load(src_entries_ptr)
+        # HAMT shallow copy - just copy the root pointer and len
+        # The tree structure is shared between copies due to structural sharing
+        # This is O(1) instead of O(n)!
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # len (field 1)
+        # Load source root (field 0)
+        src_root_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_root = builder.load(src_root_ptr)
+
+        # Load source len (field 1)
         src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_len = builder.load(src_len_ptr)
 
-        # cap (field 2)
-        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        src_cap = builder.load(src_cap_ptr)
+        # Load source flags (field 2)
+        src_flags_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_flags = builder.load(src_flags_ptr)
 
         # Allocate new Map struct (24 bytes) via GC
+        # Fields: root*, len, flags
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         dst = builder.bitcast(raw_ptr, map_ptr_type)
 
-        # Copy header fields to destination
-        # len
+        # Store root (field 0) - same tree, shared structure
+        dst_root_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_root, dst_root_ptr)
+
+        # Store len (field 1)
         dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(src_len, dst_len_ptr)
 
-        # cap
-        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        builder.store(src_cap, dst_cap_ptr)
-
-        # Allocate new entries array: cap * 24 bytes (MapEntry size)
-        entry_size = ir.Constant(i64, 24)
-        entries_size = builder.mul(src_cap, entry_size)
-        map_entry_type_id = ir.Constant(i32, self.gc.TYPE_MAP_ENTRY)
-        new_entries_raw = builder.call(self.gc.gc_alloc, [entries_size, map_entry_type_id])
-        new_entries = builder.bitcast(new_entries_raw, self.map_entry_struct.as_pointer())
-
-        # Store entries pointer
-        dst_entries_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_entries, dst_entries_ptr)
-
-        # Copy entries data: cap * 24 bytes (copy all entries including empty slots)
-        src_entries_i8 = builder.bitcast(src_entries, ir.IntType(8).as_pointer())
-        builder.call(self.memcpy, [new_entries_raw, src_entries_i8, entries_size])
+        # Store flags (field 2)
+        dst_flags_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_flags, dst_flags_ptr)
 
         builder.ret(dst)
 
-    def _implement_map_find_slot_string(self):
-        """Find slot for string key using string hash and string equality."""
-        func = self.map_find_slot_string
-        func.args[0].name = "map"
-        func.args[1].name = "key"
-
-        entry = func.append_basic_block("entry")
-        probe_loop = func.append_basic_block("probe_loop")
-        check_state = func.append_basic_block("check_state")
-        check_occupied = func.append_basic_block("check_occupied")
-        check_match = func.append_basic_block("check_match")
-        record_deleted = func.append_basic_block("record_deleted")
-        next_probe = func.append_basic_block("next_probe")
-        found_empty = func.append_basic_block("found_empty")
-        found_match = func.append_basic_block("found_match")
-
-        builder = ir.IRBuilder(entry)
-
-        map_ptr = func.args[0]
-        key = func.args[1]
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        string_ptr_type = self.string_struct.as_pointer()
-
-        # Get entries and cap
-        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
-
-        cap_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_field)
-
-        # Use string_hash for hashing
-        hash_val = builder.call(self.string_hash, [key])
-        mask = builder.sub(cap, ir.Constant(i64, 1))
-        start_idx = builder.and_(hash_val, mask)
-
-        # Track first deleted slot
-        first_deleted_ptr = builder.alloca(i64, name="first_deleted")
-        builder.store(ir.Constant(i64, -1), first_deleted_ptr)
-
-        idx_ptr = builder.alloca(i64, name="idx")
-        builder.store(start_idx, idx_ptr)
-
-        builder.branch(probe_loop)
-
-        builder.position_at_end(probe_loop)
-        idx = builder.load(idx_ptr)
-        e_ptr = builder.gep(entries, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        state = builder.load(state_ptr)
-        builder.branch(check_state)
-
-        builder.position_at_end(check_state)
-        # state == 0 (empty)?
-        is_empty = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 0))
-        builder.cbranch(is_empty, found_empty, check_occupied)
-
-        builder.position_at_end(check_occupied)
-        # state == 1 (occupied)?
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_match, record_deleted)
-
-        builder.position_at_end(check_match)
-        # Compare keys using string_eq
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        stored_key_i64 = builder.load(key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
-        keys_match = builder.call(self.string_eq, [stored_key, key])
-        builder.cbranch(keys_match, found_match, next_probe)
-
-        builder.position_at_end(record_deleted)
-        # state == 2 (deleted), record first deleted
-        first_deleted = builder.load(first_deleted_ptr)
-        is_neg1 = builder.icmp_signed("==", first_deleted, ir.Constant(i64, -1))
-
-        record_bb = func.append_basic_block("record_bb")
-        skip_record = func.append_basic_block("skip_record")
-        builder.cbranch(is_neg1, record_bb, skip_record)
-
-        builder.position_at_end(record_bb)
-        builder.store(idx, first_deleted_ptr)
-        builder.branch(next_probe)
-
-        builder.position_at_end(skip_record)
-        builder.branch(next_probe)
-
-        builder.position_at_end(next_probe)
-        # Linear probing: idx = (idx + 1) & mask
-        new_idx = builder.add(idx, ir.Constant(i64, 1))
-        new_idx = builder.and_(new_idx, mask)
-        builder.store(new_idx, idx_ptr)
-        builder.branch(probe_loop)
-
-        builder.position_at_end(found_empty)
-        # Return first_deleted if valid, else current idx
-        first_deleted = builder.load(first_deleted_ptr)
-        is_neg1 = builder.icmp_signed("==", first_deleted, ir.Constant(i64, -1))
-        result_empty = builder.select(is_neg1, idx, first_deleted)
-        builder.ret(result_empty)
-
-        builder.position_at_end(found_match)
-        builder.ret(idx)
-
     def _implement_map_set_string(self):
-        """Set value for string key, returning NEW map (value semantics)."""
+        """Set value for string key using HAMT, returning NEW map (value semantics)."""
         func = self.map_set_string
         func.args[0].name = "map"
         func.args[1].name = "key"
         func.args[2].name = "value"
 
         entry = func.append_basic_block("entry")
-        check_grow = func.append_basic_block("check_grow")
-        do_grow = func.append_basic_block("do_grow")
-        after_grow = func.append_basic_block("after_grow")
-        do_set = func.append_basic_block("do_set")
-        check_new = func.append_basic_block("check_new")
-        inc_len = func.append_basic_block("inc_len")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
         old_map = func.args[0]
-        key = func.args[1]
+        key = func.args[1]  # String pointer
         value = func.args[2]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+        map_ptr_type = self.map_struct.as_pointer()
 
-        # Copy map first (value semantics)
-        new_map = builder.call(self.map_copy, [old_map])
-        builder.branch(check_grow)
+        # Compute string hash
+        hash_val = builder.call(self.string_hash, [key])
 
-        builder.position_at_end(check_grow)
-        # Load len and cap
-        len_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        length = builder.load(len_ptr)
-        cap_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_ptr)
+        # Get old root, len, and flags
+        old_root_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(old_root_ptr)
+        old_len_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(old_len_ptr)
+        old_flags_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(old_flags_ptr)
 
-        # Check load factor (len * 2 >= cap means 50% full)
-        len_x2 = builder.mul(length, ir.Constant(i64, 2))
-        need_grow = builder.icmp_unsigned(">=", len_x2, cap)
-        builder.cbranch(need_grow, do_grow, do_set)
+        # Insert into HAMT using string comparison
+        added_ptr = builder.alloca(i32, name="added")
+        builder.store(ir.Constant(i32, 0), added_ptr)
+        new_root = builder.call(self.hamt_insert_string, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
 
-        builder.position_at_end(do_grow)
-        builder.call(self.map_grow, [new_map])
-        builder.branch(after_grow)
+        # Create new Map struct
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        new_map = builder.bitcast(raw_ptr, map_ptr_type)
 
-        builder.position_at_end(after_grow)
-        builder.branch(do_set)
+        # Store new root
+        new_root_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_ptr)
 
-        builder.position_at_end(do_set)
-        # Find slot using string key
-        slot = builder.call(self.map_find_slot_string, [new_map, key])
+        # Update len if key was added
+        added = builder.load(added_ptr)
+        added_64 = builder.zext(added, i64)
+        new_len = builder.add(old_len, added_64)
+        new_len_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_ptr)
 
-        # Get entries
-        entries_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_ptr)
-        e_ptr = builder.gep(entries, [slot])
+        # Copy flags from old map
+        new_flags_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_ptr)
 
-        # Check if this is a new entry
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        old_state = builder.load(state_ptr)
-        is_new = builder.icmp_unsigned("!=", old_state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_new, inc_len, check_new)
-
-        builder.position_at_end(inc_len)
-        # Increment length
-        len_ptr2 = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        old_len = builder.load(len_ptr2)
-        new_len = builder.add(old_len, ir.Constant(i64, 1))
-        builder.store(new_len, len_ptr2)
-        builder.branch(check_new)
-
-        builder.position_at_end(check_new)
-        # Store key (as i64 pointer value), value, and set state to occupied
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        key_i64 = builder.ptrtoint(key, i64)
-        builder.store(key_i64, key_ptr)
-
-        value_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(value, value_ptr)
-
-        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-        builder.branch(done)
-
-        builder.position_at_end(done)
         builder.ret(new_map)
 
     def _implement_map_get_string(self):
-        """Get value for string key (returns 0 if not found)."""
+        """Get value for string key using HAMT (returns 0 if not found)."""
         func = self.map_get_string
         func.args[0].name = "map"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-
         builder = ir.IRBuilder(entry)
 
         map_ptr = func.args[0]
-        key = func.args[1]
+        key = func.args[1]  # String pointer
         i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        string_ptr_type = self.string_struct.as_pointer()
 
-        slot = builder.call(self.map_find_slot_string, [map_ptr, key])
+        # Compute string hash
+        hash_val = builder.call(self.string_hash, [key])
 
-        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Get root
+        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
 
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
-
-        builder.position_at_end(check_found)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        stored_key_i64 = builder.load(key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
-        keys_match = builder.call(self.string_eq, [stored_key, key])
-        builder.cbranch(keys_match, found, not_found)
-
-        builder.position_at_end(found)
-        value_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        value = builder.load(value_ptr)
-        builder.ret(value)
-
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(i64, 0))
+        # Lookup in HAMT using string comparison
+        result = builder.call(self.hamt_lookup_string, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
 
     def _implement_map_has_string(self):
-        """Check if string key exists in map."""
+        """Check if string key exists in map using HAMT."""
         func = self.map_has_string
         func.args[0].name = "map"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-
         builder = ir.IRBuilder(entry)
 
         map_ptr = func.args[0]
-        key = func.args[1]
+        key = func.args[1]  # String pointer
         i32 = ir.IntType(32)
-        string_ptr_type = self.string_struct.as_pointer()
 
-        slot = builder.call(self.map_find_slot_string, [map_ptr, key])
+        # Compute string hash
+        hash_val = builder.call(self.string_hash, [key])
 
-        entries_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Get root
+        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
 
-        e_ptr = builder.gep(entries, [slot])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
-
-        builder.position_at_end(check_found)
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        stored_key_i64 = builder.load(key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
-        keys_match = builder.call(self.string_eq, [stored_key, key])
-        builder.cbranch(keys_match, found, not_found)
-
-        builder.position_at_end(found)
-        builder.ret(ir.Constant(ir.IntType(1), 1))
-
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
+        # Check existence in HAMT using string comparison
+        result = builder.call(self.hamt_contains_string, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
 
     def _implement_map_keys(self):
-        """Return a List of all keys in the map (as i64 values)."""
+        """Return a List of all keys in the map (as i64 values) using HAMT."""
         func = self.map_keys
         func.args[0].name = "map"
 
         entry = func.append_basic_block("entry")
-        loop_cond = func.append_basic_block("loop_cond")
-        loop_body = func.append_basic_block("loop_body")
-        add_key = func.append_basic_block("add_key")
-        loop_inc = func.append_basic_block("loop_inc")
-        loop_done = func.append_basic_block("loop_done")
-
         builder = ir.IRBuilder(entry)
 
         map_ptr = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Create result list with 8-byte elements
+        # Create empty result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
-        result_list = builder.call(self.list_new, [elem_size])
+        empty_list = builder.call(self.list_new, [elem_size])
 
-        # Get entries and cap
-        entries_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_ptr)
+        # Get HAMT root
+        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
 
-        cap_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_ptr)
-
-        # Store result list pointer (may change with append)
-        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
-        builder.store(result_list, result_ptr)
-
-        # Loop through entries
-        idx_ptr = builder.alloca(i64, name="idx")
-        builder.store(ir.Constant(i64, 0), idx_ptr)
-
-        builder.branch(loop_cond)
-
-        builder.position_at_end(loop_cond)
-        idx = builder.load(idx_ptr)
-        done = builder.icmp_signed(">=", idx, cap)
-        builder.cbranch(done, loop_done, loop_body)
-
-        builder.position_at_end(loop_body)
-        e_ptr = builder.gep(entries, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, add_key, loop_inc)
-
-        builder.position_at_end(add_key)
-        # Get key and add to list
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        key = builder.load(key_ptr)
-
-        # Allocate temp for key
-        temp = builder.alloca(i64, name="temp_key")
-        builder.store(key, temp)
-        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
-
-        # Append to list
-        current_list = builder.load(result_ptr)
-        new_list = builder.call(self.list_append, [current_list, temp_i8, elem_size])
-        builder.store(new_list, result_ptr)
-        builder.branch(loop_inc)
-
-        builder.position_at_end(loop_inc)
-        new_idx = builder.add(idx, ir.Constant(i64, 1))
-        builder.store(new_idx, idx_ptr)
-        builder.branch(loop_cond)
-
-        builder.position_at_end(loop_done)
-        final_list = builder.load(result_ptr)
-        builder.ret(final_list)
+        # Collect all keys from HAMT into list
+        result = builder.call(self.hamt_collect_keys, [root, empty_list])
+        builder.ret(result)
 
     def _register_map_methods(self):
         """Register Map as a type with methods."""
@@ -4512,32 +5746,38 @@ class CodeGenerator:
             i64 key    - Key (int value or pointer cast to i64)
             i8  state  - 0=empty, 1=occupied, 2=deleted (tombstone)
         
-        Set layout:
-            SetEntry* entries  - Array of entries
-            i64 len            - Number of occupied entries
-            i64 cap            - Total capacity (always power of 2)
+        Set layout (HAMT-based):
+            i8* root  - Root of HAMT tree (void pointer - can be null, leaf, or node)
+            i64 len   - Number of elements in the set
+
+        Uses the same HAMT infrastructure as Map with pointer tagging:
+        - Bit 0 = 1 for leaf, 0 for node
+        - Leaves store {hash, key, value} where value is always 1 for sets
         """
-        # SetEntry struct: { i64 key, i8 state }
+        # SetEntry struct: { i64 key, i8 state } - kept for backward compatibility
         self.set_entry_struct = ir.global_context.get_identified_type("struct.SetEntry")
         self.set_entry_struct.set_body(
             ir.IntType(64),  # key
             ir.IntType(8)    # state: 0=empty, 1=occupied, 2=deleted
         )
-        
-        # Set struct: { SetEntry* entries, i64 len, i64 cap }
+
+        # Set struct: { i8* root, i64 len, i32 flags } - HAMT-based like Map
+        # flags: bit 0 = element is heap pointer (e.g., string)
         self.set_struct = ir.global_context.get_identified_type("struct.Set")
         self.set_struct.set_body(
-            self.set_entry_struct.as_pointer(),  # entries
-            ir.IntType(64),   # len
-            ir.IntType(64)    # cap
+            ir.IntType(8).as_pointer(),  # root (void pointer)
+            ir.IntType(64),              # len
+            ir.IntType(32)               # flags (type info for GC)
         )
-        
+
         set_ptr = self.set_struct.as_pointer()
         i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
         i1 = ir.IntType(1)
-        
-        # set_new() -> Set*
-        set_new_ty = ir.FunctionType(set_ptr, [])
+
+        # set_new(flags: i32) -> Set*
+        # flags: bit 0 = element is ptr
+        set_new_ty = ir.FunctionType(set_ptr, [i32])
         self.set_new = ir.Function(self.module, set_new_ty, name="coex_set_new")
         
         # set_add(set: Set*, key: i64) -> Set*
@@ -4611,303 +5851,69 @@ class CodeGenerator:
         self._register_set_methods()
     
     def _implement_set_new(self):
-        """Implement set_new: allocate a new empty set."""
+        """Implement set_new: allocate a new empty HAMT-based set with type flags."""
         func = self.set_new
-        
+        func.args[0].name = "flags"
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        # Allocate Set struct (3 * 8 = 24 bytes) via GC
-        set_size = ir.Constant(ir.IntType(64), 24)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET)
+
+        flags = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Set struct (8 + 8 + 4 = 24 bytes with padding): { i8* root, i64 len, i32 flags }
+        set_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_SET)
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         set_ptr = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
-        
-        # Initial capacity = 8
-        initial_cap = ir.Constant(ir.IntType(64), 8)
-        
-        # Allocate entries array: 8 entries * 16 bytes each (i64 key + i8 state, padded)
-        entry_size = ir.Constant(ir.IntType(64), 16)
-        entries_size = builder.mul(initial_cap, entry_size)
-        set_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET_ENTRY)
-        entries_raw = builder.call(self.gc.gc_alloc, [entries_size, set_entry_type_id])
-        entries_ptr = builder.bitcast(entries_raw, self.set_entry_struct.as_pointer())
-        
-        # Initialize each entry's state to 0 (empty) using a loop
-        idx_ptr = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), idx_ptr)
-        
-        init_loop = func.append_basic_block("init_loop")
-        init_body = func.append_basic_block("init_body")
-        init_done = func.append_basic_block("init_done")
-        
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_loop)
-        idx = builder.load(idx_ptr)
-        done = builder.icmp_signed(">=", idx, initial_cap)
-        builder.cbranch(done, init_done, init_body)
-        
-        builder.position_at_end(init_body)
-        e_ptr = builder.gep(entries_ptr, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 0), state_ptr)
-        new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_idx, idx_ptr)
-        builder.branch(init_loop)
-        
-        builder.position_at_end(init_done)
-        
-        # Store entries pointer
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(entries_ptr, entries_field)
-        
+
+        # Store root = null (empty set)
+        root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), root_field)
+
         # Store len = 0
-        len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_field)
-        
-        # Store cap = 8
-        cap_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        builder.store(initial_cap, cap_field)
-        
+        len_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), len_field)
+
+        # Store flags
+        flags_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(flags, flags_field)
+
         builder.ret(set_ptr)
     
     def _implement_set_find_slot(self):
-        """Implement set_find_slot: find slot for key using linear probing.
-        
-        Returns the index of:
-        - The slot containing the key (if found), or
-        - The first empty/deleted slot suitable for insertion
+        """Legacy stub - HAMT-based sets don't use linear probing slots.
+        This function is kept for compatibility but is never called.
         """
         func = self.set_find_slot
         func.args[0].name = "set"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        set_ptr = func.args[0]
-        key = func.args[1]
-        
-        # Get entries and cap
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
-        
-        cap_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_field)
-        
-        # Compute hash and starting index
-        hash_val = builder.call(self.map_hash, [key])  # Reuse map's hash function
-        mask = builder.sub(cap, ir.Constant(ir.IntType(64), 1))
-        start_idx = builder.and_(hash_val, mask)
-        
-        # Allocate locals for loop
-        idx_alloca = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(start_idx, idx_alloca)
-        
-        first_deleted_alloca = builder.alloca(ir.IntType(64), name="first_deleted")
-        builder.store(ir.Constant(ir.IntType(64), -1), first_deleted_alloca)
-        
-        # Loop to find slot
-        loop_block = func.append_basic_block("loop")
-        found_block = func.append_basic_block("found")
-        empty_block = func.append_basic_block("empty")
-        deleted_block = func.append_basic_block("deleted")
-        continue_block = func.append_basic_block("continue")
-        
-        builder.branch(loop_block)
-        
-        # Loop body
-        builder = ir.IRBuilder(loop_block)
-        idx = builder.load(idx_alloca)
-        
-        # Get entry at idx
-        entry_ptr = builder.gep(entries, [idx], inbounds=True)
-        state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        state = builder.load(state_ptr)
-        
-        # Check state
-        is_empty = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 0))
-        is_deleted = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 2))
-        is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
-        
-        # Branch on empty
-        not_empty_block = func.append_basic_block("not_empty")
-        builder.cbranch(is_empty, empty_block, not_empty_block)
-        
-        # Not empty - check if deleted
-        builder = ir.IRBuilder(not_empty_block)
-        not_deleted_block = func.append_basic_block("not_deleted")
-        builder.cbranch(is_deleted, deleted_block, not_deleted_block)
-        
-        # Occupied - check if key matches
-        builder = ir.IRBuilder(not_deleted_block)
-        key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entry_key = builder.load(key_ptr)
-        key_matches = builder.icmp_signed("==", entry_key, key)
-        builder.cbranch(key_matches, found_block, continue_block)
-        
-        # Empty slot - return it (or first_deleted if we saw one)
-        builder = ir.IRBuilder(empty_block)
-        first_deleted = builder.load(first_deleted_alloca)
-        has_deleted = builder.icmp_signed(">=", first_deleted, ir.Constant(ir.IntType(64), 0))
-        result_idx = builder.select(has_deleted, first_deleted, idx)
-        builder.ret(result_idx)
-        
-        # Found matching key - return this slot
-        builder = ir.IRBuilder(found_block)
-        builder.ret(idx)
-        
-        # Deleted slot - track first deleted, continue probing
-        builder = ir.IRBuilder(deleted_block)
-        first_deleted_cur = builder.load(first_deleted_alloca)
-        need_update = builder.icmp_signed("<", first_deleted_cur, ir.Constant(ir.IntType(64), 0))
-        new_first_deleted = builder.select(need_update, idx, first_deleted_cur)
-        builder.store(new_first_deleted, first_deleted_alloca)
-        builder.branch(continue_block)
-        
-        # Continue probing
-        builder = ir.IRBuilder(continue_block)
-        idx = builder.load(idx_alloca)
-        next_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        next_idx = builder.and_(next_idx, mask)
-        builder.store(next_idx, idx_alloca)
-        builder.branch(loop_block)
-    
+
+        # Just return 0 - this function should never be called with HAMT
+        builder.ret(ir.Constant(ir.IntType(64), 0))
+
     def _implement_set_grow(self):
-        """Implement set_grow: double capacity and rehash all entries."""
+        """Legacy stub - HAMT-based sets grow automatically through tree structure.
+        This function is kept for compatibility but is never called.
+        """
         func = self.set_grow
         func.args[0].name = "set"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
-        set_ptr = func.args[0]
-        
-        # Get old entries, len, cap
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_entries = builder.load(entries_field)
-        
-        cap_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        old_cap = builder.load(cap_field)
-        
-        # New capacity = old_cap * 2
-        new_cap = builder.mul(old_cap, ir.Constant(ir.IntType(64), 2))
-        
-        # Allocate new entries array
-        entry_size = ir.Constant(ir.IntType(64), 16)
-        new_entries_size = builder.mul(new_cap, entry_size)
-        set_entry_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_SET_ENTRY)
-        new_entries_raw = builder.call(self.gc.gc_alloc, [new_entries_size, set_entry_type_id])
-        new_entries = builder.bitcast(new_entries_raw, self.set_entry_struct.as_pointer())
-        
-        # Initialize new entries using a loop
-        init_idx = builder.alloca(ir.IntType(64), name="init_idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), init_idx)
-        
-        init_loop = func.append_basic_block("init_loop")
-        init_body = func.append_basic_block("init_body")
-        init_done = func.append_basic_block("init_done")
-        
-        builder.branch(init_loop)
-        
-        builder = ir.IRBuilder(init_loop)
-        idx = builder.load(init_idx)
-        done = builder.icmp_signed(">=", idx, new_cap)
-        builder.cbranch(done, init_done, init_body)
-        
-        builder = ir.IRBuilder(init_body)
-        idx = builder.load(init_idx)
-        e_ptr = builder.gep(new_entries, [idx])
-        state_ptr = builder.gep(e_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 0), state_ptr)
-        new_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_idx, init_idx)
-        builder.branch(init_loop)
-        
-        builder = ir.IRBuilder(init_done)
-        
-        # Update set to use new entries and cap (len stays the same initially)
-        builder.store(new_entries, entries_field)
-        builder.store(new_cap, cap_field)
-        
-        # Temporarily set len to 0 for reinsertion
-        len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        old_len = builder.load(len_field)
-        builder.store(ir.Constant(ir.IntType(64), 0), len_field)
-        
-        # Rehash all occupied entries from old array
-        idx_alloca = builder.alloca(ir.IntType(64), name="idx")
-        builder.store(ir.Constant(ir.IntType(64), 0), idx_alloca)
-        
-        loop_block = func.append_basic_block("rehash_loop")
-        body_block = func.append_basic_block("rehash_body")
-        insert_block = func.append_basic_block("rehash_insert")
-        next_block = func.append_basic_block("rehash_next")
-        done_block = func.append_basic_block("rehash_done")
-        
-        builder.branch(loop_block)
-        
-        # Loop condition
-        builder = ir.IRBuilder(loop_block)
-        idx = builder.load(idx_alloca)
-        cond = builder.icmp_signed("<", idx, old_cap)
-        builder.cbranch(cond, body_block, done_block)
-        
-        # Loop body - check if entry is occupied
-        builder = ir.IRBuilder(body_block)
-        idx = builder.load(idx_alloca)
-        entry_ptr = builder.gep(old_entries, [idx], inbounds=True)
-        state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        state = builder.load(state_ptr)
-        is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, insert_block, next_block)
-        
-        # Insert occupied entry into new array (directly, without calling set_add)
-        builder = ir.IRBuilder(insert_block)
-        idx = builder.load(idx_alloca)
-        entry_ptr = builder.gep(old_entries, [idx], inbounds=True)
-        key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        key = builder.load(key_ptr)
 
-        # Use set_find_slot to find the slot in the resized set
-        slot = builder.call(self.set_find_slot, [set_ptr, key])
-
-        # Get the new entry location
-        new_entries_reload = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        new_entries_ptr = builder.load(new_entries_reload)
-        new_entry_ptr = builder.gep(new_entries_ptr, [slot], inbounds=True)
-
-        # Store key and mark as occupied
-        new_key_ptr = builder.gep(new_entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(key, new_key_ptr)
-        new_state_ptr = builder.gep(new_entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8), 1), new_state_ptr)
-
-        # Increment length
-        len_field_reload = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        cur_len = builder.load(len_field_reload)
-        new_len = builder.add(cur_len, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field_reload)
-
-        builder.branch(next_block)
-        
-        # Next iteration
-        builder = ir.IRBuilder(next_block)
-        idx = builder.load(idx_alloca)
-        next_idx = builder.add(idx, ir.Constant(ir.IntType(64), 1))
-        builder.store(next_idx, idx_alloca)
-        builder.branch(loop_block)
-        
-        # Done - GC will reclaim old entries
-        builder = ir.IRBuilder(done_block)
-        # GC will reclaim old entries array - no need for explicit free
+        # Just return - HAMT doesn't need explicit grow
         builder.ret_void()
 
     def _implement_set_add(self):
-        """Return a NEW set with key added (value semantics).
+        """Return a NEW set with key added (value semantics) using HAMT.
 
-        This implements value semantics - original set is unchanged.
+        This implements value semantics via structural sharing.
+        Uses the same HAMT infrastructure as Map, with value = 1.
         """
         func = self.set_add
         func.args[0].name = "old_set"
@@ -4918,171 +5924,139 @@ class CodeGenerator:
 
         old_set = func.args[0]
         key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # First, create a copy of the old set (value semantics)
-        new_set = builder.call(self.set_copy, [old_set])
+        # Get old root
+        root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(root_field)
 
-        # All operations below work on new_set, leaving old_set unchanged
+        # Get old len
+        len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_field)
 
-        # Check if we need to grow (load factor > 0.75)
-        len_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        length = builder.load(len_field)
+        # Get old flags
+        flags_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_field)
 
-        cap_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_field)
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
 
-        # Check: len * 4 >= cap * 3 (equivalent to len/cap >= 0.75)
-        len_times_4 = builder.mul(length, ir.Constant(ir.IntType(64), 4))
-        cap_times_3 = builder.mul(cap, ir.Constant(ir.IntType(64), 3))
-        need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
+        # Alloca for "added" flag
+        added_ptr = builder.alloca(i32, name="added")
 
-        grow_block = func.append_basic_block("grow")
-        insert_block = func.append_basic_block("insert")
+        # Insert into HAMT (value = 1 for sets)
+        new_root = builder.call(self.hamt_insert, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
 
-        builder.cbranch(need_grow, grow_block, insert_block)
+        # Allocate new Set struct (24 bytes)
+        set_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_SET)
+        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        # Grow the set
-        builder = ir.IRBuilder(grow_block)
-        builder.call(self.set_grow, [new_set])
-        builder.branch(insert_block)
+        # Store new root
+        new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_field)
 
-        # Find slot and insert
-        builder = ir.IRBuilder(insert_block)
-        slot = builder.call(self.set_find_slot, [new_set, key])
+        # Compute new len (old_len + added)
+        added = builder.load(added_ptr)
+        added_64 = builder.zext(added, i64)
+        new_len = builder.add(old_len, added_64)
+        new_len_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_field)
 
-        entries_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Copy flags from old set
+        new_flags_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_field)
 
-        entry_ptr = builder.gep(entries, [slot], inbounds=True)
-        state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        old_state = builder.load(state_ptr)
-
-        # Check if this is a new entry (state != 1)
-        is_new = builder.icmp_signed("!=", old_state, ir.Constant(ir.IntType(8), 1))
-
-        inc_len_block = func.append_basic_block("inc_len")
-        store_block = func.append_basic_block("store")
-
-        builder.cbranch(is_new, inc_len_block, store_block)
-
-        # Increment len for new entries
-        builder = ir.IRBuilder(inc_len_block)
-        len_field2 = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        length2 = builder.load(len_field2)
-        new_len = builder.add(length2, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field2)
-        builder.branch(store_block)
-
-        # Store key and set state to occupied
-        builder = ir.IRBuilder(store_block)
-        key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(key, key_ptr)
-        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-
-        # Return the new set (old_set is unchanged)
         builder.ret(new_set)
     
     def _implement_set_has(self):
-        """Implement set_has: check if key is in set."""
+        """Implement set_has: check if key is in HAMT-based set."""
         func = self.set_has
         func.args[0].name = "set"
         func.args[1].name = "key"
-        
+
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        
+
         set_ptr = func.args[0]
         key = func.args[1]
-        
-        # Find slot
-        slot = builder.call(self.set_find_slot, [set_ptr, key])
-        
-        entries_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
-        
-        entry_ptr = builder.gep(entries, [slot], inbounds=True)
-        state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        state = builder.load(state_ptr)
-        
-        # Check if occupied and key matches
-        is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
-        
-        check_key_block = func.append_basic_block("check_key")
-        ret_false_block = func.append_basic_block("ret_false")
-        
-        builder.cbranch(is_occupied, check_key_block, ret_false_block)
-        
-        # Check key
-        builder = ir.IRBuilder(check_key_block)
-        key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entry_key = builder.load(key_ptr)
-        key_matches = builder.icmp_signed("==", entry_key, key)
-        builder.ret(key_matches)
-        
-        # Not found
-        builder = ir.IRBuilder(ret_false_block)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
+        i32 = ir.IntType(32)
+
+        # Get root
+        root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_field)
+
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
+
+        # Call hamt_contains
+        result = builder.call(self.hamt_contains, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
     
     def _implement_set_remove(self):
-        """Return a NEW set with element removed (value semantics).
+        """Return a NEW set with element removed (value semantics) using HAMT.
 
-        This implements value semantics - original set is unchanged.
-        If element doesn't exist, returns a copy of the original set.
+        Uses structural sharing - only nodes on path to removed element are copied.
         """
         func = self.set_remove
         func.args[0].name = "old_set"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_key_block = func.append_basic_block("check_key")
-        remove_block = func.append_basic_block("remove")
-        not_found_block = func.append_basic_block("not_found")
-
         builder = ir.IRBuilder(entry)
 
         old_set = func.args[0]
         key = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        # First, create a copy of the old set (value semantics)
-        new_set = builder.call(self.set_copy, [old_set])
+        # Get old root
+        root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(root_field)
 
-        # Find slot in the new set
-        slot = builder.call(self.set_find_slot, [new_set, key])
+        # Get old len
+        len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_field)
 
-        entries_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Get old flags
+        flags_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_field)
 
-        entry_ptr = builder.gep(entries, [slot], inbounds=True)
-        state_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        state = builder.load(state_ptr)
+        # Compute hash
+        hash_val = builder.call(self.map_hash, [key])
 
-        # Check if occupied
-        is_occupied = builder.icmp_signed("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_key_block, not_found_block)
+        # Alloca for "removed" flag
+        removed_ptr = builder.alloca(i32, name="removed")
 
-        # Check key matches
-        builder = ir.IRBuilder(check_key_block)
-        key_ptr = builder.gep(entry_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        entry_key = builder.load(key_ptr)
-        key_matches = builder.icmp_signed("==", entry_key, key)
-        builder.cbranch(key_matches, remove_block, not_found_block)
+        # Remove from HAMT
+        new_root = builder.call(self.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
-        # Remove: set state to deleted (2), decrement len in the NEW set
-        builder = ir.IRBuilder(remove_block)
-        builder.store(ir.Constant(ir.IntType(8), 2), state_ptr)
+        # Allocate new Set struct (24 bytes)
+        set_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_SET)
+        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        len_field = builder.gep(new_set, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        length = builder.load(len_field)
-        new_len = builder.sub(length, ir.Constant(ir.IntType(64), 1))
-        builder.store(new_len, len_field)
+        # Store new root
+        new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_field)
 
-        # Return the new set with element removed
+        # Compute new len (old_len - removed)
+        removed = builder.load(removed_ptr)
+        removed_64 = builder.zext(removed, i64)
+        new_len = builder.sub(old_len, removed_64)
+        new_len_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_field)
+
+        # Copy flags from old set
+        new_flags_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_field)
+
         builder.ret(new_set)
 
-        # Not found - return the copy (same as original)
-        builder = ir.IRBuilder(not_found_block)
-        builder.ret(new_set)
-    
     def _implement_set_len(self):
         """Implement set_len: return number of elements in set."""
         func = self.set_len
@@ -5099,10 +6073,11 @@ class CodeGenerator:
         builder.ret(length)
 
     def _implement_set_size(self):
-        """Implement set_size: return total memory footprint in bytes.
+        """Implement set_size: return approximate memory footprint in bytes.
 
-        Size = 24 (header) + cap * 16 (SetEntry array)
-        SetEntry is {i64 key, i8 state} = 16 bytes with padding
+        With HAMT, this is an approximation since we'd need to traverse the tree.
+        Approximate size = 16 (header) + len * 32 (estimate per entry in HAMT).
+        This includes leaf nodes and amortized internal node overhead.
         """
         func = self.set_size
         func.args[0].name = "set"
@@ -5111,22 +6086,25 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         set_ptr = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        # Get cap field (field 2)
-        cap_ptr = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
-        cap = builder.load(cap_ptr)
+        # Get len field (field 1)
+        len_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        length = builder.load(len_ptr)
 
-        # Size = 24 (header) + cap * 16 (each SetEntry is 16 bytes)
-        entry_array_size = builder.mul(cap, ir.Constant(ir.IntType(64), 16))
-        total_size = builder.add(ir.Constant(ir.IntType(64), 24), entry_array_size)
+        # Approximate size = 16 (header) + len * 32 (estimated per entry in HAMT)
+        entry_estimate = builder.mul(length, ir.Constant(i64, 32))
+        total_size = builder.add(ir.Constant(i64, 16), entry_estimate)
 
         builder.ret(total_size)
 
     def _implement_set_copy(self):
-        """Implement set_copy: create a deep copy of a set for value semantics.
+        """Implement set_copy: shallow copy for HAMT-based set.
 
-        This ensures that assignment `b = a` creates an independent copy,
-        so mutations to `b` do not affect `a`.
+        With HAMT structural sharing, we only need to copy the 16-byte header
+        (root pointer + len). The tree structure is shared between copies.
+        This makes copy O(1) instead of O(n).
         """
         func = self.set_copy
         func.args[0].name = "src"
@@ -5151,48 +6129,33 @@ class CodeGenerator:
 
         builder.position_at_end(do_copy)
 
-        # Load source fields
-        # entries (field 0)
-        src_entries_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_entries = builder.load(src_entries_ptr)
+        # Load source fields: root (field 0), len (field 1), flags (field 2)
+        src_root_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_root = builder.load(src_root_ptr)
 
-        # len (field 1)
         src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_len = builder.load(src_len_ptr)
 
-        # cap (field 2)
-        src_cap_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        src_cap = builder.load(src_cap_ptr)
+        src_flags_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_flags = builder.load(src_flags_ptr)
 
-        # Allocate new Set struct (24 bytes) via GC
+        # Allocate new Set struct (24 bytes) via GC: { i8* root, i64 len, i32 flags }
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         dst = builder.bitcast(raw_ptr, set_ptr_type)
 
-        # Copy header fields to destination
-        # len
+        # Copy root pointer (shared HAMT tree)
+        dst_root_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_root, dst_root_ptr)
+
+        # Copy len
         dst_len_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(src_len, dst_len_ptr)
 
-        # cap
-        dst_cap_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        builder.store(src_cap, dst_cap_ptr)
-
-        # Allocate new entries array: cap * 16 bytes (SetEntry size)
-        entry_size = ir.Constant(i64, 16)
-        entries_size = builder.mul(src_cap, entry_size)
-        set_entry_type_id = ir.Constant(i32, self.gc.TYPE_SET_ENTRY)
-        new_entries_raw = builder.call(self.gc.gc_alloc, [entries_size, set_entry_type_id])
-        new_entries = builder.bitcast(new_entries_raw, self.set_entry_struct.as_pointer())
-
-        # Store entries pointer
-        dst_entries_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_entries, dst_entries_ptr)
-
-        # Copy entries data: cap * 16 bytes (copy all entries including empty slots)
-        src_entries_i8 = builder.bitcast(src_entries, ir.IntType(8).as_pointer())
-        builder.call(self.memcpy, [new_entries_raw, src_entries_i8, entries_size])
+        # Copy flags
+        dst_flags_ptr = builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_flags, dst_flags_ptr)
 
         builder.ret(dst)
 
@@ -5200,16 +6163,12 @@ class CodeGenerator:
         """Return a List of all elements in the set (as i64 values).
 
         This is used for Set iteration: for x in set ...
+        Uses hamt_collect_keys to gather all keys from the HAMT tree.
         """
         func = self.set_to_list
         func.args[0].name = "set"
 
         entry = func.append_basic_block("entry")
-        loop_cond = func.append_basic_block("loop_cond")
-        loop_body = func.append_basic_block("loop_body")
-        add_elem = func.append_basic_block("add_elem")
-        loop_inc = func.append_basic_block("loop_inc")
-        loop_done = func.append_basic_block("loop_done")
 
         builder = ir.IRBuilder(entry)
 
@@ -5221,210 +6180,61 @@ class CodeGenerator:
         elem_size = ir.Constant(i64, 8)
         result_list = builder.call(self.list_new, [elem_size])
 
-        # Get entries and cap from the set
-        entries_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_ptr)
+        # Get root from the set (field 0)
+        root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
 
-        cap_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_ptr)
+        # Use hamt_collect_keys to gather all keys into the list
+        final_list = builder.call(self.hamt_collect_keys, [root, result_list])
 
-        # Store result list pointer (may change with append)
-        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
-        builder.store(result_list, result_ptr)
-
-        # Loop through entries
-        idx_ptr = builder.alloca(i64, name="idx")
-        builder.store(ir.Constant(i64, 0), idx_ptr)
-
-        builder.branch(loop_cond)
-
-        builder.position_at_end(loop_cond)
-        idx = builder.load(idx_ptr)
-        done = builder.icmp_signed(">=", idx, cap)
-        builder.cbranch(done, loop_done, loop_body)
-
-        builder.position_at_end(loop_body)
-        e_ptr = builder.gep(entries, [idx])
-        # SetEntry: { i64 key, i8 state } - state is at offset 1
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, add_elem, loop_inc)
-
-        builder.position_at_end(add_elem)
-        # Get element (key at offset 0) and add to list
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        key = builder.load(key_ptr)
-
-        # Allocate temp for element
-        temp = builder.alloca(i64, name="temp_elem")
-        builder.store(key, temp)
-        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
-
-        # Append to list
-        current_list = builder.load(result_ptr)
-        new_list = builder.call(self.list_append, [current_list, temp_i8, elem_size])
-        builder.store(new_list, result_ptr)
-        builder.branch(loop_inc)
-
-        builder.position_at_end(loop_inc)
-        new_idx = builder.add(idx, ir.Constant(i64, 1))
-        builder.store(new_idx, idx_ptr)
-        builder.branch(loop_cond)
-
-        builder.position_at_end(loop_done)
-        final_list = builder.load(result_ptr)
         builder.ret(final_list)
 
     def _implement_set_find_slot_string(self):
-        """Find slot for string key using string hash and string equality."""
+        """Legacy stub - HAMT-based sets don't use linear probing slots.
+        This function is kept for compatibility but is never called.
+        """
         func = self.set_find_slot_string
         func.args[0].name = "set"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        probe_loop = func.append_basic_block("probe_loop")
-        check_state = func.append_basic_block("check_state")
-        check_occupied = func.append_basic_block("check_occupied")
-        check_match = func.append_basic_block("check_match")
-        record_deleted = func.append_basic_block("record_deleted")
-        next_probe = func.append_basic_block("next_probe")
-        found_empty = func.append_basic_block("found_empty")
-        found_match = func.append_basic_block("found_match")
-
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
-        key = func.args[1]
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        string_ptr_type = self.string_struct.as_pointer()
-
-        # Get entries and cap
-        entries_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
-
-        cap_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_field)
-
-        # Use string_hash for hashing
-        hash_val = builder.call(self.string_hash, [key])
-        mask = builder.sub(cap, ir.Constant(i64, 1))
-        start_idx = builder.and_(hash_val, mask)
-
-        # Track first deleted slot
-        first_deleted_ptr = builder.alloca(i64, name="first_deleted")
-        builder.store(ir.Constant(i64, -1), first_deleted_ptr)
-
-        idx_ptr = builder.alloca(i64, name="idx")
-        builder.store(start_idx, idx_ptr)
-
-        builder.branch(probe_loop)
-
-        builder.position_at_end(probe_loop)
-        idx = builder.load(idx_ptr)
-        e_ptr = builder.gep(entries, [idx])
-        # SetEntry: { i64 key, i8 state } - state is at offset 1
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        state = builder.load(state_ptr)
-        builder.branch(check_state)
-
-        builder.position_at_end(check_state)
-        is_empty = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 0))
-        builder.cbranch(is_empty, found_empty, check_occupied)
-
-        builder.position_at_end(check_occupied)
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_match, record_deleted)
-
-        builder.position_at_end(check_match)
-        # SetEntry: key at offset 0
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        stored_key_i64 = builder.load(key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
-        keys_match = builder.call(self.string_eq, [stored_key, key])
-        builder.cbranch(keys_match, found_match, next_probe)
-
-        builder.position_at_end(record_deleted)
-        current_first = builder.load(first_deleted_ptr)
-        is_unset = builder.icmp_signed("==", current_first, ir.Constant(i64, -1))
-        with builder.if_then(is_unset):
-            builder.store(idx, first_deleted_ptr)
-        builder.branch(next_probe)
-
-        builder.position_at_end(next_probe)
-        new_idx = builder.add(idx, ir.Constant(i64, 1))
-        wrapped_idx = builder.and_(new_idx, mask)
-        builder.store(wrapped_idx, idx_ptr)
-        builder.branch(probe_loop)
-
-        builder.position_at_end(found_empty)
-        first_deleted = builder.load(first_deleted_ptr)
-        use_deleted = builder.icmp_signed(">=", first_deleted, ir.Constant(i64, 0))
-        result_empty = builder.select(use_deleted, first_deleted, idx)
-        builder.ret(result_empty)
-
-        builder.position_at_end(found_match)
-        builder.ret(idx)
+        # Just return 0 - this function should never be called with HAMT
+        builder.ret(ir.Constant(ir.IntType(64), 0))
 
     def _implement_set_has_string(self):
-        """Check if string key exists in set."""
+        """Check if string key exists in HAMT-based set."""
         func = self.set_has_string
         func.args[0].name = "set"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_found = func.append_basic_block("check_found")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
 
         builder = ir.IRBuilder(entry)
 
         set_ptr = func.args[0]
         key = func.args[1]
         i32 = ir.IntType(32)
-        string_ptr_type = self.string_struct.as_pointer()
 
-        slot = builder.call(self.set_find_slot_string, [set_ptr, key])
+        # Get root from set (field 0)
+        root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root = builder.load(root_ptr)
 
-        entries_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
+        # Hash the string key
+        hash_val = builder.call(self.string_hash, [key])
 
-        e_ptr = builder.gep(entries, [slot])
-        # SetEntry: { i64 key, i8 state } - state is at offset 1
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_occupied = builder.icmp_unsigned("==", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_occupied, check_found, not_found)
-
-        builder.position_at_end(check_found)
-        # SetEntry: key at offset 0
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        stored_key_i64 = builder.load(key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
-        keys_match = builder.call(self.string_eq, [stored_key, key])
-        builder.cbranch(keys_match, found, not_found)
-
-        builder.position_at_end(found)
-        builder.ret(ir.Constant(ir.IntType(1), 1))
-
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(ir.IntType(1), 0))
+        # Check if key exists using hamt_contains_string
+        result = builder.call(self.hamt_contains_string, [root, hash_val, key, ir.Constant(i32, 0)])
+        builder.ret(result)
 
     def _implement_set_add_string(self):
-        """Add string element to set, returning NEW set (value semantics)."""
+        """Add string element to HAMT-based set, returning NEW set (value semantics)."""
         func = self.set_add_string
         func.args[0].name = "old_set"
         func.args[1].name = "key"
 
         entry = func.append_basic_block("entry")
-        check_grow = func.append_basic_block("check_grow")
-        do_grow = func.append_basic_block("do_grow")
-        do_insert = func.append_basic_block("do_insert")
-        new_entry_block = func.append_basic_block("new_entry")
-        store_entry = func.append_basic_block("store_entry")
 
         builder = ir.IRBuilder(entry)
 
@@ -5432,58 +6242,42 @@ class CodeGenerator:
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        string_ptr_type = self.string_struct.as_pointer()
 
-        # First, create a copy of the old set (value semantics)
-        new_set = builder.call(self.set_copy, [old_set])
+        # Get old root, len, and flags from set
+        root_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root = builder.load(root_ptr)
+        len_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_ptr)
+        flags_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_ptr)
 
-        builder.branch(check_grow)
+        # Hash the string key
+        hash_val = builder.call(self.string_hash, [key])
 
-        # All operations below work on new_set, leaving old_set unchanged
-        builder.position_at_end(check_grow)
-        len_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        length = builder.load(len_field)
-        cap_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        cap = builder.load(cap_field)
+        # Insert using hamt_insert_string (value = 1 for sets)
+        # Note: hamt_insert_string expects String* as key
+        added_ptr = builder.alloca(i32, name="added")
+        new_root = builder.call(self.hamt_insert_string, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
+        added = builder.load(added_ptr)
 
-        len_times_4 = builder.mul(length, ir.Constant(i64, 4))
-        cap_times_3 = builder.mul(cap, ir.Constant(i64, 3))
-        need_grow = builder.icmp_signed(">=", len_times_4, cap_times_3)
-        builder.cbranch(need_grow, do_grow, do_insert)
+        # Compute new_len = old_len + added
+        added_i64 = builder.zext(added, i64)
+        new_len = builder.add(old_len, added_i64)
 
-        builder.position_at_end(do_grow)
-        builder.call(self.set_grow, [new_set])
-        builder.branch(do_insert)
+        # Allocate new Set struct (24 bytes)
+        set_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_SET)
+        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        builder.position_at_end(do_insert)
-        slot = builder.call(self.set_find_slot_string, [new_set, key])
+        # Store new root, len, and flags
+        new_root_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_root, new_root_ptr)
+        new_len_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_ptr)
+        new_flags_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_ptr)
 
-        entries_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        entries = builder.load(entries_field)
-
-        e_ptr = builder.gep(entries, [slot])
-        # SetEntry: { i64 key, i8 state } - state at offset 1
-        state_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        state = builder.load(state_ptr)
-
-        is_new = builder.icmp_unsigned("!=", state, ir.Constant(ir.IntType(8), 1))
-        builder.cbranch(is_new, new_entry_block, store_entry)
-
-        builder.position_at_end(new_entry_block)
-        len_field2 = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        current_len = builder.load(len_field2)
-        new_len = builder.add(current_len, ir.Constant(i64, 1))
-        builder.store(new_len, len_field2)
-        builder.branch(store_entry)
-
-        builder.position_at_end(store_entry)
-        # SetEntry: key at offset 0
-        key_ptr = builder.gep(e_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        key_i64 = builder.ptrtoint(key, i64)
-        builder.store(key_i64, key_ptr)
-        builder.store(ir.Constant(ir.IntType(8), 1), state_ptr)
-
-        # Return the new set (old_set is unchanged)
         builder.ret(new_set)
 
     def _register_set_methods(self):
@@ -7534,7 +8328,9 @@ class CodeGenerator:
         if isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
             if isinstance(stmt.type_annotation, SetType):
                 # Empty {} with Set type annotation -> generate empty set
-                init_value = self.builder.call(self.set_new, [])
+                i32 = ir.IntType(32)
+                flags = self._compute_set_flags(stmt.type_annotation.element_type)
+                init_value = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
             else:
                 init_value = self._generate_expression(stmt.initializer)
         else:
@@ -7979,7 +8775,11 @@ class CodeGenerator:
                 # Raw string pointer
                 fmt_ptr = self.builder.bitcast(self._str_fmt, ir.IntType(8).as_pointer())
                 self.builder.call(self.printf, [fmt_ptr, value])
-    
+
+        # Flush stdout to ensure output appears in correct order
+        null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
+        self.builder.call(self.fflush, [null_ptr])
+
     def _generate_if(self, stmt: IfStmt):
         """Generate an if statement"""
         func = self.builder.function
@@ -9765,8 +10565,6 @@ class CodeGenerator:
                 # range() returns iterator - handle in for loop
                 return ir.Constant(ir.IntType(64), 0)
 
-            # Note: len() removed as builtin - use .len() method instead
-
             if name == "str":
                 # str(x) - for now just return the value
                 if expr.args:
@@ -9845,7 +10643,11 @@ class CodeGenerator:
                         else:
                             fmt_ptr = self.builder.bitcast(self._str_fmt, ir.IntType(8).as_pointer())
                             self.builder.call(self.printf, [fmt_ptr, value])
-                
+
+                    # Flush stdout to ensure output appears in correct order
+                    null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
+                    self.builder.call(self.fflush, [null_ptr])
+
                 return ir.Constant(ir.IntType(64), 0)
 
             # Check for replace alias: abs -> math.abs
@@ -10110,12 +10912,15 @@ class CodeGenerator:
     
     def _generate_type_new(self, type_name: str, args: PyList[Expr]) -> ir.Value:
         """Generate code for Type.new() - allocate and zero-initialize"""
+        i32 = ir.IntType(32)
         # Special handling for built-in types
         if type_name == "Map":
-            return self.builder.call(self.map_new, [])
-        
+            # Default flags=0 (no heap pointers) - caller should use typed Map literal if needed
+            return self.builder.call(self.map_new, [ir.Constant(i32, 0)])
+
         if type_name == "Set":
-            return self.builder.call(self.set_new, [])
+            # Default flags=0 (no heap pointers)
+            return self.builder.call(self.set_new, [ir.Constant(i32, 0)])
         
         if type_name == "atomic_ref":
             # atomic_ref.new(value) or atomic_ref.new() for nil
@@ -10873,8 +11678,18 @@ class CodeGenerator:
     
     def _generate_map(self, expr: MapExpr) -> ir.Value:
         """Generate code for map literal: {key: value, ...}"""
-        # Create empty map
-        map_ptr = self.builder.call(self.map_new, [])
+        i32 = ir.IntType(32)
+
+        # Compute flags based on entry types
+        flags = 0
+        if expr.entries:
+            key_expr, value_expr = expr.entries[0]
+            key_type = self._infer_type_from_expr(key_expr)
+            value_type = self._infer_type_from_expr(value_expr)
+            flags = self._compute_map_flags(key_type, value_type)
+
+        # Create empty map with flags
+        map_ptr = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
 
         # Add each entry (map_set returns a new map with value semantics)
         for key_expr, value_expr in expr.entries:
@@ -10901,8 +11716,16 @@ class CodeGenerator:
 
     def _generate_set(self, expr: SetExpr) -> ir.Value:
         """Generate code for set literal: {a, b, c}"""
-        # Create empty set
-        set_ptr = self.builder.call(self.set_new, [])
+        i32 = ir.IntType(32)
+
+        # Compute flags based on element type
+        flags = 0
+        if expr.elements:
+            elem_type = self._infer_type_from_expr(expr.elements[0])
+            flags = self._compute_set_flags(elem_type)
+
+        # Create empty set with flags
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
 
         # Add each element (set_add returns a new set with value semantics)
         for elem_expr in expr.elements:
@@ -10956,24 +11779,37 @@ class CodeGenerator:
     
     def _generate_set_comprehension(self, expr: SetComprehension) -> ir.Value:
         """Generate code for set comprehension using proper Set type."""
-        # Create result set
-        set_ptr = self.builder.call(self.set_new, [])
-        
+        i32 = ir.IntType(32)
+
+        # Infer element type from the body expression and compute flags
+        elem_type = self._infer_type_from_expr(expr.body)
+        flags = self._compute_set_flags(elem_type)
+
+        # Create result set with appropriate flags
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+
         result_var = f"__comp_result_{self.lambda_counter}"
         self.lambda_counter += 1
         result_alloca = self.builder.alloca(self.set_struct.as_pointer(), name=result_var)
         self.builder.store(set_ptr, result_alloca)
-        
+
         # Generate the nested loop structure
         self._generate_comprehension_loop(expr.clauses, 0, expr.body, result_alloca, "set")
-        
+
         return self.builder.load(result_alloca)
     
     def _generate_map_comprehension(self, expr: MapComprehension) -> ir.Value:
         """Generate code for map comprehension."""
-        # Create result map
-        map_ptr = self.builder.call(self.map_new, [])
-        
+        i32 = ir.IntType(32)
+
+        # Compute flags based on key/value types
+        key_type = self._infer_type_from_expr(expr.key)
+        value_type = self._infer_type_from_expr(expr.value)
+        flags = self._compute_map_flags(key_type, value_type)
+
+        # Create result map with flags
+        map_ptr = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
+
         result_var = f"__comp_result_{self.lambda_counter}"
         self.lambda_counter += 1
         result_alloca = self.builder.alloca(self.map_struct.as_pointer(), name=result_var)
