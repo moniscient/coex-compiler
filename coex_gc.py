@@ -1,8 +1,16 @@
 """
-Coex Garbage Collector
+Coex Garbage Collector - Shadow Stack Implementation
 
-Mark-and-sweep GC implemented in pure LLVM IR.
-Designed for future extension with concurrency support.
+This GC uses a manual shadow stack for cross-platform root tracking,
+avoiding platform-specific stack scanning that caused issues on Linux.
+
+Design:
+- Each function that contains heap pointers pushes a GCFrame onto a linked list
+- The frame contains pointers to root slots (allocas) in that function
+- During GC, we traverse the frame chain to find all roots
+- Mark-and-sweep collection: mark live objects, sweep unmarked
+
+This approach is portable because it doesn't depend on machine stack layout.
 """
 
 from llvmlite import ir
@@ -13,13 +21,13 @@ if TYPE_CHECKING:
 
 
 class GarbageCollector:
-    """Generates LLVM IR for garbage collection runtime"""
+    """Generates LLVM IR for garbage collection runtime with shadow stack"""
 
     # Constants
-    HEAP_SIZE = 256 * 1024 * 1024  # 256MB initial heap (easily modifiable)
     HEADER_SIZE = 16         # 8-byte size + 4-byte type_id + 4-byte flags
     MIN_BLOCK_SIZE = 24      # Minimum block: header(16) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
+    GC_THRESHOLD = 1000      # Trigger GC after this many allocations
 
     # Flag bits in header
     FLAG_MARK_BIT = 0x01     # Bit 0: mark bit for GC
@@ -57,114 +65,95 @@ class GarbageCollector:
         self.i32 = ir.IntType(32)
         self.i64 = ir.IntType(64)
         self.i8_ptr = self.i8.as_pointer()
+        self.i8_ptr_ptr = self.i8_ptr.as_pointer()
         self.void = ir.VoidType()
         self.i1 = ir.IntType(1)
 
-        # GC-specific LLVM types (set in _create_types)
+        # GC-specific LLVM types
         self.header_type = None
-        self.free_node_type = None
-        self.type_desc_type = None
+        self.gc_frame_type = None
 
-        # GC global variables (set in _create_globals)
-        self.heap_start = None
-        self.heap_end = None
-        self.heap_size_global = None
-        self.free_list_head = None
-        self.stack_bottom = None
-        self.type_table = None
-
-        # LLVM intrinsics
-        self.frameaddress = None
-        self.stacksave = None
+        # GC global variables
+        self.gc_frame_top = None      # Top of shadow stack frame chain
+        self.gc_alloc_list = None     # Linked list of all allocations
+        self.gc_alloc_count = None    # Count allocations to trigger GC
+        self.gc_enabled = None        # Whether GC is enabled
 
         # GC functions
         self.gc_init = None
         self.gc_alloc = None
         self.gc_collect = None
+        self.gc_push_frame = None
+        self.gc_pop_frame = None
+        self.gc_set_root = None
         self.gc_mark_object = None
+        self.gc_scan_roots = None
         self.gc_sweep = None
-        self.gc_scan_stack = None
-        self.gc_find_free_block = None
-        self.gc_add_to_free_list = None
 
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
         self._create_types()
         self._create_globals()
-        self._declare_intrinsics()
         self._declare_functions()
         self._register_builtin_types()
         self._implement_gc_init()
-        self._implement_gc_find_free_block()
-        self._implement_gc_add_to_free_list()
+        self._implement_gc_push_frame()
+        self._implement_gc_pop_frame()
+        self._implement_gc_set_root()
         self._implement_gc_alloc()
         self._implement_gc_mark_object()
-        self._implement_gc_scan_stack()
+        self._implement_gc_scan_roots()
         self._implement_gc_sweep()
         self._implement_gc_collect()
+        self._add_nursery_stubs()  # Disabled nursery context stubs for compatibility
 
     def _create_types(self):
         """Create GC-related LLVM types"""
         # Object header: { i64 size, i32 type_id, i32 flags }
-        # Size is preserved from allocation so sweep can traverse the heap.
-        # Placed immediately before the user data (at negative offset)
+        # Placed immediately before user data
         self.header_type = ir.LiteralStructType([
-            self.i64,  # block size (including header) - preserved for sweep
-            self.i32,  # type_id (index into type table)
-            self.i32,  # flags (bit 0 = mark, bits 1-31 reserved)
+            self.i64,  # block size (including header)
+            self.i32,  # type_id
+            self.i32,  # flags (bit 0 = mark)
         ])
 
-        # Free list node: { i64 size, i8* next }
-        # Stored in the free block itself (overlaps with user data area)
-        self.free_node_type = ir.LiteralStructType([
-            self.i64,      # block size (including header)
-            self.i8_ptr,   # next free block pointer
+        # Allocation node: { i8* next, i8* data, i64 size }
+        # Linked list of all allocations for sweep
+        self.alloc_node_type = ir.LiteralStructType([
+            self.i8_ptr,  # next allocation node
+            self.i8_ptr,  # pointer to user data
+            self.i64,     # size of allocation
         ])
 
-        # Type descriptor: { i64 size, i32 num_refs, i32* ref_offsets }
-        self.type_desc_type = ir.LiteralStructType([
-            self.i64,                 # object size (including header)
-            self.i32,                 # number of reference fields
-            self.i32.as_pointer(),    # array of offsets to reference fields
+        # GC Frame: { i8* parent, i64 num_roots, i8** roots }
+        # Shadow stack frame for root tracking
+        self.gc_frame_type = ir.LiteralStructType([
+            self.i8_ptr,      # parent frame pointer
+            self.i64,         # number of roots
+            self.i8_ptr_ptr,  # pointer to roots array
         ])
 
     def _create_globals(self):
         """Create GC global variables"""
-        # Heap region bounds
-        self.heap_start = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_heap_start")
-        self.heap_start.initializer = ir.Constant(self.i8_ptr, None)
-        self.heap_start.linkage = 'internal'
+        # Top of shadow stack frame chain
+        self.gc_frame_top = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_frame_top")
+        self.gc_frame_top.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_frame_top.linkage = 'internal'
 
-        self.heap_end = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_heap_end")
-        self.heap_end.initializer = ir.Constant(self.i8_ptr, None)
-        self.heap_end.linkage = 'internal'
+        # Head of allocation list (for sweep)
+        self.gc_alloc_list = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_alloc_list")
+        self.gc_alloc_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_alloc_list.linkage = 'internal'
 
-        # Current heap size (for tracking growth)
-        self.heap_size_global = ir.GlobalVariable(self.module, self.i64, name="gc_heap_size")
-        self.heap_size_global.initializer = ir.Constant(self.i64, 0)
-        self.heap_size_global.linkage = 'internal'
+        # Allocation counter
+        self.gc_alloc_count = ir.GlobalVariable(self.module, self.i64, name="gc_alloc_count")
+        self.gc_alloc_count.initializer = ir.Constant(self.i64, 0)
+        self.gc_alloc_count.linkage = 'internal'
 
-        # Free list head pointer
-        self.free_list_head = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_free_list")
-        self.free_list_head.initializer = ir.Constant(self.i8_ptr, None)
-        self.free_list_head.linkage = 'internal'
-
-        # Stack bottom (captured at main() entry for conservative scanning)
-        self.stack_bottom = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_stack_bottom")
-        self.stack_bottom.initializer = ir.Constant(self.i8_ptr, None)
-        self.stack_bottom.linkage = 'internal'
-
-        # Allocation counter (for triggering GC based on allocation pressure)
-        self.alloc_count = ir.GlobalVariable(self.module, self.i64, name="gc_alloc_count")
-        self.alloc_count.initializer = ir.Constant(self.i64, 0)
-        self.alloc_count.linkage = 'internal'
-
-    def _declare_intrinsics(self):
-        """Declare LLVM intrinsics for stack access"""
-        # For stack scanning, we use a local variable to get current stack position
-        # The frameaddress intrinsic returns frame pointer
-        # Note: These intrinsics are automatically available in LLVM
-        pass  # Intrinsics are declared inline when used
+        # GC enabled flag (disabled during collection)
+        self.gc_enabled = ir.GlobalVariable(self.module, self.i1, name="gc_enabled")
+        self.gc_enabled.initializer = ir.Constant(self.i1, 1)
+        self.gc_enabled.linkage = 'internal'
 
     def _declare_functions(self):
         """Declare GC runtime functions"""
@@ -180,69 +169,49 @@ class GarbageCollector:
         gc_collect_ty = ir.FunctionType(self.void, [])
         self.gc_collect = ir.Function(self.module, gc_collect_ty, name="coex_gc_collect")
 
+        # gc_push_frame(num_roots: i64, roots: i8**) -> i8*
+        # Returns pointer to frame (for passing to pop_frame)
+        gc_push_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i8_ptr_ptr])
+        self.gc_push_frame = ir.Function(self.module, gc_push_ty, name="coex_gc_push_frame")
+
+        # gc_pop_frame(frame: i8*) -> void
+        gc_pop_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_pop_frame = ir.Function(self.module, gc_pop_ty, name="coex_gc_pop_frame")
+
+        # gc_set_root(roots: i8**, index: i64, value: i8*) -> void
+        # Update a root slot
+        gc_set_root_ty = ir.FunctionType(self.void, [self.i8_ptr_ptr, self.i64, self.i8_ptr])
+        self.gc_set_root = ir.Function(self.module, gc_set_root_ty, name="coex_gc_set_root")
+
         # gc_mark_object(ptr: i8*) -> void
         gc_mark_ty = ir.FunctionType(self.void, [self.i8_ptr])
         self.gc_mark_object = ir.Function(self.module, gc_mark_ty, name="coex_gc_mark_object")
+
+        # gc_scan_roots() -> void
+        gc_scan_roots_ty = ir.FunctionType(self.void, [])
+        self.gc_scan_roots = ir.Function(self.module, gc_scan_roots_ty, name="coex_gc_scan_roots")
 
         # gc_sweep() -> void
         gc_sweep_ty = ir.FunctionType(self.void, [])
         self.gc_sweep = ir.Function(self.module, gc_sweep_ty, name="coex_gc_sweep")
 
-        # gc_scan_stack() -> void
-        gc_scan_stack_ty = ir.FunctionType(self.void, [])
-        self.gc_scan_stack = ir.Function(self.module, gc_scan_stack_ty, name="coex_gc_scan_stack")
-
-        # gc_find_free_block(size: i64) -> i8* (returns null if not found)
-        gc_find_ty = ir.FunctionType(self.i8_ptr, [self.i64])
-        self.gc_find_free_block = ir.Function(self.module, gc_find_ty, name="coex_gc_find_free_block")
-
-        # gc_add_to_free_list(block: i8*, size: i64) -> void
-        gc_add_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i64])
-        self.gc_add_to_free_list = ir.Function(self.module, gc_add_ty, name="coex_gc_add_to_free_list")
-
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
-        # Type 0: Reserved/Unknown - no references
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
-
-        # Type 1: List - { i64 len, i64 cap, i64 elem_size, i8* data }
-        # data field at offset 24 (after 3 i64s) is a reference
         self.type_info[self.TYPE_LIST] = {'size': 32, 'ref_offsets': [24]}
         self.type_descriptors['List'] = self.TYPE_LIST
-
-        # Type 2: String - { i64 length } + inline data
-        # No reference fields (data is inline)
         self.type_info[self.TYPE_STRING] = {'size': 8, 'ref_offsets': []}
         self.type_descriptors['String'] = self.TYPE_STRING
-
-        # Type 3: Map - { MapEntry* entries, i64 len, i64 cap }
-        # entries field at offset 0 is a reference
         self.type_info[self.TYPE_MAP] = {'size': 24, 'ref_offsets': [0]}
         self.type_descriptors['Map'] = self.TYPE_MAP
-
-        # Type 4: MapEntry - { i64 key, i64 value, i8 state }
-        # key and value could be references if storing objects
-        # For now, treat as non-reference (raw i64 storage)
         self.type_info[self.TYPE_MAP_ENTRY] = {'size': 17, 'ref_offsets': []}
         self.type_descriptors['MapEntry'] = self.TYPE_MAP_ENTRY
-
-        # Type 5: Set - { SetEntry* entries, i64 len, i64 cap }
-        # entries field at offset 0 is a reference
         self.type_info[self.TYPE_SET] = {'size': 24, 'ref_offsets': [0]}
         self.type_descriptors['Set'] = self.TYPE_SET
-
-        # Type 6: SetEntry - { i64 key, i8 state }
-        # key could be reference if storing objects
         self.type_info[self.TYPE_SET_ENTRY] = {'size': 9, 'ref_offsets': []}
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
-
-        # Type 7: Channel - { i64 len, i64 cap, i64 head, i64 tail, i8* data, i1 closed }
-        # data field at offset 32 is a reference
         self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': [32]}
         self.type_descriptors['Channel'] = self.TYPE_CHANNEL
-
-        # Type 8: Array - { i64 len, i64 cap, i64 elem_size, i8* data }
-        # data field at offset 24 is a reference (same layout as List)
         self.type_info[self.TYPE_ARRAY] = {'size': 32, 'ref_offsets': [24]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
 
@@ -259,7 +228,6 @@ class GarbageCollector:
 
         self.type_descriptors[type_name] = type_id
         self.type_info[type_id] = {'size': size, 'ref_offsets': ref_offsets}
-
         return type_id
 
     def get_type_id(self, type_name: str) -> int:
@@ -267,383 +235,532 @@ class GarbageCollector:
         return self.type_descriptors.get(type_name, self.TYPE_UNKNOWN)
 
     def _implement_gc_init(self):
-        """Initialize GC - simplified to no-op.
-
-        Since gc_alloc now uses malloc directly, there's no need to
-        set up a custom heap or free list.
-        """
+        """Initialize GC state"""
         func = self.gc_init
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # No initialization needed - we use malloc directly
+        # Reset state
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_frame_top)
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_alloc_list)
+        builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
+        builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+
         builder.ret_void()
 
-    def _implement_gc_find_free_block(self):
-        """Find a free block using first-fit algorithm"""
-        func = self.gc_find_free_block
-        func.args[0].name = "needed_size"
-
-        entry = func.append_basic_block("entry")
-        loop_start = func.append_basic_block("loop_start")
-        check_size = func.append_basic_block("check_size")
-        found_block = func.append_basic_block("found_block")
-        split_check = func.append_basic_block("split_check")
-        do_split = func.append_basic_block("do_split")
-        no_split = func.append_basic_block("no_split")
-        next_block = func.append_basic_block("next_block")
-        not_found = func.append_basic_block("not_found")
-
-        builder = ir.IRBuilder(entry)
-        needed_size = func.args[0]
-
-        # prev_ptr points to the location containing the current block pointer
-        # (either &free_list_head or &prev_block->next)
-        prev_ptr = builder.alloca(self.i8_ptr.as_pointer(), name="prev_ptr")
-        builder.store(self.free_list_head, prev_ptr)
-
-        # curr points to current block being examined
-        curr = builder.alloca(self.i8_ptr, name="curr")
-        head = builder.load(self.free_list_head)
-        builder.store(head, curr)
-
-        builder.branch(loop_start)
-
-        # Loop: while curr != null
-        builder.position_at_end(loop_start)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, not_found, check_size)
-
-        # Check if current block is big enough
-        builder.position_at_end(check_size)
-        curr_node = builder.bitcast(curr_val, self.free_node_type.as_pointer())
-        size_ptr = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        block_size = builder.load(size_ptr)
-
-        big_enough = builder.icmp_unsigned(">=", block_size, needed_size)
-        builder.cbranch(big_enough, found_block, next_block)
-
-        # Found a suitable block
-        builder.position_at_end(found_block)
-        # Get next pointer from current block
-        next_field = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        next_block_ptr = builder.load(next_field)
-
-        # Check if we should split the block
-        builder.branch(split_check)
-
-        builder.position_at_end(split_check)
-        remaining = builder.sub(block_size, needed_size)
-        min_block = ir.Constant(self.i64, self.MIN_BLOCK_SIZE)
-        should_split = builder.icmp_unsigned(">=", remaining, min_block)
-        builder.cbranch(should_split, do_split, no_split)
-
-        # Split the block: create new free block after allocated portion
-        builder.position_at_end(do_split)
-        # New block starts at curr + needed_size
-        curr_int = builder.ptrtoint(curr_val, self.i64)
-        new_block_int = builder.add(curr_int, needed_size)
-        new_block_ptr = builder.inttoptr(new_block_int, self.i8_ptr)
-        new_block_node = builder.bitcast(new_block_ptr, self.free_node_type.as_pointer())
-
-        # Set new block's size
-        new_size_ptr = builder.gep(new_block_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(remaining, new_size_ptr)
-
-        # Set new block's next to current block's next
-        new_next_ptr = builder.gep(new_block_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(next_block_ptr, new_next_ptr)
-
-        # Update prev to point to new block
-        prev_loc = builder.load(prev_ptr)
-        builder.store(new_block_ptr, prev_loc)
-
-        # Update size of allocated block to actual allocated size
-        builder.store(needed_size, size_ptr)
-
-        builder.ret(curr_val)
-
-        # Use entire block (no split)
-        builder.position_at_end(no_split)
-        # Update prev to point to curr's next
-        prev_loc2 = builder.load(prev_ptr)
-        builder.store(next_block_ptr, prev_loc2)
-
-        builder.ret(curr_val)
-
-        # Move to next block in free list
-        builder.position_at_end(next_block)
-        # prev_ptr = &curr->next
-        next_field2 = builder.gep(curr_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        next_field2_cast = builder.bitcast(next_field2, self.i8_ptr.as_pointer())
-        builder.store(next_field2_cast, prev_ptr)
-
-        # curr = curr->next
-        next_val = builder.load(next_field2)
-        builder.store(next_val, curr)
-
-        builder.branch(loop_start)
-
-        # No suitable block found
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(self.i8_ptr, None))
-
-    def _implement_gc_add_to_free_list(self):
-        """Add a block to the front of the free list"""
-        func = self.gc_add_to_free_list
-        func.args[0].name = "block"
-        func.args[1].name = "size"
+    def _implement_gc_push_frame(self):
+        """Push a new frame onto the shadow stack"""
+        func = self.gc_push_frame
+        func.args[0].name = "num_roots"
+        func.args[1].name = "roots"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        block = func.args[0]
-        size = func.args[1]
+        num_roots = func.args[0]
+        roots = func.args[1]
 
-        # Cast block to free node
-        free_node = builder.bitcast(block, self.free_node_type.as_pointer())
+        # Allocate frame struct (24 bytes: parent + num_roots + roots_ptr)
+        frame_size = ir.Constant(self.i64, 24)
+        raw_frame = builder.call(self.codegen.malloc, [frame_size])
+        frame = builder.bitcast(raw_frame, self.gc_frame_type.as_pointer())
 
-        # Set size
-        size_ptr = builder.gep(free_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(size, size_ptr)
+        # Set parent to current top
+        old_top = builder.load(self.gc_frame_top)
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(old_top, parent_ptr)
 
-        # Set next to current free list head
-        old_head = builder.load(self.free_list_head)
-        next_ptr = builder.gep(free_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(old_head, next_ptr)
+        # Set num_roots
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(num_roots, num_roots_ptr)
 
-        # Update free list head
-        builder.store(block, self.free_list_head)
+        # Set roots pointer
+        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(roots, roots_ptr_ptr)
+
+        # Update frame top
+        builder.store(raw_frame, self.gc_frame_top)
+
+        builder.ret(raw_frame)
+
+    def _implement_gc_pop_frame(self):
+        """Pop a frame from the shadow stack"""
+        func = self.gc_pop_frame
+        func.args[0].name = "frame_ptr"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        frame_ptr = func.args[0]
+        frame = builder.bitcast(frame_ptr, self.gc_frame_type.as_pointer())
+
+        # Get parent and set as new top
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, self.gc_frame_top)
+
+        # Free the frame
+        builder.call(self.codegen.free, [frame_ptr])
+
+        builder.ret_void()
+
+    def _implement_gc_set_root(self):
+        """Set a root slot value"""
+        func = self.gc_set_root
+        func.args[0].name = "roots"
+        func.args[1].name = "index"
+        func.args[2].name = "value"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        roots = func.args[0]
+        index = func.args[1]
+        value = func.args[2]
+
+        # roots[index] = value
+        slot_ptr = builder.gep(roots, [index], inbounds=True)
+        builder.store(value, slot_ptr)
 
         builder.ret_void()
 
     def _implement_gc_alloc(self):
-        """Allocate memory - simplified to use malloc directly.
-
-        The custom free-list allocator caused segfaults on Linux.
-        This simplified version just uses malloc, which is reliable
-        but means memory is never freed (until process exit).
-        """
+        """Allocate memory with GC tracking"""
         func = self.gc_alloc
         func.args[0].name = "user_size"
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
+        check_gc = func.append_basic_block("check_gc")
+        do_alloc = func.append_basic_block("do_alloc")
+
         builder = ir.IRBuilder(entry)
 
         user_size = func.args[0]
-        # type_id is ignored since we're not tracking types
+        type_id = func.args[1]
 
-        # Just call malloc with the requested size
-        # No header needed since we're not doing GC
-        result = builder.call(self.codegen.malloc, [user_size])
-        builder.ret(result)
+        # Increment allocation counter
+        count = builder.load(self.gc_alloc_count)
+        new_count = builder.add(count, ir.Constant(self.i64, 1))
+        builder.store(new_count, self.gc_alloc_count)
+
+        builder.branch(check_gc)
+
+        # Check if we should trigger GC
+        builder.position_at_end(check_gc)
+        threshold = ir.Constant(self.i64, self.GC_THRESHOLD)
+        should_gc = builder.icmp_unsigned(">=", new_count, threshold)
+        gc_enabled = builder.load(self.gc_enabled)
+        trigger_gc = builder.and_(should_gc, gc_enabled)
+        builder.cbranch(trigger_gc, do_alloc, do_alloc)  # For now, skip GC trigger
+
+        # Allocate memory
+        builder.position_at_end(do_alloc)
+
+        # Total size = header + user_size, aligned to 8 bytes
+        header_size = ir.Constant(self.i64, self.HEADER_SIZE)
+        total_size = builder.add(user_size, header_size)
+
+        # Align to 8 bytes
+        seven = ir.Constant(self.i64, 7)
+        aligned_size = builder.and_(
+            builder.add(total_size, seven),
+            ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
+        )
+
+        # Allocate block (header + data)
+        block = builder.call(self.codegen.malloc, [aligned_size])
+
+        # Initialize header
+        header = builder.bitcast(block, self.header_type.as_pointer())
+
+        # Size field
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(aligned_size, size_ptr)
+
+        # Type ID field
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(type_id, type_id_ptr)
+
+        # Flags field (0 = not marked)
+        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(ir.Constant(self.i32, 0), flags_ptr)
+
+        # Add to allocation list
+        node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
+        raw_node = builder.call(self.codegen.malloc, [node_size])
+        node = builder.bitcast(raw_node, self.alloc_node_type.as_pointer())
+
+        # node->next = gc_alloc_list
+        old_head = builder.load(self.gc_alloc_list)
+        next_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(old_head, next_ptr)
+
+        # node->data = user_ptr (after header)
+        block_int = builder.ptrtoint(block, self.i64)
+        user_ptr_int = builder.add(block_int, header_size)
+        user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
+        data_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(user_ptr, data_ptr)
+
+        # node->size = aligned_size
+        node_size_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(aligned_size, node_size_ptr)
+
+        # gc_alloc_list = node
+        builder.store(raw_node, self.gc_alloc_list)
+
+        builder.ret(user_ptr)
 
     def _implement_gc_mark_object(self):
-        """Mark an object and recursively mark its references"""
+        """Mark an object as live"""
         func = self.gc_mark_object
-        func.args[0].name = "obj_ptr"
+        func.args[0].name = "ptr"
 
         entry = func.append_basic_block("entry")
-        null_check = func.append_basic_block("null_check")
-        bounds_check = func.append_basic_block("bounds_check")
-        already_marked = func.append_basic_block("already_marked")
+        get_header = func.append_basic_block("get_header")
         do_mark = func.append_basic_block("do_mark")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
-        obj_ptr = func.args[0]
+        ptr = func.args[0]
 
         # Null check
-        is_null = builder.icmp_unsigned("==", obj_ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, null_check)
+        is_null = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, get_header)
 
-        builder.position_at_end(null_check)
-        # Check if pointer is within heap bounds
-        heap_start = builder.load(self.heap_start)
-        heap_end = builder.load(self.heap_end)
-
-        ge_start = builder.icmp_unsigned(">=", obj_ptr, heap_start)
-        lt_end = builder.icmp_unsigned("<", obj_ptr, heap_end)
-        in_heap = builder.and_(ge_start, lt_end)
-
-        builder.cbranch(in_heap, bounds_check, done)
-
-        builder.position_at_end(bounds_check)
-        # Get header (HEADER_SIZE bytes before user pointer)
-        obj_int = builder.ptrtoint(obj_ptr, self.i64)
-        header_int = builder.sub(obj_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        builder.position_at_end(get_header)
+        # Get header (before user pointer)
+        ptr_int = builder.ptrtoint(ptr, self.i64)
+        header_int = builder.sub(ptr_int, ir.Constant(self.i64, self.HEADER_SIZE))
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
 
-        # Check mark bit (flags is at offset 2 in new header layout)
+        # Check if already marked
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         flags = builder.load(flags_ptr)
-        mark_bit = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
-        is_marked = builder.icmp_unsigned("!=", mark_bit, ir.Constant(self.i32, 0))
-        builder.cbranch(is_marked, already_marked, do_mark)
-
-        builder.position_at_end(already_marked)
-        builder.branch(done)
+        is_marked = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
+        already_marked = builder.icmp_unsigned("!=", is_marked, ir.Constant(self.i32, 0))
+        builder.cbranch(already_marked, done, do_mark)
 
         builder.position_at_end(do_mark)
-        # Set mark bit
-        new_flags = builder.or_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
+        # Set mark bit - need to reload flags since we're in a new block
+        flags_val = builder.load(flags_ptr)
+        new_flags = builder.or_(flags_val, ir.Constant(self.i32, self.FLAG_MARK_BIT))
         builder.store(new_flags, flags_ptr)
 
-        # For now, we don't trace references (conservative scanning handles roots)
-        # TODO: In future, look up type descriptor and trace reference fields
-        # This is safe because conservative scanning will find all live pointers
+        # TODO: Recursively mark referenced objects based on type_id
+        # For now, we rely on the shadow stack having all roots
 
         builder.branch(done)
 
         builder.position_at_end(done)
         builder.ret_void()
 
-    def _implement_gc_scan_stack(self):
-        """Conservative stack scanning DISABLED.
-
-        Stack scanning has been disabled because it causes segfaults on Linux
-        due to platform differences in stack layout. Without proper root
-        tracking (like LLVM's shadow stack GC), conservative scanning is
-        unreliable across platforms.
-
-        For now, this is a no-op. The GC will only free memory when triggered
-        by allocation pressure, and won't mark any roots. This means some
-        garbage may not be collected, but the program will be stable.
-
-        TODO: Implement LLVM shadow stack GC for reliable cross-platform
-        garbage collection.
-        """
-        func = self.gc_scan_stack
+    def _implement_gc_scan_roots(self):
+        """Scan shadow stack and mark all roots"""
+        func = self.gc_scan_roots
 
         entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        # Stack scanning disabled - just return immediately
-        builder.ret_void()
-
-    def _implement_gc_sweep(self):
-        """Sweep heap, reclaiming unmarked objects"""
-        func = self.gc_sweep
-
-        entry = func.append_basic_block("entry")
-        loop_start = func.append_basic_block("loop_start")
-        check_block = func.append_basic_block("check_block")
-        block_marked = func.append_basic_block("block_marked")
-        block_unmarked = func.append_basic_block("block_unmarked")
-        next_block = func.append_basic_block("next_block")
+        frame_loop = func.append_basic_block("frame_loop")
+        process_frame = func.append_basic_block("process_frame")
+        root_loop = func.append_basic_block("root_loop")
+        mark_root = func.append_basic_block("mark_root")
+        next_root = func.append_basic_block("next_root")
+        next_frame = func.append_basic_block("next_frame")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
 
-        heap_start = builder.load(self.heap_start)
-        heap_end = builder.load(self.heap_end)
+        # curr_frame = gc_frame_top
+        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
+        top = builder.load(self.gc_frame_top)
+        builder.store(top, curr_frame)
 
-        # Clear free list (we'll rebuild it during sweep)
-        builder.store(ir.Constant(self.i8_ptr, None), self.free_list_head)
+        builder.branch(frame_loop)
 
-        # Scan through heap linearly
-        curr = builder.alloca(self.i8_ptr, name="curr")
-        builder.store(heap_start, curr)
+        # Frame loop: while curr_frame != null
+        builder.position_at_end(frame_loop)
+        frame_val = builder.load(curr_frame)
+        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, process_frame)
 
-        builder.branch(loop_start)
+        # Process frame
+        builder.position_at_end(process_frame)
+        frame = builder.bitcast(frame_val, self.gc_frame_type.as_pointer())
 
-        # Loop: while curr < heap_end
-        builder.position_at_end(loop_start)
-        curr_val = builder.load(curr)
-        at_end = builder.icmp_unsigned(">=", curr_val, heap_end)
-        builder.cbranch(at_end, done, check_block)
+        # Get num_roots
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
 
-        # Read header to get block info
-        builder.position_at_end(check_block)
-        # First check if this looks like a valid block (read size from free node position)
-        free_node = builder.bitcast(curr_val, self.free_node_type.as_pointer())
-        size_ptr = builder.gep(free_node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        block_size = builder.load(size_ptr)
+        # Get roots array
+        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        roots = builder.load(roots_ptr_ptr)
 
-        # Sanity check: size must be reasonable
-        size_ok = builder.icmp_unsigned(">", block_size, ir.Constant(self.i64, 0))
-        size_not_huge = builder.icmp_unsigned("<=", block_size, builder.load(self.heap_size_global))
-        valid_size = builder.and_(size_ok, size_not_huge)
+        # Root index
+        root_idx = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx)
 
-        # If size looks invalid, something is wrong - skip to end
-        builder.cbranch(valid_size, block_marked, done)
+        builder.branch(root_loop)
 
-        # Check mark bit in header (flags is at offset 2 in new header layout)
-        builder.position_at_end(block_marked)
-        header = builder.bitcast(curr_val, self.header_type.as_pointer())
-        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        flags = builder.load(flags_ptr)
+        # Root loop: for i in 0..num_roots
+        builder.position_at_end(root_loop)
+        i = builder.load(root_idx)
+        done_roots = builder.icmp_unsigned(">=", i, num_roots)
+        builder.cbranch(done_roots, next_frame, mark_root)
 
-        mark_bit = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
-        is_marked = builder.icmp_unsigned("!=", mark_bit, ir.Constant(self.i32, 0))
-        builder.cbranch(is_marked, next_block, block_unmarked)
+        # Mark root
+        builder.position_at_end(mark_root)
+        i_val = builder.load(root_idx)
+        root_slot = builder.gep(roots, [i_val], inbounds=True)
+        root_ptr = builder.load(root_slot)
 
-        # Block is marked - clear mark bit for next cycle, then continue
-        # (already in next_block path via cbranch)
+        # Mark if not null
+        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_root_null, next_root, next_root)  # Skip null roots
 
-        # Block is unmarked - add to free list
-        builder.position_at_end(block_unmarked)
-        builder.call(self.gc_add_to_free_list, [curr_val, block_size])
-        builder.branch(next_block)
+        # TODO: Actually call gc_mark_object for non-null roots
+        # For simplicity, we'll just increment and continue
 
-        # Move to next block
-        builder.position_at_end(next_block)
-        # Clear mark bit if it was set
-        cleared_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_MARK_BIT & 0xFFFFFFFF))
-        builder.store(cleared_flags, flags_ptr)
+        builder.position_at_end(next_root)
+        # Actually mark the root
+        builder.call(self.gc_mark_object, [root_ptr])
 
-        # Advance by block size
-        curr_int = builder.ptrtoint(curr_val, self.i64)
-        next_int = builder.add(curr_int, block_size)
-        next_ptr = builder.inttoptr(next_int, self.i8_ptr)
-        builder.store(next_ptr, curr)
-        builder.branch(loop_start)
+        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
+        builder.store(next_i, root_idx)
+        builder.branch(root_loop)
+
+        # Move to next frame
+        builder.position_at_end(next_frame)
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, curr_frame)
+        builder.branch(frame_loop)
 
         builder.position_at_end(done)
         builder.ret_void()
 
+    def _implement_gc_sweep(self):
+        """Sweep allocation list and free unmarked objects"""
+        func = self.gc_sweep
+
+        entry = func.append_basic_block("entry")
+        sweep_loop = func.append_basic_block("sweep_loop")
+        check_marked = func.append_basic_block("check_marked")
+        keep_obj = func.append_basic_block("keep_obj")
+        free_obj = func.append_basic_block("free_obj")
+        next_obj = func.append_basic_block("next_obj")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # prev_ptr = &gc_alloc_list
+        prev_ptr = builder.alloca(self.i8_ptr.as_pointer(), name="prev_ptr")
+        builder.store(self.gc_alloc_list, prev_ptr)
+
+        # curr = gc_alloc_list
+        curr = builder.alloca(self.i8_ptr, name="curr")
+        head = builder.load(self.gc_alloc_list)
+        builder.store(head, curr)
+
+        builder.branch(sweep_loop)
+
+        # Sweep loop
+        builder.position_at_end(sweep_loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, check_marked)
+
+        # Check if object is marked
+        builder.position_at_end(check_marked)
+        node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
+
+        # Get data pointer
+        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        # Get header
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr = builder.inttoptr(header_int, self.i8_ptr)
+        header = builder.bitcast(header_ptr, self.header_type.as_pointer())
+
+        # Check mark bit
+        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        flags = builder.load(flags_ptr)
+        is_marked = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
+        marked = builder.icmp_unsigned("!=", is_marked, ir.Constant(self.i32, 0))
+        builder.cbranch(marked, keep_obj, free_obj)
+
+        # Keep object: clear mark bit and advance
+        builder.position_at_end(keep_obj)
+        cleared_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_MARK_BIT & 0xFFFFFFFF))
+        builder.store(cleared_flags, flags_ptr)
+
+        # prev_ptr = &curr->next
+        next_ptr_field = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_ptr_cast = builder.bitcast(next_ptr_field, self.i8_ptr.as_pointer())
+        builder.store(next_ptr_cast, prev_ptr)
+
+        builder.branch(next_obj)
+
+        # Free object: unlink and free
+        builder.position_at_end(free_obj)
+        # Get next node
+        next_node_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_node = builder.load(next_node_ptr)
+
+        # *prev_ptr = next_node (unlink current)
+        prev_loc = builder.load(prev_ptr)
+        builder.store(next_node, prev_loc)
+
+        # Free the data block (including header)
+        builder.call(self.codegen.free, [header_ptr])
+
+        # Free the node
+        builder.call(self.codegen.free, [curr_val])
+
+        # curr = next_node (don't advance prev_ptr)
+        builder.store(next_node, curr)
+        builder.branch(sweep_loop)
+
+        # Next object
+        builder.position_at_end(next_obj)
+        next_val = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_ptr = builder.load(next_val)
+        builder.store(next_ptr, curr)
+        builder.branch(sweep_loop)
+
+        builder.position_at_end(done)
+        # Reset allocation counter
+        builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
+        builder.ret_void()
+
     def _implement_gc_collect(self):
-        """Run a full garbage collection cycle - DISABLED
+        """Run a full garbage collection cycle
 
-        Garbage collection has been disabled because the conservative stack
-        scanning causes segfaults on Linux. Without proper root tracking,
-        we cannot safely determine which objects are still in use.
-
-        This means memory will never be freed (memory leak), but programs
-        will be stable. For test programs and short-lived executables, this
-        is acceptable. Long-running programs may eventually run out of memory.
-
-        TODO: Implement LLVM shadow stack GC for reliable cross-platform
-        garbage collection with proper root tracking.
+        NOTE: Currently a no-op because shadow stack frames are not yet
+        integrated into codegen. Without root tracking, sweep would free
+        all live objects. Enable this once codegen pushes/pops GC frames
+        and sets roots properly.
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # GC collection disabled - just return immediately
-        # The heap will grow without bound, but at least we won't crash
+        # TODO: Enable once shadow stack is integrated with codegen
+        # For now, just return without collecting to avoid freeing live objects
         builder.ret_void()
 
+        # The full implementation (enable when root tracking is ready):
+        # # Disable GC during collection
+        # builder.store(ir.Constant(self.i1, 0), self.gc_enabled)
+        #
+        # # Mark phase: scan roots
+        # builder.call(self.gc_scan_roots, [])
+        #
+        # # Sweep phase: free unmarked
+        # builder.call(self.gc_sweep, [])
+        #
+        # # Re-enable GC
+        # builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
-        """
-        Replace a malloc call with GC-tracked allocation.
-        Returns pointer to user data (after GC header).
-        """
+        """Replace a malloc call with GC-tracked allocation."""
         type_id = self.get_type_id(type_name)
         type_id_const = ir.Constant(self.i32, type_id)
         return builder.call(self.gc_alloc, [size, type_id_const])
 
     def inject_gc_init(self, builder: ir.IRBuilder):
         """Inject GC initialization at start of main()"""
-        # Initialize GC heap and free list
         builder.call(self.gc_init, [])
 
-        # Capture stack bottom for conservative scanning
-        # Use an alloca as a marker for the current stack position
-        stack_marker = builder.alloca(self.i64, name="gc_stack_marker")
-        stack_ptr = builder.bitcast(stack_marker, self.i8_ptr)
-        builder.store(stack_ptr, self.stack_bottom)
+    # Helper methods for codegen to manage shadow stack frames
+
+    def create_frame_roots(self, builder: ir.IRBuilder, num_roots: int) -> ir.Value:
+        """Create an array of root slots on the stack.
+
+        Returns pointer to the roots array (i8**).
+        """
+        if num_roots == 0:
+            return ir.Constant(self.i8_ptr_ptr, None)
+
+        # Allocate array of i8* on stack
+        roots_type = ir.ArrayType(self.i8_ptr, num_roots)
+        roots_alloca = builder.alloca(roots_type, name="gc_roots")
+
+        # Zero-initialize
+        for i in range(num_roots):
+            slot_ptr = builder.gep(roots_alloca, [
+                ir.Constant(self.i32, 0),
+                ir.Constant(self.i32, i)
+            ], inbounds=True)
+            builder.store(ir.Constant(self.i8_ptr, None), slot_ptr)
+
+        # Cast to i8**
+        return builder.bitcast(roots_alloca, self.i8_ptr_ptr)
+
+    def push_frame(self, builder: ir.IRBuilder, num_roots: int, roots: ir.Value) -> ir.Value:
+        """Push a GC frame. Returns frame pointer for later pop."""
+        num_roots_val = ir.Constant(self.i64, num_roots)
+        return builder.call(self.gc_push_frame, [num_roots_val, roots])
+
+    def pop_frame(self, builder: ir.IRBuilder, frame: ir.Value):
+        """Pop a GC frame."""
+        builder.call(self.gc_pop_frame, [frame])
+
+    def set_root(self, builder: ir.IRBuilder, roots: ir.Value, index: int, value: ir.Value):
+        """Set a root slot to a value."""
+        index_val = ir.Constant(self.i64, index)
+        # Cast value to i8* if needed
+        if value.type != self.i8_ptr:
+            if isinstance(value.type, ir.PointerType):
+                value = builder.bitcast(value, self.i8_ptr)
+            else:
+                value = builder.inttoptr(value, self.i8_ptr)
+        builder.call(self.gc_set_root, [roots, index_val, value])
+
+    # ========================================================================
+    # Nursery Context Stubs (disabled in shadow stack GC)
+    # ========================================================================
+    # The old GC had nursery contexts for loop optimization.
+    # With shadow stack GC, we disable this by returning null from create_context.
+    # The codegen checks for null and skips nursery when creation fails.
+
+    def _add_nursery_stubs(self):
+        """Add stub functions for old nursery context API (disabled)"""
+        # Type for heap context (just i8 for pointer compatibility)
+        self.heap_context_type = self.i8
+
+        # gc_create_context(size: i64, type: i64) -> i8*
+        # Always returns null to disable nursery
+        create_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i64])
+        self.gc_create_context = ir.Function(self.module, create_ty, name="coex_gc_create_context")
+        entry = self.gc_create_context.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        builder.ret(ir.Constant(self.i8_ptr, None))
+
+        # gc_push_context(ctx: i8*) -> void
+        # No-op
+        push_ctx_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_push_context = ir.Function(self.module, push_ctx_ty, name="coex_gc_push_context")
+        entry = self.gc_push_context.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        builder.ret_void()
+
+        # gc_pop_context() -> void
+        # No-op
+        pop_ctx_ty = ir.FunctionType(self.void, [])
+        self.gc_pop_context = ir.Function(self.module, pop_ctx_ty, name="coex_gc_pop_context")
+        entry = self.gc_pop_context.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        builder.ret_void()
+
+        # gc_destroy_context(ctx: i8*) -> void
+        # No-op
+        destroy_ctx_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_destroy_context = ir.Function(self.module, destroy_ctx_ty, name="coex_gc_destroy_context")
+        entry = self.gc_destroy_context.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        builder.ret_void()
