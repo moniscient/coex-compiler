@@ -338,3 +338,103 @@ func main() -> int
     return 0
 ~
 ''', "12\n")
+
+
+class TestGCMapSetStress:
+    """Stress tests for GC with Map and Set allocations.
+
+    These tests verify that memory is properly reclaimed for HAMT-based
+    collections, which use structural sharing and have complex allocation
+    patterns.
+    """
+
+    def test_gc_map_stress_create_and_collect(self, expect_output):
+        """Create many Maps in a loop with gc() calls - verifies HAMT marking works."""
+        expect_output('''
+func main() -> int
+    var live: Map<int, int> = {1: 100}
+
+    for i in 0..50
+        var temp: Map<int, int> = {i: i * 10}
+        gc()
+    ~
+
+    print(live.get(1))
+    return 0
+~
+''', "100\n")
+
+    def test_gc_map_literal_then_gc(self, expect_output):
+        """Test map literal construction followed by gc() - the minimal failing case."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10, 2: 20, 3: 30}
+    gc()
+    print(m.get(1))
+    print(m.get(2))
+    print(m.get(3))
+    return 0
+~
+''', "10\n20\n30\n")
+
+    def test_gc_set_stress_create_and_collect(self, expect_output):
+        """Create many Sets in a loop with gc() calls - verifies HAMT marking works."""
+        expect_output('''
+func main() -> int
+    var live: Set<int> = {100, 200, 300}
+
+    for i in 0..50
+        var temp: Set<int> = {i, i + 1, i + 2}
+        gc()
+    ~
+
+    print(live.len())
+    return 0
+~
+''', "3\n")
+
+    def test_gc_map_mutation_across_gc(self, expect_output):
+        """Test map mutations interleaved with gc() calls."""
+        expect_output('''
+func main() -> int
+    var m: Map<int, int> = {1: 10}
+    gc()
+    m = m.set(2, 20)
+    gc()
+    m = m.set(3, 30)
+    gc()
+    print(m.len())
+    print(m.get(1))
+    print(m.get(2))
+    print(m.get(3))
+    return 0
+~
+''', "3\n10\n20\n30\n")
+
+    def test_gc_reclaims_intermediate_maps(self, expect_output):
+        """Verify that intermediate Map allocations are reclaimed.
+
+        This test creates garbage by building a large map then replacing it.
+        If GC properly reclaims intermediate maps, this should complete
+        without running out of memory even with small allocators.
+        """
+        expect_output('''
+func build_map(n: int) -> Map<int, int>
+    var m: Map<int, int> = {}
+    for i in 0..n
+        m = m.set(i, i * 2)
+    ~
+    return m
+~
+
+func main() -> int
+    for round in 0..10
+        var temp: Map<int, int> = build_map(20)
+        gc()
+    ~
+
+    var final: Map<int, int> = build_map(5)
+    print(final.get(3))
+    return 0
+~
+''', "6\n")

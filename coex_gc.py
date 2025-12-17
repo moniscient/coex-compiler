@@ -101,6 +101,7 @@ class GarbageCollector:
         self._implement_gc_pop_frame()
         self._implement_gc_set_root()
         self._implement_gc_alloc()
+        self._implement_gc_mark_hamt()
         self._implement_gc_mark_object()
         self._implement_gc_scan_roots()
         self._implement_gc_sweep()
@@ -195,6 +196,11 @@ class GarbageCollector:
         gc_sweep_ty = ir.FunctionType(self.void, [])
         self.gc_sweep = ir.Function(self.module, gc_sweep_ty, name="coex_gc_sweep")
 
+        # gc_mark_hamt(root: i8*) -> void
+        # Recursively mark HAMT nodes/leaves (used by Map and Set marking)
+        gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_mark_hamt = ir.Function(self.module, gc_mark_hamt_ty, name="coex_gc_mark_hamt")
+
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
@@ -202,11 +208,13 @@ class GarbageCollector:
         self.type_descriptors['List'] = self.TYPE_LIST
         self.type_info[self.TYPE_STRING] = {'size': 8, 'ref_offsets': []}
         self.type_descriptors['String'] = self.TYPE_STRING
-        self.type_info[self.TYPE_MAP] = {'size': 24, 'ref_offsets': [0]}
+        # Map/Set now use HAMT (16 bytes: root pointer + len)
+        # HAMT nodes are malloc'd not gc_alloc'd, so no ref_offsets
+        self.type_info[self.TYPE_MAP] = {'size': 16, 'ref_offsets': []}
         self.type_descriptors['Map'] = self.TYPE_MAP
         self.type_info[self.TYPE_MAP_ENTRY] = {'size': 17, 'ref_offsets': []}
         self.type_descriptors['MapEntry'] = self.TYPE_MAP_ENTRY
-        self.type_info[self.TYPE_SET] = {'size': 24, 'ref_offsets': [0]}
+        self.type_info[self.TYPE_SET] = {'size': 16, 'ref_offsets': []}
         self.type_descriptors['Set'] = self.TYPE_SET
         self.type_info[self.TYPE_SET_ENTRY] = {'size': 9, 'ref_offsets': []}
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
@@ -412,6 +420,123 @@ class GarbageCollector:
 
         builder.ret(user_ptr)
 
+    def _implement_gc_mark_hamt(self):
+        """Recursively mark HAMT nodes and leaves.
+
+        HAMT uses pointer tagging:
+        - bit 0 = 1: leaf node
+        - bit 0 = 0: internal node (or null)
+
+        HAMT node struct: { i32 bitmap, i8** children }
+        HAMT leaf struct: { i64 hash, i64 key, i64 value }
+
+        Both are allocated via gc_alloc, so we need to mark them.
+        """
+        func = self.gc_mark_hamt
+        func.args[0].name = "root"
+
+        entry = func.append_basic_block("entry")
+        check_tag = func.append_basic_block("check_tag")
+        is_leaf = func.append_basic_block("is_leaf")
+        is_internal = func.append_basic_block("is_internal")
+        child_loop = func.append_basic_block("child_loop")
+        child_body = func.append_basic_block("child_body")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        root = func.args[0]
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", root, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, check_tag)
+
+        # Check tag bit (bit 0)
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(root, self.i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(self.i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(self.i64, 0))
+        builder.cbranch(is_leaf_tag, is_leaf, is_internal)
+
+        # Handle leaf - untag and mark
+        builder.position_at_end(is_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(self.i64, ~1 & 0xFFFFFFFFFFFFFFFF))
+        untagged_ptr = builder.inttoptr(untagged_int, self.i8_ptr)
+        builder.call(self.gc_mark_object, [untagged_ptr])
+        builder.branch(done)
+
+        # Handle internal node
+        builder.position_at_end(is_internal)
+        # Mark the node itself
+        builder.call(self.gc_mark_object, [root])
+
+        # HAMT node struct: { i32 bitmap, i8** children }
+        hamt_node_type = ir.LiteralStructType([self.i32, self.i8_ptr.as_pointer()])
+        node_ptr = builder.bitcast(root, hamt_node_type.as_pointer())
+
+        # Get bitmap to count children
+        bitmap_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+
+        # Compute popcount inline (Brian Kernighan's algorithm)
+        count_ptr = builder.alloca(self.i32, name="count")
+        x_ptr = builder.alloca(self.i32, name="x")
+        builder.store(ir.Constant(self.i32, 0), count_ptr)
+        builder.store(bitmap, x_ptr)
+
+        popcount_cond = func.append_basic_block("popcount_cond")
+        popcount_body = func.append_basic_block("popcount_body")
+        popcount_done = func.append_basic_block("popcount_done")
+
+        builder.branch(popcount_cond)
+
+        builder.position_at_end(popcount_cond)
+        curr_x = builder.load(x_ptr)
+        is_nonzero = builder.icmp_unsigned("!=", curr_x, ir.Constant(self.i32, 0))
+        builder.cbranch(is_nonzero, popcount_body, popcount_done)
+
+        builder.position_at_end(popcount_body)
+        x_minus_1 = builder.sub(curr_x, ir.Constant(self.i32, 1))
+        new_x = builder.and_(curr_x, x_minus_1)
+        builder.store(new_x, x_ptr)
+        curr_count = builder.load(count_ptr)
+        new_count = builder.add(curr_count, ir.Constant(self.i32, 1))
+        builder.store(new_count, count_ptr)
+        builder.branch(popcount_cond)
+
+        builder.position_at_end(popcount_done)
+        child_count = builder.load(count_ptr)
+
+        # Get children array pointer
+        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+
+        # Mark the children array itself (it's also gc_alloc'd)
+        children_as_i8 = builder.bitcast(children_ptr, self.i8_ptr)
+        builder.call(self.gc_mark_object, [children_as_i8])
+
+        # Iterate over children and recursively mark
+        idx_ptr = builder.alloca(self.i32, name="idx")
+        builder.store(ir.Constant(self.i32, 0), idx_ptr)
+        builder.branch(child_loop)
+
+        builder.position_at_end(child_loop)
+        idx = builder.load(idx_ptr)
+        done_children = builder.icmp_signed(">=", idx, child_count)
+        builder.cbranch(done_children, done, child_body)
+
+        builder.position_at_end(child_body)
+        idx_64 = builder.zext(idx, self.i64)
+        child_ptr_ptr = builder.gep(children_ptr, [idx_64], inbounds=True)
+        child_ptr = builder.load(child_ptr_ptr)
+        # Recursive call to mark child (could be node or leaf)
+        builder.call(func, [child_ptr])
+        next_idx = builder.add(idx, ir.Constant(self.i32, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(child_loop)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
     def _implement_gc_mark_object(self):
         """Mark an object as live and recursively mark referenced objects"""
         func = self.gc_mark_object
@@ -473,14 +598,15 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i32, self.TYPE_STRING), mark_string)
         switch.add_case(ir.Constant(self.i32, self.TYPE_CHANNEL), mark_channel)
 
-        # Mark Map: entries pointer at offset 0
-        # Map struct: { i8* entries, i64 len, i64 cap }
+        # Mark Map: HAMT-based, root at offset 0
+        # Map struct: { i8* root, i64 len }
+        # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
         builder.position_at_end(mark_map)
-        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64]).as_pointer()
         map_typed = builder.bitcast(ptr, map_ptr_type)
-        entries_ptr_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        entries_ptr = builder.load(entries_ptr_ptr)
-        builder.call(func, [entries_ptr])  # Recursive call
+        map_root_ptr_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        map_root_ptr = builder.load(map_root_ptr_ptr)
+        builder.call(self.gc_mark_hamt, [map_root_ptr])
         builder.branch(done)
 
         # Mark List: root (field 0) and tail (field 3) pointers
@@ -508,13 +634,15 @@ class GarbageCollector:
         builder.call(func, [data_ptr])  # Recursive call
         builder.branch(done)
 
-        # Mark Set: entries pointer at offset 0 (same as Map)
+        # Mark Set: HAMT-based, root at offset 0
+        # Set struct: { i8* root, i64 len }
+        # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
         builder.position_at_end(mark_set)
-        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64]).as_pointer()
         set_typed = builder.bitcast(ptr, set_ptr_type)
-        set_entries_ptr_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        set_entries_ptr = builder.load(set_entries_ptr_ptr)
-        builder.call(func, [set_entries_ptr])  # Recursive call
+        set_root_ptr_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        set_root_ptr = builder.load(set_root_ptr_ptr)
+        builder.call(self.gc_mark_hamt, [set_root_ptr])
         builder.branch(done)
 
         # Mark String: data pointer at field 0
@@ -623,22 +751,26 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_sweep(self):
-        """Sweep allocation list and free unmarked objects"""
+        """Sweep allocation list and free unmarked objects.
+
+        Traverses the allocation list, freeing unmarked objects and keeping
+        marked ones (after clearing their mark bits for the next cycle).
+        """
         func = self.gc_sweep
 
         entry = func.append_basic_block("entry")
         sweep_loop = func.append_basic_block("sweep_loop")
         check_marked = func.append_basic_block("check_marked")
-        keep_obj = func.append_basic_block("keep_obj")
-        free_obj = func.append_basic_block("free_obj")
+        is_marked_block = func.append_basic_block("is_marked")
+        is_unmarked_block = func.append_basic_block("is_unmarked")
         next_obj = func.append_basic_block("next_obj")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
 
-        # prev_ptr = &gc_alloc_list
-        prev_ptr = builder.alloca(self.i8_ptr.as_pointer(), name="prev_ptr")
-        builder.store(self.gc_alloc_list, prev_ptr)
+        # prev = null (pointer to previous node's next field, or gc_alloc_list)
+        prev = builder.alloca(self.i8_ptr.as_pointer(), name="prev")
+        builder.store(self.gc_alloc_list, prev)
 
         # curr = gc_alloc_list
         curr = builder.alloca(self.i8_ptr, name="curr")
@@ -653,7 +785,7 @@ class GarbageCollector:
         is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
         builder.cbranch(is_null, done, check_marked)
 
-        # Check if object is marked
+        # Process allocation - check if marked
         builder.position_at_end(check_marked)
         node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
 
@@ -670,47 +802,41 @@ class GarbageCollector:
         # Check mark bit
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         flags = builder.load(flags_ptr)
-        is_marked = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
-        marked = builder.icmp_unsigned("!=", is_marked, ir.Constant(self.i32, 0))
-        builder.cbranch(marked, keep_obj, free_obj)
+        mark_bit = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
+        is_marked = builder.icmp_unsigned("!=", mark_bit, ir.Constant(self.i32, 0))
+        builder.cbranch(is_marked, is_marked_block, is_unmarked_block)
 
-        # Keep object: clear mark bit and advance
-        builder.position_at_end(keep_obj)
+        # Object is marked - clear mark bit and keep it
+        builder.position_at_end(is_marked_block)
         cleared_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_MARK_BIT & 0xFFFFFFFF))
         builder.store(cleared_flags, flags_ptr)
+        # Update prev to point to this node's next field
+        next_field_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_field_ptr_cast = builder.bitcast(next_field_ptr, self.i8_ptr.as_pointer())
+        builder.store(next_field_ptr_cast, prev)
+        # Move to next
+        next_ptr = builder.load(next_field_ptr)
+        builder.store(next_ptr, curr)
+        builder.branch(sweep_loop)
 
-        # prev_ptr = &curr->next
-        next_ptr_field = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        next_ptr_cast = builder.bitcast(next_ptr_field, self.i8_ptr.as_pointer())
-        builder.store(next_ptr_cast, prev_ptr)
-
-        builder.branch(next_obj)
-
-        # Free object: unlink and free
-        builder.position_at_end(free_obj)
-        # Get next node
-        next_node_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        next_node = builder.load(next_node_ptr)
-
-        # *prev_ptr = next_node (unlink current)
-        prev_loc = builder.load(prev_ptr)
-        builder.store(next_node, prev_loc)
-
-        # Free the data block (including header)
+        # Object is unmarked - free it and remove from list
+        builder.position_at_end(is_unmarked_block)
+        # Get next node before freeing
+        next_field_ptr2 = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_node = builder.load(next_field_ptr2)
+        # Update previous node's next pointer to skip this node
+        prev_ptr = builder.load(prev)
+        builder.store(next_node, prev_ptr)
+        # Free the allocation (header + data)
         builder.call(self.codegen.free, [header_ptr])
-
-        # Free the node
+        # Free the allocation node
         builder.call(self.codegen.free, [curr_val])
-
-        # curr = next_node (don't advance prev_ptr)
+        # Move to next (prev stays the same since we removed current)
         builder.store(next_node, curr)
         builder.branch(sweep_loop)
 
-        # Next object
         builder.position_at_end(next_obj)
-        next_val = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        next_ptr = builder.load(next_val)
-        builder.store(next_ptr, curr)
+        # This block is no longer used but keep for compatibility
         builder.branch(sweep_loop)
 
         builder.position_at_end(done)
