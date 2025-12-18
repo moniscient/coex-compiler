@@ -8307,7 +8307,47 @@ class CodeGenerator:
             # Infer type from initializer
             init_value = self._generate_expression(stmt.initializer)
             llvm_type = init_value.type
-            alloca = self.builder.alloca(llvm_type, name=stmt.name)
+
+            # Check if variable was pre-allocated (e.g., by loop optimization)
+            # If so, reuse the existing alloca if types are compatible
+            if stmt.name in self.locals:
+                existing_alloca = self.locals[stmt.name]
+                existing_type = existing_alloca.type.pointee
+
+                # If types match, reuse the existing alloca
+                if existing_type == llvm_type:
+                    alloca = existing_alloca
+                elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                    # Pre-allocated as i64 placeholder but needs different type
+                    # Create proper alloca ONCE at function entry (not in loop)
+                    # Use entry block for alloca to avoid stack growth in loops
+                    func = self.builder.function
+                    entry_block = func.entry_basic_block
+                    current_block = self.builder.block
+
+                    # Save current position
+                    saved_block = self.builder.block
+                    saved_pos = self.builder._anchor
+
+                    # Insert at end of entry block (before terminator if any)
+                    if entry_block.is_terminated:
+                        # Position before the terminator
+                        self.builder.position_before(entry_block.terminator)
+                    else:
+                        self.builder.position_at_end(entry_block)
+
+                    alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+
+                    # Restore position
+                    self.builder.position_at_end(saved_block)
+
+                    # Update locals to use new alloca
+                    self.locals[stmt.name] = alloca
+                else:
+                    # Different non-placeholder type - create new alloca
+                    alloca = self.builder.alloca(llvm_type, name=stmt.name)
+            else:
+                alloca = self.builder.alloca(llvm_type, name=stmt.name)
 
             # Value semantics: deep copy collections on assignment to prevent aliasing
             # Try to get Coex type from initializer for proper deep copy
@@ -8365,8 +8405,33 @@ class CodeGenerator:
             if move_source_name:
                 self.moved_vars.add(move_source_name)
             return
-        
-        alloca = self.builder.alloca(llvm_type, name=stmt.name)
+
+        # Check if variable was pre-allocated (e.g., by loop optimization)
+        if stmt.name in self.locals:
+            existing_alloca = self.locals[stmt.name]
+            existing_type = existing_alloca.type.pointee
+
+            if existing_type == llvm_type:
+                alloca = existing_alloca
+            elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                # Pre-allocated as i64 placeholder but needs different type
+                # Create proper alloca at function entry
+                func = self.builder.function
+                entry_block = func.entry_basic_block
+                saved_block = self.builder.block
+
+                if entry_block.is_terminated:
+                    self.builder.position_before(entry_block.terminator)
+                else:
+                    self.builder.position_at_end(entry_block)
+
+                alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                self.builder.position_at_end(saved_block)
+                self.locals[stmt.name] = alloca
+            else:
+                alloca = self.builder.alloca(llvm_type, name=stmt.name)
+        else:
+            alloca = self.builder.alloca(llvm_type, name=stmt.name)
 
         # Generate initializer
         # Handle empty {} which parses as MapExpr but might need to be Set based on type annotation
