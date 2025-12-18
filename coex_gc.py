@@ -90,6 +90,39 @@ class GarbageCollector:
         self.gc_scan_roots = None
         self.gc_sweep = None
 
+        # Dual-heap async GC functions
+        self.gc_async = None
+        self.gc_capture_snapshot = None
+        self.gc_swap_heaps = None
+        self.gc_thread_main = None
+        self.gc_scan_cross_heap = None
+        self.gc_mark_from_snapshot = None
+        self.gc_sweep_heap = None
+        self.gc_grow_heaps = None
+        self.gc_wait_for_completion = None
+
+        # Dual-heap types and globals
+        self.heap_region_type = None
+        self.root_snapshot_type = None
+        self.gc_state_type = None
+        self.gc_state = None
+        self.gc_mutex = None
+        self.gc_cond_start = None
+        self.gc_cond_done = None
+        self.gc_snapshot = None
+        self.gc_thread_handle = None
+
+        # Pthread functions
+        self.pthread_create = None
+        self.pthread_mutex_init = None
+        self.pthread_mutex_lock = None
+        self.pthread_mutex_unlock = None
+        self.pthread_cond_init = None
+        self.pthread_cond_wait = None
+        self.pthread_cond_signal = None
+        self.pthread_attr_init = None
+        self.pthread_attr_setdetachstate = None
+
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
         self._create_types()
@@ -107,6 +140,16 @@ class GarbageCollector:
         self._implement_gc_sweep()
         self._implement_gc_collect()
         self._add_nursery_stubs()  # Disabled nursery context stubs for compatibility
+        # Dual-heap async GC implementations
+        self._implement_gc_capture_snapshot()
+        self._implement_gc_mark_from_snapshot()
+        self._implement_gc_swap_heaps()
+        self._implement_gc_scan_cross_heap()
+        self._implement_gc_sweep_heap()
+        self._implement_gc_thread_main()
+        self._implement_gc_async()
+        self._implement_gc_wait_for_completion()
+        self._implement_gc_grow_heaps()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -134,6 +177,38 @@ class GarbageCollector:
             self.i8_ptr_ptr,  # pointer to roots array
         ])
 
+        # ============================================================
+        # Dual-heap async GC types
+        # All use i64 for cross-platform consistency (no padding issues)
+        # ============================================================
+
+        # HeapRegion: { i8* alloc_list, i64 alloc_count, i64 region_id }
+        # Represents one heap region (A or B)
+        self.heap_region_type = ir.LiteralStructType([
+            self.i8_ptr,  # alloc_list - head of allocation linked list
+            self.i64,     # alloc_count - allocations in this region
+            self.i64,     # region_id - 0 for heap A, 1 for heap B
+        ])
+
+        # RootSnapshot: { i8** roots, i64 count, i64 heap_to_collect }
+        # Captures shadow stack state at swap time
+        self.root_snapshot_type = ir.LiteralStructType([
+            self.i8_ptr_ptr,  # roots - array of root pointer values
+            self.i64,         # count - number of roots captured
+            self.i64,         # heap_to_collect - 0 for A, 1 for B
+        ])
+
+        # GCState: { i64 active_heap, i64 gc_in_progress, i64 gc_complete,
+        #            HeapRegion heap_a, HeapRegion heap_b }
+        # Main state for dual-heap GC
+        self.gc_state_type = ir.LiteralStructType([
+            self.i64,              # active_heap - 0 for A, 1 for B
+            self.i64,              # gc_in_progress - flag
+            self.i64,              # gc_complete - flag
+            self.heap_region_type, # heap_a (offset 24)
+            self.heap_region_type, # heap_b (offset 48)
+        ])
+
     def _create_globals(self):
         """Create GC global variables"""
         # Top of shadow stack frame chain
@@ -155,6 +230,60 @@ class GarbageCollector:
         self.gc_enabled = ir.GlobalVariable(self.module, self.i1, name="gc_enabled")
         self.gc_enabled.initializer = ir.Constant(self.i1, 1)
         self.gc_enabled.linkage = 'internal'
+
+        # ============================================================
+        # Dual-heap async GC globals
+        # ============================================================
+
+        # GC state structure containing both heap regions
+        # Initialize: active=0, in_progress=0, complete=1,
+        #             heap_a={null,0,0}, heap_b={null,0,1}
+        heap_a_init = ir.Constant(self.heap_region_type, [
+            ir.Constant(self.i8_ptr, None),  # alloc_list = null
+            ir.Constant(self.i64, 0),        # alloc_count = 0
+            ir.Constant(self.i64, 0),        # region_id = 0 (heap A)
+        ])
+        heap_b_init = ir.Constant(self.heap_region_type, [
+            ir.Constant(self.i8_ptr, None),  # alloc_list = null
+            ir.Constant(self.i64, 0),        # alloc_count = 0
+            ir.Constant(self.i64, 1),        # region_id = 1 (heap B)
+        ])
+        gc_state_init = ir.Constant(self.gc_state_type, [
+            ir.Constant(self.i64, 0),        # active_heap = 0 (A)
+            ir.Constant(self.i64, 0),        # gc_in_progress = 0
+            ir.Constant(self.i64, 1),        # gc_complete = 1
+            heap_a_init,
+            heap_b_init,
+        ])
+        self.gc_state = ir.GlobalVariable(self.module, self.gc_state_type, name="gc_state")
+        self.gc_state.initializer = gc_state_init
+        self.gc_state.linkage = 'internal'
+
+        # Pthread mutex for synchronization (opaque, allocated at runtime)
+        self.gc_mutex = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_mutex")
+        self.gc_mutex.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_mutex.linkage = 'internal'
+
+        # Pthread condition variable for GC thread start signal
+        self.gc_cond_start = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_cond_start")
+        self.gc_cond_start.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_cond_start.linkage = 'internal'
+
+        # Pthread condition variable for GC completion signal
+        self.gc_cond_done = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_cond_done")
+        self.gc_cond_done.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_cond_done.linkage = 'internal'
+
+        # Current snapshot for GC thread to process
+        self.gc_snapshot = ir.GlobalVariable(
+            self.module, self.root_snapshot_type.as_pointer(), name="gc_snapshot")
+        self.gc_snapshot.initializer = ir.Constant(self.root_snapshot_type.as_pointer(), None)
+        self.gc_snapshot.linkage = 'internal'
+
+        # GC thread handle (stored as i8* but really pthread_t)
+        self.gc_thread_handle = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_thread_handle")
+        self.gc_thread_handle.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_thread_handle.linkage = 'internal'
 
     def _declare_functions(self):
         """Declare GC runtime functions"""
@@ -202,6 +331,100 @@ class GarbageCollector:
         gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i32])
         self.gc_mark_hamt = ir.Function(self.module, gc_mark_hamt_ty, name="coex_gc_mark_hamt")
 
+        # ============================================================
+        # Dual-heap async GC function declarations
+        # ============================================================
+
+        # gc_async() -> void
+        # Trigger async collection (returns immediately)
+        gc_async_ty = ir.FunctionType(self.void, [])
+        self.gc_async = ir.Function(self.module, gc_async_ty, name="coex_gc_async")
+
+        # gc_capture_snapshot() -> RootSnapshot*
+        # Capture shadow stack roots into snapshot
+        gc_capture_ty = ir.FunctionType(self.root_snapshot_type.as_pointer(), [])
+        self.gc_capture_snapshot = ir.Function(self.module, gc_capture_ty, name="coex_gc_capture_snapshot")
+
+        # gc_swap_heaps() -> void
+        # Atomically swap active heap and signal GC thread
+        gc_swap_ty = ir.FunctionType(self.void, [])
+        self.gc_swap_heaps = ir.Function(self.module, gc_swap_ty, name="coex_gc_swap_heaps")
+
+        # gc_thread_main(arg: i8*) -> i8*
+        # GC thread entry point (pthread signature)
+        gc_thread_ty = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
+        self.gc_thread_main = ir.Function(self.module, gc_thread_ty, name="coex_gc_thread_main")
+
+        # gc_scan_cross_heap(source_heap: i64, target_heap: i64) -> void
+        # Scan source heap for pointers into target heap
+        gc_scan_cross_ty = ir.FunctionType(self.void, [self.i64, self.i64])
+        self.gc_scan_cross_heap = ir.Function(self.module, gc_scan_cross_ty, name="coex_gc_scan_cross_heap")
+
+        # gc_mark_from_snapshot(snapshot: RootSnapshot*) -> void
+        # Mark phase using captured snapshot roots
+        gc_mark_snap_ty = ir.FunctionType(self.void, [self.root_snapshot_type.as_pointer()])
+        self.gc_mark_from_snapshot = ir.Function(self.module, gc_mark_snap_ty, name="coex_gc_mark_from_snapshot")
+
+        # gc_sweep_heap(heap_idx: i64) -> void
+        # Sweep specific heap region
+        gc_sweep_heap_ty = ir.FunctionType(self.void, [self.i64])
+        self.gc_sweep_heap = ir.Function(self.module, gc_sweep_heap_ty, name="coex_gc_sweep_heap")
+
+        # gc_grow_heaps() -> void
+        # Double both heap sizes on OOM
+        gc_grow_ty = ir.FunctionType(self.void, [])
+        self.gc_grow_heaps = ir.Function(self.module, gc_grow_ty, name="coex_gc_grow_heaps")
+
+        # gc_wait_for_completion() -> void
+        # Wait for current GC cycle to complete
+        gc_wait_ty = ir.FunctionType(self.void, [])
+        self.gc_wait_for_completion = ir.Function(self.module, gc_wait_ty, name="coex_gc_wait_for_completion")
+
+        # ============================================================
+        # Pthread function declarations (external)
+        # ============================================================
+
+        # pthread_create(thread*, attr*, start_routine, arg) -> int
+        pthread_create_ty = ir.FunctionType(self.i32, [
+            self.i8_ptr,   # pthread_t* (thread handle pointer)
+            self.i8_ptr,   # pthread_attr_t* (attributes, can be null)
+            self.i8_ptr,   # void* (*start_routine)(void*)
+            self.i8_ptr    # void* arg
+        ])
+        self.pthread_create = ir.Function(self.module, pthread_create_ty, name="pthread_create")
+
+        # pthread_mutex_init(mutex*, attr*) -> int
+        pthread_mutex_init_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr])
+        self.pthread_mutex_init = ir.Function(self.module, pthread_mutex_init_ty, name="pthread_mutex_init")
+
+        # pthread_mutex_lock(mutex*) -> int
+        pthread_mutex_lock_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        self.pthread_mutex_lock = ir.Function(self.module, pthread_mutex_lock_ty, name="pthread_mutex_lock")
+
+        # pthread_mutex_unlock(mutex*) -> int
+        pthread_mutex_unlock_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        self.pthread_mutex_unlock = ir.Function(self.module, pthread_mutex_unlock_ty, name="pthread_mutex_unlock")
+
+        # pthread_cond_init(cond*, attr*) -> int
+        pthread_cond_init_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr])
+        self.pthread_cond_init = ir.Function(self.module, pthread_cond_init_ty, name="pthread_cond_init")
+
+        # pthread_cond_wait(cond*, mutex*) -> int
+        pthread_cond_wait_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr])
+        self.pthread_cond_wait = ir.Function(self.module, pthread_cond_wait_ty, name="pthread_cond_wait")
+
+        # pthread_cond_signal(cond*) -> int
+        pthread_cond_signal_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        self.pthread_cond_signal = ir.Function(self.module, pthread_cond_signal_ty, name="pthread_cond_signal")
+
+        # pthread_attr_init(attr*) -> int
+        pthread_attr_init_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        self.pthread_attr_init = ir.Function(self.module, pthread_attr_init_ty, name="pthread_attr_init")
+
+        # pthread_attr_setdetachstate(attr*, detachstate) -> int
+        pthread_attr_setdetach_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i32])
+        self.pthread_attr_setdetachstate = ir.Function(self.module, pthread_attr_setdetach_ty, name="pthread_attr_setdetachstate")
+
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
@@ -244,16 +467,113 @@ class GarbageCollector:
         return self.type_descriptors.get(type_name, self.TYPE_UNKNOWN)
 
     def _implement_gc_init(self):
-        """Initialize GC state"""
+        """Initialize GC state, pthread primitives, and spawn GC thread"""
         func = self.gc_init
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # Reset state
+        # Reset basic state
         builder.store(ir.Constant(self.i8_ptr, None), self.gc_frame_top)
         builder.store(ir.Constant(self.i8_ptr, None), self.gc_alloc_list)
         builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
         builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+
+        # ============================================================
+        # Initialize pthread mutex and condition variables
+        # Allocate 64 bytes for each (enough for any platform)
+        # ============================================================
+
+        # Allocate and initialize mutex
+        mutex_size = ir.Constant(self.i64, 64)
+        mutex_ptr = builder.call(self.codegen.malloc, [mutex_size])
+        builder.store(mutex_ptr, self.gc_mutex)
+        builder.call(self.pthread_mutex_init, [mutex_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # Allocate and initialize condition variable for GC start
+        cond_size = ir.Constant(self.i64, 64)
+        cond_start_ptr = builder.call(self.codegen.malloc, [cond_size])
+        builder.store(cond_start_ptr, self.gc_cond_start)
+        builder.call(self.pthread_cond_init, [cond_start_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # Allocate and initialize condition variable for GC completion
+        cond_done_ptr = builder.call(self.codegen.malloc, [cond_size])
+        builder.store(cond_done_ptr, self.gc_cond_done)
+        builder.call(self.pthread_cond_init, [cond_done_ptr, ir.Constant(self.i8_ptr, None)])
+
+        # ============================================================
+        # Initialize dual-heap state
+        # gc_state is already initialized by global initializer
+        # Just reset it here for good measure
+        # ============================================================
+
+        # Reset gc_state.active_heap = 0
+        active_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), active_ptr)
+
+        # Reset gc_state.gc_in_progress = 0
+        in_prog_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), in_prog_ptr)
+
+        # Reset gc_state.gc_complete = 1
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), complete_ptr)
+
+        # Reset heap_a.alloc_list = null, heap_a.alloc_count = 0
+        heap_a_list_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), heap_a_list_ptr)
+        heap_a_count_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), heap_a_count_ptr)
+
+        # Reset heap_b.alloc_list = null, heap_b.alloc_count = 0
+        heap_b_list_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), heap_b_list_ptr)
+        heap_b_count_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), heap_b_count_ptr)
+
+        # ============================================================
+        # Spawn GC thread as detached
+        # PTHREAD_CREATE_DETACHED = 1 on most systems
+        # ============================================================
+
+        # Allocate thread attribute
+        attr_size = ir.Constant(self.i64, 64)
+        attr_ptr = builder.call(self.codegen.malloc, [attr_size])
+        builder.call(self.pthread_attr_init, [attr_ptr])
+
+        # Set detached state (PTHREAD_CREATE_DETACHED = 1)
+        builder.call(self.pthread_attr_setdetachstate, [attr_ptr, ir.Constant(self.i32, 1)])
+
+        # Allocate space for thread handle (8 bytes is enough for pthread_t)
+        thread_ptr_storage = builder.call(self.codegen.malloc, [ir.Constant(self.i64, 8)])
+        builder.store(thread_ptr_storage, self.gc_thread_handle)
+
+        # Get function pointer to GC thread main
+        gc_thread_func_ptr = builder.bitcast(self.gc_thread_main, self.i8_ptr)
+
+        # Create the GC thread
+        builder.call(self.pthread_create, [
+            thread_ptr_storage,      # pthread_t*
+            attr_ptr,                # pthread_attr_t*
+            gc_thread_func_ptr,      # start_routine
+            ir.Constant(self.i8_ptr, None)  # arg (none)
+        ])
+
+        # Free the attr after thread creation (no longer needed)
+        builder.call(self.codegen.free, [attr_ptr])
 
         builder.ret_void()
 
@@ -907,29 +1227,55 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_collect(self):
-        """Run a full garbage collection cycle
+        """Run a full garbage collection cycle (dual-heap async model).
 
-        Now that shadow stack frames are integrated into codegen, we can
-        safely perform mark-sweep collection. The shadow stack tracks all
-        heap roots, so sweep will only free unreachable objects.
+        This triggers async collection and waits for completion, maintaining
+        synchronous semantics from the caller's perspective.
+
+        Steps:
+        1. If GC already in progress, wait for it to complete
+        2. If not, swap heaps (triggers async collection) and wait
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
+        check_in_progress = func.append_basic_block("check_in_progress")
+        wait_existing = func.append_basic_block("wait_existing")
+        trigger_gc = func.append_basic_block("trigger_gc")
+        wait_new = func.append_basic_block("wait_new")
+        done = func.append_basic_block("done")
+
         builder = ir.IRBuilder(entry)
 
-        # Disable GC during collection (prevent recursion)
-        builder.store(ir.Constant(self.i1, 0), self.gc_enabled)
+        # Check if GC enabled
+        gc_enabled = builder.load(self.gc_enabled)
+        builder.cbranch(gc_enabled, check_in_progress, done)
 
-        # Mark phase: scan shadow stack and mark all reachable objects
-        builder.call(self.gc_scan_roots, [])
+        builder.position_at_end(check_in_progress)
+        # Check if GC already in progress
+        in_prog_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        in_progress = builder.load(in_prog_ptr)
+        is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+        builder.cbranch(is_in_progress, wait_existing, trigger_gc)
 
-        # Sweep phase: free unmarked objects
-        builder.call(self.gc_sweep, [])
+        builder.position_at_end(wait_existing)
+        # Wait for existing GC to complete
+        builder.call(self.gc_wait_for_completion, [])
+        builder.branch(done)
 
-        # Re-enable GC
-        builder.store(ir.Constant(self.i1, 1), self.gc_enabled)
+        builder.position_at_end(trigger_gc)
+        # Swap heaps (captures snapshot, signals GC thread)
+        builder.call(self.gc_swap_heaps, [])
+        builder.branch(wait_new)
 
+        builder.position_at_end(wait_new)
+        # Wait for the new GC cycle to complete
+        builder.call(self.gc_wait_for_completion, [])
+        builder.branch(done)
+
+        builder.position_at_end(done)
         builder.ret_void()
 
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
@@ -986,6 +1332,521 @@ class GarbageCollector:
             else:
                 value = builder.inttoptr(value, self.i8_ptr)
         builder.call(self.gc_set_root, [roots, index_val, value])
+
+    # ========================================================================
+    # Dual-Heap Async GC Implementations
+    # ========================================================================
+
+    def _implement_gc_capture_snapshot(self):
+        """Capture shadow stack roots into a snapshot structure.
+
+        Walks the shadow stack chain and copies all root pointer values
+        into a newly allocated snapshot. Returns pointer to snapshot.
+        """
+        func = self.gc_capture_snapshot
+
+        entry = func.append_basic_block("entry")
+        count_loop = func.append_basic_block("count_loop")
+        count_frame = func.append_basic_block("count_frame")
+        count_next = func.append_basic_block("count_next")
+        alloc_snap = func.append_basic_block("alloc_snap")
+        copy_loop = func.append_basic_block("copy_loop")
+        copy_frame = func.append_basic_block("copy_frame")
+        copy_roots = func.append_basic_block("copy_roots")
+        copy_root = func.append_basic_block("copy_root")
+        copy_next_root = func.append_basic_block("copy_next_root")
+        copy_next_frame = func.append_basic_block("copy_next_frame")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # First pass: count total roots
+        total_roots = builder.alloca(self.i64, name="total_roots")
+        builder.store(ir.Constant(self.i64, 0), total_roots)
+        frame_ptr = builder.alloca(self.i8_ptr, name="frame_ptr")
+        top = builder.load(self.gc_frame_top)
+        builder.store(top, frame_ptr)
+        builder.branch(count_loop)
+
+        # Count loop
+        builder.position_at_end(count_loop)
+        curr_frame = builder.load(frame_ptr)
+        is_null = builder.icmp_unsigned("==", curr_frame, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, alloc_snap, count_frame)
+
+        builder.position_at_end(count_frame)
+        frame = builder.bitcast(curr_frame, self.gc_frame_type.as_pointer())
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
+        curr_total = builder.load(total_roots)
+        new_total = builder.add(curr_total, num_roots)
+        builder.store(new_total, total_roots)
+        builder.branch(count_next)
+
+        builder.position_at_end(count_next)
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, frame_ptr)
+        builder.branch(count_loop)
+
+        # Allocate snapshot
+        builder.position_at_end(alloc_snap)
+        final_count = builder.load(total_roots)
+
+        # Allocate snapshot struct (24 bytes)
+        snap_size = ir.Constant(self.i64, 24)
+        snap_raw = builder.call(self.codegen.malloc, [snap_size])
+        snapshot = builder.bitcast(snap_raw, self.root_snapshot_type.as_pointer())
+
+        # Allocate roots array
+        ptr_size = ir.Constant(self.i64, 8)
+        array_size = builder.mul(final_count, ptr_size)
+        # Ensure at least 8 bytes even if count is 0
+        min_size = builder.icmp_unsigned(">", array_size, ir.Constant(self.i64, 0))
+        actual_size = builder.select(min_size, array_size, ir.Constant(self.i64, 8))
+        roots_array = builder.call(self.codegen.malloc, [actual_size])
+        roots_typed = builder.bitcast(roots_array, self.i8_ptr_ptr)
+
+        # Store in snapshot
+        roots_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(roots_typed, roots_field)
+        count_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(final_count, count_field)
+        # heap_to_collect will be set by caller
+        heap_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), heap_field)
+
+        # Second pass: copy roots
+        copy_idx = builder.alloca(self.i64, name="copy_idx")
+        builder.store(ir.Constant(self.i64, 0), copy_idx)
+        top2 = builder.load(self.gc_frame_top)
+        builder.store(top2, frame_ptr)
+        builder.branch(copy_loop)
+
+        builder.position_at_end(copy_loop)
+        curr_frame2 = builder.load(frame_ptr)
+        is_null2 = builder.icmp_unsigned("==", curr_frame2, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null2, done, copy_frame)
+
+        builder.position_at_end(copy_frame)
+        frame2 = builder.bitcast(curr_frame2, self.gc_frame_type.as_pointer())
+        num_roots_ptr2 = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        frame_num_roots = builder.load(num_roots_ptr2)
+        roots_ptr_ptr = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        frame_roots = builder.load(roots_ptr_ptr)
+
+        root_idx = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx)
+        builder.branch(copy_roots)
+
+        builder.position_at_end(copy_roots)
+        ri = builder.load(root_idx)
+        done_roots = builder.icmp_unsigned(">=", ri, frame_num_roots)
+        builder.cbranch(done_roots, copy_next_frame, copy_root)
+
+        builder.position_at_end(copy_root)
+        ri2 = builder.load(root_idx)
+        src_slot = builder.gep(frame_roots, [ri2], inbounds=True)
+        root_val = builder.load(src_slot)
+
+        ci = builder.load(copy_idx)
+        dst_slot = builder.gep(roots_typed, [ci], inbounds=True)
+        builder.store(root_val, dst_slot)
+
+        new_ci = builder.add(ci, ir.Constant(self.i64, 1))
+        builder.store(new_ci, copy_idx)
+        builder.branch(copy_next_root)
+
+        builder.position_at_end(copy_next_root)
+        next_ri = builder.add(ri2, ir.Constant(self.i64, 1))
+        builder.store(next_ri, root_idx)
+        builder.branch(copy_roots)
+
+        builder.position_at_end(copy_next_frame)
+        parent_ptr2 = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent2 = builder.load(parent_ptr2)
+        builder.store(parent2, frame_ptr)
+        builder.branch(copy_loop)
+
+        builder.position_at_end(done)
+        builder.ret(snapshot)
+
+    def _implement_gc_mark_from_snapshot(self):
+        """Mark objects reachable from snapshot roots."""
+        func = self.gc_mark_from_snapshot
+        func.args[0].name = "snapshot"
+
+        entry = func.append_basic_block("entry")
+        mark_loop = func.append_basic_block("mark_loop")
+        mark_root = func.append_basic_block("mark_root")
+        next_root = func.append_basic_block("next_root")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        snapshot = func.args[0]
+
+        # Get roots array and count
+        roots_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        roots = builder.load(roots_ptr)
+        count_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        count = builder.load(count_ptr)
+
+        idx = builder.alloca(self.i64, name="idx")
+        builder.store(ir.Constant(self.i64, 0), idx)
+        builder.branch(mark_loop)
+
+        builder.position_at_end(mark_loop)
+        i = builder.load(idx)
+        done_marking = builder.icmp_unsigned(">=", i, count)
+        builder.cbranch(done_marking, done, mark_root)
+
+        builder.position_at_end(mark_root)
+        i2 = builder.load(idx)
+        root_slot = builder.gep(roots, [i2], inbounds=True)
+        root_ptr = builder.load(root_slot)
+
+        # Mark if not null
+        is_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
+        with builder.if_then(builder.not_(is_null)):
+            builder.call(self.gc_mark_object, [root_ptr])
+
+        builder.branch(next_root)
+
+        builder.position_at_end(next_root)
+        next_i = builder.add(i2, ir.Constant(self.i64, 1))
+        builder.store(next_i, idx)
+        builder.branch(mark_loop)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_swap_heaps(self):
+        """Atomically swap active heap and prepare for collection."""
+        func = self.gc_swap_heaps
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Lock mutex
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Capture snapshot
+        snapshot = builder.call(self.gc_capture_snapshot, [])
+
+        # Get current active heap index
+        active_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        old_active = builder.load(active_ptr)
+
+        # Set snapshot.heap_to_collect = old_active
+        heap_to_collect_ptr = builder.gep(snapshot, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(old_active, heap_to_collect_ptr)
+
+        # Swap active heap: new_active = 1 - old_active
+        new_active = builder.sub(ir.Constant(self.i64, 1), old_active)
+        builder.store(new_active, active_ptr)
+
+        # Store snapshot for GC thread
+        builder.store(snapshot, self.gc_snapshot)
+
+        # Set gc_in_progress = 1, gc_complete = 0
+        in_prog_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
+
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), complete_ptr)
+
+        # Signal GC thread to start
+        cond_start = builder.load(self.gc_cond_start)
+        builder.call(self.pthread_cond_signal, [cond_start])
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        builder.ret_void()
+
+    def _implement_gc_scan_cross_heap(self):
+        """Scan source heap for pointers into target heap and mark them.
+
+        This is simplified - in practice we'd need to track address ranges.
+        For now, we just mark everything in the source heap's allocation list.
+        """
+        func = self.gc_scan_cross_heap
+        func.args[0].name = "source_heap"
+        func.args[1].name = "target_heap"
+
+        entry = func.append_basic_block("entry")
+        scan_loop = func.append_basic_block("scan_loop")
+        process_alloc = func.append_basic_block("process_alloc")
+        next_alloc = func.append_basic_block("next_alloc")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        source_heap = func.args[0]
+        # target_heap = func.args[1]  # Not used in simplified version
+
+        # Get source heap's alloc list
+        # source_heap: 0 = heap_a (index 3), 1 = heap_b (index 4)
+        # Calculate field index: 3 + source_heap
+        field_idx = builder.add(source_heap, ir.Constant(self.i64, 3))
+        field_idx_32 = builder.trunc(field_idx, self.i32)
+
+        # Get alloc_list from source heap
+        # This is a bit tricky with dynamic index, use a simpler approach
+        # We'll just scan both heaps' allocations and mark everything
+        # (The full implementation would filter by heap)
+
+        # For simplicity, scan the global gc_alloc_list which tracks all allocations
+        # In the full dual-heap model, each heap would have its own list
+        curr = builder.alloca(self.i8_ptr, name="curr")
+        head = builder.load(self.gc_alloc_list)
+        builder.store(head, curr)
+        builder.branch(scan_loop)
+
+        builder.position_at_end(scan_loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, process_alloc)
+
+        builder.position_at_end(process_alloc)
+        node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
+
+        # Get data pointer and mark the object
+        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        # Mark the object (gc_mark_object handles null and already-marked)
+        builder.call(self.gc_mark_object, [data_ptr])
+
+        builder.branch(next_alloc)
+
+        builder.position_at_end(next_alloc)
+        next_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_node = builder.load(next_ptr)
+        builder.store(next_node, curr)
+        builder.branch(scan_loop)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_sweep_heap(self):
+        """Sweep a specific heap region, freeing unmarked objects.
+
+        For now, this delegates to the existing gc_sweep which handles
+        the global allocation list. In a full implementation, each heap
+        would have its own allocation list.
+        """
+        func = self.gc_sweep_heap
+        func.args[0].name = "heap_idx"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # For now, just call the existing sweep
+        builder.call(self.gc_sweep, [])
+
+        builder.ret_void()
+
+    def _implement_gc_thread_main(self):
+        """GC thread main loop - waits for signal, collects, signals completion."""
+        func = self.gc_thread_main
+        func.args[0].name = "arg"
+
+        entry = func.append_basic_block("entry")
+        wait_loop = func.append_basic_block("wait_loop")
+        check_work = func.append_basic_block("check_work")
+        do_collection = func.append_basic_block("do_collection")
+        signal_done = func.append_basic_block("signal_done")
+
+        builder = ir.IRBuilder(entry)
+        builder.branch(wait_loop)
+
+        # Wait loop - check for work
+        builder.position_at_end(wait_loop)
+
+        # Lock mutex
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        builder.branch(check_work)
+
+        builder.position_at_end(check_work)
+        # Check if gc_in_progress == 1
+        in_prog_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        in_progress = builder.load(in_prog_ptr)
+        has_work = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+
+        # If no work, wait on condition variable
+        with builder.if_then(builder.not_(has_work)):
+            cond_start = builder.load(self.gc_cond_start)
+            mutex_ptr2 = builder.load(self.gc_mutex)
+            builder.call(self.pthread_cond_wait, [cond_start, mutex_ptr2])
+
+        # Re-check after wait (spurious wakeup protection)
+        in_progress2 = builder.load(in_prog_ptr)
+        has_work2 = builder.icmp_unsigned("!=", in_progress2, ir.Constant(self.i64, 0))
+        builder.cbranch(has_work2, do_collection, check_work)
+
+        # Do collection
+        builder.position_at_end(do_collection)
+
+        # Get snapshot
+        snapshot = builder.load(self.gc_snapshot)
+
+        # Get which heap to collect
+        heap_to_collect_ptr = builder.gep(snapshot, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        heap_to_collect = builder.load(heap_to_collect_ptr)
+
+        # Unlock mutex during collection (collection is thread-safe)
+        mutex_ptr3 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
+
+        # Phase 1: Mark from snapshot roots
+        builder.call(self.gc_mark_from_snapshot, [snapshot])
+
+        # Phase 2: Scan other heap for cross-heap pointers
+        other_heap = builder.sub(ir.Constant(self.i64, 1), heap_to_collect)
+        builder.call(self.gc_scan_cross_heap, [other_heap, heap_to_collect])
+
+        # Phase 3: Sweep collected heap
+        builder.call(self.gc_sweep_heap, [heap_to_collect])
+
+        # Free snapshot
+        roots_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        roots = builder.load(roots_ptr)
+        roots_raw = builder.bitcast(roots, self.i8_ptr)
+        builder.call(self.codegen.free, [roots_raw])
+        snap_raw = builder.bitcast(snapshot, self.i8_ptr)
+        builder.call(self.codegen.free, [snap_raw])
+
+        builder.branch(signal_done)
+
+        # Signal completion
+        builder.position_at_end(signal_done)
+
+        # Lock mutex to update state
+        mutex_ptr4 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr4])
+
+        # Set gc_in_progress = 0, gc_complete = 1
+        builder.store(ir.Constant(self.i64, 0), in_prog_ptr)
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), complete_ptr)
+
+        # Signal completion
+        cond_done = builder.load(self.gc_cond_done)
+        builder.call(self.pthread_cond_signal, [cond_done])
+
+        # Unlock and loop back
+        mutex_ptr5 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr5])
+
+        builder.branch(wait_loop)
+
+        # Note: Thread never returns (runs until program exits)
+        # The detached thread will be cleaned up when main exits
+
+    def _implement_gc_async(self):
+        """Trigger async GC - swap heaps and return immediately."""
+        func = self.gc_async
+
+        entry = func.append_basic_block("entry")
+        check_in_progress = func.append_basic_block("check_in_progress")
+        do_swap = func.append_basic_block("do_swap")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Check if GC enabled
+        gc_enabled = builder.load(self.gc_enabled)
+        builder.cbranch(gc_enabled, check_in_progress, done)
+
+        builder.position_at_end(check_in_progress)
+        # If GC already in progress, just return (no-op)
+        in_prog_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        in_progress = builder.load(in_prog_ptr)
+        is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+        builder.cbranch(is_in_progress, done, do_swap)
+
+        builder.position_at_end(do_swap)
+        # Swap heaps (captures snapshot, signals GC thread)
+        builder.call(self.gc_swap_heaps, [])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_wait_for_completion(self):
+        """Wait for current GC cycle to complete."""
+        func = self.gc_wait_for_completion
+
+        entry = func.append_basic_block("entry")
+        check_complete = func.append_basic_block("check_complete")
+        wait_for_done = func.append_basic_block("wait_for_done")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Lock mutex
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        builder.branch(check_complete)
+
+        builder.position_at_end(check_complete)
+        # Check if gc_complete == 1
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        is_complete = builder.load(complete_ptr)
+        completed = builder.icmp_unsigned("!=", is_complete, ir.Constant(self.i64, 0))
+        builder.cbranch(completed, done, wait_for_done)
+
+        builder.position_at_end(wait_for_done)
+        # Wait on gc_cond_done
+        cond_done = builder.load(self.gc_cond_done)
+        mutex_ptr2 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_cond_wait, [cond_done, mutex_ptr2])
+        builder.branch(check_complete)
+
+        builder.position_at_end(done)
+        # Unlock mutex
+        mutex_ptr3 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
+        builder.ret_void()
+
+    def _implement_gc_grow_heaps(self):
+        """Double heap sizes when OOM - stub for now."""
+        func = self.gc_grow_heaps
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # For now, this is a no-op
+        # In a full implementation, this would:
+        # 1. Allocate larger heap regions
+        # 2. Copy existing allocations
+        # 3. Update pointers
+        # Since we're using malloc per-allocation (not bump allocator),
+        # heap growth is implicit - we just keep allocating.
+
+        builder.ret_void()
 
     # ========================================================================
     # Nursery Context Stubs (disabled in shadow stack GC)

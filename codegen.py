@@ -10641,8 +10641,13 @@ class CodeGenerator:
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
-                # Trigger garbage collection
+                # Trigger garbage collection (waits for completion)
                 self.builder.call(self.gc.gc_collect, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_async":
+                # Trigger async garbage collection (returns immediately)
+                self.builder.call(self.gc.gc_async, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "print":
