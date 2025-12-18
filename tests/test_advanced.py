@@ -666,38 +666,38 @@ func main() -> int
 ''', "24\n")
 
     def test_map_size_empty(self, expect_output):
-        """Empty map size (header + initial capacity * entry size)."""
-        # Map header: 24 bytes, initial cap=8, MapEntry=24 bytes
-        # Size = 24 + 8 * 24 = 216
+        """Empty map size with HAMT: header (16 bytes) only."""
+        # HAMT Map header: { i8* root, i64 len } = 16 bytes
+        # Empty map has no tree nodes, size = 16
         expect_output('''
 func main() -> int
     var m: Map<int, int> = {}
     print(m.size())
     return 0
 ~
-''', "216\n")
+''', "16\n")
 
     def test_map_size_with_elements(self, expect_output):
-        """Map size with some elements."""
+        """Map size with elements: header + estimated 32 bytes per entry in HAMT."""
+        # HAMT Map: 16 (header) + 2 elements * 32 (estimated per entry) = 80
         expect_output('''
 func main() -> int
     var m: Map<int, int> = {1: 10, 2: 20}
     print(m.size())
     return 0
 ~
-''', "216\n")
+''', "80\n")
 
-    def test_set_size_empty(self, expect_output):
-        """Empty set size (header + initial capacity * entry size)."""
-        # Set header: 24 bytes, initial cap=8, SetEntry=16 bytes
-        # Size = 24 + 8 * 16 = 152
+    def test_set_size_with_elements(self, expect_output):
+        """Set size with elements: header + estimated 32 bytes per entry in HAMT."""
+        # HAMT Set: 16 (header) + 3 elements * 32 (estimated per entry) = 112
         expect_output('''
 func main() -> int
     var s: Set<int> = {1, 2, 3}
     print(s.size())
     return 0
 ~
-''', "152\n")
+''', "112\n")
 
     def test_size_and_len_different(self, expect_output):
         """Verify .size() and .len() return different values."""
@@ -780,7 +780,6 @@ func main() -> int
 ~
 ''', "5\n5\n")
 
-    @pytest.mark.xfail(reason="Nested lists have a preexisting bug - .get() crashes")
     def test_nested_list_parameter_isolated(self, expect_output):
         """Nested list modifications should not affect caller."""
         expect_output('''

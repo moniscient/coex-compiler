@@ -149,7 +149,6 @@ func main() -> int
 ~
 ''', "3\nabc\n")
 
-    @pytest.mark.xfail(reason="String in list + concat has pre-existing type bug")
     def test_string_in_list(self, expect_output):
         """Strings in lists should maintain COW semantics."""
         expect_output('''

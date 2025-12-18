@@ -1908,7 +1908,7 @@ class CodeGenerator:
 
         # Create new empty Set with flags indicating element type
         flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
-        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
 
         # Store set_ptr in alloca since set_add returns new set
         set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="arr_to_set")
@@ -3049,7 +3049,7 @@ class CodeGenerator:
 
         # Create new set with appropriate flags
         flags = self._compute_set_flags(elem_type)
-        initial_dst = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+        initial_dst = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
 
         # Allocate pointer to track dst across loop iterations (value semantics)
         dst_ptr = self.builder.alloca(self.set_struct.as_pointer(), name="dst_set")
@@ -3138,7 +3138,7 @@ class CodeGenerator:
 
         # Create new map with type flags
         flags = self._compute_map_flags(key_type, value_type)
-        initial_dst = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
+        initial_dst = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
 
         # Allocate pointer to track dst across loop iterations (value semantics)
         dst_ptr = self.builder.alloca(self.map_struct.as_pointer(), name="dst_map")
@@ -3398,14 +3398,15 @@ class CodeGenerator:
             self.hamt_leaf_struct.as_pointer()  # entries (field 2)
         )
 
-        # Map struct: { i8* root, i64 len, i32 flags }
-        # Root can be null (empty), HAMTLeaf*, HAMTNode*, or HAMTCollision*
+        # Map struct: { i64 root, i64 len, i64 flags }
+        # All fields are i64 for consistent cross-platform layout (no padding ambiguity)
+        # Root is stored as i64, converted with inttoptr/ptrtoint when used as pointer
         # flags: bit 0 = key is heap pointer, bit 1 = value is heap pointer
         self.map_struct = ir.global_context.get_identified_type("struct.Map")
         self.map_struct.set_body(
-            ir.IntType(8).as_pointer(),  # root (field 0) - void pointer
+            ir.IntType(64),              # root (field 0) - pointer stored as i64
             ir.IntType(64),              # len (field 1)
-            ir.IntType(32)               # flags (field 2) - type info for GC
+            ir.IntType(64)               # flags (field 2) - type info for GC
         )
 
         # Flag constants for Map/Set type info
@@ -3428,9 +3429,9 @@ class CodeGenerator:
         hamt_node_ptr = self.hamt_node_struct.as_pointer()
         hamt_leaf_ptr = self.hamt_leaf_struct.as_pointer()
 
-        # map_new(flags: i32) -> Map*
+        # map_new(flags: i64) -> Map*
         # flags: bit 0 = key is ptr, bit 1 = value is ptr
-        map_new_ty = ir.FunctionType(map_ptr, [i32])
+        map_new_ty = ir.FunctionType(map_ptr, [i64])
         self.map_new = ir.Function(self.module, map_new_ty, name="coex_map_new")
 
         # map_set(map: Map*, key: i64, value: i64) -> Map*
@@ -5270,18 +5271,18 @@ class CodeGenerator:
         flags = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        # Allocate Map struct (8 + 8 + 4 = 24 bytes with padding) via GC
-        # Fields: root (void*), len (i64), flags (i32)
+        # Allocate Map struct (24 bytes) via GC
+        # All fields are i64 for consistent cross-platform layout
+        # Fields: root (i64), len (i64), flags (i64)
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         map_ptr = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
-        # Store root = null (field 0)
+        # Store root = 0 (null as i64) (field 0)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(void_ptr, None), root_field)
+        builder.store(ir.Constant(i64, 0), root_field)
 
         # Store len = 0 (field 1)
         len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -5316,9 +5317,10 @@ class CodeGenerator:
         # Compute hash of key
         hash_val = builder.call(self.map_hash, [key])
 
-        # Get old root
+        # Get old root (stored as i64, convert to pointer for HAMT ops)
         root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(root_field)
+        old_root_i64 = builder.load(root_field)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
 
         # Get old len
         len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -5341,9 +5343,10 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
-        # Store new root
+        # Store new root (convert pointer to i64)
         new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_field)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_field)
 
         # Update len if new key was added
         added = builder.load(added_ptr)
@@ -5372,13 +5375,16 @@ class CodeGenerator:
         map_ptr = func.args[0]
         key = func.args[1]
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Compute hash
         hash_val = builder.call(self.map_hash, [key])
 
-        # Get root
+        # Get root (stored as i64, convert to pointer)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_field)
+        root_i64 = builder.load(root_field)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Lookup in HAMT
         result = builder.call(self.hamt_lookup, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -5396,13 +5402,16 @@ class CodeGenerator:
         map_ptr = func.args[0]
         key = func.args[1]
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Compute hash
         hash_val = builder.call(self.map_hash, [key])
 
-        # Get root
+        # Get root (stored as i64, convert to pointer)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_field)
+        root_i64 = builder.load(root_field)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Check in HAMT
         result = builder.call(self.hamt_contains, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -5424,13 +5433,15 @@ class CodeGenerator:
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Compute hash
         hash_val = builder.call(self.map_hash, [key])
 
-        # Get old root
+        # Get old root (stored as i64, convert to pointer)
         root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(root_field)
+        old_root_i64 = builder.load(root_field)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
 
         # Get old len
         len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -5453,9 +5464,10 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
-        # Store new root
+        # Store new root (convert pointer to i64)
         new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_field)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_field)
 
         # Update len if key was removed
         removed = builder.load(removed_ptr)
@@ -5602,9 +5614,10 @@ class CodeGenerator:
         # Compute string hash
         hash_val = builder.call(self.string_hash, [key])
 
-        # Get old root, len, and flags
+        # Get old root (stored as i64, convert to pointer), len, and flags
         old_root_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(old_root_ptr)
+        old_root_i64 = builder.load(old_root_ptr)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
         old_len_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(old_len_ptr)
         old_flags_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
@@ -5621,9 +5634,10 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
         new_map = builder.bitcast(raw_ptr, map_ptr_type)
 
-        # Store new root
+        # Store new root (convert pointer to i64)
         new_root_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_ptr)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_ptr)
 
         # Update len if key was added
         added = builder.load(added_ptr)
@@ -5650,13 +5664,16 @@ class CodeGenerator:
         map_ptr = func.args[0]
         key = func.args[1]  # String pointer
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Compute string hash
         hash_val = builder.call(self.string_hash, [key])
 
-        # Get root
+        # Get root (stored as i64, convert to pointer)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Lookup in HAMT using string comparison
         result = builder.call(self.hamt_lookup_string, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -5674,13 +5691,16 @@ class CodeGenerator:
         map_ptr = func.args[0]
         key = func.args[1]  # String pointer
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Compute string hash
         hash_val = builder.call(self.string_hash, [key])
 
-        # Get root
+        # Get root (stored as i64, convert to pointer)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Check existence in HAMT using string comparison
         result = builder.call(self.hamt_contains_string, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -5697,14 +5717,16 @@ class CodeGenerator:
         map_ptr = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Create empty result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
         empty_list = builder.call(self.list_new, [elem_size])
 
-        # Get HAMT root
+        # Get HAMT root (stored as i64, convert to pointer)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Collect all keys from HAMT into list
         result = builder.call(self.hamt_collect_keys, [root, empty_list])
@@ -5761,13 +5783,15 @@ class CodeGenerator:
             ir.IntType(8)    # state: 0=empty, 1=occupied, 2=deleted
         )
 
-        # Set struct: { i8* root, i64 len, i32 flags } - HAMT-based like Map
+        # Set struct: { i64 root, i64 len, i64 flags } - HAMT-based like Map
+        # All fields are i64 for consistent cross-platform layout (no padding ambiguity)
+        # Root is stored as i64, converted with inttoptr/ptrtoint when used as pointer
         # flags: bit 0 = element is heap pointer (e.g., string)
         self.set_struct = ir.global_context.get_identified_type("struct.Set")
         self.set_struct.set_body(
-            ir.IntType(8).as_pointer(),  # root (void pointer)
+            ir.IntType(64),              # root (pointer stored as i64)
             ir.IntType(64),              # len
-            ir.IntType(32)               # flags (type info for GC)
+            ir.IntType(64)               # flags (type info for GC)
         )
 
         set_ptr = self.set_struct.as_pointer()
@@ -5775,9 +5799,9 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         i1 = ir.IntType(1)
 
-        # set_new(flags: i32) -> Set*
+        # set_new(flags: i64) -> Set*
         # flags: bit 0 = element is ptr
-        set_new_ty = ir.FunctionType(set_ptr, [i32])
+        set_new_ty = ir.FunctionType(set_ptr, [i64])
         self.set_new = ir.Function(self.module, set_new_ty, name="coex_set_new")
         
         # set_add(set: Set*, key: i64) -> Set*
@@ -5862,21 +5886,22 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Allocate Set struct (8 + 8 + 4 = 24 bytes with padding): { i8* root, i64 len, i32 flags }
+        # Allocate Set struct (24 bytes): { i64 root, i64 len, i64 flags }
+        # All fields are i64 for consistent cross-platform layout
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         set_ptr = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        # Store root = null (empty set)
+        # Store root = 0 (null pointer as i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), root_field)
+        builder.store(ir.Constant(i64, 0), root_field)
 
         # Store len = 0
         len_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), len_field)
 
-        # Store flags
+        # Store flags (already i64)
         flags_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(flags, flags_field)
 
@@ -5928,9 +5953,10 @@ class CodeGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (stored as i64, convert to pointer for HAMT ops)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(root_field)
+        old_root_i64 = builder.load(root_field)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
 
         # Get old len
         len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -5955,9 +5981,10 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        # Store new root
+        # Store new root (convert pointer to i64)
         new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_field)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_field)
 
         # Compute new len (old_len + added)
         added = builder.load(added_ptr)
@@ -5984,10 +6011,13 @@ class CodeGenerator:
         set_ptr = func.args[0]
         key = func.args[1]
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # Get root
+        # Get root (stored as i64, convert to pointer)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_field)
+        root_i64 = builder.load(root_field)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Compute hash
         hash_val = builder.call(self.map_hash, [key])
@@ -6012,10 +6042,12 @@ class CodeGenerator:
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (stored as i64, convert to pointer for HAMT ops)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(root_field)
+        old_root_i64 = builder.load(root_field)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
 
         # Get old len
         len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -6040,9 +6072,10 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        # Store new root
+        # Store new root (convert pointer to i64)
         new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_field)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_field)
 
         # Compute new len (old_len - removed)
         removed = builder.load(removed_ptr)
@@ -6175,14 +6208,16 @@ class CodeGenerator:
         set_ptr = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
         # Create result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
         result_list = builder.call(self.list_new, [elem_size])
 
-        # Get root from the set (field 0)
+        # Get root from the set (stored as i64, convert to pointer)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Use hamt_collect_keys to gather all keys into the list
         final_list = builder.call(self.hamt_collect_keys, [root, result_list])
@@ -6216,10 +6251,13 @@ class CodeGenerator:
         set_ptr = func.args[0]
         key = func.args[1]
         i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # Get root from set (field 0)
+        # Get root from set (stored as i64, convert to pointer)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
 
         # Hash the string key
         hash_val = builder.call(self.string_hash, [key])
@@ -6242,10 +6280,14 @@ class CodeGenerator:
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root, len, and flags from set
+        # Get old root (stored as i64, convert to pointer for HAMT ops)
         root_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(root_ptr)
+        old_root_i64 = builder.load(root_ptr)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
+
+        # Get len and flags
         len_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(len_ptr)
         flags_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
@@ -6270,9 +6312,12 @@ class CodeGenerator:
         raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
-        # Store new root, len, and flags
+        # Store new root (convert pointer to i64)
         new_root_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_ptr)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_ptr)
+
+        # Store len and flags
         new_len_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(new_len, new_len_ptr)
         new_flags_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
@@ -8328,9 +8373,9 @@ class CodeGenerator:
         if isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
             if isinstance(stmt.type_annotation, SetType):
                 # Empty {} with Set type annotation -> generate empty set
-                i32 = ir.IntType(32)
+                i64 = ir.IntType(64)
                 flags = self._compute_set_flags(stmt.type_annotation.element_type)
-                init_value = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+                init_value = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
             else:
                 init_value = self._generate_expression(stmt.initializer)
         else:
@@ -10912,15 +10957,15 @@ class CodeGenerator:
     
     def _generate_type_new(self, type_name: str, args: PyList[Expr]) -> ir.Value:
         """Generate code for Type.new() - allocate and zero-initialize"""
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
         # Special handling for built-in types
         if type_name == "Map":
             # Default flags=0 (no heap pointers) - caller should use typed Map literal if needed
-            return self.builder.call(self.map_new, [ir.Constant(i32, 0)])
+            return self.builder.call(self.map_new, [ir.Constant(i64, 0)])
 
         if type_name == "Set":
             # Default flags=0 (no heap pointers)
-            return self.builder.call(self.set_new, [ir.Constant(i32, 0)])
+            return self.builder.call(self.set_new, [ir.Constant(i64, 0)])
         
         if type_name == "atomic_ref":
             # atomic_ref.new(value) or atomic_ref.new() for nil
@@ -11678,7 +11723,7 @@ class CodeGenerator:
     
     def _generate_map(self, expr: MapExpr) -> ir.Value:
         """Generate code for map literal: {key: value, ...}"""
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Compute flags based on entry types
         flags = 0
@@ -11689,7 +11734,7 @@ class CodeGenerator:
             flags = self._compute_map_flags(key_type, value_type)
 
         # Create empty map with flags
-        map_ptr = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
+        map_ptr = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
 
         # Add each entry (map_set returns a new map with value semantics)
         for key_expr, value_expr in expr.entries:
@@ -11716,7 +11761,7 @@ class CodeGenerator:
 
     def _generate_set(self, expr: SetExpr) -> ir.Value:
         """Generate code for set literal: {a, b, c}"""
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Compute flags based on element type
         flags = 0
@@ -11725,7 +11770,7 @@ class CodeGenerator:
             flags = self._compute_set_flags(elem_type)
 
         # Create empty set with flags
-        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
 
         # Add each element (set_add returns a new set with value semantics)
         for elem_expr in expr.elements:
@@ -11779,14 +11824,14 @@ class CodeGenerator:
     
     def _generate_set_comprehension(self, expr: SetComprehension) -> ir.Value:
         """Generate code for set comprehension using proper Set type."""
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Infer element type from the body expression and compute flags
         elem_type = self._infer_type_from_expr(expr.body)
         flags = self._compute_set_flags(elem_type)
 
         # Create result set with appropriate flags
-        set_ptr = self.builder.call(self.set_new, [ir.Constant(i32, flags)])
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
 
         result_var = f"__comp_result_{self.lambda_counter}"
         self.lambda_counter += 1
@@ -11800,7 +11845,7 @@ class CodeGenerator:
     
     def _generate_map_comprehension(self, expr: MapComprehension) -> ir.Value:
         """Generate code for map comprehension."""
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Compute flags based on key/value types
         key_type = self._infer_type_from_expr(expr.key)
@@ -11808,7 +11853,7 @@ class CodeGenerator:
         flags = self._compute_map_flags(key_type, value_type)
 
         # Create result map with flags
-        map_ptr = self.builder.call(self.map_new, [ir.Constant(i32, flags)])
+        map_ptr = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
 
         result_var = f"__comp_result_{self.lambda_counter}"
         self.lambda_counter += 1

@@ -649,16 +649,19 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i32, self.TYPE_CHANNEL), mark_channel)
 
         # Mark Map: HAMT-based, root at offset 0
-        # Map struct: { i8* root, i64 len, i32 flags }
+        # Map struct: { i64 root, i64 len, i64 flags }
+        # All fields are i64 for cross-platform consistency (no padding issues)
         # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
         # flags: bit 0 = key is ptr, bit 1 = value is ptr
         builder.position_at_end(mark_map)
-        map_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32]).as_pointer()
+        map_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64]).as_pointer()
         map_typed = builder.bitcast(ptr, map_ptr_type)
-        map_root_ptr_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        map_root_ptr = builder.load(map_root_ptr_ptr)
+        map_root_i64_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        map_root_i64 = builder.load(map_root_i64_ptr)
+        map_root_ptr = builder.inttoptr(map_root_i64, self.i8_ptr)  # Convert i64 to pointer
         map_flags_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        map_flags = builder.load(map_flags_ptr)
+        map_flags_i64 = builder.load(map_flags_ptr)
+        map_flags = builder.trunc(map_flags_i64, self.i32)  # Truncate to i32 for gc_mark_hamt
         builder.call(self.gc_mark_hamt, [map_root_ptr, map_flags])
         builder.branch(done)
 
@@ -688,16 +691,19 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark Set: HAMT-based, root at offset 0
-        # Set struct: { i8* root, i64 len, i32 flags }
+        # Set struct: { i64 root, i64 len, i64 flags }
+        # All fields are i64 for cross-platform consistency (no padding issues)
         # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
         # flags: bit 0 = element is ptr
         builder.position_at_end(mark_set)
-        set_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32]).as_pointer()
+        set_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64]).as_pointer()
         set_typed = builder.bitcast(ptr, set_ptr_type)
-        set_root_ptr_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        set_root_ptr = builder.load(set_root_ptr_ptr)
+        set_root_i64_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        set_root_i64 = builder.load(set_root_i64_ptr)
+        set_root_ptr = builder.inttoptr(set_root_i64, self.i8_ptr)  # Convert i64 to pointer
         set_flags_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        set_flags = builder.load(set_flags_ptr)
+        set_flags_i64 = builder.load(set_flags_ptr)
+        set_flags = builder.trunc(set_flags_i64, self.i32)  # Truncate to i32 for gc_mark_hamt
         builder.call(self.gc_mark_hamt, [set_root_ptr, set_flags])
         builder.branch(done)
 
