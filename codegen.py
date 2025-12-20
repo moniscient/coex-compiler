@@ -3294,9 +3294,9 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         struct_type = self.type_registry[type_name]
 
-        # Allocate new struct via GC
+        # Allocate new struct via GC with correct type ID for proper marking
         struct_size = ir.Constant(ir.IntType(64), struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
-        type_id = ir.Constant(i32, 0)  # Generic type ID
+        type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
         raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
         dst = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
@@ -7100,7 +7100,12 @@ class CodeGenerator:
         # Generate matrix formula methods (after functions, as they may reference them)
         for matrix_decl in program.matrices:
             self._generate_matrix_methods(matrix_decl)
-        
+
+        # Phase 9: Finalize GC type tables after all types are registered
+        # This creates the offset arrays for user types so gc_mark_object can
+        # recursively mark pointer fields in user-defined types
+        self.gc.finalize_type_tables()
+
         return self.get_ir()
 
     # ========================================================================
@@ -7838,6 +7843,12 @@ class CodeGenerator:
                 elem_type = self._infer_type_from_expr(expr.elements[0])
                 return SetType(elem_type)
             return SetType(PrimitiveType("int"))
+        elif isinstance(expr, CallExpr):
+            # Check if this is a type constructor call (e.g., Point(10, 20))
+            func_name = expr.callee.name if isinstance(expr.callee, Identifier) else None
+            if func_name and func_name in self.type_fields:
+                # This is a user type constructor
+                return NamedType(func_name)
 
         # Default
         return PrimitiveType("int")
@@ -8112,8 +8123,14 @@ class CodeGenerator:
         def visit_stmts(statements):
             for stmt in statements:
                 if isinstance(stmt, VarDecl):
+                    # Check explicit type annotation first
                     if stmt.type_annotation and self._is_heap_type(stmt.type_annotation):
                         heap_vars.append(stmt.name)
+                    # Also check inferred type from initializer expression
+                    elif stmt.initializer and not stmt.type_annotation:
+                        inferred_type = self._infer_type_from_expr(stmt.initializer)
+                        if self._is_heap_type(inferred_type):
+                            heap_vars.append(stmt.name)
                 # Recurse into nested blocks
                 if isinstance(stmt, IfStmt):
                     visit_stmts(stmt.then_body)
@@ -8434,13 +8451,18 @@ class CodeGenerator:
             alloca = self.builder.alloca(llvm_type, name=stmt.name)
 
         # Generate initializer
-        # Handle empty {} which parses as MapExpr but might need to be Set based on type annotation
+        # Handle empty {} which parses as MapExpr but might need to be Set or Map based on type annotation
         if isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
             if isinstance(stmt.type_annotation, SetType):
                 # Empty {} with Set type annotation -> generate empty set
                 i64 = ir.IntType(64)
                 flags = self._compute_set_flags(stmt.type_annotation.element_type)
                 init_value = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
+            elif isinstance(stmt.type_annotation, MapType):
+                # Empty {} with Map type annotation -> generate empty map with correct flags
+                i64 = ir.IntType(64)
+                flags = self._compute_map_flags(stmt.type_annotation.key_type, stmt.type_annotation.value_type)
+                init_value = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
             else:
                 init_value = self._generate_expression(stmt.initializer)
         else:
@@ -10713,6 +10735,43 @@ class CodeGenerator:
             if name == "gc_async":
                 # Trigger async garbage collection (returns immediately)
                 self.builder.call(self.gc.gc_async, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            # Phase 0: GC debugging infrastructure builtins
+            if name == "gc_dump_stats":
+                # Print GC statistics
+                self.builder.call(self.gc.gc_dump_stats, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_dump_heap":
+                # Print all objects in the heap
+                self.builder.call(self.gc.gc_dump_heap, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_dump_roots":
+                # Print all roots from shadow stack
+                self.builder.call(self.gc.gc_dump_roots, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_validate_heap":
+                # Validate heap integrity - returns 0 if valid, error code otherwise
+                result = self.builder.call(self.gc.gc_validate_heap, [])
+                return result
+
+            if name == "gc_set_trace_level":
+                # Set GC trace verbosity level (0-4)
+                if expr.args:
+                    level = self._generate_expression(expr.args[0])
+                    if level.type != ir.IntType(64):
+                        level = self.builder.sext(level, ir.IntType(64))
+                    self.builder.call(self.gc.gc_set_trace_level, [level])
+                return ir.Constant(ir.IntType(64), 0)
+
+            # Phase 3: High watermark GC builtins
+            if name == "gc_install_watermark":
+                # Install watermark at current frame depth
+                # GC will trigger when returning to this depth
+                self.builder.call(self.gc.gc_install_watermark, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "print":

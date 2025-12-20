@@ -96,17 +96,22 @@ def compile_coex(compiler_root):
 def expect_output(compile_coex):
     """
     Fixture that compiles code and asserts expected output.
-    
+
     Usage:
         expect_output(source_code, "expected output\n")
+        expect_output(source_code, "substring", partial=True)  # Check for substring
     """
-    def _expect(source: str, expected: str):
+    def _expect(source: str, expected: str, partial: bool = False):
         result = compile_coex(source)
         assert result.compile_success, f"Compilation failed:\n{result.compile_output}"
         assert result.run_success, f"Execution failed:\n{result.run_output}"
-        assert result.run_output == expected, \
-            f"Output mismatch:\nExpected: {expected!r}\nGot: {result.run_output!r}"
-    
+        if partial:
+            assert expected in result.run_output, \
+                f"Output does not contain expected substring:\nExpected to find: {expected!r}\nIn output: {result.run_output!r}"
+        else:
+            assert result.run_output == expected, \
+                f"Output mismatch:\nExpected: {expected!r}\nGot: {result.run_output!r}"
+
     return _expect
 
 

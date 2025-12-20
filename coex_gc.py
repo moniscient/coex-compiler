@@ -23,16 +23,25 @@ if TYPE_CHECKING:
 class GarbageCollector:
     """Generates LLVM IR for garbage collection runtime with shadow stack"""
 
-    # Constants
-    HEADER_SIZE = 16         # 8-byte size + 4-byte type_id + 4-byte flags
-    MIN_BLOCK_SIZE = 24      # Minimum block: header(16) + alignment padding
+    # Constants (Phase 1: Updated to 32-byte header)
+    HEADER_SIZE = 32         # 4 x i64: size, type_id, flags, forward
+    MIN_BLOCK_SIZE = 40      # Minimum block: header(32) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
     GC_THRESHOLD = 1000      # Trigger GC after this many allocations
+    INITIAL_HEAP_SIZE = 1024 * 1024 * 1024  # 1GB initial heap
 
-    # Flag bits in header
+    # Flag bits in header (stored in i64 flags field)
     FLAG_MARK_BIT = 0x01     # Bit 0: mark bit for GC
-    FLAG_PINNED = 0x02       # Bit 1: pinned (not movable) - future use
-    FLAG_FINALIZER = 0x04    # Bit 2: has finalizer - future use
+    FLAG_FORWARDED = 0x02    # Bit 1: object has been forwarded (compaction)
+    FLAG_PINNED = 0x04       # Bit 2: pinned (not movable) - future use
+    FLAG_FINALIZER = 0x08    # Bit 3: has finalizer - future use
+
+    # Trace levels for debugging infrastructure (Phase 0)
+    GC_TRACE_NONE = 0        # No tracing output
+    GC_TRACE_PHASES = 1      # Collection phase boundaries
+    GC_TRACE_OPS = 2         # Major operations (alloc, mark, sweep)
+    GC_TRACE_DETAIL = 3      # Individual object operations
+    GC_TRACE_ALL = 4         # Everything including pointer traversals
 
     # Built-in type IDs
     TYPE_UNKNOWN = 0
@@ -66,6 +75,7 @@ class GarbageCollector:
         self.i64 = ir.IntType(64)
         self.i8_ptr = self.i8.as_pointer()
         self.i8_ptr_ptr = self.i8_ptr.as_pointer()
+        self.i64_ptr = self.i64.as_pointer()
         self.void = ir.VoidType()
         self.i1 = ir.IntType(1)
 
@@ -123,6 +133,44 @@ class GarbageCollector:
         self.pthread_attr_init = None
         self.pthread_attr_setdetachstate = None
 
+        # ============================================================
+        # Phase 0: Debugging Infrastructure
+        # ============================================================
+
+        # GC stats type and global
+        self.gc_stats_type = None
+        self.gc_stats = None
+
+        # Trace level global
+        self.gc_trace_level = None
+
+        # Frame depth tracking (for watermark in later phases)
+        self.gc_frame_depth = None
+
+        # Debug/trace functions
+        self.gc_trace = None
+        self.gc_dump_heap = None
+        self.gc_dump_roots = None
+        self.gc_dump_object = None
+        self.gc_validate_heap = None
+        self.gc_dump_stats = None
+        self.gc_stats_alloc = None
+        self.gc_stats_collect = None
+        self.gc_set_trace_level = None
+
+        # ============================================================
+        # Phase 3: High Watermark Tracking
+        # ============================================================
+
+        # Watermark depth - GC triggers when frame depth returns to this level
+        self.gc_watermark_depth = None
+
+        # Flag indicating if a watermark is currently installed
+        self.gc_watermark_installed = None
+
+        # Function to install watermark at current depth
+        self.gc_install_watermark = None
+
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
         self._create_types()
@@ -150,15 +198,40 @@ class GarbageCollector:
         self._implement_gc_async()
         self._implement_gc_wait_for_completion()
         self._implement_gc_grow_heaps()
+        # Phase 0: Debugging infrastructure
+        self._implement_gc_trace()
+        self._implement_gc_dump_stats()
+        self._implement_gc_dump_heap()
+        self._implement_gc_dump_roots()
+        self._implement_gc_dump_object()
+        self._implement_gc_validate_heap()
+        self._implement_gc_set_trace_level()
+        # Phase 3: High watermark tracking
+        self._implement_gc_install_watermark()
+        # Phase 5: Thread registry
+        self._implement_gc_register_thread()
+        self._implement_gc_unregister_thread()
+        self._implement_gc_get_thread_entry()
+        self._implement_gc_get_current_thread_entry()
+        # Phase 6: Watermark mechanism enhancement
+        self._implement_gc_install_watermarks()
+        self._implement_gc_clear_watermarks()
+        self._implement_gc_sync_thread_depth()
+        # Phase 7: First trace pass
+        self._implement_gc_scan_roots_watermark()
+        self._implement_gc_first_trace()
+        self._implement_gc_count_roots()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
-        # Object header: { i64 size, i32 type_id, i32 flags }
+        # Object header (Phase 1): { i64 size, i64 type_id, i64 flags, i64 forward }
+        # 32 bytes total, all i64 for cross-platform consistency
         # Placed immediately before user data
         self.header_type = ir.LiteralStructType([
-            self.i64,  # block size (including header)
-            self.i32,  # type_id
-            self.i32,  # flags (bit 0 = mark)
+            self.i64,  # 0: block size (including header)
+            self.i64,  # 8: type_id (was i32, now i64)
+            self.i64,  # 16: flags (mark, forward, pinned, finalizer bits)
+            self.i64,  # 24: forward pointer (for compaction, 0 if not forwarded)
         ])
 
         # Allocation node: { i8* next, i8* data, i64 size }
@@ -209,24 +282,97 @@ class GarbageCollector:
             self.heap_region_type, # heap_b (offset 48)
         ])
 
+        # ============================================================
+        # Phase 0: Debugging Infrastructure Types
+        # ============================================================
+
+        # GCStats: Statistics collection structure (all i64 for consistency)
+        # Tracks allocation and collection metrics for debugging
+        self.gc_stats_type = ir.LiteralStructType([
+            # Allocation metrics (offsets 0-24)
+            self.i64,    # 0: total_allocations
+            self.i64,    # 8: total_bytes_allocated
+            self.i64,    # 16: allocations_since_last_gc
+            self.i64,    # 24: bytes_since_last_gc
+
+            # Collection metrics (offsets 32-56)
+            self.i64,    # 32: collections_completed
+            self.i64,    # 40: objects_marked_last_cycle
+            self.i64,    # 48: objects_swept_last_cycle
+            self.i64,    # 56: bytes_reclaimed_last_cycle
+
+            # Compaction metrics (offsets 64-80) - for future use
+            self.i64,    # 64: compactions_completed
+            self.i64,    # 72: objects_moved_last_compact
+            self.i64,    # 80: bytes_moved_last_compact
+
+            # Timing metrics in nanoseconds (offsets 88-128)
+            self.i64,    # 88: last_watermark_install_ns
+            self.i64,    # 96: last_first_trace_ns
+            self.i64,    # 104: last_compact_ns
+            self.i64,    # 112: last_second_trace_ns
+            self.i64,    # 120: last_sweep_ns
+            self.i64,    # 128: last_total_gc_ns
+
+            # Threading metrics (offsets 136-144) - for future use
+            self.i64,    # 136: total_block_events
+            self.i64,    # 144: total_block_wait_ns
+        ])
+
+        # ============================================================
+        # Phase 5: Thread Registry Types
+        # ============================================================
+
+        # ThreadEntry: Per-thread GC state for multi-threading support
+        # Currently single-threaded, but this prepares for future threading
+        # All fields are i64 for cross-platform consistency
+        self.thread_entry_type = ir.LiteralStructType([
+            self.i64,     # 0: thread_id - platform thread ID (0 for main thread in stub)
+            self.i8_ptr,  # 8: shadow_stack_chain - pointer to this thread's gc_frame_top
+            self.i64,     # 16: watermark - current watermark depth (0 if none)
+            self.i64,     # 24: watermark_active - watermark is set and collection ongoing
+            self.i64,     # 32: stack_depth - current shadow stack depth
+            self.i64,     # 40: blocked - thread is blocked waiting for GC
+            self.i8_ptr,  # 48: alloc_buffer - thread's allocation buffer (future use)
+            self.i8_ptr,  # 56: next - next thread in registry linked list
+        ])
+
     def _create_globals(self):
         """Create GC global variables"""
+        # ============================================================
+        # Phase 2: Shadow Stack Thread-Local Storage Preparation
+        # ============================================================
+        # The following globals are per-thread in a multi-threaded implementation:
+        #   - gc_frame_top: Each thread has its own shadow stack
+        #   - gc_frame_depth: Each thread tracks its own call depth
+        #
+        # For thread-local storage, these would be declared with __thread
+        # in the generated C code, or use platform-specific TLS APIs.
+        #
+        # Current implementation: Single-threaded (globals work fine)
+        # Future implementation: Replace with TLS for multi-threading
+        # ============================================================
+
         # Top of shadow stack frame chain
+        # THREAD-LOCAL in multi-threaded implementation
         self.gc_frame_top = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_frame_top")
         self.gc_frame_top.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_frame_top.linkage = 'internal'
 
         # Head of allocation list (for sweep)
+        # SHARED - protected by gc_mutex in multi-threaded implementation
         self.gc_alloc_list = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_alloc_list")
         self.gc_alloc_list.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_alloc_list.linkage = 'internal'
 
         # Allocation counter
+        # SHARED - use atomic increment in multi-threaded implementation
         self.gc_alloc_count = ir.GlobalVariable(self.module, self.i64, name="gc_alloc_count")
         self.gc_alloc_count.initializer = ir.Constant(self.i64, 0)
         self.gc_alloc_count.linkage = 'internal'
 
         # GC enabled flag (disabled during collection)
+        # SHARED - use atomic access in multi-threaded implementation
         self.gc_enabled = ir.GlobalVariable(self.module, self.i1, name="gc_enabled")
         self.gc_enabled.initializer = ir.Constant(self.i1, 1)
         self.gc_enabled.linkage = 'internal'
@@ -284,6 +430,114 @@ class GarbageCollector:
         self.gc_thread_handle = ir.GlobalVariable(self.module, self.i8_ptr, name="gc_thread_handle")
         self.gc_thread_handle.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_thread_handle.linkage = 'internal'
+
+        # ============================================================
+        # Phase 0: Debugging Infrastructure Globals
+        # ============================================================
+
+        # GC trace level (0=none, 1=phases, 2=ops, 3=detail, 4=all)
+        self.gc_trace_level = ir.GlobalVariable(self.module, self.i64, name="gc_trace_level")
+        self.gc_trace_level.initializer = ir.Constant(self.i64, self.GC_TRACE_NONE)
+        self.gc_trace_level.linkage = 'internal'
+
+        # GC frame depth for watermark tracking (Phase 0/2)
+        # THREAD-LOCAL in multi-threaded implementation
+        # Tracks current call stack depth for high watermark GC
+        self.gc_frame_depth = ir.GlobalVariable(self.module, self.i64, name="gc_frame_depth")
+        self.gc_frame_depth.initializer = ir.Constant(self.i64, 0)
+        self.gc_frame_depth.linkage = 'internal'
+
+        # GC statistics structure - initialize all fields to 0
+        gc_stats_init = ir.Constant(self.gc_stats_type, [
+            ir.Constant(self.i64, 0),  # total_allocations
+            ir.Constant(self.i64, 0),  # total_bytes_allocated
+            ir.Constant(self.i64, 0),  # allocations_since_last_gc
+            ir.Constant(self.i64, 0),  # bytes_since_last_gc
+            ir.Constant(self.i64, 0),  # collections_completed
+            ir.Constant(self.i64, 0),  # objects_marked_last_cycle
+            ir.Constant(self.i64, 0),  # objects_swept_last_cycle
+            ir.Constant(self.i64, 0),  # bytes_reclaimed_last_cycle
+            ir.Constant(self.i64, 0),  # compactions_completed
+            ir.Constant(self.i64, 0),  # objects_moved_last_compact
+            ir.Constant(self.i64, 0),  # bytes_moved_last_compact
+            ir.Constant(self.i64, 0),  # last_watermark_install_ns
+            ir.Constant(self.i64, 0),  # last_first_trace_ns
+            ir.Constant(self.i64, 0),  # last_compact_ns
+            ir.Constant(self.i64, 0),  # last_second_trace_ns
+            ir.Constant(self.i64, 0),  # last_sweep_ns
+            ir.Constant(self.i64, 0),  # last_total_gc_ns
+            ir.Constant(self.i64, 0),  # total_block_events
+            ir.Constant(self.i64, 0),  # total_block_wait_ns
+        ])
+        self.gc_stats = ir.GlobalVariable(self.module, self.gc_stats_type, name="gc_stats")
+        self.gc_stats.initializer = gc_stats_init
+        self.gc_stats.linkage = 'internal'
+
+        # ============================================================
+        # Phase 3: High Watermark Tracking Globals
+        # ============================================================
+
+        # Watermark depth - GC triggers when frame depth returns to this level
+        # THREAD-LOCAL in multi-threaded implementation
+        self.gc_watermark_depth = ir.GlobalVariable(self.module, self.i64, name="gc_watermark_depth")
+        self.gc_watermark_depth.initializer = ir.Constant(self.i64, 0)
+        self.gc_watermark_depth.linkage = 'internal'
+
+        # Flag indicating if a watermark is currently installed
+        # THREAD-LOCAL in multi-threaded implementation
+        self.gc_watermark_installed = ir.GlobalVariable(self.module, self.i1, name="gc_watermark_installed")
+        self.gc_watermark_installed.initializer = ir.Constant(self.i1, 0)
+        self.gc_watermark_installed.linkage = 'internal'
+
+        # ============================================================
+        # Phase 4: Mark Bit Inversion
+        # ============================================================
+        # Instead of clearing mark bits during sweep, we invert the meaning.
+        # gc_current_mark_value alternates between 1 and 0 each cycle.
+        # An object is "marked" if its mark bit equals gc_current_mark_value.
+        # This eliminates the need to clear marks during sweep.
+
+        # Current mark value - objects with this mark bit value are live
+        # Starts at 1 (matching birth-marking), flips after each GC cycle
+        self.gc_current_mark_value = ir.GlobalVariable(self.module, self.i64, name="gc_current_mark_value")
+        self.gc_current_mark_value.initializer = ir.Constant(self.i64, 1)
+        self.gc_current_mark_value.linkage = 'internal'
+
+        # ============================================================
+        # Phase 5: Thread Registry Globals
+        # ============================================================
+
+        # Head of thread registry linked list
+        # Points to first ThreadEntry (main thread in single-threaded mode)
+        # In multi-threaded mode, new threads add entries to this list
+        self.gc_thread_registry = ir.GlobalVariable(
+            self.module, self.thread_entry_type.as_pointer(), name="gc_thread_registry")
+        self.gc_thread_registry.initializer = ir.Constant(
+            self.thread_entry_type.as_pointer(), None)
+        self.gc_thread_registry.linkage = 'internal'
+
+        # Count of registered threads (for debugging and iteration)
+        self.gc_thread_count = ir.GlobalVariable(self.module, self.i64, name="gc_thread_count")
+        self.gc_thread_count.initializer = ir.Constant(self.i64, 0)
+        self.gc_thread_count.linkage = 'internal'
+
+        # ============================================================
+        # Phase 9: User Type Descriptor Tables
+        # ============================================================
+        # For each user-defined type, we need to know which field offsets
+        # contain pointers so gc_mark_object can mark them recursively.
+        #
+        # gc_type_offsets_table[type_id] -> pointer to array of i64 offsets
+        # Each offset array is terminated by -1 (0xFFFFFFFFFFFFFFFF)
+        # Built-in types (< TYPE_FIRST_USER) have NULL entries.
+
+        # Table of pointers to offset arrays (indexed by type_id)
+        offsets_table_type = ir.ArrayType(self.i64_ptr, self.MAX_TYPES)
+        null_ptr_array = [ir.Constant(self.i64_ptr, None)] * self.MAX_TYPES
+        self.gc_type_offsets_table = ir.GlobalVariable(
+            self.module, offsets_table_type, name="gc_type_offsets_table")
+        self.gc_type_offsets_table.initializer = ir.Constant(offsets_table_type, null_ptr_array)
+        self.gc_type_offsets_table.linkage = 'internal'
 
     def _declare_functions(self):
         """Declare GC runtime functions"""
@@ -425,6 +679,117 @@ class GarbageCollector:
         pthread_attr_setdetach_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i32])
         self.pthread_attr_setdetachstate = ir.Function(self.module, pthread_attr_setdetach_ty, name="pthread_attr_setdetachstate")
 
+        # ============================================================
+        # Phase 0: Debugging Infrastructure Function Declarations
+        # ============================================================
+
+        # gc_trace(level: i64, msg_ptr: i8*) -> void
+        # Trace output based on current trace level
+        gc_trace_ty = ir.FunctionType(self.void, [self.i64, self.i8_ptr])
+        self.gc_trace = ir.Function(self.module, gc_trace_ty, name="coex_gc_trace")
+
+        # gc_dump_heap() -> void
+        # Print all live objects with type, size, mark status
+        gc_dump_heap_ty = ir.FunctionType(self.void, [])
+        self.gc_dump_heap = ir.Function(self.module, gc_dump_heap_ty, name="coex_gc_dump_heap")
+
+        # gc_dump_roots() -> void
+        # Print all roots from shadow stack
+        gc_dump_roots_ty = ir.FunctionType(self.void, [])
+        self.gc_dump_roots = ir.Function(self.module, gc_dump_roots_ty, name="coex_gc_dump_roots")
+
+        # gc_dump_object(ptr: i8*) -> void
+        # Detailed dump of single object and its references
+        gc_dump_object_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_dump_object = ir.Function(self.module, gc_dump_object_ty, name="coex_gc_dump_object")
+
+        # gc_validate_heap() -> i64
+        # Check invariants - returns 0 if valid, error code otherwise
+        gc_validate_heap_ty = ir.FunctionType(self.i64, [])
+        self.gc_validate_heap = ir.Function(self.module, gc_validate_heap_ty, name="coex_gc_validate_heap")
+
+        # gc_dump_stats() -> void
+        # Print current GC statistics
+        gc_dump_stats_ty = ir.FunctionType(self.void, [])
+        self.gc_dump_stats = ir.Function(self.module, gc_dump_stats_ty, name="coex_gc_dump_stats")
+
+        # gc_set_trace_level(level: i64) -> void
+        # Set trace verbosity level
+        gc_set_trace_level_ty = ir.FunctionType(self.void, [self.i64])
+        self.gc_set_trace_level = ir.Function(self.module, gc_set_trace_level_ty, name="coex_gc_set_trace_level")
+
+        # ============================================================
+        # Phase 3: High Watermark Tracking Function Declarations
+        # ============================================================
+
+        # gc_install_watermark() -> void
+        # Install watermark at current frame depth - GC triggers when we return to this depth
+        gc_install_watermark_ty = ir.FunctionType(self.void, [])
+        self.gc_install_watermark = ir.Function(self.module, gc_install_watermark_ty, name="coex_gc_install_watermark")
+
+        # ============================================================
+        # Phase 5: Thread Registry Function Declarations
+        # ============================================================
+
+        # gc_register_thread(thread_id: i64) -> i8* (pointer to ThreadEntry)
+        # Register a thread with the GC system
+        gc_register_thread_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [self.i64])
+        self.gc_register_thread = ir.Function(self.module, gc_register_thread_ty, name="coex_gc_register_thread")
+
+        # gc_unregister_thread(thread_id: i64) -> void
+        # Unregister a thread from the GC system
+        gc_unregister_thread_ty = ir.FunctionType(self.void, [self.i64])
+        self.gc_unregister_thread = ir.Function(self.module, gc_unregister_thread_ty, name="coex_gc_unregister_thread")
+
+        # gc_get_thread_entry(thread_id: i64) -> i8* (pointer to ThreadEntry or null)
+        # Get the ThreadEntry for a given thread ID
+        gc_get_thread_entry_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [self.i64])
+        self.gc_get_thread_entry = ir.Function(self.module, gc_get_thread_entry_ty, name="coex_gc_get_thread_entry")
+
+        # gc_get_current_thread_entry() -> i8* (pointer to ThreadEntry)
+        # Get the ThreadEntry for the current (main) thread - convenience for single-threaded
+        gc_get_current_thread_entry_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [])
+        self.gc_get_current_thread_entry = ir.Function(self.module, gc_get_current_thread_entry_ty, name="coex_gc_get_current_thread_entry")
+
+        # ============================================================
+        # Phase 6: Watermark Mechanism Enhancement Declarations
+        # ============================================================
+
+        # gc_install_watermarks() -> void
+        # Install watermarks on all registered threads at their current stack depth
+        gc_install_watermarks_ty = ir.FunctionType(self.void, [])
+        self.gc_install_watermarks = ir.Function(self.module, gc_install_watermarks_ty, name="coex_gc_install_watermarks")
+
+        # gc_clear_watermarks() -> void
+        # Clear watermarks on all registered threads
+        gc_clear_watermarks_ty = ir.FunctionType(self.void, [])
+        self.gc_clear_watermarks = ir.Function(self.module, gc_clear_watermarks_ty, name="coex_gc_clear_watermarks")
+
+        # gc_sync_thread_depth() -> void
+        # Sync global gc_frame_depth to current thread's ThreadEntry.stack_depth
+        gc_sync_thread_depth_ty = ir.FunctionType(self.void, [])
+        self.gc_sync_thread_depth = ir.Function(self.module, gc_sync_thread_depth_ty, name="coex_gc_sync_thread_depth")
+
+        # ============================================================
+        # Phase 7: First Trace Pass Function Declarations
+        # ============================================================
+
+        # gc_scan_roots_watermark() -> i64
+        # Scan shadow stack up to watermark depth, marking all roots
+        # Returns number of roots marked
+        gc_scan_roots_watermark_ty = ir.FunctionType(self.i64, [])
+        self.gc_scan_roots_watermark = ir.Function(self.module, gc_scan_roots_watermark_ty, name="coex_gc_scan_roots_watermark")
+
+        # gc_first_trace() -> void
+        # Orchestrate the first trace pass: enumerate roots and mark reachable objects
+        gc_first_trace_ty = ir.FunctionType(self.void, [])
+        self.gc_first_trace = ir.Function(self.module, gc_first_trace_ty, name="coex_gc_first_trace")
+
+        # gc_count_roots() -> i64
+        # Count total roots in shadow stack (for debugging/stats)
+        gc_count_roots_ty = ir.FunctionType(self.i64, [])
+        self.gc_count_roots = ir.Function(self.module, gc_count_roots_ty, name="coex_gc_count_roots")
+
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
@@ -465,6 +830,78 @@ class GarbageCollector:
     def get_type_id(self, type_name: str) -> int:
         """Get type_id for a type name, defaulting to TYPE_UNKNOWN"""
         return self.type_descriptors.get(type_name, self.TYPE_UNKNOWN)
+
+    def finalize_type_tables(self):
+        """Create global offset arrays for registered user types.
+
+        Phase 9: This must be called after all types are registered (after codegen
+        processes all type declarations) to populate gc_type_offsets_table.
+
+        For each user type with pointer fields (ref_offsets), creates a global
+        array containing the offsets terminated by -1, and stores a pointer to
+        it in gc_type_offsets_table[type_id].
+        """
+        for type_id, info in self.type_info.items():
+            # Skip built-in types (they have hardcoded handling in gc_mark_object)
+            if type_id < self.TYPE_FIRST_USER:
+                continue
+
+            ref_offsets = info.get('ref_offsets', [])
+            if not ref_offsets:
+                # No pointer fields - leave table entry as NULL
+                continue
+
+            # Create global array with offsets + terminator (-1)
+            offsets_with_terminator = ref_offsets + [-1]
+            array_type = ir.ArrayType(self.i64, len(offsets_with_terminator))
+            array_values = [ir.Constant(self.i64, off) for off in offsets_with_terminator]
+            array_const = ir.Constant(array_type, array_values)
+
+            # Create global variable for this type's offsets
+            global_name = f"gc_type_{type_id}_offsets"
+            offset_array = ir.GlobalVariable(self.module, array_type, name=global_name)
+            offset_array.initializer = array_const
+            offset_array.linkage = 'internal'
+
+            # Get pointer to first element
+            zero = ir.Constant(self.i32, 0)
+            array_ptr = offset_array.gep([zero, zero])
+
+            # Store in gc_type_offsets_table[type_id]
+            # We need to use a constant expression to initialize the table entry
+            # Since we can't modify the initializer after creation, we need to
+            # rebuild the table with the new entries
+            # Actually, we need to update the global's initializer
+
+            # Store the array pointer in the table
+            # For now, we'll build a new initializer with all the entries
+            pass  # We'll handle this after the loop
+
+        # Rebuild gc_type_offsets_table initializer with all entries
+        new_entries = []
+        for i in range(self.MAX_TYPES):
+            if i in self.type_info and i >= self.TYPE_FIRST_USER:
+                ref_offsets = self.type_info[i].get('ref_offsets', [])
+                if ref_offsets:
+                    # Find the global we created
+                    global_name = f"gc_type_{i}_offsets"
+                    for gv in self.module.global_values:
+                        if gv.name == global_name:
+                            # Get pointer to first element as constant expr
+                            zero = ir.Constant(self.i32, 0)
+                            ptr = gv.gep([zero, zero])
+                            new_entries.append(ptr)
+                            break
+                    else:
+                        new_entries.append(ir.Constant(self.i64_ptr, None))
+                else:
+                    new_entries.append(ir.Constant(self.i64_ptr, None))
+            else:
+                new_entries.append(ir.Constant(self.i64_ptr, None))
+
+        # Update the table initializer
+        table_type = ir.ArrayType(self.i64_ptr, self.MAX_TYPES)
+        self.gc_type_offsets_table.initializer = ir.Constant(table_type, new_entries)
 
     def _implement_gc_init(self):
         """Initialize GC state, pthread primitives, and spawn GC thread"""
@@ -550,30 +987,20 @@ class GarbageCollector:
         # ============================================================
 
         # Allocate thread attribute
-        attr_size = ir.Constant(self.i64, 64)
-        attr_ptr = builder.call(self.codegen.malloc, [attr_size])
-        builder.call(self.pthread_attr_init, [attr_ptr])
+        # Phase 9: Disable background GC thread for synchronous collection model
+        # The high watermark GC uses synchronous collection via gc_collect(),
+        # so we don't need the background thread. This avoids potential race
+        # conditions and simplifies the implementation.
+        #
+        # The pthread infrastructure is kept in place for future use if we
+        # want to re-enable async collection.
+        pass  # Thread spawn disabled
 
-        # Set detached state (PTHREAD_CREATE_DETACHED = 1)
-        builder.call(self.pthread_attr_setdetachstate, [attr_ptr, ir.Constant(self.i32, 1)])
-
-        # Allocate space for thread handle (8 bytes is enough for pthread_t)
-        thread_ptr_storage = builder.call(self.codegen.malloc, [ir.Constant(self.i64, 8)])
-        builder.store(thread_ptr_storage, self.gc_thread_handle)
-
-        # Get function pointer to GC thread main
-        gc_thread_func_ptr = builder.bitcast(self.gc_thread_main, self.i8_ptr)
-
-        # Create the GC thread
-        builder.call(self.pthread_create, [
-            thread_ptr_storage,      # pthread_t*
-            attr_ptr,                # pthread_attr_t*
-            gc_thread_func_ptr,      # start_routine
-            ir.Constant(self.i8_ptr, None)  # arg (none)
-        ])
-
-        # Free the attr after thread creation (no longer needed)
-        builder.call(self.codegen.free, [attr_ptr])
+        # ============================================================
+        # Phase 5: Register main thread with the GC system
+        # Thread ID 0 is used for the main thread in single-threaded mode
+        # ============================================================
+        builder.call(self.gc_register_thread, [ir.Constant(self.i64, 0)])
 
         builder.ret_void()
 
@@ -610,14 +1037,30 @@ class GarbageCollector:
         # Update frame top
         builder.store(raw_frame, self.gc_frame_top)
 
+        # Increment frame depth (Phase 0/2 preparation)
+        depth = builder.load(self.gc_frame_depth)
+        new_depth = builder.add(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, self.gc_frame_depth)
+
+        # Phase 6: Sync depth to ThreadEntry
+        builder.call(self.gc_sync_thread_depth, [])
+
         builder.ret(raw_frame)
 
     def _implement_gc_pop_frame(self):
-        """Pop a frame from the shadow stack"""
+        """Pop a frame from the shadow stack.
+
+        Phase 3: Also checks if we've returned to the watermark depth,
+        and if so, triggers a garbage collection.
+        """
         func = self.gc_pop_frame
         func.args[0].name = "frame_ptr"
 
         entry = func.append_basic_block("entry")
+        check_watermark = func.append_basic_block("check_watermark")
+        trigger_gc = func.append_basic_block("trigger_gc")
+        done = func.append_basic_block("done")
+
         builder = ir.IRBuilder(entry)
 
         frame_ptr = func.args[0]
@@ -628,9 +1071,41 @@ class GarbageCollector:
         parent = builder.load(parent_ptr)
         builder.store(parent, self.gc_frame_top)
 
+        # Decrement frame depth (Phase 0/2/3)
+        depth = builder.load(self.gc_frame_depth)
+        new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, self.gc_frame_depth)
+
+        # Phase 6: Sync depth to ThreadEntry
+        builder.call(self.gc_sync_thread_depth, [])
+
         # Free the frame
         builder.call(self.codegen.free, [frame_ptr])
 
+        # Phase 3: Check if we've hit the watermark
+        builder.branch(check_watermark)
+
+        builder.position_at_end(check_watermark)
+        # Check if watermark is installed
+        watermark_installed = builder.load(self.gc_watermark_installed)
+        builder.cbranch(watermark_installed, trigger_gc, done)
+
+        builder.position_at_end(trigger_gc)
+        # Check if new_depth <= watermark_depth (we've returned to or past the watermark)
+        watermark_depth = builder.load(self.gc_watermark_depth)
+        at_watermark = builder.icmp_unsigned("<=", new_depth, watermark_depth)
+
+        with builder.if_then(at_watermark):
+            # Clear the watermark (one-shot trigger) - global state
+            builder.store(ir.Constant(self.i1, 0), self.gc_watermark_installed)
+            # Trigger garbage collection
+            builder.call(self.gc_collect, [])
+            # Phase 6: Clear watermarks on all ThreadEntries
+            builder.call(self.gc_clear_watermarks, [])
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
         builder.ret_void()
 
     def _implement_gc_set_root(self):
@@ -700,20 +1175,28 @@ class GarbageCollector:
         # Allocate block (header + data)
         block = builder.call(self.codegen.malloc, [aligned_size])
 
-        # Initialize header
+        # Initialize header (Phase 1: 32-byte header with birth-marking)
         header = builder.bitcast(block, self.header_type.as_pointer())
 
-        # Size field
+        # Size field (offset 0)
         size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         builder.store(aligned_size, size_ptr)
 
-        # Type ID field
+        # Type ID field (offset 8) - extend i32 to i64
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(type_id, type_id_ptr)
+        type_id_64 = builder.zext(type_id, self.i64)
+        builder.store(type_id_64, type_id_ptr)
 
-        # Flags field (0 = not marked)
+        # Flags field (offset 16) - BIRTH-MARKING: objects are born marked!
+        # Phase 4: Use gc_current_mark_value for birth-marking (supports mark inversion)
+        # This is critical for high watermark correctness
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(ir.Constant(self.i32, 0), flags_ptr)
+        current_mark = builder.load(self.gc_current_mark_value)
+        builder.store(current_mark, flags_ptr)
+
+        # Forward pointer field (offset 24) - 0 means not forwarded
+        forward_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), forward_ptr)
 
         # Add to allocation list
         node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
@@ -738,6 +1221,31 @@ class GarbageCollector:
 
         # gc_alloc_list = node
         builder.store(raw_node, self.gc_alloc_list)
+
+        # Update GC statistics (Phase 0)
+        # Increment total_allocations
+        total_allocs_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        total_allocs = builder.load(total_allocs_ptr)
+        new_total_allocs = builder.add(total_allocs, ir.Constant(self.i64, 1))
+        builder.store(new_total_allocs, total_allocs_ptr)
+
+        # Add to total_bytes_allocated
+        total_bytes_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        total_bytes = builder.load(total_bytes_ptr)
+        new_total_bytes = builder.add(total_bytes, aligned_size)
+        builder.store(new_total_bytes, total_bytes_ptr)
+
+        # Increment allocations_since_last_gc
+        allocs_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        allocs_since = builder.load(allocs_since_ptr)
+        new_allocs_since = builder.add(allocs_since, ir.Constant(self.i64, 1))
+        builder.store(new_allocs_since, allocs_since_ptr)
+
+        # Add to bytes_since_last_gc
+        bytes_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        bytes_since = builder.load(bytes_since_ptr)
+        new_bytes_since = builder.add(bytes_since, aligned_size)
+        builder.store(new_bytes_since, bytes_since_ptr)
 
         builder.ret(user_ptr)
 
@@ -908,7 +1416,11 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_mark_object(self):
-        """Mark an object as live and recursively mark referenced objects"""
+        """Mark an object as live and recursively mark referenced objects.
+
+        Phase 9 Enhancement: Handles user-defined types by looking up their
+        pointer field offsets from gc_type_offsets_table and marking each field.
+        """
         func = self.gc_mark_object
         func.args[0].name = "ptr"
 
@@ -916,6 +1428,11 @@ class GarbageCollector:
         get_header = func.append_basic_block("get_header")
         do_mark = func.append_basic_block("do_mark")
         check_type = func.append_basic_block("check_type")
+        check_user_type = func.append_basic_block("check_user_type")
+        mark_user_type = func.append_basic_block("mark_user_type")
+        user_offset_loop = func.append_basic_block("user_offset_loop")
+        user_mark_field = func.append_basic_block("user_mark_field")
+        user_next_offset = func.append_basic_block("user_next_offset")
         mark_map = func.append_basic_block("mark_map")
         mark_list = func.append_basic_block("mark_list")
         mark_array = func.append_basic_block("mark_array")
@@ -938,20 +1455,24 @@ class GarbageCollector:
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
 
-        # Check if already marked
+        # Check if already marked (Phase 4: compare mark bit to gc_current_mark_value)
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         flags = builder.load(flags_ptr)
-        is_marked = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
-        already_marked = builder.icmp_unsigned("!=", is_marked, ir.Constant(self.i32, 0))
+        mark_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
+        current_mark = builder.load(self.gc_current_mark_value)
+        already_marked = builder.icmp_unsigned("==", mark_bit, current_mark)
         builder.cbranch(already_marked, done, do_mark)
 
         builder.position_at_end(do_mark)
-        # Set mark bit - need to reload flags since we're in a new block
+        # Set mark bit to current mark value (Phase 4: mark inversion)
+        # Clear bit 0 and set it to gc_current_mark_value
         flags_val = builder.load(flags_ptr)
-        new_flags = builder.or_(flags_val, ir.Constant(self.i32, self.FLAG_MARK_BIT))
+        cleared_flags = builder.and_(flags_val, ir.Constant(self.i64, ~self.FLAG_MARK_BIT & 0xFFFFFFFFFFFFFFFF))
+        current_mark2 = builder.load(self.gc_current_mark_value)
+        new_flags = builder.or_(cleared_flags, current_mark2)
         builder.store(new_flags, flags_ptr)
 
-        # Get type_id and check for types that need recursive marking
+        # Get type_id and check for types that need recursive marking (Phase 1: type_id is now i64)
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         type_id = builder.load(type_id_ptr)
         builder.branch(check_type)
@@ -959,21 +1480,109 @@ class GarbageCollector:
         # Check type and branch to appropriate recursive marking
         builder.position_at_end(check_type)
 
-        # Create a switch for type_id
-        switch = builder.switch(type_id, done)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_MAP), mark_map)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_LIST), mark_list)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_ARRAY), mark_array)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_SET), mark_set)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_STRING), mark_string)
-        switch.add_case(ir.Constant(self.i32, self.TYPE_CHANNEL), mark_channel)
+        # Phase 9: First check if this is a user-defined type (type_id >= TYPE_FIRST_USER)
+        is_user_type = builder.icmp_unsigned(">=", type_id, ir.Constant(self.i64, self.TYPE_FIRST_USER))
+        builder.cbranch(is_user_type, check_user_type, mark_map)  # Fall through to built-in type check
 
+        # Check if user type has offset table entry
+        builder.position_at_end(check_user_type)
+        # Store type_id and ptr for use in loops
+        type_id_alloca = builder.alloca(self.i64, name="type_id_store")
+        builder.store(type_id, type_id_alloca)
+        ptr_alloca = builder.alloca(self.i8_ptr, name="ptr_store")
+        builder.store(ptr, ptr_alloca)
+
+        # Look up gc_type_offsets_table[type_id]
+        table_ptr = builder.gep(self.gc_type_offsets_table,
+                                [ir.Constant(self.i32, 0), type_id], inbounds=False)
+        offset_array_ptr = builder.load(table_ptr)
+
+        # If offset_array_ptr is null, no pointer fields to mark
+        has_offsets = builder.icmp_unsigned("!=", offset_array_ptr, ir.Constant(self.i64_ptr, None))
+        builder.cbranch(has_offsets, mark_user_type, done)
+
+        # Mark user type: iterate through offset array (terminated by -1)
+        builder.position_at_end(mark_user_type)
+        offset_idx = builder.alloca(self.i64, name="offset_idx")
+        builder.store(ir.Constant(self.i64, 0), offset_idx)
+        builder.branch(user_offset_loop)
+
+        # User offset loop
+        builder.position_at_end(user_offset_loop)
+        idx = builder.load(offset_idx)
+        # Reload offset_array_ptr in this block
+        type_id_val = builder.load(type_id_alloca)
+        table_ptr2 = builder.gep(self.gc_type_offsets_table,
+                                 [ir.Constant(self.i32, 0), type_id_val], inbounds=False)
+        offset_array = builder.load(table_ptr2)
+        offset_ptr = builder.gep(offset_array, [idx], inbounds=False)
+        offset = builder.load(offset_ptr)
+
+        # Check if offset is -1 (terminator)
+        is_terminator = builder.icmp_signed("==", offset, ir.Constant(self.i64, -1))
+        builder.cbranch(is_terminator, done, user_mark_field)
+
+        # Mark field at offset
+        builder.position_at_end(user_mark_field)
+        # Reload ptr in this block
+        obj_ptr = builder.load(ptr_alloca)
+        obj_int = builder.ptrtoint(obj_ptr, self.i64)
+        # Reload offset for this block
+        idx2 = builder.load(offset_idx)
+        type_id_val2 = builder.load(type_id_alloca)
+        table_ptr3 = builder.gep(self.gc_type_offsets_table,
+                                 [ir.Constant(self.i32, 0), type_id_val2], inbounds=False)
+        offset_array2 = builder.load(table_ptr3)
+        offset_ptr2 = builder.gep(offset_array2, [idx2], inbounds=False)
+        field_offset = builder.load(offset_ptr2)
+
+        field_addr_int = builder.add(obj_int, field_offset)
+        field_addr = builder.inttoptr(field_addr_int, self.i8_ptr_ptr)
+        field_ptr = builder.load(field_addr)
+        # Recursively mark the field
+        builder.call(func, [field_ptr])
+        builder.branch(user_next_offset)
+
+        # Increment index and continue loop
+        builder.position_at_end(user_next_offset)
+        idx3 = builder.load(offset_idx)
+        next_idx = builder.add(idx3, ir.Constant(self.i64, 1))
+        builder.store(next_idx, offset_idx)
+        builder.branch(user_offset_loop)
+
+        # Built-in type handling with switch
+        # Create a new block for the switch since we may have branched here
+        builtin_switch = func.append_basic_block("builtin_switch")
+
+        # Fix the mark_map block - it now needs to check if it's actually TYPE_MAP
+        builder.position_at_end(mark_map)
+        # type_id was computed in do_mark, we need to reload from header
+        header2 = builder.bitcast(
+            builder.inttoptr(
+                builder.sub(builder.ptrtoint(ptr, self.i64), ir.Constant(self.i64, self.HEADER_SIZE)),
+                self.i8_ptr
+            ),
+            self.header_type.as_pointer()
+        )
+        type_id_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id2 = builder.load(type_id_ptr2)
+
+        # Create a switch for type_id (Phase 1: type_id is now i64)
+        switch = builder.switch(type_id2, done)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_MAP), builtin_switch)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_LIST), mark_list)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), mark_array)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_SET), mark_set)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), mark_string)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_CHANNEL), mark_channel)
+
+        # Actual map marking (in builtin_switch block)
+        builder.position_at_end(builtin_switch)
         # Mark Map: HAMT-based, root at offset 0
         # Map struct: { i64 root, i64 len, i64 flags }
         # All fields are i64 for cross-platform consistency (no padding issues)
         # HAMT nodes and leaves ARE gc_alloc'd, so we must traverse and mark them.
         # flags: bit 0 = key is ptr, bit 1 = value is ptr
-        builder.position_at_end(mark_map)
         map_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64]).as_pointer()
         map_typed = builder.bitcast(ptr, map_ptr_type)
         map_root_i64_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
@@ -1137,6 +1746,10 @@ class GarbageCollector:
 
         Traverses the allocation list, freeing unmarked objects and keeping
         marked ones (after clearing their mark bits for the next cycle).
+
+        Phase 8 Enhancement: Tracks sweep statistics:
+        - objects_swept_last_cycle (gc_stats offset 48)
+        - bytes_reclaimed_last_cycle (gc_stats offset 56)
         """
         func = self.gc_sweep
 
@@ -1149,6 +1762,12 @@ class GarbageCollector:
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
+
+        # Phase 8: Track sweep statistics
+        swept_count = builder.alloca(self.i64, name="swept_count")
+        builder.store(ir.Constant(self.i64, 0), swept_count)
+        swept_bytes = builder.alloca(self.i64, name="swept_bytes")
+        builder.store(ir.Constant(self.i64, 0), swept_bytes)
 
         # prev = null (pointer to previous node's next field, or gc_alloc_list)
         prev = builder.alloca(self.i8_ptr.as_pointer(), name="prev")
@@ -1181,17 +1800,16 @@ class GarbageCollector:
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
 
-        # Check mark bit
+        # Check mark bit (Phase 4: compare to gc_current_mark_value for mark inversion)
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         flags = builder.load(flags_ptr)
-        mark_bit = builder.and_(flags, ir.Constant(self.i32, self.FLAG_MARK_BIT))
-        is_marked = builder.icmp_unsigned("!=", mark_bit, ir.Constant(self.i32, 0))
+        mark_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
+        current_mark = builder.load(self.gc_current_mark_value)
+        is_marked = builder.icmp_unsigned("==", mark_bit, current_mark)
         builder.cbranch(is_marked, is_marked_block, is_unmarked_block)
 
-        # Object is marked - clear mark bit and keep it
+        # Object is marked - keep it (Phase 4: no need to clear mark bit with mark inversion)
         builder.position_at_end(is_marked_block)
-        cleared_flags = builder.and_(flags, ir.Constant(self.i32, ~self.FLAG_MARK_BIT & 0xFFFFFFFF))
-        builder.store(cleared_flags, flags_ptr)
         # Update prev to point to this node's next field
         next_field_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         next_field_ptr_cast = builder.bitcast(next_field_ptr, self.i8_ptr.as_pointer())
@@ -1203,6 +1821,21 @@ class GarbageCollector:
 
         # Object is unmarked - free it and remove from list
         builder.position_at_end(is_unmarked_block)
+
+        # Phase 8: Get size for statistics before freeing
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        obj_size = builder.load(size_ptr)
+
+        # Phase 8: Increment swept count
+        old_count = builder.load(swept_count)
+        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
+        builder.store(new_count, swept_count)
+
+        # Phase 8: Add to swept bytes
+        old_bytes = builder.load(swept_bytes)
+        new_bytes = builder.add(old_bytes, obj_size)
+        builder.store(new_bytes, swept_bytes)
+
         # Get next node before freeing
         next_field_ptr2 = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         next_node = builder.load(next_field_ptr2)
@@ -1224,55 +1857,111 @@ class GarbageCollector:
         builder.position_at_end(done)
         # Reset allocation counter
         builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
+
+        # Phase 8: Update gc_stats with sweep statistics
+        # gc_stats.objects_swept_last_cycle (offset 6 = index 48/8)
+        final_count = builder.load(swept_count)
+        swept_count_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
+        ], inbounds=True)
+        builder.store(final_count, swept_count_ptr)
+
+        # gc_stats.bytes_reclaimed_last_cycle (offset 7 = index 56/8)
+        final_bytes = builder.load(swept_bytes)
+        swept_bytes_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        builder.store(final_bytes, swept_bytes_ptr)
+
+        # Phase 9: Mark value flip moved to gc_collect (before mark phase)
+        # This ensures objects born after flip are properly traversed
+
         builder.ret_void()
 
     def _implement_gc_collect(self):
-        """Run a full garbage collection cycle (dual-heap async model).
+        """Run a full garbage collection cycle (high watermark model).
 
-        This triggers async collection and waits for completion, maintaining
-        synchronous semantics from the caller's perspective.
-
-        Steps:
-        1. If GC already in progress, wait for it to complete
-        2. If not, swap heaps (triggers async collection) and wait
+        Phase 9: Collection Orchestration
+        This implements the synchronous collection cycle:
+        1. Check if GC enabled and not already in progress
+        2. Set gc_in_progress = 1
+        3. Mark phase: scan roots and mark reachable objects
+        4. Sweep phase: free unmarked objects
+        5. Update statistics
+        6. Set gc_in_progress = 0
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
-        check_in_progress = func.append_basic_block("check_in_progress")
-        wait_existing = func.append_basic_block("wait_existing")
-        trigger_gc = func.append_basic_block("trigger_gc")
-        wait_new = func.append_basic_block("wait_new")
+        check_enabled = func.append_basic_block("check_enabled")
+        do_collection = func.append_basic_block("do_collection")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
 
         # Check if GC enabled
         gc_enabled = builder.load(self.gc_enabled)
-        builder.cbranch(gc_enabled, check_in_progress, done)
+        builder.cbranch(gc_enabled, check_enabled, done)
 
-        builder.position_at_end(check_in_progress)
-        # Check if GC already in progress
+        builder.position_at_end(check_enabled)
+        # Check if GC already in progress (reentrant protection)
         in_prog_ptr = builder.gep(self.gc_state, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
         in_progress = builder.load(in_prog_ptr)
         is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
-        builder.cbranch(is_in_progress, wait_existing, trigger_gc)
+        builder.cbranch(is_in_progress, done, do_collection)
 
-        builder.position_at_end(wait_existing)
-        # Wait for existing GC to complete
-        builder.call(self.gc_wait_for_completion, [])
-        builder.branch(done)
+        builder.position_at_end(do_collection)
 
-        builder.position_at_end(trigger_gc)
-        # Swap heaps (captures snapshot, signals GC thread)
-        builder.call(self.gc_swap_heaps, [])
-        builder.branch(wait_new)
+        # Set gc_in_progress = 1
+        builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
 
-        builder.position_at_end(wait_new)
-        # Wait for the new GC cycle to complete
-        builder.call(self.gc_wait_for_completion, [])
+        # Phase 9: Flip gc_current_mark_value BEFORE mark phase
+        # This ensures newly allocated objects (born with OLD mark value) will be
+        # properly traversed, since they won't appear "already marked" with new value
+        old_mark = builder.load(self.gc_current_mark_value)
+        new_mark = builder.xor(old_mark, ir.Constant(self.i64, 1))
+        builder.store(new_mark, self.gc_current_mark_value)
+
+        # Phase 9: Mark phase - scan roots and mark all reachable objects
+        # Use gc_scan_roots which marks from the shadow stack
+        builder.call(self.gc_scan_roots, [])
+
+        # Phase 9: Sweep phase - free unmarked objects
+        # gc_sweep handles mark inversion (flips gc_current_mark_value)
+        builder.call(self.gc_sweep, [])
+
+        # Phase 9: Update statistics
+        # Increment collections_completed (gc_stats offset 4 = index 32/8)
+        collections_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        old_collections = builder.load(collections_ptr)
+        new_collections = builder.add(old_collections, ir.Constant(self.i64, 1))
+        builder.store(new_collections, collections_ptr)
+
+        # Reset allocations_since_last_gc (gc_stats offset 2 = index 16/8)
+        alloc_since_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), alloc_since_ptr)
+
+        # Reset bytes_since_last_gc (gc_stats offset 3 = index 24/8)
+        bytes_since_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), bytes_since_ptr)
+
+        # Set gc_in_progress = 0
+        builder.store(ir.Constant(self.i64, 0), in_prog_ptr)
+
+        # Also set gc_complete = 1 for compatibility
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), complete_ptr)
+
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -1761,35 +2450,20 @@ class GarbageCollector:
         # The detached thread will be cleaned up when main exits
 
     def _implement_gc_async(self):
-        """Trigger async GC - swap heaps and return immediately."""
+        """Trigger async GC (Phase 9: In single-threaded mode, just do synchronous collection).
+
+        In the high watermark model for single-threaded execution, gc_async
+        simply calls gc_collect since there's no separate GC thread.
+        Multi-threaded implementation would spawn/signal a GC thread.
+        """
         func = self.gc_async
 
         entry = func.append_basic_block("entry")
-        check_in_progress = func.append_basic_block("check_in_progress")
-        do_swap = func.append_basic_block("do_swap")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
-        # Check if GC enabled
-        gc_enabled = builder.load(self.gc_enabled)
-        builder.cbranch(gc_enabled, check_in_progress, done)
+        # Phase 9: In single-threaded mode, just do synchronous collection
+        builder.call(self.gc_collect, [])
 
-        builder.position_at_end(check_in_progress)
-        # If GC already in progress, just return (no-op)
-        in_prog_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        in_progress = builder.load(in_prog_ptr)
-        is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
-        builder.cbranch(is_in_progress, done, do_swap)
-
-        builder.position_at_end(do_swap)
-        # Swap heaps (captures snapshot, signals GC thread)
-        builder.call(self.gc_swap_heaps, [])
-        builder.branch(done)
-
-        builder.position_at_end(done)
         builder.ret_void()
 
     def _implement_gc_wait_for_completion(self):
@@ -1891,3 +2565,1243 @@ class GarbageCollector:
         entry = self.gc_destroy_context.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
         builder.ret_void()
+
+    # ============================================================
+    # Phase 0: Debugging Infrastructure Implementations
+    # ============================================================
+
+    def _implement_gc_trace(self):
+        """Implement trace output function based on current trace level"""
+        func = self.gc_trace
+        func.args[0].name = "level"
+        func.args[1].name = "msg"
+
+        entry = func.append_basic_block("entry")
+        do_trace = func.append_basic_block("do_trace")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        level = func.args[0]
+        msg = func.args[1]
+
+        # Check if trace level is high enough
+        current_level = builder.load(self.gc_trace_level)
+        should_trace = builder.icmp_unsigned(">=", current_level, level)
+        builder.cbranch(should_trace, do_trace, done)
+
+        # Print the trace message
+        builder.position_at_end(do_trace)
+        # Call puts to output the message
+        puts_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        if "puts" in self.module.globals:
+            puts = self.module.globals["puts"]
+        else:
+            puts = ir.Function(self.module, puts_ty, name="puts")
+        builder.call(puts, [msg])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_dump_stats(self):
+        """Implement function to print current GC statistics"""
+        func = self.gc_dump_stats
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Create format strings for printf
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Header format
+        header_str = "[GC:STATS] === GC Statistics ===\n"
+        header_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(header_str) + 1), name=".gc_stats_header")
+        header_global.global_constant = True
+        header_global.linkage = 'private'
+        header_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(header_str) + 1),
+                                                  bytearray(header_str.encode('utf-8')) + bytearray([0]))
+        header_ptr = builder.bitcast(header_global, self.i8_ptr)
+        builder.call(printf, [header_ptr])
+
+        # Allocation stats format
+        alloc_fmt = "[GC:STATS] total_allocations: %lld, total_bytes: %lld\n"
+        alloc_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(alloc_fmt) + 1), name=".gc_stats_alloc")
+        alloc_global.global_constant = True
+        alloc_global.linkage = 'private'
+        alloc_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(alloc_fmt) + 1),
+                                                bytearray(alloc_fmt.encode('utf-8')) + bytearray([0]))
+        alloc_ptr = builder.bitcast(alloc_global, self.i8_ptr)
+
+        # Load stats fields
+        total_allocs_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        total_allocs = builder.load(total_allocs_ptr)
+        total_bytes_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        total_bytes = builder.load(total_bytes_ptr)
+        builder.call(printf, [alloc_ptr, total_allocs, total_bytes])
+
+        # Collection stats format
+        collect_fmt = "[GC:STATS] collections: %lld, marked_last: %lld, swept_last: %lld\n"
+        collect_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(collect_fmt) + 1), name=".gc_stats_collect")
+        collect_global.global_constant = True
+        collect_global.linkage = 'private'
+        collect_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(collect_fmt) + 1),
+                                                  bytearray(collect_fmt.encode('utf-8')) + bytearray([0]))
+        collect_ptr = builder.bitcast(collect_global, self.i8_ptr)
+
+        collections_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        collections = builder.load(collections_ptr)
+        marked_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)], inbounds=True)
+        marked = builder.load(marked_ptr)
+        swept_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)], inbounds=True)
+        swept = builder.load(swept_ptr)
+        builder.call(printf, [collect_ptr, collections, marked, swept])
+
+        # Timing stats format
+        timing_fmt = "[GC:STATS] last_gc_ns: %lld\n"
+        timing_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(timing_fmt) + 1), name=".gc_stats_timing")
+        timing_global.global_constant = True
+        timing_global.linkage = 'private'
+        timing_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(timing_fmt) + 1),
+                                                 bytearray(timing_fmt.encode('utf-8')) + bytearray([0]))
+        timing_ptr = builder.bitcast(timing_global, self.i8_ptr)
+
+        last_gc_ns_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 16)], inbounds=True)
+        last_gc_ns = builder.load(last_gc_ns_ptr)
+        builder.call(printf, [timing_ptr, last_gc_ns])
+
+        builder.ret_void()
+
+    def _implement_gc_dump_heap(self):
+        """Implement function to print all objects in the heap"""
+        func = self.gc_dump_heap
+
+        entry = func.append_basic_block("entry")
+        loop = func.append_basic_block("loop")
+        print_obj = func.append_basic_block("print_obj")
+        next_obj = func.append_basic_block("next_obj")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Printf for output
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Header
+        header_str = "[GC:HEAP] === Heap Dump ===\n"
+        header_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(header_str) + 1), name=".gc_heap_header")
+        header_global.global_constant = True
+        header_global.linkage = 'private'
+        header_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(header_str) + 1),
+                                                  bytearray(header_str.encode('utf-8')) + bytearray([0]))
+        header_ptr = builder.bitcast(header_global, self.i8_ptr)
+        builder.call(printf, [header_ptr])
+
+        # Object format string
+        obj_fmt = "[GC:HEAP] obj=%p type=%d size=%lld marked=%d\n"
+        obj_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(obj_fmt) + 1), name=".gc_heap_obj")
+        obj_global.global_constant = True
+        obj_global.linkage = 'private'
+        obj_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(obj_fmt) + 1),
+                                              bytearray(obj_fmt.encode('utf-8')) + bytearray([0]))
+        obj_ptr = builder.bitcast(obj_global, self.i8_ptr)
+
+        # Count format
+        count_fmt = "[GC:HEAP] Total objects: %lld\n"
+        count_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(count_fmt) + 1), name=".gc_heap_count")
+        count_global.global_constant = True
+        count_global.linkage = 'private'
+        count_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(count_fmt) + 1),
+                                                bytearray(count_fmt.encode('utf-8')) + bytearray([0]))
+        count_ptr_fmt = builder.bitcast(count_global, self.i8_ptr)
+
+        # Allocate counter
+        count_alloca = builder.alloca(self.i64, name="count")
+        builder.store(ir.Constant(self.i64, 0), count_alloca)
+
+        # Get head of allocation list
+        head = builder.load(self.gc_alloc_list)
+        curr_alloca = builder.alloca(self.i8_ptr, name="curr")
+        builder.store(head, curr_alloca)
+        builder.branch(loop)
+
+        # Loop through allocation list
+        builder.position_at_end(loop)
+        curr = builder.load(curr_alloca)
+        is_null = builder.icmp_unsigned("==", curr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, print_obj)
+
+        # Print object info
+        builder.position_at_end(print_obj)
+        node = builder.bitcast(curr, self.alloc_node_type.as_pointer())
+
+        # Get data pointer
+        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        # Get header
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr_local = builder.inttoptr(header_int, self.header_type.as_pointer())
+
+        # Load header fields
+        size_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        size = builder.load(size_ptr)
+        # Phase 1: type_id and flags are now i64
+        type_id_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+        flags_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        flags = builder.load(flags_ptr)
+
+        # Extract mark bit (Phase 1: flags is i64)
+        marked = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
+
+        builder.call(printf, [obj_ptr, data_ptr, type_id, size, marked])
+
+        # Increment counter
+        count_val = builder.load(count_alloca)
+        new_count = builder.add(count_val, ir.Constant(self.i64, 1))
+        builder.store(new_count, count_alloca)
+
+        builder.branch(next_obj)
+
+        # Get next object
+        builder.position_at_end(next_obj)
+        next_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_ptr = builder.load(next_ptr_ptr)
+        builder.store(next_ptr, curr_alloca)
+        builder.branch(loop)
+
+        # Done
+        builder.position_at_end(done)
+        final_count = builder.load(count_alloca)
+        builder.call(printf, [count_ptr_fmt, final_count])
+        builder.ret_void()
+
+    def _implement_gc_dump_roots(self):
+        """Implement function to print all roots from shadow stack"""
+        func = self.gc_dump_roots
+
+        entry = func.append_basic_block("entry")
+        frame_loop = func.append_basic_block("frame_loop")
+        process_frame = func.append_basic_block("process_frame")
+        root_loop = func.append_basic_block("root_loop")
+        print_root = func.append_basic_block("print_root")
+        next_root = func.append_basic_block("next_root")
+        next_frame = func.append_basic_block("next_frame")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Printf for output
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Header
+        header_str = "[GC:ROOTS] === Root Dump (depth=%lld) ===\n"
+        header_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(header_str) + 1), name=".gc_roots_header")
+        header_global.global_constant = True
+        header_global.linkage = 'private'
+        header_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(header_str) + 1),
+                                                  bytearray(header_str.encode('utf-8')) + bytearray([0]))
+        header_ptr = builder.bitcast(header_global, self.i8_ptr)
+        depth = builder.load(self.gc_frame_depth)
+        builder.call(printf, [header_ptr, depth])
+
+        # Frame format
+        frame_fmt = "[GC:ROOTS] Frame %lld: %lld roots\n"
+        frame_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(frame_fmt) + 1), name=".gc_roots_frame")
+        frame_global.global_constant = True
+        frame_global.linkage = 'private'
+        frame_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(frame_fmt) + 1),
+                                                bytearray(frame_fmt.encode('utf-8')) + bytearray([0]))
+        frame_ptr_fmt = builder.bitcast(frame_global, self.i8_ptr)
+
+        # Root format
+        root_fmt = "[GC:ROOTS]   root[%lld]=%p\n"
+        root_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(root_fmt) + 1), name=".gc_roots_root")
+        root_global.global_constant = True
+        root_global.linkage = 'private'
+        root_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(root_fmt) + 1),
+                                               bytearray(root_fmt.encode('utf-8')) + bytearray([0]))
+        root_ptr_fmt = builder.bitcast(root_global, self.i8_ptr)
+
+        # Initialize frame pointer and counter
+        frame_ptr_alloca = builder.alloca(self.i8_ptr, name="frame_ptr")
+        frame_num_alloca = builder.alloca(self.i64, name="frame_num")
+        frame_top = builder.load(self.gc_frame_top)
+        builder.store(frame_top, frame_ptr_alloca)
+        builder.store(ir.Constant(self.i64, 0), frame_num_alloca)
+        builder.branch(frame_loop)
+
+        # Frame loop
+        builder.position_at_end(frame_loop)
+        curr_frame_raw = builder.load(frame_ptr_alloca)
+        is_null = builder.icmp_unsigned("==", curr_frame_raw, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, process_frame)
+
+        # Process frame
+        builder.position_at_end(process_frame)
+        frame = builder.bitcast(curr_frame_raw, self.gc_frame_type.as_pointer())
+
+        # Get num_roots
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
+        frame_num = builder.load(frame_num_alloca)
+        builder.call(printf, [frame_ptr_fmt, frame_num, num_roots])
+
+        # Get roots pointer
+        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        roots_ptr = builder.load(roots_ptr_ptr)
+
+        # Initialize root index
+        root_idx_alloca = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx_alloca)
+        builder.branch(root_loop)
+
+        # Root loop
+        builder.position_at_end(root_loop)
+        root_idx = builder.load(root_idx_alloca)
+        done_roots = builder.icmp_signed(">=", root_idx, num_roots)
+        builder.cbranch(done_roots, next_frame, print_root)
+
+        # Print root
+        builder.position_at_end(print_root)
+        root_slot = builder.gep(roots_ptr, [root_idx], inbounds=True)
+        root_val = builder.load(root_slot)
+        builder.call(printf, [root_ptr_fmt, root_idx, root_val])
+        builder.branch(next_root)
+
+        # Next root
+        builder.position_at_end(next_root)
+        new_idx = builder.add(root_idx, ir.Constant(self.i64, 1))
+        builder.store(new_idx, root_idx_alloca)
+        builder.branch(root_loop)
+
+        # Next frame
+        builder.position_at_end(next_frame)
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, frame_ptr_alloca)
+        new_frame_num = builder.add(frame_num, ir.Constant(self.i64, 1))
+        builder.store(new_frame_num, frame_num_alloca)
+        builder.branch(frame_loop)
+
+        # Done
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_dump_object(self):
+        """Implement function to dump detailed info about a single object"""
+        func = self.gc_dump_object
+        func.args[0].name = "ptr"
+
+        entry = func.append_basic_block("entry")
+        valid = func.append_basic_block("valid")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        ptr = func.args[0]
+
+        # Printf for output
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Null check
+        is_null = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, valid)
+
+        builder.position_at_end(valid)
+
+        # Object format
+        obj_fmt = "[GC:OBJ] ptr=%p size=%lld type=%d flags=0x%x\n"
+        obj_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(obj_fmt) + 1), name=".gc_obj_fmt")
+        obj_global.global_constant = True
+        obj_global.linkage = 'private'
+        obj_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(obj_fmt) + 1),
+                                              bytearray(obj_fmt.encode('utf-8')) + bytearray([0]))
+        obj_ptr_fmt = builder.bitcast(obj_global, self.i8_ptr)
+
+        # Get header
+        ptr_int = builder.ptrtoint(ptr, self.i64)
+        header_int = builder.sub(ptr_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header = builder.inttoptr(header_int, self.header_type.as_pointer())
+
+        # Load header fields (Phase 1: type_id and flags are now i64)
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        size = builder.load(size_ptr)
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        flags = builder.load(flags_ptr)
+
+        builder.call(printf, [obj_ptr_fmt, ptr, size, type_id, flags])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_validate_heap(self):
+        """Implement heap validation function - returns 0 if valid, error code otherwise"""
+        func = self.gc_validate_heap
+
+        entry = func.append_basic_block("entry")
+        loop = func.append_basic_block("loop")
+        check_obj = func.append_basic_block("check_obj")
+        check_size = func.append_basic_block("check_size")
+        check_type = func.append_basic_block("check_type")
+        next_obj = func.append_basic_block("next_obj")
+        invalid_size = func.append_basic_block("invalid_size")
+        invalid_type = func.append_basic_block("invalid_type")
+        valid = func.append_basic_block("valid")
+
+        builder = ir.IRBuilder(entry)
+
+        # Get head of allocation list
+        head = builder.load(self.gc_alloc_list)
+        curr_alloca = builder.alloca(self.i8_ptr, name="curr")
+        builder.store(head, curr_alloca)
+        builder.branch(loop)
+
+        # Loop through allocation list
+        builder.position_at_end(loop)
+        curr = builder.load(curr_alloca)
+        is_null = builder.icmp_unsigned("==", curr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, valid, check_obj)
+
+        # Check object
+        builder.position_at_end(check_obj)
+        node = builder.bitcast(curr, self.alloc_node_type.as_pointer())
+
+        # Get data pointer
+        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+
+        # Get header
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header = builder.inttoptr(header_int, self.header_type.as_pointer())
+
+        # Load header fields
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        size = builder.load(size_ptr)
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+
+        builder.branch(check_size)
+
+        # Check size >= HEADER_SIZE
+        builder.position_at_end(check_size)
+        header_size_const = ir.Constant(self.i64, self.HEADER_SIZE)
+        size_valid = builder.icmp_unsigned(">=", size, header_size_const)
+        builder.cbranch(size_valid, check_type, invalid_size)
+
+        # Check type_id < MAX_TYPES (Phase 1: type_id is now i64)
+        builder.position_at_end(check_type)
+        max_types = ir.Constant(self.i64, self.MAX_TYPES)
+        type_valid = builder.icmp_unsigned("<", type_id, max_types)
+        builder.cbranch(type_valid, next_obj, invalid_type)
+
+        # Get next object
+        builder.position_at_end(next_obj)
+        next_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_ptr = builder.load(next_ptr_ptr)
+        builder.store(next_ptr, curr_alloca)
+        builder.branch(loop)
+
+        # Invalid size
+        builder.position_at_end(invalid_size)
+        builder.ret(ir.Constant(self.i64, 1))  # Error code 1
+
+        # Invalid type
+        builder.position_at_end(invalid_type)
+        builder.ret(ir.Constant(self.i64, 2))  # Error code 2
+
+        # All valid
+        builder.position_at_end(valid)
+        builder.ret(ir.Constant(self.i64, 0))  # Success
+
+    def _implement_gc_set_trace_level(self):
+        """Implement function to set trace verbosity level"""
+        func = self.gc_set_trace_level
+        func.args[0].name = "level"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        level = func.args[0]
+        builder.store(level, self.gc_trace_level)
+        builder.ret_void()
+
+    # ============================================================
+    # Phase 3: High Watermark Tracking Implementation
+    # ============================================================
+
+    def _implement_gc_install_watermark(self):
+        """Install watermark at current frame depth.
+
+        When gc_pop_frame detects that frame_depth has returned to
+        watermark_depth, it will trigger a garbage collection.
+
+        This is the key mechanism for the high watermark GC:
+        1. Program calls gc_install_watermark() at a safe point (e.g., top of main loop)
+        2. Watermark is set to current frame depth
+        3. Program continues, creating allocations
+        4. When returning to the watermark depth (unwinding back to that point),
+           GC is triggered to collect objects that are no longer reachable
+        """
+        func = self.gc_install_watermark
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Get current frame depth
+        current_depth = builder.load(self.gc_frame_depth)
+
+        # Store as watermark depth
+        builder.store(current_depth, self.gc_watermark_depth)
+
+        # Set watermark installed flag
+        builder.store(ir.Constant(self.i1, 1), self.gc_watermark_installed)
+
+        # Phase 6: Also install watermarks on all ThreadEntries
+        builder.call(self.gc_install_watermarks, [])
+
+        builder.ret_void()
+
+    # ============================================================
+    # Phase 5: Thread Registry Implementations
+    # ============================================================
+
+    def _implement_gc_register_thread(self):
+        """Register a thread with the GC system.
+
+        Allocates a ThreadEntry, initializes it, and adds it to the registry.
+        For single-threaded mode, this is called once for the main thread.
+
+        Returns pointer to the new ThreadEntry.
+        """
+        func = self.gc_register_thread
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        thread_id = func.args[0]
+
+        # Allocate ThreadEntry (using malloc for simplicity, this is GC metadata)
+        entry_size = ir.Constant(self.i64, 64)  # 8 fields * 8 bytes
+        entry_ptr_raw = builder.call(self.codegen.malloc, [entry_size])
+        entry_ptr = builder.bitcast(entry_ptr_raw, self.thread_entry_type.as_pointer())
+
+        # Initialize fields:
+        # 0: thread_id
+        thread_id_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(thread_id, thread_id_ptr)
+
+        # 1: shadow_stack_chain - point to gc_frame_top global
+        # In single-threaded mode, all threads share gc_frame_top
+        # Cast the global variable address to i8*
+        frame_top_addr = builder.bitcast(self.gc_frame_top, self.i8_ptr)
+        shadow_stack_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(frame_top_addr, shadow_stack_ptr)
+
+        # 2: watermark = 0 (no watermark)
+        watermark_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), watermark_ptr)
+
+        # 3: watermark_active = 0
+        watermark_active_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), watermark_active_ptr)
+
+        # 4: stack_depth = 0
+        stack_depth_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), stack_depth_ptr)
+
+        # 5: blocked = 0
+        blocked_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), blocked_ptr)
+
+        # 6: alloc_buffer = null (future use)
+        alloc_buffer_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), alloc_buffer_ptr)
+
+        # 7: next = current registry head
+        old_head = builder.load(self.gc_thread_registry)
+        old_head_raw = builder.bitcast(old_head, self.i8_ptr)
+        next_ptr = builder.gep(entry_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        builder.store(old_head_raw, next_ptr)
+
+        # Update registry head to point to new entry
+        builder.store(entry_ptr, self.gc_thread_registry)
+
+        # Increment thread count
+        old_count = builder.load(self.gc_thread_count)
+        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
+        builder.store(new_count, self.gc_thread_count)
+
+        builder.ret(entry_ptr)
+
+    def _implement_gc_unregister_thread(self):
+        """Unregister a thread from the GC system.
+
+        Removes the ThreadEntry from the registry and frees it.
+        For single-threaded mode, this is called at program exit.
+        """
+        func = self.gc_unregister_thread
+
+        entry = func.append_basic_block("entry")
+        search_loop = func.append_basic_block("search_loop")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        thread_id = func.args[0]
+
+        # prev = null, curr = registry head
+        prev = builder.alloca(self.thread_entry_type.as_pointer(), name="prev")
+        builder.store(ir.Constant(self.thread_entry_type.as_pointer(), None), prev)
+
+        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr)
+
+        builder.branch(search_loop)
+
+        # Search loop
+        builder.position_at_end(search_loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        builder.cbranch(is_null, not_found, found)
+
+        # Check if this is the thread we're looking for
+        builder.position_at_end(found)
+        curr_id_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        curr_id = builder.load(curr_id_ptr)
+        is_match = builder.icmp_unsigned("==", curr_id, thread_id)
+
+        # If match, remove from list
+        remove_block = func.append_basic_block("remove")
+        next_iter = func.append_basic_block("next_iter")
+        builder.cbranch(is_match, remove_block, next_iter)
+
+        # Remove from list
+        builder.position_at_end(remove_block)
+        # Get next pointer
+        next_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        next_raw = builder.load(next_ptr)
+        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
+
+        # Update prev->next or registry head
+        prev_val = builder.load(prev)
+        is_head = builder.icmp_unsigned("==", prev_val,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        update_head = func.append_basic_block("update_head")
+        update_prev = func.append_basic_block("update_prev")
+        after_update = func.append_basic_block("after_update")
+        builder.cbranch(is_head, update_head, update_prev)
+
+        # Update registry head
+        builder.position_at_end(update_head)
+        builder.store(next_entry, self.gc_thread_registry)
+        builder.branch(after_update)
+
+        # Update prev->next
+        builder.position_at_end(update_prev)
+        prev_next_ptr = builder.gep(prev_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        builder.store(next_raw, prev_next_ptr)
+        builder.branch(after_update)
+
+        # Free the entry and decrement count
+        builder.position_at_end(after_update)
+        curr_raw = builder.bitcast(curr_val, self.i8_ptr)
+        builder.call(self.codegen.free, [curr_raw])
+        old_count = builder.load(self.gc_thread_count)
+        new_count = builder.sub(old_count, ir.Constant(self.i64, 1))
+        builder.store(new_count, self.gc_thread_count)
+        builder.branch(done)
+
+        # Move to next entry
+        builder.position_at_end(next_iter)
+        builder.store(curr_val, prev)
+        next_ptr2 = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        next_raw2 = builder.load(next_ptr2)
+        next_entry2 = builder.bitcast(next_raw2, self.thread_entry_type.as_pointer())
+        builder.store(next_entry2, curr)
+        builder.branch(search_loop)
+
+        # Not found - do nothing
+        builder.position_at_end(not_found)
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_get_thread_entry(self):
+        """Get the ThreadEntry for a given thread ID.
+
+        Searches the registry for a matching thread_id.
+        Returns pointer to ThreadEntry or null if not found.
+        """
+        func = self.gc_get_thread_entry
+
+        entry = func.append_basic_block("entry")
+        search_loop = func.append_basic_block("search_loop")
+        check_match = func.append_basic_block("check_match")
+        found = func.append_basic_block("found")
+        next_iter = func.append_basic_block("next_iter")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        thread_id = func.args[0]
+
+        # curr = registry head
+        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr)
+
+        builder.branch(search_loop)
+
+        # Search loop
+        builder.position_at_end(search_loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        builder.cbranch(is_null, not_found, check_match)
+
+        # Check if this is the thread we're looking for
+        builder.position_at_end(check_match)
+        curr_id_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        curr_id = builder.load(curr_id_ptr)
+        is_match = builder.icmp_unsigned("==", curr_id, thread_id)
+        builder.cbranch(is_match, found, next_iter)
+
+        # Found - return entry
+        builder.position_at_end(found)
+        builder.ret(curr_val)
+
+        # Move to next entry
+        builder.position_at_end(next_iter)
+        next_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        next_raw = builder.load(next_ptr)
+        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
+        builder.store(next_entry, curr)
+        builder.branch(search_loop)
+
+        # Not found - return null
+        builder.position_at_end(not_found)
+        builder.ret(ir.Constant(self.thread_entry_type.as_pointer(), None))
+
+    def _implement_gc_get_current_thread_entry(self):
+        """Get the ThreadEntry for the current (main) thread.
+
+        In single-threaded mode, this just returns the first entry in the registry.
+        In multi-threaded mode, this would use thread-local storage or thread ID lookup.
+        """
+        func = self.gc_get_current_thread_entry
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # In single-threaded mode, just return the registry head
+        # (which is the only entry - the main thread)
+        head = builder.load(self.gc_thread_registry)
+        builder.ret(head)
+
+    # ============================================================
+    # Phase 6: Watermark Mechanism Enhancement Implementations
+    # ============================================================
+
+    def _implement_gc_install_watermarks(self):
+        """Install watermarks on all registered threads.
+
+        For each thread in the registry:
+        1. Set thread.watermark = thread.stack_depth (or global gc_frame_depth)
+        2. Set thread.watermark_active = 1
+
+        This is called at the start of a GC cycle to mark the point
+        where threads should block if they try to unwind past.
+        """
+        func = self.gc_install_watermarks
+
+        entry = func.append_basic_block("entry")
+        loop = func.append_basic_block("loop")
+        process = func.append_basic_block("process")
+        next_thread = func.append_basic_block("next_thread")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # curr = registry head
+        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr)
+
+        builder.branch(loop)
+
+        # Loop through all threads
+        builder.position_at_end(loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        builder.cbranch(is_null, done, process)
+
+        # Process this thread - set watermark
+        builder.position_at_end(process)
+
+        # Get current global frame depth (in single-threaded mode, all threads share this)
+        current_depth = builder.load(self.gc_frame_depth)
+
+        # Set thread.watermark = current_depth
+        watermark_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(current_depth, watermark_ptr)
+
+        # Set thread.watermark_active = 1
+        watermark_active_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), watermark_active_ptr)
+
+        # Also sync stack_depth field
+        stack_depth_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        builder.store(current_depth, stack_depth_ptr)
+
+        builder.branch(next_thread)
+
+        # Move to next thread
+        builder.position_at_end(next_thread)
+        next_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        next_raw = builder.load(next_ptr)
+        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
+        builder.store(next_entry, curr)
+        builder.branch(loop)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_clear_watermarks(self):
+        """Clear watermarks on all registered threads.
+
+        For each thread in the registry:
+        1. Set thread.watermark = 0
+        2. Set thread.watermark_active = 0
+
+        This is called at the end of a GC cycle to allow blocked threads
+        to continue.
+        """
+        func = self.gc_clear_watermarks
+
+        entry = func.append_basic_block("entry")
+        loop = func.append_basic_block("loop")
+        process = func.append_basic_block("process")
+        next_thread = func.append_basic_block("next_thread")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Also clear the global watermark state
+        builder.store(ir.Constant(self.i64, 0), self.gc_watermark_depth)
+        builder.store(ir.Constant(self.i1, 0), self.gc_watermark_installed)
+
+        # curr = registry head
+        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr)
+
+        builder.branch(loop)
+
+        # Loop through all threads
+        builder.position_at_end(loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        builder.cbranch(is_null, done, process)
+
+        # Process this thread - clear watermark
+        builder.position_at_end(process)
+
+        # Set thread.watermark = 0
+        watermark_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), watermark_ptr)
+
+        # Set thread.watermark_active = 0
+        watermark_active_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), watermark_active_ptr)
+
+        builder.branch(next_thread)
+
+        # Move to next thread
+        builder.position_at_end(next_thread)
+        next_ptr = builder.gep(curr_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        next_raw = builder.load(next_ptr)
+        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
+        builder.store(next_entry, curr)
+        builder.branch(loop)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_sync_thread_depth(self):
+        """Sync global gc_frame_depth to current thread's ThreadEntry.stack_depth.
+
+        This keeps the ThreadEntry in sync with the global frame depth counter.
+        In single-threaded mode, there's only one thread so this is straightforward.
+        In multi-threaded mode, each thread would update its own entry.
+        """
+        func = self.gc_sync_thread_depth
+
+        entry = func.append_basic_block("entry")
+        has_entry = func.append_basic_block("has_entry")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Get current thread entry
+        thread_entry = builder.load(self.gc_thread_registry)
+        is_null = builder.icmp_unsigned("==", thread_entry,
+                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
+        builder.cbranch(is_null, done, has_entry)
+
+        builder.position_at_end(has_entry)
+        # Get current global frame depth
+        current_depth = builder.load(self.gc_frame_depth)
+
+        # Update thread.stack_depth
+        stack_depth_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        builder.store(current_depth, stack_depth_ptr)
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    # ============================================================
+    # Phase 7: First Trace Pass Implementations
+    # ============================================================
+
+    def _implement_gc_scan_roots_watermark(self):
+        """Scan shadow stack up to watermark depth, marking all roots.
+
+        This is the watermark-aware version of gc_scan_roots.
+        It only scans frames at depth <= watermark_depth, skipping
+        frames above the watermark (which contain objects allocated
+        after watermark installation that are birth-marked).
+
+        Returns the number of roots marked.
+        """
+        func = self.gc_scan_roots_watermark
+
+        entry = func.append_basic_block("entry")
+        frame_loop = func.append_basic_block("frame_loop")
+        check_depth = func.append_basic_block("check_depth")
+        process_frame = func.append_basic_block("process_frame")
+        root_loop = func.append_basic_block("root_loop")
+        check_root = func.append_basic_block("check_root")
+        mark_root = func.append_basic_block("mark_root")
+        next_root = func.append_basic_block("next_root")
+        next_frame = func.append_basic_block("next_frame")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Count of roots marked
+        roots_marked = builder.alloca(self.i64, name="roots_marked")
+        builder.store(ir.Constant(self.i64, 0), roots_marked)
+
+        # Current frame depth (counting down from gc_frame_depth)
+        curr_depth = builder.alloca(self.i64, name="curr_depth")
+        total_depth = builder.load(self.gc_frame_depth)
+        builder.store(total_depth, curr_depth)
+
+        # Current frame pointer
+        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
+        top = builder.load(self.gc_frame_top)
+        builder.store(top, curr_frame)
+
+        builder.branch(frame_loop)
+
+        # Frame loop: while curr_frame != null
+        builder.position_at_end(frame_loop)
+        frame_val = builder.load(curr_frame)
+        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, check_depth)
+
+        # Check if we've gone past the watermark depth
+        builder.position_at_end(check_depth)
+        depth_val = builder.load(curr_depth)
+        watermark_depth = builder.load(self.gc_watermark_depth)
+        wm_installed = builder.load(self.gc_watermark_installed)
+
+        # gc_frame_depth starts at 0, increments on push, decrements on pop
+        # When watermark is installed, watermark_depth = current gc_frame_depth
+        # We want to scan frames that existed at watermark time (depth <= watermark_depth)
+        # As we walk the stack, we're going from current top towards older frames
+        # The frame at top has depth = gc_frame_depth, next frame has depth = gc_frame_depth-1, etc.
+        #
+        # If gc_frame_depth = 5 and watermark_depth = 3:
+        # - Frame at depth 5: newer than watermark, skip
+        # - Frame at depth 4: newer than watermark, skip
+        # - Frame at depth 3: at watermark, scan
+        # - Frame at depth 2: older than watermark, scan
+        # etc.
+        #
+        # So we should scan when depth <= watermark_depth
+        # And skip when depth > watermark_depth
+
+        past_watermark = builder.icmp_unsigned(">", depth_val, watermark_depth)
+        should_skip = builder.and_(wm_installed, past_watermark)
+        builder.cbranch(should_skip, next_frame, process_frame)
+
+        # Process frame - scan its roots
+        builder.position_at_end(process_frame)
+        # Re-load frame_val since we need it here
+        frame_val_pf = builder.load(curr_frame)
+        frame = builder.bitcast(frame_val_pf, self.gc_frame_type.as_pointer())
+
+        # Get num_roots
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
+
+        # Get roots array
+        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        roots = builder.load(roots_ptr_ptr)
+
+        # Root index
+        root_idx = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx)
+
+        builder.branch(root_loop)
+
+        # Root loop: for i in 0..num_roots
+        builder.position_at_end(root_loop)
+        i = builder.load(root_idx)
+        done_roots = builder.icmp_unsigned(">=", i, num_roots)
+        builder.cbranch(done_roots, next_frame, check_root)
+
+        # Check if root is non-null
+        builder.position_at_end(check_root)
+        i_val = builder.load(root_idx)
+        root_slot = builder.gep(roots, [i_val], inbounds=True)
+        root_ptr = builder.load(root_slot)
+
+        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_root_null, next_root, mark_root)
+
+        # Mark non-null root
+        builder.position_at_end(mark_root)
+        builder.call(self.gc_mark_object, [root_ptr])
+
+        # Increment roots marked count
+        count = builder.load(roots_marked)
+        new_count = builder.add(count, ir.Constant(self.i64, 1))
+        builder.store(new_count, roots_marked)
+
+        builder.branch(next_root)
+
+        # Next root
+        builder.position_at_end(next_root)
+        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
+        builder.store(next_i, root_idx)
+        builder.branch(root_loop)
+
+        # Move to next (older) frame - reload curr_frame since we may have
+        # come from check_depth (skip) or root_loop (after processing)
+        builder.position_at_end(next_frame)
+        frame_val_nf = builder.load(curr_frame)
+        frame_nf = builder.bitcast(frame_val_nf, self.gc_frame_type.as_pointer())
+        parent_ptr = builder.gep(frame_nf, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, curr_frame)
+
+        # Decrement depth as we go to older frames
+        d = builder.load(curr_depth)
+        new_d = builder.sub(d, ir.Constant(self.i64, 1))
+        builder.store(new_d, curr_depth)
+
+        builder.branch(frame_loop)
+
+        # Return count of roots marked
+        builder.position_at_end(done)
+        result = builder.load(roots_marked)
+        builder.ret(result)
+
+    def _implement_gc_first_trace(self):
+        """Orchestrate the first trace pass.
+
+        This is the entry point for the trace phase of GC:
+        1. Scan roots from shadow stack (respecting watermark)
+        2. Mark all reachable objects
+        3. Update statistics
+
+        Objects are birth-marked, so we use mark bit inversion to
+        identify garbage (objects with the OLD mark value).
+        """
+        func = self.gc_first_trace
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Call watermark-aware root scanning
+        # This will mark all objects reachable from roots at or below watermark
+        roots_marked = builder.call(self.gc_scan_roots_watermark, [])
+
+        # Update statistics: objects_marked_last_cycle
+        # Note: gc_mark_object increments this internally, but we track roots here
+        # The stats field is at offset 40 in gc_stats
+        # Actually, we should update a different stat - root count
+        # For now, just call scan_roots_watermark
+
+        builder.ret_void()
+
+    def _implement_gc_count_roots(self):
+        """Count total roots in shadow stack (for debugging/stats).
+
+        Counts all non-null roots across all frames without marking them.
+        """
+        func = self.gc_count_roots
+
+        entry = func.append_basic_block("entry")
+        frame_loop = func.append_basic_block("frame_loop")
+        process_frame = func.append_basic_block("process_frame")
+        root_loop = func.append_basic_block("root_loop")
+        check_root = func.append_basic_block("check_root")
+        count_root = func.append_basic_block("count_root")
+        next_root = func.append_basic_block("next_root")
+        next_frame = func.append_basic_block("next_frame")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Count of roots
+        root_count = builder.alloca(self.i64, name="root_count")
+        builder.store(ir.Constant(self.i64, 0), root_count)
+
+        # Current frame pointer
+        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
+        top = builder.load(self.gc_frame_top)
+        builder.store(top, curr_frame)
+
+        builder.branch(frame_loop)
+
+        # Frame loop: while curr_frame != null
+        builder.position_at_end(frame_loop)
+        frame_val = builder.load(curr_frame)
+        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, process_frame)
+
+        # Process frame
+        builder.position_at_end(process_frame)
+        frame = builder.bitcast(frame_val, self.gc_frame_type.as_pointer())
+
+        # Get num_roots
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
+
+        # Get roots array
+        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        roots = builder.load(roots_ptr_ptr)
+
+        # Root index
+        root_idx = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx)
+
+        builder.branch(root_loop)
+
+        # Root loop: for i in 0..num_roots
+        builder.position_at_end(root_loop)
+        i = builder.load(root_idx)
+        done_roots = builder.icmp_unsigned(">=", i, num_roots)
+        builder.cbranch(done_roots, next_frame, check_root)
+
+        # Check if root is non-null
+        builder.position_at_end(check_root)
+        i_val = builder.load(root_idx)
+        root_slot = builder.gep(roots, [i_val], inbounds=True)
+        root_ptr = builder.load(root_slot)
+
+        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_root_null, next_root, count_root)
+
+        # Count non-null root
+        builder.position_at_end(count_root)
+        count = builder.load(root_count)
+        new_count = builder.add(count, ir.Constant(self.i64, 1))
+        builder.store(new_count, root_count)
+        builder.branch(next_root)
+
+        # Next root
+        builder.position_at_end(next_root)
+        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
+        builder.store(next_i, root_idx)
+        builder.branch(root_loop)
+
+        # Move to next frame
+        builder.position_at_end(next_frame)
+        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, curr_frame)
+        builder.branch(frame_loop)
+
+        # Return count
+        builder.position_at_end(done)
+        result = builder.load(root_count)
+        builder.ret(result)
