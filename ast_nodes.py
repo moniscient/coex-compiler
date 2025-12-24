@@ -94,9 +94,19 @@ class AtomicType(Type):
 @dataclass
 class OptionalType(Type):
     inner: Type
-    
+
     def __repr__(self):
         return f"{self.inner}?"
+
+
+@dataclass
+class ResultType(Type):
+    """Result type for error handling: Result<T, E>"""
+    ok_type: Type
+    err_type: Type
+
+    def __repr__(self):
+        return f"Result<{self.ok_type}, {self.err_type}>"
 
 
 @dataclass
@@ -639,6 +649,13 @@ class Parameter:
 
 
 @dataclass
+class Annotation:
+    """Annotation on declarations: @name or @name("argument")"""
+    name: str
+    argument: Optional[str] = None
+
+
+@dataclass
 class FunctionDecl:
     kind: FunctionKind
     name: str
@@ -646,6 +663,7 @@ class FunctionDecl:
     params: List[Parameter] = field(default_factory=list)
     return_type: Optional[Type] = None
     body: List[Stmt] = field(default_factory=list)
+    annotations: List[Annotation] = field(default_factory=list)
 
 
 @dataclass
@@ -678,6 +696,7 @@ class TypeDecl:
     fields: List[FieldDecl] = field(default_factory=list)
     methods: List[FunctionDecl] = field(default_factory=list)
     variants: List['EnumVariant'] = field(default_factory=list)  # For enums
+    is_extern: bool = False  # True for extern types (scope-restricted, auto-close)
 
 
 @dataclass

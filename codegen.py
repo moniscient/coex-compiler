@@ -238,7 +238,28 @@ class CodeGenerator:
         
         # Create channel helper functions
         self._create_channel_helpers()
-        
+
+        # Create Result type and helpers
+        # struct.Result { i64 tag, i64 ok_value, i64 err_value }
+        # tag: 0 = Ok, 1 = Err
+        self.result_struct = ir.global_context.get_identified_type("struct.Result")
+        self.result_struct.set_body(
+            ir.IntType(64),  # tag: 0 = Ok, 1 = Err
+            ir.IntType(64),  # ok_value (stored as i64, may be pointer)
+            ir.IntType(64),  # err_value (stored as i64, may be pointer)
+        )
+        self._create_result_helpers()
+
+        # Register Result as an enum-like type with Ok and Err variants
+        # This enables pattern matching: case Ok(v): / case Err(e):
+        self.enum_variants["Result"] = {
+            "Ok": (0, [("value", PrimitiveType("int"))]),   # tag 0
+            "Err": (1, [("error", PrimitiveType("string"))]),  # tag 1
+        }
+
+        # Create built-in File extern type
+        self._create_file_type()
+
         # Matrix registry for tracking declared matrices
         self.matrix_decls: Dict[str, 'MatrixDecl'] = {}  # name -> MatrixDecl
         self.matrix_structs: Dict[str, ir.Type] = {}  # name -> LLVM struct type
@@ -6896,7 +6917,577 @@ class CodeGenerator:
         builder.store(ir.Constant(ir.IntType(1), 1), closed_field)
         
         builder.ret_void()
-    
+
+    def _create_result_helpers(self):
+        """Create Result type helper functions.
+
+        Result<T, E> is a tagged union:
+        - tag: 0 = Ok, 1 = Err
+        - ok_value: the success value (as i64)
+        - err_value: the error value (as i64)
+        """
+        result_ptr = self.result_struct.as_pointer()
+        i64 = ir.IntType(64)
+        i1 = ir.IntType(1)
+
+        # Register Result in type registry
+        self.type_registry["Result"] = self.result_struct
+        self.type_methods["Result"] = {}
+
+        # Register Result with GC (24 bytes, reference offsets at ok_value and err_value fields)
+        # Fields: tag (offset 0), ok_value (offset 8), err_value (offset 16)
+        # Both value fields may contain pointers
+        self.gc.register_type("Result", 24, [8, 16])
+
+        # result_ok(value: i64) -> Result*
+        self._create_result_ok(result_ptr, i64)
+
+        # result_err(error: i64) -> Result*
+        self._create_result_err(result_ptr, i64)
+
+        # result_is_ok(r: Result*) -> bool
+        self._create_result_is_ok(result_ptr, i1)
+
+        # result_is_err(r: Result*) -> bool
+        self._create_result_is_err(result_ptr, i1)
+
+        # result_unwrap(r: Result*) -> i64
+        self._create_result_unwrap(result_ptr, i64)
+
+        # result_unwrap_or(r: Result*, default: i64) -> i64
+        self._create_result_unwrap_or(result_ptr, i64)
+
+    def _create_result_ok(self, result_ptr: ir.Type, i64: ir.Type):
+        """Create Result.ok(value) constructor."""
+        func_type = ir.FunctionType(result_ptr, [i64])
+        func = ir.Function(self.module, func_type, name="coex_result_ok")
+        self.result_ok = func
+        self.functions["coex_result_ok"] = func
+        self.functions["Result_ok"] = func  # Also register for static method lookup
+        self.type_methods["Result"]["ok"] = "coex_result_ok"
+
+        func.args[0].name = "value"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        value = func.args[0]
+
+        # Allocate Result struct (24 bytes = 3 * 8) via GC
+        struct_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id("Result"))
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        result = builder.bitcast(raw_ptr, result_ptr)
+
+        # Set tag = 0 (Ok)
+        tag_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(i64, 0), tag_field)
+
+        # Set ok_value = value
+        ok_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        builder.store(value, ok_field)
+
+        # Set err_value = 0 (unused)
+        err_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(i64, 0), err_field)
+
+        builder.ret(result)
+
+    def _create_result_err(self, result_ptr: ir.Type, i64: ir.Type):
+        """Create Result.err(error) constructor."""
+        func_type = ir.FunctionType(result_ptr, [i64])
+        func = ir.Function(self.module, func_type, name="coex_result_err")
+        self.result_err = func
+        self.functions["coex_result_err"] = func
+        self.functions["Result_err"] = func  # Also register for static method lookup
+        self.type_methods["Result"]["err"] = "coex_result_err"
+
+        func.args[0].name = "error"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        error = func.args[0]
+
+        # Allocate Result struct (24 bytes = 3 * 8) via GC
+        struct_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id("Result"))
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        result = builder.bitcast(raw_ptr, result_ptr)
+
+        # Set tag = 1 (Err)
+        tag_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(i64, 1), tag_field)
+
+        # Set ok_value = 0 (unused)
+        ok_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(i64, 0), ok_field)
+
+        # Set err_value = error
+        err_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 2)
+        ], inbounds=True)
+        builder.store(error, err_field)
+
+        builder.ret(result)
+
+    def _create_result_is_ok(self, result_ptr: ir.Type, i1: ir.Type):
+        """Create result.is_ok() method."""
+        func_type = ir.FunctionType(i1, [result_ptr])
+        func = ir.Function(self.module, func_type, name="coex_result_is_ok")
+        self.result_is_ok = func
+        self.functions["coex_result_is_ok"] = func
+        self.type_methods["Result"]["is_ok"] = "coex_result_is_ok"
+
+        func.args[0].name = "result"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        result = func.args[0]
+
+        # Get tag
+        tag_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        tag = builder.load(tag_field)
+
+        # Return tag == 0
+        is_ok = builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+        builder.ret(is_ok)
+
+    def _create_result_is_err(self, result_ptr: ir.Type, i1: ir.Type):
+        """Create result.is_err() method."""
+        func_type = ir.FunctionType(i1, [result_ptr])
+        func = ir.Function(self.module, func_type, name="coex_result_is_err")
+        self.result_is_err = func
+        self.functions["coex_result_is_err"] = func
+        self.type_methods["Result"]["is_err"] = "coex_result_is_err"
+
+        func.args[0].name = "result"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        result = func.args[0]
+
+        # Get tag
+        tag_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        tag = builder.load(tag_field)
+
+        # Return tag != 0 (i.e., tag == 1 means Err)
+        is_err = builder.icmp_signed("!=", tag, ir.Constant(ir.IntType(64), 0))
+        builder.ret(is_err)
+
+    def _create_result_unwrap(self, result_ptr: ir.Type, i64: ir.Type):
+        """Create result.unwrap() method. Returns ok_value (panics if Err in real impl)."""
+        func_type = ir.FunctionType(i64, [result_ptr])
+        func = ir.Function(self.module, func_type, name="coex_result_unwrap")
+        self.result_unwrap = func
+        self.functions["coex_result_unwrap"] = func
+        self.type_methods["Result"]["unwrap"] = "coex_result_unwrap"
+
+        func.args[0].name = "result"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        result = func.args[0]
+
+        # Get ok_value (field 1)
+        ok_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        ok_value = builder.load(ok_field)
+
+        builder.ret(ok_value)
+
+    def _create_result_unwrap_or(self, result_ptr: ir.Type, i64: ir.Type):
+        """Create result.unwrap_or(default) method."""
+        func_type = ir.FunctionType(i64, [result_ptr, i64])
+        func = ir.Function(self.module, func_type, name="coex_result_unwrap_or")
+        self.result_unwrap_or = func
+        self.functions["coex_result_unwrap_or"] = func
+        self.type_methods["Result"]["unwrap_or"] = "coex_result_unwrap_or"
+
+        func.args[0].name = "result"
+        func.args[1].name = "default"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        result = func.args[0]
+        default = func.args[1]
+
+        # Get tag
+        tag_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        tag = builder.load(tag_field)
+
+        # Check if Ok (tag == 0)
+        is_ok = builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+
+        # Get ok_value
+        ok_field = builder.gep(result, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        ok_value = builder.load(ok_field)
+
+        # Return ok_value if Ok, else default
+        result_val = builder.select(is_ok, ok_value, default)
+        builder.ret(result_val)
+
+    def _create_file_type(self):
+        """Create built-in File extern type for file I/O.
+
+        File is an extern type wrapping POSIX file descriptors:
+        - File.open(path, mode) -> Result<File, string>
+        - file.read_all() -> Result<string, string>
+        - file.writeln(text) -> Result<(), string>
+        - file.close() -> Result<(), string>
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        i1 = ir.IntType(1)
+
+        # Declare POSIX file functions
+        # int open(const char *pathname, int flags, mode_t mode)
+        open_ty = ir.FunctionType(i32, [i8_ptr, i32, i32])
+        self.posix_open = ir.Function(self.module, open_ty, name="open")
+
+        # ssize_t read(int fd, void *buf, size_t count)
+        read_ty = ir.FunctionType(i64, [i32, i8_ptr, i64])
+        self.posix_read = ir.Function(self.module, read_ty, name="read")
+
+        # int close(int fd)
+        close_ty = ir.FunctionType(i32, [i32])
+        self.posix_close = ir.Function(self.module, close_ty, name="close")
+
+        # off_t lseek(int fd, off_t offset, int whence)
+        lseek_ty = ir.FunctionType(i64, [i32, i64, i32])
+        self.posix_lseek = ir.Function(self.module, lseek_ty, name="lseek")
+
+        # Create File struct: { i32 fd, i1 is_open }
+        self.file_struct = ir.global_context.get_identified_type("struct.File")
+        self.file_struct.set_body(
+            i32,  # fd - file descriptor (field 0)
+            i1,   # is_open - whether file is open (field 1)
+        )
+        file_ptr = self.file_struct.as_pointer()
+
+        # Register File in type registry
+        self.type_registry["File"] = self.file_struct
+        self.type_fields["File"] = [("fd", PrimitiveType("int")), ("is_open", PrimitiveType("bool"))]
+        self.type_methods["File"] = {}
+
+        # Track File as extern type
+        self.extern_types = getattr(self, 'extern_types', set())
+        self.extern_types.add("File")
+
+        # Register File with GC (8 bytes, no reference fields)
+        self.gc.register_type("File", 8, [])
+
+        # Create File.open(path, mode) -> Result<File, string>
+        self._create_file_open(file_ptr, i8_ptr, i32, i64)
+
+        # Create file.read_all() -> Result<string, string>
+        self._create_file_read_all(file_ptr, i64, i8_ptr)
+
+        # Create file.writeln(text) -> Result<(), string>
+        self._create_file_writeln(file_ptr, i64)
+
+        # Create file.close() -> Result<(), string>
+        self._create_file_close(file_ptr, i32)
+
+    def _create_file_open(self, file_ptr: ir.Type, i8_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
+        """Create File.open(path, mode) static method."""
+        result_ptr = self.result_struct.as_pointer()
+        string_ptr = self.string_struct.as_pointer()
+
+        # File.open(path: String*, mode: String*) -> Result*
+        func_type = ir.FunctionType(result_ptr, [string_ptr, string_ptr])
+        func = ir.Function(self.module, func_type, name="coex_file_open")
+        self.file_open = func
+        self.functions["coex_file_open"] = func
+        self.functions["File_open"] = func  # For static method lookup
+        self.type_methods["File"]["open"] = "coex_file_open"
+
+        func.args[0].name = "path"
+        func.args[1].name = "mode"
+
+        entry = func.append_basic_block("entry")
+        open_ok = func.append_basic_block("open_ok")
+        open_err = func.append_basic_block("open_err")
+
+        builder = ir.IRBuilder(entry)
+
+        path = func.args[0]
+        mode = func.args[1]
+
+        # Get path as C string
+        path_cstr = builder.call(self.string_data, [path])
+
+        # Parse mode string to get flags
+        # For now, just check first char: 'r' = O_RDONLY (0), 'w' = O_WRONLY|O_CREAT|O_TRUNC (577)
+        mode_cstr = builder.call(self.string_data, [mode])
+        first_char = builder.load(mode_cstr)
+
+        # Check if mode is 'r' (114) or 'w' (119)
+        is_read = builder.icmp_unsigned("==", first_char, ir.Constant(ir.IntType(8), ord('r')))
+        read_flags = ir.Constant(i32, 0)  # O_RDONLY
+        write_flags = ir.Constant(i32, 577)  # O_WRONLY | O_CREAT | O_TRUNC
+        flags = builder.select(is_read, read_flags, write_flags)
+
+        # Call open(path, flags, 0644)
+        mode_bits = ir.Constant(i32, 0o644)
+        fd = builder.call(self.posix_open, [path_cstr, flags, mode_bits])
+
+        # Check if open succeeded (fd >= 0)
+        zero = ir.Constant(i32, 0)
+        success = builder.icmp_signed(">=", fd, zero)
+        builder.cbranch(success, open_ok, open_err)
+
+        # Open succeeded - create File and return Ok(file)
+        builder.position_at_end(open_ok)
+
+        # Allocate File struct
+        file_size = ir.Constant(i64, 8)
+        file_type_id = ir.Constant(i32, self.gc.get_type_id("File"))
+        file_raw = builder.call(self.gc.gc_alloc, [file_size, file_type_id])
+        file_ptr_val = builder.bitcast(file_raw, file_ptr)
+
+        # Set fd field
+        fd_field = builder.gep(file_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(fd, fd_field)
+
+        # Set is_open = true
+        is_open_field = builder.gep(file_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(1), 1), is_open_field)
+
+        # Return Result.ok(file) - store file pointer as i64
+        file_as_i64 = builder.ptrtoint(file_ptr_val, i64)
+        ok_result = builder.call(self.result_ok, [file_as_i64])
+        builder.ret(ok_result)
+
+        # Open failed - return Err(message)
+        builder.position_at_end(open_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to open file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _get_raw_string_ptr_with_builder(self, builder: ir.IRBuilder, value: str) -> ir.Value:
+        """Get raw pointer to a string constant using a specific builder."""
+        name = f"str_{self.string_counter}"
+        self.string_counter += 1
+        global_str = self._create_global_string(value, name)
+        return builder.bitcast(global_str, ir.IntType(8).as_pointer())
+
+    def _create_file_read_all(self, file_ptr: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create file.read_all() method."""
+        result_ptr = self.result_struct.as_pointer()
+        string_ptr = self.string_struct.as_pointer()
+        i32 = ir.IntType(32)
+
+        # file.read_all() -> Result*
+        func_type = ir.FunctionType(result_ptr, [file_ptr])
+        func = ir.Function(self.module, func_type, name="coex_file_read_all")
+        self.file_read_all = func
+        self.functions["coex_file_read_all"] = func
+        self.type_methods["File"]["read_all"] = "coex_file_read_all"
+
+        func.args[0].name = "file"
+
+        entry = func.append_basic_block("entry")
+        read_done = func.append_basic_block("read_done")
+        read_err = func.append_basic_block("read_err")
+
+        builder = ir.IRBuilder(entry)
+
+        file = func.args[0]
+
+        # Get fd from file
+        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Get file size using lseek
+        # lseek(fd, 0, SEEK_END) to get size
+        SEEK_END = ir.Constant(i32, 2)
+        SEEK_SET = ir.Constant(i32, 0)
+        file_size = builder.call(self.posix_lseek, [fd, ir.Constant(i64, 0), SEEK_END])
+
+        # Seek back to start
+        builder.call(self.posix_lseek, [fd, ir.Constant(i64, 0), SEEK_SET])
+
+        # Allocate buffer for file content
+        buf_size = builder.add(file_size, ir.Constant(i64, 1))  # +1 for null terminator
+        string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        buffer = builder.call(self.gc.gc_alloc, [buf_size, string_data_type_id])
+
+        # Read entire file
+        bytes_read = builder.call(self.posix_read, [fd, buffer, file_size])
+
+        # Check if read succeeded
+        zero = ir.Constant(i64, 0)
+        success = builder.icmp_signed(">=", bytes_read, zero)
+        builder.cbranch(success, read_done, read_err)
+
+        # Read succeeded - create string and return Ok
+        builder.position_at_end(read_done)
+
+        # Null-terminate the buffer
+        null_pos = builder.gep(buffer, [bytes_read])
+        builder.store(ir.Constant(ir.IntType(8), 0), null_pos)
+
+        # Create string from buffer (bytes_read = byte_len, assume ASCII for char_count)
+        result_string = builder.call(self.string_new, [buffer, bytes_read, bytes_read])
+        string_as_i64 = builder.ptrtoint(result_string, i64)
+        ok_result = builder.call(self.result_ok, [string_as_i64])
+        builder.ret(ok_result)
+
+        # Read failed
+        builder.position_at_end(read_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _create_file_writeln(self, file_ptr: ir.Type, i64: ir.Type):
+        """Create file.writeln(text) method."""
+        result_ptr = self.result_struct.as_pointer()
+        string_ptr = self.string_struct.as_pointer()
+        i32 = ir.IntType(32)
+
+        # file.writeln(text: String*) -> Result*
+        func_type = ir.FunctionType(result_ptr, [file_ptr, string_ptr])
+        func = ir.Function(self.module, func_type, name="coex_file_writeln")
+        self.file_writeln = func
+        self.functions["coex_file_writeln"] = func
+        self.type_methods["File"]["writeln"] = "coex_file_writeln"
+
+        func.args[0].name = "file"
+        func.args[1].name = "text"
+
+        entry = func.append_basic_block("entry")
+        write_ok = func.append_basic_block("write_ok")
+        write_err = func.append_basic_block("write_err")
+
+        builder = ir.IRBuilder(entry)
+
+        file = func.args[0]
+        text = func.args[1]
+
+        # Get fd from file
+        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Get text data and size
+        text_data = builder.call(self.string_data, [text])
+        text_size = builder.call(self.string_size, [text])
+
+        # Write text
+        bytes_written = builder.call(self.write_syscall, [fd, text_data, text_size])
+
+        # Write newline
+        newline_str = self._get_raw_string_ptr_with_builder(builder, "\n")
+        builder.call(self.write_syscall, [fd, newline_str, ir.Constant(i64, 1)])
+
+        # Check if write succeeded
+        zero = ir.Constant(i64, 0)
+        success = builder.icmp_signed(">=", bytes_written, zero)
+        builder.cbranch(success, write_ok, write_err)
+
+        # Write succeeded - return Ok(())
+        builder.position_at_end(write_ok)
+        ok_result = builder.call(self.result_ok, [ir.Constant(i64, 0)])
+        builder.ret(ok_result)
+
+        # Write failed
+        builder.position_at_end(write_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _create_file_close(self, file_ptr: ir.Type, i32: ir.Type):
+        """Create file.close() method."""
+        result_ptr = self.result_struct.as_pointer()
+        i64 = ir.IntType(64)
+
+        # file.close() -> Result*
+        func_type = ir.FunctionType(result_ptr, [file_ptr])
+        func = ir.Function(self.module, func_type, name="coex_file_close")
+        self.file_close = func
+        self.functions["coex_file_close"] = func
+        self.type_methods["File"]["close"] = "coex_file_close"
+
+        func.args[0].name = "file"
+
+        entry = func.append_basic_block("entry")
+        close_ok = func.append_basic_block("close_ok")
+        close_err = func.append_basic_block("close_err")
+
+        builder = ir.IRBuilder(entry)
+
+        file = func.args[0]
+
+        # Get fd from file
+        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Close the file
+        result = builder.call(self.posix_close, [fd])
+
+        # Set is_open = false
+        is_open_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(1), 0), is_open_field)
+
+        # Check if close succeeded (result == 0)
+        zero = ir.Constant(i32, 0)
+        success = builder.icmp_signed("==", result, zero)
+        builder.cbranch(success, close_ok, close_err)
+
+        # Close succeeded - return Ok(())
+        builder.position_at_end(close_ok)
+        ok_result = builder.call(self.result_ok, [ir.Constant(i64, 0)])
+        builder.ret(ok_result)
+
+        # Close failed
+        builder.position_at_end(close_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to close file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
     # ========================================================================
     # Type Mapping
     # ========================================================================
@@ -6927,7 +7518,11 @@ class CodeGenerator:
             # Optional is a struct { i1 has_value, T value }
             inner = self._get_llvm_type(coex_type.inner)
             return ir.LiteralStructType([ir.IntType(1), inner])
-        
+
+        elif isinstance(coex_type, ResultType):
+            # Result<T, E> is a pointer to Result struct
+            return self.result_struct.as_pointer()
+
         elif isinstance(coex_type, ListType):
             # Lists are pointers to List struct
             return self.list_struct.as_pointer()
@@ -6989,7 +7584,7 @@ class CodeGenerator:
         if isinstance(coex_type, PrimitiveType):
             # Only string is a reference among primitives
             return coex_type.name == "string"
-        elif isinstance(coex_type, (ListType, MapType, SetType, ChannelType)):
+        elif isinstance(coex_type, (ListType, MapType, SetType, ChannelType, ResultType)):
             return True
         elif isinstance(coex_type, NamedType):
             # User-defined types are pointers
@@ -7305,17 +7900,26 @@ class CodeGenerator:
         """Register a user-defined type"""
         # Store the AST for later reference
         self.type_decls[type_decl.name] = type_decl
-        
+
+        # Track extern types for validation
+        if type_decl.is_extern:
+            self.extern_types = getattr(self, 'extern_types', set())
+            self.extern_types.add(type_decl.name)
+            # Validate: extern types must have a close() method
+            has_close = any(m.name == "close" for m in type_decl.methods)
+            if not has_close:
+                raise Exception(f"Extern type '{type_decl.name}' must have a close() method")
+
         # If generic, store as template for later monomorphization
         if type_decl.type_params:
             self.generic_types[type_decl.name] = type_decl
             return
-        
+
         # Check if this is an enum (has variants)
         if type_decl.variants:
             self._register_enum_type(type_decl)
             return
-        
+
         # Regular struct type
         self._register_concrete_type(type_decl.name, type_decl)
     
@@ -7372,6 +7976,11 @@ class CodeGenerator:
             return ListType(self._substitute_type(coex_type.element_type))
         elif isinstance(coex_type, OptionalType):
             return OptionalType(self._substitute_type(coex_type.inner))
+        elif isinstance(coex_type, ResultType):
+            return ResultType(
+                self._substitute_type(coex_type.ok_type),
+                self._substitute_type(coex_type.err_type)
+            )
         elif isinstance(coex_type, TupleType):
             new_elements = [(name, self._substitute_type(t)) for name, t in coex_type.elements]
             return TupleType(new_elements)
@@ -7402,6 +8011,10 @@ class CodeGenerator:
             return f"List_{self._type_to_string(coex_type.element_type)}"
         elif isinstance(coex_type, OptionalType):
             return f"Opt_{self._type_to_string(coex_type.inner)}"
+        elif isinstance(coex_type, ResultType):
+            ok_str = self._type_to_string(coex_type.ok_type)
+            err_str = self._type_to_string(coex_type.err_type)
+            return f"Result_{ok_str}_{err_str}"
         else:
             return "unknown"
     
@@ -7894,9 +8507,15 @@ class CodeGenerator:
                                                inferred, param_names)
         elif isinstance(param_type, OptionalType):
             if isinstance(arg_type, OptionalType):
-                self._unify_types_with_params(param_type.inner, arg_type.inner, 
+                self._unify_types_with_params(param_type.inner, arg_type.inner,
                                                inferred, param_names)
-    
+        elif isinstance(param_type, ResultType):
+            if isinstance(arg_type, ResultType):
+                self._unify_types_with_params(param_type.ok_type, arg_type.ok_type,
+                                               inferred, param_names)
+                self._unify_types_with_params(param_type.err_type, arg_type.err_type,
+                                               inferred, param_names)
+
     def _unify_types(self, param_type: Type, arg_type: Type, inferred: Dict[str, Type]):
         """Unify a parameter type with an argument type to infer type parameters (legacy)"""
         # This version looks up params from current function - may not work correctly
@@ -7914,6 +8533,10 @@ class CodeGenerator:
         elif isinstance(param_type, OptionalType):
             if isinstance(arg_type, OptionalType):
                 self._unify_types(param_type.inner, arg_type.inner, inferred)
+        elif isinstance(param_type, ResultType):
+            if isinstance(arg_type, ResultType):
+                self._unify_types(param_type.ok_type, arg_type.ok_type, inferred)
+                self._unify_types(param_type.err_type, arg_type.err_type, inferred)
 
     def _register_enum_type(self, type_decl: TypeDecl):
         """Register an enum type as a tagged union"""
@@ -8092,30 +8715,273 @@ class CodeGenerator:
             global_var.initializer = ir.Constant(llvm_type, 0)
         
         self.globals[decl.name] = global_var
-    
+
+    def _get_clink_symbol(self, func: FunctionDecl) -> Optional[str]:
+        """Check if function has @clink annotation and return the C symbol name."""
+        for annotation in func.annotations:
+            if annotation.name == "clink" and annotation.argument:
+                return annotation.argument
+        return None
+
+    def _get_c_type(self, coex_type: Type) -> ir.Type:
+        """Get LLVM type for C ABI (e.g., int -> i32, float -> double)."""
+        if isinstance(coex_type, PrimitiveType):
+            if coex_type.name == "int":
+                return ir.IntType(32)  # C int is 32-bit
+            elif coex_type.name == "float":
+                return ir.DoubleType()  # C double
+            elif coex_type.name == "bool":
+                return ir.IntType(32)  # C int for bool
+            elif coex_type.name == "string":
+                return ir.IntType(8).as_pointer()  # C char*
+        # For other types, use the Coex LLVM type
+        return self._get_llvm_type(coex_type)
+
+    def _convert_to_c_type(self, value: ir.Value, coex_type: Type) -> ir.Value:
+        """Convert a Coex value to C ABI type for @clink call."""
+        if isinstance(coex_type, PrimitiveType):
+            if coex_type.name == "int":
+                # Coex int is i64, C int is i32
+                return self.builder.trunc(value, ir.IntType(32))
+            elif coex_type.name == "string":
+                # Coex string is struct, C needs char*
+                # Get the data pointer from the string struct using string_data
+                return self.builder.call(self.string_data, [value])
+        return value
+
+    def _convert_from_c_type(self, value: ir.Value, coex_type: Type) -> ir.Value:
+        """Convert a C return value back to Coex type."""
+        if isinstance(coex_type, PrimitiveType):
+            if coex_type.name == "int":
+                # C int (i32) to Coex int (i64)
+                return self.builder.sext(value, ir.IntType(64))
+        return value
+
+    def _generate_clink_wrapper(self, func: FunctionDecl, llvm_func: ir.Function):
+        """Generate a wrapper function that calls an external C function."""
+        # Create entry block
+        entry = llvm_func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(entry)
+
+        # Get the external C function
+        clink_functions = getattr(self, 'clink_functions', {})
+        c_func = clink_functions.get(func.name)
+        if c_func is None:
+            # Shouldn't happen, but handle gracefully
+            if isinstance(llvm_func.return_value.type, ir.VoidType):
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(llvm_func.return_value.type, 0))
+            return
+
+        # Convert Coex arguments to C types
+        c_args = []
+        for i, param in enumerate(func.params):
+            coex_arg = llvm_func.args[i]
+            c_arg = self._convert_to_c_type(coex_arg, param.type_annotation)
+            c_args.append(c_arg)
+
+        # Call the C function
+        if isinstance(c_func.return_value.type, ir.VoidType):
+            self.builder.call(c_func, c_args)
+            self.builder.ret_void()
+        else:
+            c_result = self.builder.call(c_func, c_args)
+            # Convert C result back to Coex type
+            coex_result = self._convert_from_c_type(c_result, func.return_type)
+            self.builder.ret(coex_result)
+
     def _declare_function(self, func: FunctionDecl):
         """Declare a function (for forward references)"""
         # If generic, store as template
         if func.type_params:
             self.generic_functions[func.name] = func
             return
-        
+
+        # Special handling for main() with parameters
+        if func.name == "main" and func.params:
+            self._declare_main_with_params(func)
+            return
+
         # Build parameter types
         param_types = []
         for param in func.params:
             param_types.append(self._get_llvm_type(param.type_annotation))
-        
+
         # Build return type
         if func.return_type:
             return_type = self._get_llvm_type(func.return_type)
         else:
             return_type = ir.VoidType()
-        
+
+        # Check for @clink annotation - also declare external C function
+        clink_symbol = self._get_clink_symbol(func)
+        if clink_symbol:
+            # Build C ABI parameter types
+            c_param_types = []
+            for param in func.params:
+                c_param_types.append(self._get_c_type(param.type_annotation))
+
+            # Build C return type
+            if func.return_type:
+                c_return_type = self._get_c_type(func.return_type)
+            else:
+                c_return_type = ir.VoidType()
+
+            # Check if the C function is already declared in the module
+            if clink_symbol in self.module.globals:
+                c_func = self.module.globals[clink_symbol]
+            else:
+                # Declare the external C function
+                c_func_type = ir.FunctionType(c_return_type, c_param_types)
+                c_func = ir.Function(self.module, c_func_type, name=clink_symbol)
+            # Store reference to the C function
+            self.clink_functions = getattr(self, 'clink_functions', {})
+            self.clink_functions[func.name] = c_func
+
         # Create function
         func_type = ir.FunctionType(return_type, param_types)
         llvm_func = ir.Function(self.module, func_type, name=func.name)
         self.functions[func.name] = llvm_func
-    
+
+    def _declare_main_with_params(self, func: FunctionDecl):
+        """Handle main() function with special parameters (args, stdin, stdout, stderr).
+
+        Supported signatures:
+        1. func main(args: [string]) -> int
+        2. func main(stdin: File, stdout: File, stderr: File) -> int
+        3. func main(args: [string], stdin: File, stdout: File, stderr: File) -> int
+        """
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Detect which signature is being used
+        has_args = False
+        has_stdio = False
+
+        for param in func.params:
+            if param.name == "args":
+                has_args = True
+            elif param.name in ("stdin", "stdout", "stderr"):
+                has_stdio = True
+
+        # Build parameter types for user's main (coex_main_impl)
+        impl_param_types = []
+        if has_args:
+            impl_param_types.append(self.list_struct.as_pointer())  # [string] is a List*
+        if has_stdio:
+            impl_param_types.append(self.file_struct.as_pointer())  # stdin: File*
+            impl_param_types.append(self.file_struct.as_pointer())  # stdout: File*
+            impl_param_types.append(self.file_struct.as_pointer())  # stderr: File*
+
+        # Create user's main as coex_main_impl
+        impl_func_type = ir.FunctionType(i64, impl_param_types)
+        impl_func = ir.Function(self.module, impl_func_type, name="coex_main_impl")
+        self.functions["main"] = impl_func  # Store as "main" so _generate_function finds it
+
+        # Store signature info for later use in _generate_main_wrapper
+        self.main_has_args = has_args
+        self.main_has_stdio = has_stdio
+
+        # Create C main wrapper: int main(int argc, char** argv)
+        c_main_type = ir.FunctionType(i32, [i32, i8_ptr.as_pointer()])
+        c_main = ir.Function(self.module, c_main_type, name="main")
+        c_main.args[0].name = "argc"
+        c_main.args[1].name = "argv"
+
+        # Implement the C main wrapper
+        entry = c_main.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        call_args = []
+
+        if has_args:
+            # Convert argc/argv to [string]
+            argc = c_main.args[0]
+            argv = c_main.args[1]
+
+            # Create new list for strings (elem_size = 8 for pointers)
+            elem_size = ir.Constant(i64, 8)
+            args_list = builder.call(self.list_new, [elem_size])
+
+            # Store in alloca for list_append (which returns new list)
+            args_alloca = builder.alloca(self.list_struct.as_pointer(), name="args_list")
+            builder.store(args_list, args_alloca)
+
+            # Loop through argv and convert each to string
+            idx_alloca = builder.alloca(i32, name="arg_idx")
+            builder.store(ir.Constant(i32, 0), idx_alloca)
+
+            cond_block = c_main.append_basic_block("args_cond")
+            body_block = c_main.append_basic_block("args_body")
+            end_block = c_main.append_basic_block("args_end")
+
+            builder.branch(cond_block)
+
+            # Condition: idx < argc
+            builder.position_at_end(cond_block)
+            idx = builder.load(idx_alloca)
+            cond = builder.icmp_signed("<", idx, argc)
+            builder.cbranch(cond, body_block, end_block)
+
+            # Body: convert argv[idx] to string, append to list
+            builder.position_at_end(body_block)
+            idx = builder.load(idx_alloca)
+            idx_64 = builder.sext(idx, i64)
+
+            # Get argv[idx]
+            arg_ptr_ptr = builder.gep(argv, [idx_64])
+            c_str = builder.load(arg_ptr_ptr)
+
+            # Convert C string to Coex string using string_from_literal
+            coex_string = builder.call(self.string_from_literal, [c_str])
+
+            # Append to list: we need to store the string pointer and pass its address
+            str_alloca = builder.alloca(self.string_struct.as_pointer(), name="str_temp")
+            builder.store(coex_string, str_alloca)
+
+            current_list = builder.load(args_alloca)
+            new_list = builder.call(self.list_append, [current_list,
+                                                        builder.bitcast(str_alloca, i8_ptr),
+                                                        elem_size])
+            builder.store(new_list, args_alloca)
+
+            # Increment index
+            next_idx = builder.add(idx, ir.Constant(i32, 1))
+            builder.store(next_idx, idx_alloca)
+            builder.branch(cond_block)
+
+            # End - get final list
+            builder.position_at_end(end_block)
+            final_args_list = builder.load(args_alloca)
+            call_args.append(final_args_list)
+
+        if has_stdio:
+            # Create File handles for stdin (fd=0), stdout (fd=1), stderr (fd=2)
+            file_ptr = self.file_struct.as_pointer()
+
+            for fd_num, name in [(0, "stdin_file"), (1, "stdout_file"), (2, "stderr_file")]:
+                # Allocate File struct
+                file_alloca = builder.alloca(self.file_struct, name=name)
+
+                # Set fd field
+                fd_ptr = builder.gep(file_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+                builder.store(ir.Constant(i32, fd_num), fd_ptr)
+
+                # Set is_open to true
+                is_open_ptr = builder.gep(file_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+                builder.store(ir.Constant(ir.IntType(1), 1), is_open_ptr)
+
+                call_args.append(file_alloca)
+
+        # Call user's main implementation
+        result = builder.call(impl_func, call_args)
+
+        # Truncate i64 to i32 for C return
+        result_32 = builder.trunc(result, i32)
+        builder.ret(result_32)
+
     def _collect_heap_vars_from_body(self, stmts: PyList[Stmt]) -> PyList[str]:
         """Collect names of heap-typed variable declarations from function body.
 
@@ -8160,6 +9026,12 @@ class CodeGenerator:
             return
 
         llvm_func = self.functions[func.name]
+
+        # Check for @clink annotation - generate wrapper that calls C function
+        clink_symbol = self._get_clink_symbol(func)
+        if clink_symbol:
+            self._generate_clink_wrapper(func, llvm_func)
+            return
 
         # Create entry block
         entry = llvm_func.append_basic_block(name="entry")
@@ -8212,6 +9084,10 @@ class CodeGenerator:
         for i, param in enumerate(func.params):
             llvm_param = llvm_func.args[i]
             llvm_param.name = param.name
+
+            # Track Coex AST type for method calls on collections (e.g., list.get())
+            if param.type_annotation:
+                self.var_coex_types[param.name] = param.type_annotation
 
             # Deep copy parameter if it needs copying (value semantics)
             param_value = llvm_param
@@ -8872,6 +9748,11 @@ class CodeGenerator:
     
     def _generate_print(self, stmt: PrintStmt):
         """Generate a print statement"""
+        # Emit deprecation warning
+        import sys
+        print("Warning: print() is deprecated. Use stdout.writeln() instead.",
+              file=sys.stderr)
+
         value = self._generate_expression(stmt.value)
         
         # Select format based on type
@@ -11341,6 +12222,19 @@ class CodeGenerator:
                                 # If value type is a pointer, convert i64 result back to pointer
                                 if isinstance(value_llvm_type, ir.PointerType):
                                     return self.builder.inttoptr(result, value_llvm_type)
+                    return result
+
+                # Special handling for Result.unwrap and Result.unwrap_or - returns typed value
+                if type_name == "Result" and method in ("unwrap", "unwrap_or"):
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, ResultType):
+                                ok_llvm_type = self._get_llvm_type(coex_type.ok_type)
+                                # If ok_type is a pointer, convert i64 result back to pointer
+                                if isinstance(ok_llvm_type, ir.PointerType):
+                                    return self.builder.inttoptr(result, ok_llvm_type)
                     return result
 
                 return result

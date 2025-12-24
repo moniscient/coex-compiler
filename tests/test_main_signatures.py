@@ -1,0 +1,112 @@
+"""
+Tests for flexible main() function signatures.
+
+Supported signatures:
+1. func main() -> int                                           - basic
+2. func main(args: [string]) -> int                             - with args
+3. func main(stdin: File, stdout: File, stderr: File) -> int   - with stdio
+4. func main(args: [string], stdin: File, stdout: File, stderr: File) -> int - full
+"""
+
+import pytest
+
+
+class TestMainBasic:
+    """Test basic main() -> int signature."""
+
+    def test_main_no_args(self, expect_output):
+        """Basic main with no parameters."""
+        expect_output('''
+func main() -> int
+    print(42)
+    return 0
+~
+''', "42\n")
+
+    def test_main_returns_exit_code(self, compile_coex):
+        """Main return value becomes exit code."""
+        result = compile_coex('''
+func main() -> int
+    return 5
+~
+''')
+        assert result.compile_success
+        # run_success is False when exit code != 0
+        assert result.run_success is False
+
+
+class TestMainWithArgs:
+    """Test main(args: [string]) -> int signature."""
+
+    def test_main_with_args_count(self, compile_binary):
+        """Main receives command line arguments."""
+        binary = compile_binary('''
+func main(args: [string]) -> int
+    print(args.len())
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        # Run with arguments
+        proc = binary.run("one", "two", "three")
+        # args[0] is program name, so 4 total
+        assert proc.stdout.strip() == "4", f"Expected 4 args, got: {proc.stdout.strip()}"
+
+    def test_main_with_args_access(self, compile_binary):
+        """Main can access individual arguments."""
+        binary = compile_binary('''
+func main(args: [string]) -> int
+    if args.len() > 1
+        print(args.get(1))
+    ~
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run("hello")
+        assert proc.stdout.strip() == "hello", f"Expected 'hello', got: {proc.stdout.strip()}"
+
+
+class TestMainWithStdio:
+    """Test main(stdin: File, stdout: File, stderr: File) -> int signature."""
+
+    def test_main_stdout_writeln(self, compile_binary):
+        """Main can write to stdout File handle."""
+        binary = compile_binary('''
+func main(stdin: File, stdout: File, stderr: File) -> int
+    stdout.writeln("hello via stdout")
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run()
+        assert "hello via stdout" in proc.stdout, f"Expected 'hello via stdout' in stdout, got: {proc.stdout}"
+
+    def test_main_stderr_writeln(self, compile_binary):
+        """Main can write to stderr File handle."""
+        binary = compile_binary('''
+func main(stdin: File, stdout: File, stderr: File) -> int
+    stderr.writeln("error message")
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run()
+        assert "error message" in proc.stderr, f"Expected 'error message' in stderr, got: {proc.stderr}"
+
+
+class TestMainFull:
+    """Test main(args: [string], stdin: File, stdout: File, stderr: File) -> int signature."""
+
+    def test_main_full_signature(self, compile_binary):
+        """Main with both args and stdio."""
+        binary = compile_binary('''
+func main(args: [string], stdin: File, stdout: File, stderr: File) -> int
+    stdout.writeln("arg count:")
+    print(args.len())
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run("test")
+        assert "arg count:" in proc.stdout, f"Expected 'arg count:' in stdout, got: {proc.stdout}"

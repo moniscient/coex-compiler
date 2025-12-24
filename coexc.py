@@ -6,8 +6,9 @@ Usage:
     python coexc.py <source_file> [-o output] [--emit-ir] [--emit-ast]
     
 Examples:
-    python coexc.py hello.coex                    # Produces hello.o
-    python coexc.py hello.coex -o hello           # Produces hello (linked executable)
+    python coexc.py hello.coex                    # Produces hello (linked executable)
+    python coexc.py hello.coex -o myapp           # Produces myapp (linked executable)
+    python coexc.py hello.coex -o hello.o         # Produces hello.o (object file only)
     python coexc.py hello.coex --emit-ir          # Print LLVM IR
     python coexc.py hello.coex --emit-ast         # Print AST
 """
@@ -88,10 +89,10 @@ def compile_coex(source_path: str, output_path: str = None,
                  link: bool = False):
     """
     Compile a Coex source file.
-    
+
     Args:
         source_path: Path to .coex source file
-        output_path: Output path (default: source name with .o extension)
+        output_path: Output path (default: source name without .coex extension)
         emit_ir: Print LLVM IR instead of compiling
         emit_ast: Print AST instead of compiling
         link: Link to produce executable (requires clang)
@@ -99,7 +100,10 @@ def compile_coex(source_path: str, output_path: str = None,
     # Determine output path
     if output_path is None:
         base = os.path.splitext(source_path)[0]
-        output_path = base + ".o"
+        # Remove .coex extension if present
+        if base.endswith('.coex'):
+            base = base[:-5]
+        output_path = base
     
     # Parse
     print(f"Parsing {source_path}...")
@@ -158,27 +162,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s hello.coex                    Compile to hello.o
-  %(prog)s hello.coex -o hello           Compile and link to hello
+  %(prog)s hello.coex                    Compile and link to hello
+  %(prog)s hello.coex -o myapp           Compile and link to myapp
+  %(prog)s hello.coex -o hello.o         Compile to hello.o (object only)
   %(prog)s hello.coex --emit-ir          Print LLVM IR
   %(prog)s hello.coex --emit-ast         Print AST
         """
     )
     
     parser.add_argument("source", help="Source file (.coex)")
-    parser.add_argument("-o", "--output", help="Output file")
+    parser.add_argument("-o", "--output", help="Output file (default: source without .coex)")
     parser.add_argument("--emit-ir", action="store_true", 
                         help="Print LLVM IR to stdout")
     parser.add_argument("--emit-ast", action="store_true",
                         help="Print AST to stdout")
     
     args = parser.parse_args()
-    
+
+    # Default output to source filename without .coex extension
+    output = args.output
+    if output is None:
+        base = os.path.splitext(args.source)[0]
+        # Remove .coex extension if present
+        if base.endswith('.coex'):
+            base = base[:-5]
+        output = base
+
     try:
-        link = args.output and not args.output.endswith(".o")
+        link = not output.endswith(".o")
         compile_coex(
             args.source,
-            args.output,
+            output,
             emit_ir=args.emit_ir,
             emit_ast=args.emit_ast,
             link=link

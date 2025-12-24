@@ -130,5 +130,73 @@ def expect_compile_error(compile_coex):
         if error_substring:
             assert error_substring.lower() in result.compile_output.lower(), \
                 f"Expected error containing '{error_substring}' but got:\n{result.compile_output}"
-    
+
     return _expect
+
+
+class CompiledBinary:
+    """Context manager for compiled binary that persists until exit."""
+
+    def __init__(self, compiler_root):
+        self.compiler_root = compiler_root
+        self.tmpdir = None
+        self.binary_path = None
+
+    def compile(self, source: str) -> bool:
+        """Compile source code and return True if successful."""
+        import shutil
+        self.tmpdir = tempfile.mkdtemp()
+        source_path = os.path.join(self.tmpdir, "test.coex")
+        self.binary_path = os.path.join(self.tmpdir, "test")
+
+        with open(source_path, 'w') as f:
+            f.write(source)
+
+        coexc = os.path.join(self.compiler_root, "coexc.py")
+        result = subprocess.run(
+            [sys.executable, coexc, source_path, "-o", self.binary_path],
+            capture_output=True,
+            text=True,
+            cwd=self.compiler_root
+        )
+
+        self.compile_output = result.stdout + result.stderr
+        return result.returncode == 0
+
+    def run(self, *args, **kwargs) -> subprocess.CompletedProcess:
+        """Run the binary with optional arguments."""
+        cmd = [self.binary_path] + list(args)
+        return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+    def cleanup(self):
+        """Remove temporary directory."""
+        if self.tmpdir:
+            import shutil
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+@pytest.fixture
+def compile_binary(compiler_root):
+    """
+    Fixture that compiles code and returns a binary that can be run with custom args.
+
+    Usage:
+        binary = compile_binary(source_code)
+        assert binary.compile_success
+        result = binary.run("arg1", "arg2")
+        assert result.returncode == 0
+    """
+    binaries = []
+
+    def _compile(source: str):
+        binary = CompiledBinary(compiler_root)
+        compile_success = binary.compile(source)
+        binary.compile_success = compile_success
+        binaries.append(binary)
+        return binary
+
+    yield _compile
+
+    # Cleanup all compiled binaries
+    for binary in binaries:
+        binary.cleanup()

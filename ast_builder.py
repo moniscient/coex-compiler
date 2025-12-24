@@ -91,6 +91,11 @@ class ASTBuilder:
     
     def visit_function_decl(self, ctx: CoexParser.FunctionDeclContext) -> FunctionDecl:
         """Visit a function declaration"""
+        # Get annotations
+        annotations = []
+        for ann_ctx in ctx.annotation():
+            annotations.append(self.visit_annotation(ann_ctx))
+
         # Get function kind
         kind_ctx = ctx.functionKind()
         kind_text = kind_ctx.getText()
@@ -100,29 +105,38 @@ class ASTBuilder:
             kind = FunctionKind.TASK
         else:
             kind = FunctionKind.FUNC
-        
+
         # Get function name
         name = ctx.IDENTIFIER().getText()
-        
+
         # Get type parameters
         type_params = []
         if ctx.genericParams():
             type_params = self.visit_generic_params(ctx.genericParams())
-        
+
         # Get parameters
         params = []
         if ctx.parameterList():
             params = self.visit_param_list(ctx.parameterList())
-        
+
         # Get return type
         return_type = None
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-        
+
         # Get body
         body = self.visit_block(ctx.block())
-        
-        return FunctionDecl(kind, name, type_params, params, return_type, body)
+
+        return FunctionDecl(kind, name, type_params, params, return_type, body, annotations)
+
+    def visit_annotation(self, ctx) -> Annotation:
+        """Visit an annotation: @name or @name("argument")"""
+        name = ctx.IDENTIFIER().getText()
+        argument = None
+        if ctx.stringLiteral():
+            # Extract string value without quotes
+            argument = self._get_string_value(ctx.stringLiteral())
+        return Annotation(name, argument)
     
     def visit_generic_params(self, ctx: CoexParser.GenericParamsContext) -> List[TypeParam]:
         """Visit generic type parameters"""
@@ -166,15 +180,18 @@ class ASTBuilder:
     def visit_type_decl(self, ctx: CoexParser.TypeDeclContext) -> TypeDecl:
         """Visit a type declaration"""
         name = ctx.IDENTIFIER().getText()
-        
+
+        # Check for extern keyword
+        is_extern = ctx.EXTERN() is not None
+
         type_params = []
         if ctx.genericParams():
             type_params = self.visit_generic_params(ctx.genericParams())
-        
+
         fields = []
         methods = []
         variants = []
-        
+
         # Visit type body for fields, methods, and enum cases
         if ctx.typeBody():
             for member in ctx.typeBody().typeMember():
@@ -184,8 +201,8 @@ class ASTBuilder:
                     variants.append(self.visit_enum_case(member.enumCase()))
                 elif member.methodDecl():
                     methods.append(self.visit_method_decl(member.methodDecl()))
-        
-        return TypeDecl(name, type_params, fields, methods, variants)
+
+        return TypeDecl(name, type_params, fields, methods, variants, is_extern)
     
     def visit_enum_case(self, ctx: CoexParser.EnumCaseContext) -> EnumVariant:
         """Visit an enum case"""
@@ -350,6 +367,8 @@ class ASTBuilder:
                     return ArrayType(type_args[0])
                 elif name == "Channel" and len(type_args) == 1:
                     return ChannelType(type_args[0])
+                elif name == "Result" and len(type_args) == 2:
+                    return ResultType(type_args[0], type_args[1])
                 else:
                     return NamedType(name, type_args)
             return NamedType(name)
@@ -357,7 +376,11 @@ class ASTBuilder:
             return self.visit_tuple_type(ctx.tupleType())
         elif ctx.functionType():
             return self.visit_function_type(ctx.functionType())
-        
+        elif ctx.listType():
+            # [T] syntax for list types
+            elem_type = self.visit_type_expr(ctx.listType().typeExpr())
+            return ListType(elem_type)
+
         return PrimitiveType("int")  # fallback
     
     def visit_primitive_type(self, ctx: CoexParser.PrimitiveTypeContext) -> Type:

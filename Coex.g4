@@ -56,8 +56,13 @@ declaration
 // Function Declarations
 // ----------------------------------------------------------------------------
 
+// Annotation: @name or @name("argument")
+annotation
+    : AT IDENTIFIER (LPAREN stringLiteral RPAREN)? NEWLINE*
+    ;
+
 functionDecl
-    : functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? NEWLINE* block
+    : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? NEWLINE* block
     ;
 
 functionKind
@@ -99,7 +104,7 @@ returnType
 // ----------------------------------------------------------------------------
 
 typeDecl
-    : TYPE IDENTIFIER genericParams? COLON typeBody blockTerminator
+    : EXTERN? TYPE IDENTIFIER genericParams? COLON typeBody blockTerminator
     ;
 
 typeBody
@@ -585,6 +590,11 @@ baseType
     | IDENTIFIER genericArgs?
     | tupleType
     | functionType
+    | listType
+    ;
+
+listType
+    : LBRACKET typeExpr RBRACKET
     ;
 
 primitiveType
@@ -630,6 +640,7 @@ FUNC        : 'func' ;
 
 // Type definitions
 TYPE        : 'type' ;
+EXTERN      : 'extern' ;
 TRAIT       : 'trait' ;
 MATRIX      : 'matrix' ;
 INIT        : 'init' ;
@@ -756,6 +767,7 @@ RBRACE      : '}' ;
 COMMA       : ',' ;
 COLON       : ':' ;
 UNDERSCORE  : '_' ;
+AT          : '@' ;
 
 // ----------------------------------------------------------------------------
 // Literals
