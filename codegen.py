@@ -7544,6 +7544,10 @@ class CodeGenerator:
             self.gc_frame = self.gc.push_frame(self.builder, num_roots, self.gc_roots)
             self.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
 
+        # GC Safe-point check: trigger GC if allocation threshold exceeded
+        if self.gc is not None:
+            self.gc.inject_safepoint(self.builder)
+
         # Store self pointer
         self_alloca = self.builder.alloca(llvm_func.args[0].type, name="self")
         self.builder.store(llvm_func.args[0], self_alloca)
@@ -8198,6 +8202,11 @@ class CodeGenerator:
             # Store mapping of var_name -> root_index
             self.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
         # ====================================================================
+
+        # GC Safe-point check: trigger GC if allocation threshold exceeded
+        # This is safe because we're at function entry with no intermediate allocations
+        if self.gc is not None and func.name != "main":
+            self.gc.inject_safepoint(self.builder)
 
         # Allocate parameters with value semantics (deep copy heap-allocated types)
         for i, param in enumerate(func.params):

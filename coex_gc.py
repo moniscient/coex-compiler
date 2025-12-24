@@ -27,7 +27,7 @@ class GarbageCollector:
     HEADER_SIZE = 32         # 4 x i64: size, type_id, flags, forward
     MIN_BLOCK_SIZE = 40      # Minimum block: header(32) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
-    GC_THRESHOLD = 1000      # Trigger GC after this many allocations
+    GC_THRESHOLD = 10000     # Trigger GC after this many allocations
     INITIAL_HEAP_SIZE = 1024 * 1024 * 1024  # 1GB initial heap
 
     # Flag bits in header (stored in i64 flags field)
@@ -187,6 +187,7 @@ class GarbageCollector:
         self._implement_gc_scan_roots()
         self._implement_gc_sweep()
         self._implement_gc_collect()
+        self._implement_gc_safepoint()
         self._add_nursery_stubs()  # Disabled nursery context stubs for compatibility
         # Dual-heap async GC implementations
         self._implement_gc_capture_snapshot()
@@ -578,6 +579,12 @@ class GarbageCollector:
         # gc_sweep() -> void
         gc_sweep_ty = ir.FunctionType(self.void, [])
         self.gc_sweep = ir.Function(self.module, gc_sweep_ty, name="coex_gc_sweep")
+
+        # gc_safepoint() -> void
+        # Check allocation threshold and trigger GC if needed
+        # Safe to call at function entry (before any allocations in the function)
+        gc_safepoint_ty = ir.FunctionType(self.void, [])
+        self.gc_safepoint = ir.Function(self.module, gc_safepoint_ty, name="coex_gc_safepoint")
 
         # gc_mark_hamt(root: i8*, flags: i32) -> void
         # Recursively mark HAMT nodes/leaves (used by Map and Set marking)
@@ -1135,7 +1142,6 @@ class GarbageCollector:
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
-        check_gc = func.append_basic_block("check_gc")
         do_alloc = func.append_basic_block("do_alloc")
 
         builder = ir.IRBuilder(entry)
@@ -1143,20 +1149,22 @@ class GarbageCollector:
         user_size = func.args[0]
         type_id = func.args[1]
 
-        # Increment allocation counter
+        # Increment allocation counter (for statistics, threshold check disabled)
         count = builder.load(self.gc_alloc_count)
         new_count = builder.add(count, ir.Constant(self.i64, 1))
         builder.store(new_count, self.gc_alloc_count)
 
-        builder.branch(check_gc)
-
-        # Check if we should trigger GC
-        builder.position_at_end(check_gc)
-        threshold = ir.Constant(self.i64, self.GC_THRESHOLD)
-        should_gc = builder.icmp_unsigned(">=", new_count, threshold)
-        gc_enabled = builder.load(self.gc_enabled)
-        trigger_gc = builder.and_(should_gc, gc_enabled)
-        builder.cbranch(trigger_gc, do_alloc, do_alloc)  # For now, skip GC trigger
+        # NOTE: Automatic GC triggering from gc_alloc is UNSAFE because:
+        # - Multi-allocation operations (HAMT insert, list append, etc.) create
+        #   intermediate objects that aren't rooted until the operation completes
+        # - If GC runs mid-operation, these unrooted objects get swept
+        # - This causes use-after-free crashes
+        #
+        # Safe collection points are:
+        # 1. Explicit gc() calls in user code
+        # 2. gc_install_watermark() for high-watermark collection
+        # 3. Future: function entry/exit with proper safe-point checks
+        builder.branch(do_alloc)
 
         # Allocate memory
         builder.position_at_end(do_alloc)
@@ -1967,6 +1975,46 @@ class GarbageCollector:
         builder.position_at_end(done)
         builder.ret_void()
 
+    def _implement_gc_safepoint(self):
+        """Implement safe-point check for automatic GC triggering.
+
+        This function is safe to call at function entry because:
+        1. All previous operations have completed
+        2. Caller's heap variables are properly rooted
+        3. No intermediate allocations exist yet
+
+        Checks if allocation count >= threshold and triggers GC if so.
+        """
+        func = self.gc_safepoint
+
+        entry = func.append_basic_block("entry")
+        do_gc = func.append_basic_block("do_gc")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Check if GC is enabled
+        gc_enabled = builder.load(self.gc_enabled)
+        enabled_check = func.append_basic_block("enabled_check")
+        builder.cbranch(gc_enabled, enabled_check, done)
+
+        builder.position_at_end(enabled_check)
+
+        # Check if allocation count >= threshold
+        count = builder.load(self.gc_alloc_count)
+        threshold = ir.Constant(self.i64, self.GC_THRESHOLD)
+        should_gc = builder.icmp_unsigned(">=", count, threshold)
+        builder.cbranch(should_gc, do_gc, done)
+
+        # Trigger GC and reset counter
+        builder.position_at_end(do_gc)
+        builder.call(self.gc_collect, [])
+        builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
     def wrap_allocation(self, builder: ir.IRBuilder, type_name: str, size: ir.Value) -> ir.Value:
         """Replace a malloc call with GC-tracked allocation."""
         type_id = self.get_type_id(type_name)
@@ -1976,6 +2024,14 @@ class GarbageCollector:
     def inject_gc_init(self, builder: ir.IRBuilder):
         """Inject GC initialization at start of main()"""
         builder.call(self.gc_init, [])
+
+    def inject_safepoint(self, builder: ir.IRBuilder):
+        """Inject a GC safe-point check.
+
+        Call this at function entry (after shadow stack frame is pushed).
+        If allocation threshold is exceeded, triggers synchronous GC.
+        """
+        builder.call(self.gc_safepoint, [])
 
     # Helper methods for codegen to manage shadow stack frames
 
