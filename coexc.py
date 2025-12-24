@@ -138,7 +138,7 @@ def compile_coex(source_path: str, output_path: str = None,
         print(f"Linking to {exe_path}...")
         
         result = subprocess.run(
-            ["clang", obj_path, "-o", exe_path, "-lpthread"],
+            ["clang", obj_path, "-o", exe_path, "-lpthread", "-lm"],
             capture_output=True,
             text=True
         )

@@ -7408,9 +7408,9 @@ class CodeGenerator:
         fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
-        # Get text data and size
+        # Get text data and byte size (not total memory footprint)
         text_data = builder.call(self.string_data, [text])
-        text_size = builder.call(self.string_size, [text])
+        text_size = builder.call(self.string_byte_size, [text])
 
         # Write text
         bytes_written = builder.call(self.write_syscall, [fd, text_data, text_size])
