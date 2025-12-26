@@ -395,7 +395,6 @@ func main() -> int
 class TestStressMemory:
     """Memory stress tests - verify no memory explosion."""
 
-    @pytest.mark.xfail(reason="Coex grammar doesn't support [Type] syntax for List type annotations")
     def test_map_many_independent_versions(self, compiler_root):
         """Create many independent versions of a map - should share structure."""
         source = '''
