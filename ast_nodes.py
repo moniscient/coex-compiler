@@ -549,11 +549,6 @@ class ForAssignStmt(Stmt):
 
 
 @dataclass
-class LoopStmt(Stmt):
-    body: List[Stmt]
-
-
-@dataclass
 class WhileStmt(Stmt):
     """Standard while loop: while condition block"""
     condition: Expr

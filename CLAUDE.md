@@ -97,7 +97,7 @@ func main() -> int
 ### Fully Working (185 tests passing)
 - Arithmetic, comparisons, boolean logic
 - Variables, assignment, compound operators (`+=`, `-=`, etc.)
-- Control flow: `if`/`else`/`elif`, `for..in`, `loop`, `break`, `continue`
+- Control flow: `if`/`else`/`elif`, `for..in`, `while`, `break`, `continue`
 - All three function kinds with recursion
 - User-defined types with fields and methods
 - Tuples (construction, `.0`/`.1` access, destructuring)
@@ -184,6 +184,6 @@ ternaryExpr → orExpr → andExpr → notExpr → nullCoalesceExpr
 → unaryExpr → postfixExpr → primaryExpr
 
 // Statements
-statement: varDeclStmt | ifStmt | forStmt | loopStmt | matchStmt
+statement: varDeclStmt | ifStmt | forStmt | whileStmt | matchStmt
          | selectStmt | withinStmt | returnStmt | breakStmt | continueStmt
 ```

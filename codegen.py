@@ -9010,7 +9010,7 @@ class CodeGenerator:
                         visit_stmts(stmt.else_body)
                 elif isinstance(stmt, (ForStmt, ForAssignStmt)):
                     visit_stmts(stmt.body)
-                elif isinstance(stmt, (LoopStmt, WhileStmt)):
+                elif isinstance(stmt, WhileStmt):
                     visit_stmts(stmt.body)
                 elif isinstance(stmt, MatchStmt):
                     for arm in stmt.arms:
@@ -9145,8 +9145,6 @@ class CodeGenerator:
             self._generate_print(stmt)
         elif isinstance(stmt, IfStmt):
             self._generate_if(stmt)
-        elif isinstance(stmt, LoopStmt):
-            self._generate_loop(stmt)
         elif isinstance(stmt, WhileStmt):
             self._generate_while(stmt)
         elif isinstance(stmt, CycleStmt):
@@ -9880,46 +9878,6 @@ class CodeGenerator:
             return self.builder.icmp_unsigned("!=", value, null)
         return value
     
-    def _generate_loop(self, stmt: LoopStmt):
-        """Generate a loop statement"""
-        func = self.builder.function
-        
-        # PRE-ALLOCATE all local variables used in the loop body
-        local_vars = self._collect_local_variables(stmt.body)
-        for lv_name in local_vars:
-            if lv_name not in self.locals:
-                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
-                self.locals[lv_name] = lv_alloca
-        
-        loop_block = func.append_basic_block("loop_body")
-        exit_block = func.append_basic_block("loop_exit")
-        
-        # Save loop blocks for break/continue
-        old_exit = self.loop_exit_block
-        old_continue = self.loop_continue_block
-        self.loop_exit_block = exit_block
-        self.loop_continue_block = loop_block
-        
-        # Jump to loop
-        self.builder.branch(loop_block)
-        
-        # Generate loop body
-        self.builder.position_at_end(loop_block)
-        for s in stmt.body:
-            self._generate_statement(s)
-            if self.builder.block.is_terminated:
-                break
-        
-        if not self.builder.block.is_terminated:
-            self.builder.branch(loop_block)
-        
-        # Continue after loop
-        self.builder.position_at_end(exit_block)
-
-        # Restore loop blocks
-        self.loop_exit_block = old_exit
-        self.loop_continue_block = old_continue
-
     def _generate_while(self, stmt: WhileStmt):
         """Generate a standard while loop: while condition block
 
@@ -10102,8 +10060,6 @@ class CodeGenerator:
                 # Do NOT count the for loop variable as a cycle variable
                 # For loop manages its own iteration variable
                 declared.update(self._find_cycle_declared_vars(stmt.body))
-            elif isinstance(stmt, LoopStmt):
-                declared.update(self._find_cycle_declared_vars(stmt.body))
             elif isinstance(stmt, WhileStmt):
                 declared.update(self._find_cycle_declared_vars(stmt.body))
             # Note: Don't recurse into nested CycleStmt - those have their own scope
@@ -10181,10 +10137,6 @@ class CodeGenerator:
                 if stmt.else_body and self._has_collection_mutations(stmt.else_body):
                     return True
 
-            elif isinstance(stmt, LoopStmt):
-                if self._has_collection_mutations(stmt.body):
-                    return True
-
             elif isinstance(stmt, WhileStmt):
                 if self._has_collection_mutations(stmt.body):
                     return True
@@ -10246,9 +10198,6 @@ class CodeGenerator:
 
             elif isinstance(stmt, ForStmt):
                 self._collect_expr_reads(stmt.iterable, read)
-                self._collect_var_usage(stmt.body, written, read)
-
-            elif isinstance(stmt, LoopStmt):
                 self._collect_var_usage(stmt.body, written, read)
 
             elif isinstance(stmt, WhileStmt):
@@ -14066,9 +14015,6 @@ class CodeGenerator:
                     var_names.add(stmt.pattern)
                 elif hasattr(stmt.pattern, 'name'):
                     var_names.add(stmt.pattern.name)
-                for s in stmt.body:
-                    collect_from_stmt(s)
-            elif isinstance(stmt, LoopStmt):
                 for s in stmt.body:
                     collect_from_stmt(s)
             elif isinstance(stmt, MatchStmt):

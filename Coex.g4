@@ -220,7 +220,6 @@ controlFlowStmt
     : ifStmt
     | forStmt
     | forAssignStmt
-    | loopStmt
     | whileStmt
     | cycleStmt
     | matchStmt
@@ -310,11 +309,6 @@ forStmt
 // For-assign pattern: results = for i in items expr ~
 forAssignStmt
     : IDENTIFIER ASSIGN FOR bindingPattern IN expression expression NEWLINE* block
-    ;
-
-// Infinite loop
-loopStmt
-    : LOOP NEWLINE* block
     ;
 
 // While loop (standard while condition)
@@ -650,7 +644,7 @@ IF          : 'if' ;
 ELSE        : 'else' ;
 FOR         : 'for' ;
 IN          : 'in' ;
-LOOP        : 'loop' ;
+// LOOP keyword removed - use 'while true' instead
 WHILE       : 'while' ;
 CYCLE       : 'cycle' ;
 MATCH       : 'match' ;

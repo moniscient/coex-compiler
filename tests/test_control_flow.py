@@ -4,8 +4,7 @@ Tests for control flow statements.
 These tests verify:
 - If/else if/else chains
 - For loops with range
-- Loop statements with break/continue
-- While loops (if supported)
+- While loops with break/continue (use 'while true' for infinite loops)
 """
 
 import pytest
@@ -205,14 +204,14 @@ func main() -> int
 ''', "10\n")
 
 
-class TestLoopStatement:
-    """Tests for infinite loop with break/continue."""
-    
-    def test_loop_with_break(self, expect_output):
+class TestWhileTrueStatement:
+    """Tests for infinite loop (while true) with break/continue."""
+
+    def test_while_true_with_break(self, expect_output):
         expect_output('''
 func main() -> int
     var i: int = 0
-    loop
+    while true
         i += 1
         if i >= 5
             break
@@ -222,13 +221,13 @@ func main() -> int
     return 0
 ~
 ''', "5\n")
-    
-    def test_loop_with_continue(self, expect_output):
+
+    def test_while_true_with_continue(self, expect_output):
         expect_output('''
 func main() -> int
     var sum: int = 0
     var i: int = 0
-    loop
+    while true
         i += 1
         if i > 10
             break
@@ -307,3 +306,18 @@ func main() -> int
     return 0
 ~
 ''', "7\n")
+
+
+class TestLoopKeywordRemoved:
+    """Verify that the 'loop' keyword is no longer valid syntax."""
+
+    def test_loop_keyword_is_syntax_error(self, expect_compile_error):
+        """The 'loop' keyword should no longer be recognized."""
+        expect_compile_error('''
+func main() -> int
+    loop
+        break
+    ~
+    return 0
+~
+''')

@@ -607,8 +607,6 @@ class ASTBuilder:
             return self.visit_for_stmt(child)
         elif isinstance(child, CoexParser.ForAssignStmtContext):
             return self.visit_for_assign_stmt(child)
-        elif isinstance(child, CoexParser.LoopStmtContext):
-            return self.visit_loop_stmt(child)
         elif isinstance(child, CoexParser.WhileStmtContext):
             return self.visit_while_stmt(child)
         elif isinstance(child, CoexParser.CycleStmtContext):
@@ -671,11 +669,6 @@ class ASTBuilder:
             elements = [self.visit_binding_pattern(p) for p in ctx.bindingPattern()]
             return TuplePattern(elements)
     
-    def visit_loop_stmt(self, ctx: CoexParser.LoopStmtContext) -> LoopStmt:
-        """Visit a loop statement"""
-        body = self.visit_block(ctx.block())
-        return LoopStmt(body)
-
     def visit_while_stmt(self, ctx: CoexParser.WhileStmtContext) -> WhileStmt:
         """Visit a while statement: while condition block"""
         condition = self.visit_expression(ctx.expression())
