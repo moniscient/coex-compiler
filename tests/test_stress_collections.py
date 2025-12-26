@@ -11,6 +11,12 @@ import sys
 import time
 from pathlib import Path
 
+# Skip 10M tests on CI (too resource-intensive)
+skip_on_ci = pytest.mark.skipif(
+    os.environ.get('CI') == 'true',
+    reason="10M element tests too slow for CI"
+)
+
 
 class TestStressMap:
     """Stress tests for Map at scale."""
@@ -34,6 +40,7 @@ func main() -> int
 ~
 ''', "100000\n0\n100000\n199998\n")
 
+    @skip_on_ci
     def test_map_10m_build_and_lookup(self, compiler_root):
         """Build a map with 10 million entries and verify lookups."""
         source = '''
@@ -163,6 +170,7 @@ func main() -> int
 ~
 ''', "yes\nyes\nyes\nno\n100000\n")
 
+    @skip_on_ci
     def test_set_10m_build_and_check(self, compiler_root):
         """Build a set with 10 million entries and verify membership."""
         source = '''
