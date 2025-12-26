@@ -62,12 +62,14 @@ annotation
 
 functionDecl
     : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? NEWLINE* block
+    | EXTERN IDENTIFIER LPAREN parameterList? RPAREN returnType? NEWLINE* blockTerminator  // extern has no body
     ;
 
 functionKind
     : FORMULA
     | TASK
     | FUNC
+    | EXTERN
     ;
 
 genericParams
@@ -103,7 +105,7 @@ returnType
 // ----------------------------------------------------------------------------
 
 typeDecl
-    : EXTERN? TYPE IDENTIFIER genericParams? COLON typeBody blockTerminator
+    : TYPE IDENTIFIER genericParams? COLON typeBody blockTerminator
     ;
 
 typeBody

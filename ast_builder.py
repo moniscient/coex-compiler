@@ -87,6 +87,25 @@ class ASTBuilder:
     
     def visit_function_decl(self, ctx: CoexParser.FunctionDeclContext) -> FunctionDecl:
         """Visit a function declaration"""
+        # Check if this is an extern function (no body, just declaration)
+        if ctx.EXTERN():
+            # Extern function: extern name(params) -> type ~
+            name = ctx.IDENTIFIER().getText()
+
+            # Get parameters
+            params = []
+            if ctx.parameterList():
+                params = self.visit_param_list(ctx.parameterList())
+
+            # Get return type
+            return_type = None
+            if ctx.returnType():
+                return_type = self.visit_type_expr(ctx.returnType().typeExpr())
+
+            # Extern functions have no body
+            return FunctionDecl(FunctionKind.EXTERN, name, [], params, return_type, [], [])
+
+        # Regular function declaration
         # Get annotations
         annotations = []
         for ann_ctx in ctx.annotation():
@@ -99,6 +118,8 @@ class ASTBuilder:
             kind = FunctionKind.FORMULA
         elif kind_text == "task":
             kind = FunctionKind.TASK
+        elif kind_text == "extern":
+            kind = FunctionKind.EXTERN
         else:
             kind = FunctionKind.FUNC
 
@@ -120,8 +141,11 @@ class ASTBuilder:
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
 
-        # Get body
-        body = self.visit_block(ctx.block())
+        # Get body - extern functions have no body
+        if kind == FunctionKind.EXTERN:
+            body = []
+        else:
+            body = self.visit_block(ctx.block())
 
         return FunctionDecl(kind, name, type_params, params, return_type, body, annotations)
 
@@ -170,9 +194,6 @@ class ASTBuilder:
         """Visit a type declaration"""
         name = ctx.IDENTIFIER().getText()
 
-        # Check for extern keyword
-        is_extern = ctx.EXTERN() is not None
-
         type_params = []
         if ctx.genericParams():
             type_params = self.visit_generic_params(ctx.genericParams())
@@ -191,7 +212,7 @@ class ASTBuilder:
                 elif member.methodDecl():
                     methods.append(self.visit_method_decl(member.methodDecl()))
 
-        return TypeDecl(name, type_params, fields, methods, variants, is_extern)
+        return TypeDecl(name, type_params, fields, methods, variants)
     
     def visit_enum_case(self, ctx: CoexParser.EnumCaseContext) -> EnumVariant:
         """Visit an enum case"""

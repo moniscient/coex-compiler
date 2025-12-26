@@ -7902,15 +7902,6 @@ class CodeGenerator:
         # Store the AST for later reference
         self.type_decls[type_decl.name] = type_decl
 
-        # Track extern types for validation
-        if type_decl.is_extern:
-            self.extern_types = getattr(self, 'extern_types', set())
-            self.extern_types.add(type_decl.name)
-            # Validate: extern types must have a close() method
-            has_close = any(m.name == "close" for m in type_decl.methods)
-            if not has_close:
-                raise Exception(f"Extern type '{type_decl.name}' must have a close() method")
-
         # If generic, store as template for later monomorphization
         if type_decl.type_params:
             self.generic_types[type_decl.name] = type_decl
@@ -8697,13 +8688,6 @@ class CodeGenerator:
                 return i
         return None
 
-    def _get_clink_symbol(self, func: FunctionDecl) -> Optional[str]:
-        """Check if function has @clink annotation and return the C symbol name."""
-        for annotation in func.annotations:
-            if annotation.name == "clink" and annotation.argument:
-                return annotation.argument
-        return None
-
     def _get_c_type(self, coex_type: Type) -> ir.Type:
         """Get LLVM type for C ABI (e.g., int -> i32, float -> double)."""
         if isinstance(coex_type, PrimitiveType):
@@ -8738,40 +8722,6 @@ class CodeGenerator:
                 return self.builder.sext(value, ir.IntType(64))
         return value
 
-    def _generate_clink_wrapper(self, func: FunctionDecl, llvm_func: ir.Function):
-        """Generate a wrapper function that calls an external C function."""
-        # Create entry block
-        entry = llvm_func.append_basic_block(name="entry")
-        self.builder = ir.IRBuilder(entry)
-
-        # Get the external C function
-        clink_functions = getattr(self, 'clink_functions', {})
-        c_func = clink_functions.get(func.name)
-        if c_func is None:
-            # Shouldn't happen, but handle gracefully
-            if isinstance(llvm_func.return_value.type, ir.VoidType):
-                self.builder.ret_void()
-            else:
-                self.builder.ret(ir.Constant(llvm_func.return_value.type, 0))
-            return
-
-        # Convert Coex arguments to C types
-        c_args = []
-        for i, param in enumerate(func.params):
-            coex_arg = llvm_func.args[i]
-            c_arg = self._convert_to_c_type(coex_arg, param.type_annotation)
-            c_args.append(c_arg)
-
-        # Call the C function
-        if isinstance(c_func.return_value.type, ir.VoidType):
-            self.builder.call(c_func, c_args)
-            self.builder.ret_void()
-        else:
-            c_result = self.builder.call(c_func, c_args)
-            # Convert C result back to Coex type
-            coex_result = self._convert_from_c_type(c_result, func.return_type)
-            self.builder.ret(coex_result)
-
     def _declare_function(self, func: FunctionDecl):
         """Declare a function (for forward references)"""
         # If generic, store as template
@@ -8782,6 +8732,11 @@ class CodeGenerator:
         # Special handling for main() with parameters
         if func.name == "main" and func.params:
             self._declare_main_with_params(func)
+            return
+
+        # Handle extern functions (FFI to C)
+        if func.kind == FunctionKind.EXTERN:
+            self._declare_extern_function(func)
             return
 
         # Build parameter types
@@ -8795,35 +8750,89 @@ class CodeGenerator:
         else:
             return_type = ir.VoidType()
 
-        # Check for @clink annotation - also declare external C function
-        clink_symbol = self._get_clink_symbol(func)
-        if clink_symbol:
-            # Build C ABI parameter types
-            c_param_types = []
-            for param in func.params:
-                c_param_types.append(self._get_c_type(param.type_annotation))
-
-            # Build C return type
-            if func.return_type:
-                c_return_type = self._get_c_type(func.return_type)
-            else:
-                c_return_type = ir.VoidType()
-
-            # Check if the C function is already declared in the module
-            if clink_symbol in self.module.globals:
-                c_func = self.module.globals[clink_symbol]
-            else:
-                # Declare the external C function
-                c_func_type = ir.FunctionType(c_return_type, c_param_types)
-                c_func = ir.Function(self.module, c_func_type, name=clink_symbol)
-            # Store reference to the C function
-            self.clink_functions = getattr(self, 'clink_functions', {})
-            self.clink_functions[func.name] = c_func
-
         # Create function
         func_type = ir.FunctionType(return_type, param_types)
         llvm_func = ir.Function(self.module, func_type, name=func.name)
         self.functions[func.name] = llvm_func
+
+    def _declare_extern_function(self, func: FunctionDecl):
+        """Declare an extern function (external C linkage, no body).
+
+        Extern functions are FFI boundaries to C code. They use C ABI types
+        and are declared with external linkage so the linker can resolve them.
+        """
+        # Track this extern function for calling hierarchy validation
+        self.extern_function_decls = getattr(self, 'extern_function_decls', {})
+        self.extern_function_decls[func.name] = func
+
+        # Build C ABI parameter types
+        c_param_types = []
+        for param in func.params:
+            c_param_types.append(self._get_c_type(param.type_annotation))
+
+        # Build C ABI return type
+        if func.return_type:
+            c_return_type = self._get_c_type(func.return_type)
+        else:
+            c_return_type = ir.VoidType()
+
+        # Check if already declared in the module
+        if func.name in self.module.globals:
+            # Use the existing declaration
+            self.functions[func.name] = self.module.globals[func.name]
+            return
+
+        # Declare the external function
+        func_type = ir.FunctionType(c_return_type, c_param_types)
+        llvm_func = ir.Function(self.module, func_type, name=func.name)
+        llvm_func.linkage = 'external'
+        self.functions[func.name] = llvm_func
+
+    def _generate_extern_call(self, name: str, args: list, func_decl: FunctionDecl) -> ir.Value:
+        """Generate a call to an extern function with C ABI type conversion.
+
+        Extern functions can only be called from func (not formula or task).
+        Arguments are converted from Coex types to C ABI types, and return
+        values are converted back.
+        """
+        # Validate calling hierarchy: only func can call extern
+        if hasattr(self, 'current_function') and self.current_function:
+            caller_kind = self.current_function.kind
+            if caller_kind == FunctionKind.FORMULA:
+                raise RuntimeError(
+                    f"Cannot call extern function '{name}' from formula "
+                    f"'{self.current_function.name}'. Extern functions can only "
+                    f"be called from func."
+                )
+            elif caller_kind == FunctionKind.TASK:
+                raise RuntimeError(
+                    f"Cannot call extern function '{name}' from task "
+                    f"'{self.current_function.name}'. Extern functions can only "
+                    f"be called from func."
+                )
+
+        llvm_func = self.functions[name]
+
+        # Convert Coex arguments to C ABI types
+        c_args = []
+        for i, arg in enumerate(args):
+            arg_val = self._generate_expression(arg)
+            if i < len(func_decl.params):
+                c_arg = self._convert_to_c_type(arg_val, func_decl.params[i].type_annotation)
+            else:
+                c_arg = arg_val
+            c_args.append(c_arg)
+
+        # Call the extern function
+        if isinstance(llvm_func.return_value.type, ir.VoidType):
+            self.builder.call(llvm_func, c_args)
+            return ir.Constant(ir.IntType(64), 0)
+        else:
+            c_result = self.builder.call(llvm_func, c_args)
+            # Convert C result back to Coex type
+            if func_decl.return_type:
+                return self._convert_from_c_type(c_result, func_decl.return_type)
+            return c_result
 
     def _declare_main_with_params(self, func: FunctionDecl):
         """Handle main() function with special parameters (args, stdin, stdout, stderr).
@@ -9006,13 +9015,11 @@ class CodeGenerator:
         if func.type_params:
             return
 
-        llvm_func = self.functions[func.name]
-
-        # Check for @clink annotation - generate wrapper that calls C function
-        clink_symbol = self._get_clink_symbol(func)
-        if clink_symbol:
-            self._generate_clink_wrapper(func, llvm_func)
+        # Skip extern functions (they have no body, external linkage only)
+        if func.kind == FunctionKind.EXTERN:
             return
+
+        llvm_func = self.functions[func.name]
 
         # Create entry block
         entry = llvm_func.append_basic_block(name="entry")
@@ -11761,6 +11768,11 @@ class CodeGenerator:
                     return self.builder.call(func, args)
                 else:
                     raise RuntimeError(f"Function '{qualified_name}' not found in module '{module_name}'")
+
+            # Check if this is an extern function call
+            extern_decls = getattr(self, 'extern_function_decls', {})
+            if name in extern_decls:
+                return self._generate_extern_call(name, expr.args, extern_decls[name])
 
             # Look up function
             if name in self.functions:

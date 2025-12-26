@@ -18,6 +18,7 @@ class FunctionKind(Enum):
     FORMULA = auto()
     TASK = auto()
     FUNC = auto()
+    EXTERN = auto()  # FFI to C functions
 
 
 class BinaryOp(Enum):
@@ -684,7 +685,6 @@ class TypeDecl:
     fields: List[FieldDecl] = field(default_factory=list)
     methods: List[FunctionDecl] = field(default_factory=list)
     variants: List['EnumVariant'] = field(default_factory=list)  # For enums
-    is_extern: bool = False  # True for extern types (scope-restricted, auto-close)
 
 
 @dataclass
