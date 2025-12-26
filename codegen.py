@@ -111,6 +111,9 @@ class CodeGenerator:
         # Const binding tracking for reassignment checking
         self.const_bindings: set = set()  # Set of const variable names
 
+        # Placeholder variable tracking for loop pre-allocation
+        self.placeholder_vars: set = set()  # Set of pre-allocated placeholder variable names
+
         # List and channel runtime support
         self.list_type = None
         self.channel_type = None
@@ -9185,16 +9188,22 @@ class CodeGenerator:
         # - const x = ...: ALWAYS create new binding (shadows if name exists)
         # - x = ...: reassign if exists, create new if not
         if not stmt.is_const and stmt.name in self.locals:
-            # Variable exists and this is NOT a const declaration -> reassignment
-            # Check if target is a const binding
-            if stmt.name in self.const_bindings:
-                raise RuntimeError(
-                    f"Cannot reassign const binding '{stmt.name}'. "
-                    f"Remove 'const' from the declaration to make it rebindable."
-                )
-            # Perform reassignment
-            self._generate_var_reassignment(stmt)
-            return
+            # Variable exists and this is NOT a const declaration -> possible reassignment
+            # But first check if this is a pre-allocated placeholder that needs proper typing
+            is_placeholder = stmt.name in self.placeholder_vars
+
+            if not is_placeholder:
+                # This is a properly typed variable - do reassignment
+                # Check if target is a const binding
+                if stmt.name in self.const_bindings:
+                    raise RuntimeError(
+                        f"Cannot reassign const binding '{stmt.name}'. "
+                        f"Remove 'const' from the declaration to make it rebindable."
+                    )
+                # Perform reassignment
+                self._generate_var_reassignment(stmt)
+                return
+            # else: fall through to new binding logic to upgrade the placeholder
 
         # Track const bindings
         if stmt.is_const:
@@ -9394,6 +9403,9 @@ class CodeGenerator:
 
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
+
+        # Variable is now properly typed, remove from placeholders
+        self.placeholder_vars.discard(stmt.name)
 
         # Register as GC root if this is a heap type
         if stmt.name in self.gc_root_indices and self.gc is not None:
@@ -9983,6 +9995,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Create basic blocks
         cond_block = func.append_basic_block("while_cond")
@@ -10481,6 +10494,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Allocate loop variable
         loop_var = self.builder.alloca(ir.IntType(64), name=var_name)
@@ -10614,6 +10628,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Same as range_for
         loop_var = self.builder.alloca(ir.IntType(64), name=stmt.var_name)
@@ -10728,7 +10743,8 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
-        
+                self.placeholder_vars.add(lv_name)
+
         # Allocate index variable
         index_var = self.builder.alloca(ir.IntType(64), name="list_idx")
         self.builder.store(ir.Constant(ir.IntType(64), 0), index_var)
@@ -10804,6 +10820,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Allocate index variable
         index_var = self.builder.alloca(ir.IntType(64), name="array_idx")
@@ -10883,6 +10900,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Allocate index variable
         index_var = self.builder.alloca(ir.IntType(64), name="map_idx")
@@ -10967,6 +10985,7 @@ class CodeGenerator:
             if lv_name not in self.locals:
                 lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
                 self.locals[lv_name] = lv_alloca
+                self.placeholder_vars.add(lv_name)
 
         # Allocate index variable
         index_var = self.builder.alloca(ir.IntType(64), name="set_idx")
