@@ -2,7 +2,7 @@
 # Note: Set has a pre-existing scalability issue above ~3000 elements
 
 func main() -> int
-    var s: Set<int> = {}
+    s: Set<int> = {}
     for i in 0..3000
         s = s.add(i)
     ~

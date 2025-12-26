@@ -15,7 +15,7 @@ class TestStringLen:
         """.len() on a basic string literal"""
         expect_output('''
 func main() -> int
-    var s: string = "hello"
+    s: string = "hello"
     print(s.len())
     return 0
 ~
@@ -25,7 +25,7 @@ func main() -> int
         """.len() on single character string"""
         expect_output('''
 func main() -> int
-    var s: string = "x"
+    s: string = "x"
     print(s.len())
     return 0
 ~
@@ -35,7 +35,7 @@ func main() -> int
         """.len() on a longer string"""
         expect_output('''
 func main() -> int
-    var s: string = "hello world"
+    s: string = "hello world"
     print(s.len())
     return 0
 ~
@@ -45,7 +45,7 @@ func main() -> int
         """.len() on empty string"""
         expect_output('''
 func main() -> int
-    var s: string = ""
+    s: string = ""
     print(s.len())
     return 0
 ~
@@ -59,7 +59,7 @@ func get_greeting() -> string
 ~
 
 func main() -> int
-    var s: string = get_greeting()
+    s: string = get_greeting()
     print(s.len())
     return 0
 ~
@@ -86,7 +86,7 @@ class TestStringLenInExpressions:
         """s.len() in comparison expression"""
         expect_output('''
 func main() -> int
-    var s: string = "hello"
+    s: string = "hello"
     if s.len() > 0
         print(1)
     else
@@ -100,7 +100,7 @@ func main() -> int
         """s.len() in arithmetic expression"""
         expect_output('''
 func main() -> int
-    var s: string = "abc"
+    s: string = "abc"
     print(s.len() * 2)
     return 0
 ~
@@ -110,8 +110,8 @@ func main() -> int
         """s.len() used in range for loop"""
         expect_output('''
 func main() -> int
-    var s: string = "abc"
-    var count: int = 0
+    s: string = "abc"
+    count: int = 0
     for i in 0..s.len()
         count = count + 1
     ~
@@ -128,7 +128,7 @@ class TestStringLenContrast:
         """Verify list .len() works"""
         expect_output('''
 func main() -> int
-    var items: List<int> = [1, 2, 3, 4, 5]
+    items: List<int> = [1, 2, 3, 4, 5]
     print(items.len())
     return 0
 ~
@@ -138,8 +138,8 @@ func main() -> int
         """Both string and list .len() in same program"""
         expect_output('''
 func main() -> int
-    var s: string = "hello"
-    var items: List<int> = [1, 2, 3]
+    s: string = "hello"
+    items: List<int> = [1, 2, 3]
     print(s.len())
     print(items.len())
     return 0

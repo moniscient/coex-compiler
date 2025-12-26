@@ -54,7 +54,7 @@ func main() -> int
     def test_func_with_locals(self, expect_output):
         expect_output('''
 func sum_range(first: int, last: int) -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(first, last)
         sum += i
     ~
@@ -117,7 +117,7 @@ class TestTaskKind:
     def test_simple_task(self, expect_output):
         expect_output('''
 task work(n: int) -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(0, n)
         sum += i
     ~
@@ -137,7 +137,7 @@ task compute(x: int) -> int
 ~
 
 func main() -> int
-    var result: int = compute(21)
+    result: int = compute(21)
     print(result)
     return 0
 ~
@@ -250,7 +250,7 @@ formula square(x: int) -> int
 ~
 
 func main() -> int
-    var result: int = square(3) + square(4)
+    result: int = square(3) + square(4)
     print(result)
     return 0
 ~
@@ -293,7 +293,7 @@ formula compute(x: int) -> int
 ~
 
 task worker(n: int) -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(1, n)
         sum += compute(i)
     ~
@@ -308,13 +308,13 @@ func main() -> int
 
 
 class TestFormulaPurity:
-    """Tests that formulas are pure (no var declarations allowed)."""
+    """Tests that formulas are pure (require const bindings)."""
 
-    def test_var_in_formula_rejected(self, expect_compile_error):
-        """var declarations should be rejected in formulas."""
+    def test_rebindable_in_formula_rejected(self, expect_compile_error):
+        """Rebindable bindings should be rejected in formulas."""
         expect_compile_error('''
 formula bad_formula(x: int) -> int
-    var total: int = 0
+    total: int = 0
     total = x * 2
     return total
 ~
@@ -323,13 +323,13 @@ func main() -> int
     print(bad_formula(21))
     return 0
 ~
-''', "mutable variable")
+''', "requires const")
 
-    def test_assignment_in_formula_allowed(self, expect_output):
-        """Assignment in formulas creates functional bindings (shadowing)."""
+    def test_const_in_formula_allowed(self, expect_output):
+        """Const bindings should work in formulas."""
         expect_output('''
 formula good_formula(x: int) -> int
-    result = x * 2
+    const result = x * 2
     return result
 ~
 
@@ -340,10 +340,10 @@ func main() -> int
 ''', "42\n")
 
     def test_var_in_func_allowed(self, expect_output):
-        """var declarations should be allowed in func."""
+        """declarations should be allowed in func."""
         expect_output('''
 func compute(x: int) -> int
-    var total: int = 0
+    total: int = 0
     total = x * 2
     return total
 ~
@@ -355,10 +355,10 @@ func main() -> int
 ''', "42\n")
 
     def test_var_in_task_allowed(self, expect_output):
-        """var declarations should be allowed in task."""
+        """declarations should be allowed in task."""
         expect_output('''
 task compute(x: int) -> int
-    var total: int = 0
+    total: int = 0
     total = x * 2
     return total
 ~

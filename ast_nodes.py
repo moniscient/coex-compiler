@@ -468,7 +468,7 @@ class VarDecl(Stmt):
     name: str
     type_annotation: Optional[Type]
     initializer: Expr
-    is_mutable: bool = True  # var = mutable, no var = immutable
+    is_const: bool = False  # True if declared with 'const'
     is_move: bool = False  # True if := was used
 
 

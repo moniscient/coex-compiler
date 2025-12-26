@@ -49,27 +49,59 @@ Read the language specification document "coex-compiler/coex_specification_revis
 
 coex uses value semantics. The only mutable states are atomics.
 
-ll types in Coex have value semantics. Assignment always produces a logically independent copy of the value. This applies uniformly to primitive types, user-defined types, and collections.
+All types in Coex have value semantics. Assignment always produces a logically independent copy of the value. This applies uniformly to primitive types, user-defined types, and collections.
+
+```coex
 a = [1, 2, 3]
-b = a           # b is an independent copy
-var c = a       # c is an independent copy, rebindable
-c.append(4)     # c is now [1, 2, 3, 4]; a and b unchanged
+b = a              # b is an independent copy
+b = b.append(4)    # b is now [1, 2, 3, 4]; a is unchanged
+```
+
 There is no aliasing in Coex. Two bindings never refer to "the same" mutable storage such that modifications through one are visible through the other. This guarantee is foundational to Coex's concurrency safety: a task that receives a value as a parameter owns that value exclusively and cannot observe modifications from other tasks.
+
 The compiler may implement value semantics through copy-on-write, structural sharing, or other optimizations, but the observable behavior is always as if a full copy occurred at assignment.
-The "var" keyword is then syntactic sugar for rebinding a new value to a name. Without it, a compiler error is thrown.
-The Two Kinds of Mutability
-Coex distinguishes between rebinding and shared mutation.
-Rebinding is purely local. A var declaration creates a name that can be bound to different values over time within its scope. The values themselves are never shared; rebinding one variable cannot affect any other binding anywhere in the program.
-var x = 1
+
+### Bindings: `const` vs Rebindable
+
+Coex uses `const` for non-rebindable bindings. Bare identifier declarations are rebindable by default:
+
+```coex
+x = 5           # Rebindable binding - can reassign
+const y = 10    # Immutable binding - cannot reassign
+x = 6           # OK
+y = 20          # ERROR: cannot reassign const binding
+```
+
+Rebinding is purely local. A declaration creates a name that can be bound to different values over time within its scope. The values themselves are never shared; rebinding one variable cannot affect any other binding anywhere in the program.
+
+```coex
+x = 1
 x = 2      # Rebinding: x now refers to the value 2
-Rebinding is available in task and func contexts. It provides the ergonomics of imperative programming while preserving local reasoning—you need only consider the current scope to understand what a var can become.
+```
+
+Rebinding is available in task and func contexts. Formulas require `const` bindings for purity:
+
+```coex
+formula compute(a: int) -> int
+    const result = a * 2    # const required in formulas
+    return result
+~
+```
+
+### Shared Mutation
+
 Shared mutation requires atomic types. When multiple tasks must coordinate through shared state, they do so through atomic_int, atomic_float, atomic_bool, or atomic_ref<T>. These are the only mechanism for shared mutable state in Coex.
-var counter: atomic_int = 0    # Module-level shared state
+
+```coex
+var counter: atomic_int = 0    # Module-level shared state (var required for globals)
 
 task increment()
     counter.increment()        # Shared mutation
 ~
-There are no global mutable variables, no mutable references passed between functions, and no out-parameters. Functions receive values and return values. If a function must mutate shared state, it receives an atomic handle and the mutation is explicit in both the type signature and the call site.
+```
+
+There are no global mutable variables (except atomics), no mutable references passed between functions, and no out-parameters. Functions receive values and return values. If a function must mutate shared state, it receives an atomic handle and the mutation is explicit in both the type signature and the call site.
+
 This design makes sharing visible. Code that contains no atomic types cannot exhibit data races, and the presence of atomics signals "concurrent coordination happens here."
 
 
@@ -90,7 +122,7 @@ func main() -> int
 - `task` - Concurrent tasks (currently runs sequentially)
 
 ### Reserved Words
-`end`, `init`, `self`, `cell`, `true`, `false`, `nil`, `and`, `or`, `not`
+`end`, `init`, `self`, `cell`, `true`, `false`, `nil`, `and`, `or`, `not`, `const`, `var`
 
 ## Feature Status (as of Dec 2024)
 

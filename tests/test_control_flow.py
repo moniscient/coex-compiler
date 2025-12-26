@@ -61,7 +61,7 @@ func main() -> int
     def test_elif_first_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 1
+    x: int = 1
     if x == 1
         print(10)
     else if x == 2
@@ -76,7 +76,7 @@ func main() -> int
     def test_elif_second_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 2
+    x: int = 2
     if x == 1
         print(10)
     else if x == 2
@@ -91,7 +91,7 @@ func main() -> int
     def test_elif_else_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 99
+    x: int = 99
     if x == 1
         print(10)
     else if x == 2
@@ -106,7 +106,7 @@ func main() -> int
     def test_multiple_elif(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 3
+    x: int = 3
     if x == 1
         print(1)
     else if x == 2
@@ -125,8 +125,8 @@ func main() -> int
     def test_nested_if(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 5
-    var y: int = 3
+    x: int = 5
+    y: int = 3
     if x > 0
         if y > 0
             print(1)
@@ -143,7 +143,7 @@ class TestForLoops:
     def test_for_range_sum(self, expect_output):
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(1, 6)
         sum += i
     ~
@@ -155,7 +155,7 @@ func main() -> int
     def test_for_range_count(self, expect_output):
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     for i in range(0, 10)
         count += 1
     ~
@@ -167,7 +167,7 @@ func main() -> int
     def test_for_range_empty(self, expect_output):
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(5, 5)
         sum += i
     ~
@@ -179,7 +179,7 @@ func main() -> int
     def test_for_nested(self, expect_output):
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(1, 4)
         for j in range(1, 4)
             sum += 1
@@ -193,8 +193,8 @@ func main() -> int
     def test_for_with_variable_bounds(self, expect_output):
         expect_output('''
 func main() -> int
-    var n: int = 5
-    var sum: int = 0
+    n: int = 5
+    sum: int = 0
     for i in range(0, n)
         sum += i
     ~
@@ -210,7 +210,7 @@ class TestWhileTrueStatement:
     def test_while_true_with_break(self, expect_output):
         expect_output('''
 func main() -> int
-    var i: int = 0
+    i: int = 0
     while true
         i += 1
         if i >= 5
@@ -225,8 +225,8 @@ func main() -> int
     def test_while_true_with_continue(self, expect_output):
         expect_output('''
 func main() -> int
-    var sum: int = 0
-    var i: int = 0
+    sum: int = 0
+    i: int = 0
     while true
         i += 1
         if i > 10
@@ -245,7 +245,7 @@ func main() -> int
     def test_for_break(self, expect_output):
         expect_output('''
 func main() -> int
-    var last: int = 0
+    last: int = 0
     for i in range(0, 100)
         last = i
         if i >= 5
@@ -260,7 +260,7 @@ func main() -> int
     def test_for_continue(self, expect_output):
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in range(1, 11)
         if i % 2 == 0
             continue
@@ -279,7 +279,7 @@ class TestNestedControlFlow:
     def test_if_in_for(self, expect_output):
         expect_output('''
 func main() -> int
-    var evens: int = 0
+    evens: int = 0
     for i in range(1, 11)
         if i % 2 == 0
             evens += 1
@@ -294,7 +294,7 @@ func main() -> int
         # Count how many numbers 1-15 are divisible by 3 or 5
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     for i in range(1, 16)
         if i % 3 == 0
             count += 1

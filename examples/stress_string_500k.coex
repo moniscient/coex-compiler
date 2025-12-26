@@ -2,9 +2,9 @@
 # Tests string allocation in loops
 
 func main() -> int
-    var count: int = 0
+    count: int = 0
     for i in 0..500000
-        var s: string = "hello"
+        s: string = "hello"
         count = count + s.len()
     ~
     print(count)

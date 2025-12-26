@@ -130,7 +130,7 @@ class TestQualifiedCalls:
 import math
 
 func main() -> int
-    var x: int = math.abs(-5) + math.abs(-7)
+    x: int = math.abs(-5) + math.abs(-7)
     print(x)
     return 0
 ~
@@ -157,7 +157,7 @@ func square(_ x: int) -> int
 ~
 
 func main() -> int
-    var x: int = math.abs(-3)
+    x: int = math.abs(-3)
     print(square(x))
     return 0
 ~

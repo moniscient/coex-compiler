@@ -3,7 +3,7 @@
 
 func main() -> int
     # Reduced size for now
-    var mat: Matrix<int> = Matrix(100, 100, 0)
+    mat: Matrix<int> = Matrix(100, 100, 0)
 
     # Set diagonal elements
     for i in 0..100

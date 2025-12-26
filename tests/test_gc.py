@@ -28,8 +28,8 @@ func main() -> int
         """Test gc() with basic integer variables"""
         expect_output('''
 func main() -> int
-    var x: int = 10
-    var y: int = 20
+    x: int = 10
+    y: int = 20
     gc()
     print(x + y)
     return 0
@@ -41,9 +41,9 @@ func main() -> int
         expect_output('''
 func main() -> int
     gc()
-    var x: int = 5
+    x: int = 5
     gc()
-    var y: int = 10
+    y: int = 10
     gc()
     print(x + y)
     return 0
@@ -54,7 +54,7 @@ func main() -> int
         """Test gc() called inside a loop"""
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in 0..5
         gc()
         sum = sum + i
@@ -68,7 +68,7 @@ func main() -> int
         """Test gc() with list allocation"""
         expect_output('''
 func main() -> int
-    var items: List<int> = [1, 2, 3, 4, 5]
+    items: List<int> = [1, 2, 3, 4, 5]
     gc()
     print(items.len())
     return 0
@@ -84,7 +84,7 @@ type Point:
 ~
 
 func main() -> int
-    var p: Point = Point(x: 10, y: 20)
+    p: Point = Point(x: 10, y: 20)
     gc()
     print(p.x + p.y)
     return 0
@@ -99,7 +99,7 @@ func make_list() -> List<int>
 ~
 
 func main() -> int
-    var items: List<int> = make_list()
+    items: List<int> = make_list()
     gc()
     print(items.len())
     return 0
@@ -114,8 +114,8 @@ type Node:
 ~
 
 func main() -> int
-    var n1: Node = Node(value: 10)
-    var n2: Node = Node(value: 20)
+    n1: Node = Node(value: 10)
+    n2: Node = Node(value: 20)
     gc()
     print(n1.value + n2.value)
     return 0
@@ -126,7 +126,7 @@ func main() -> int
         """Test gc() with string values"""
         expect_output('''
 func main() -> int
-    var s: string = "hello"
+    s: string = "hello"
     gc()
     print(s.len())
     return 0
@@ -137,7 +137,7 @@ func main() -> int
         """Test gc() with map allocation"""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10, 2: 20}
+    m: Map<int, int> = {1: 10, 2: 20}
     gc()
     print(m.get(1))
     return 0
@@ -148,7 +148,7 @@ func main() -> int
         """Test gc() with set allocation"""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 2, 3}
+    s: Set<int> = {1, 2, 3}
     gc()
     print(s.len())
     return 0
@@ -163,7 +163,7 @@ class TestGCWithControlFlow:
         """Test gc() in conditional branch"""
         expect_output('''
 func main() -> int
-    var x: int = 5
+    x: int = 5
     if x > 0
         gc()
         print(1)
@@ -178,7 +178,7 @@ func main() -> int
         """Test values preserved across gc() in conditional"""
         expect_output('''
 func main() -> int
-    var items: List<int> = [1, 2, 3]
+    items: List<int> = [1, 2, 3]
     if true
         gc()
     ~
@@ -196,7 +196,7 @@ func trigger_gc() -> int
 ~
 
 func main() -> int
-    var x: List<int> = [1, 2, 3]
+    x: List<int> = [1, 2, 3]
     trigger_gc()
     print(x.len())
     return 0
@@ -211,7 +211,7 @@ class TestGCMemoryReclamation:
         """Test gc() after creating many temporary objects"""
         expect_output('''
 func create_list() -> int
-    var temp: List<int> = [1, 2, 3, 4, 5]
+    temp: List<int> = [1, 2, 3, 4, 5]
     return temp.len()
 ~
 
@@ -236,7 +236,7 @@ func sum_to(n: int) -> int
 ~
 
 func main() -> int
-    var result: int = sum_to(5)
+    result: int = sum_to(5)
     gc()
     print(result)
     return 0
@@ -255,7 +255,7 @@ type Node:
 ~
 
 func create_garbage() -> int
-    var garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     return 0
 ~
 
@@ -269,7 +269,7 @@ func main() -> int
     gc()
 
     # Allocate new object - should use reclaimed memory
-    var node: Node = Node(value: 42)
+    node: Node = Node(value: 42)
     print(node.value)
     return 0
 ~
@@ -287,10 +287,10 @@ class TestGCShadowStack:
         """
         expect_output('''
 func main() -> int
-    var live: List<int> = [1, 2, 3]
+    live: List<int> = [1, 2, 3]
 
     for i in 0..10
-        var garbage: List<int> = [i, i+1, i+2]
+        garbage: List<int> = [i, i+1, i+2]
         gc()
     ~
 
@@ -308,14 +308,14 @@ func inner(s: string) -> int
 ~
 
 func middle(s: string) -> int
-    var prefix: string = ">"
+    prefix: string = ">"
     gc()
     return inner(s)
 ~
 
 func main() -> int
-    var text: string = "hello"
-    var result: int = middle(text)
+    text: string = "hello"
+    result: int = middle(text)
     gc()
     print(result)
     return 0
@@ -326,14 +326,14 @@ func main() -> int
         """Test that all live variables in scope are preserved across gc()."""
         expect_output('''
 func main() -> int
-    var a: List<int> = [1, 2, 3]
-    var b: Map<int, int> = {1: 10, 2: 20}
-    var c: Set<int> = {5, 6, 7}
-    var d: string = "test"
+    a: List<int> = [1, 2, 3]
+    b: Map<int, int> = {1: 10, 2: 20}
+    c: Set<int> = {5, 6, 7}
+    d: string = "test"
 
     gc()
 
-    var total: int = a.len() + b.len() + c.len() + d.len()
+    total: int = a.len() + b.len() + c.len() + d.len()
     print(total)
     return 0
 ~
@@ -352,10 +352,10 @@ class TestGCMapSetStress:
         """Create many Maps in a loop with gc() calls - verifies HAMT marking works."""
         expect_output('''
 func main() -> int
-    var live: Map<int, int> = {1: 100}
+    live: Map<int, int> = {1: 100}
 
     for i in 0..50
-        var temp: Map<int, int> = {i: i * 10}
+        temp: Map<int, int> = {i: i * 10}
         gc()
     ~
 
@@ -368,7 +368,7 @@ func main() -> int
         """Test map literal construction followed by gc() - the minimal failing case."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10, 2: 20, 3: 30}
+    m: Map<int, int> = {1: 10, 2: 20, 3: 30}
     gc()
     print(m.get(1))
     print(m.get(2))
@@ -381,10 +381,10 @@ func main() -> int
         """Create many Sets in a loop with gc() calls - verifies HAMT marking works."""
         expect_output('''
 func main() -> int
-    var live: Set<int> = {100, 200, 300}
+    live: Set<int> = {100, 200, 300}
 
     for i in 0..50
-        var temp: Set<int> = {i, i + 1, i + 2}
+        temp: Set<int> = {i, i + 1, i + 2}
         gc()
     ~
 
@@ -397,7 +397,7 @@ func main() -> int
         """Test map mutations interleaved with gc() calls."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10}
+    m: Map<int, int> = {1: 10}
     gc()
     m = m.set(2, 20)
     gc()
@@ -420,7 +420,7 @@ func main() -> int
         """
         expect_output('''
 func build_map(n: int) -> Map<int, int>
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     for i in 0..n
         m = m.set(i, i * 2)
     ~
@@ -429,11 +429,11 @@ func build_map(n: int) -> Map<int, int>
 
 func main() -> int
     for round in 0..10
-        var temp: Map<int, int> = build_map(20)
+        temp: Map<int, int> = build_map(20)
         gc()
     ~
 
-    var final: Map<int, int> = build_map(5)
+    final: Map<int, int> = build_map(5)
     print(final.get(3))
     return 0
 ~

@@ -7,9 +7,6 @@ formula factorial(n: int) -> int
     else
         return n * factorial(n - 1) ~~
  
-
 func main() -> int
-    print(factorial(5))
-    print(factorial(10))
-    return 0
-~
+    for x in range(1,100)
+    	print(factorial(x)) ~~

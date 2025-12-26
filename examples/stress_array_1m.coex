@@ -5,7 +5,7 @@
 
 func main() -> int
     # Create array with 1M elements initialized to 42
-    var arr: Array<int> = Array(1000000, 42)
+    arr: Array<int> = Array(1000000, 42)
     print(arr.len())
     print(arr.get(0))
     print(arr.get(500000))

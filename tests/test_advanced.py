@@ -18,7 +18,7 @@ type Box<T>:
 ~
 
 func main() -> int
-    var b: Box<int> = Box<int>(42)
+    b: Box<int> = Box<int>(42)
     print(b.value)
     return 0
 ~
@@ -33,7 +33,7 @@ type Pair<A, B>:
 ~
 
 func main() -> int
-    var p: Pair<int, int> = Pair<int, int>(10, 20)
+    p: Pair<int, int> = Pair<int, int>(10, 20)
     print(p.first + p.second)
     return 0
 ~
@@ -47,7 +47,7 @@ func identity<T>(x: T) -> T
 ~
 
 func main() -> int
-    var result: int = identity<int>(42)
+    result: int = identity<int>(42)
     print(result)
     return 0
 ~
@@ -61,7 +61,7 @@ type Box<T>:
 ~
 
 func main() -> int
-    var b: Box<int> = Box(99)
+    b: Box<int> = Box(99)
     print(b.value)
     return 0
 ~
@@ -79,7 +79,7 @@ type Box<T>:
 ~
 
 func main() -> int
-    var b: Box<int> = Box<int>(123)
+    b: Box<int> = Box<int>(123)
     print(b.get())
     return 0
 ~
@@ -93,8 +93,8 @@ type Box<T>:
 ~
 
 func main() -> int
-    var b1: Box<int> = Box<int>(10)
-    var b2: Box<int> = Box<int>(20)
+    b1: Box<int> = Box<int>(10)
+    b2: Box<int> = Box<int>(20)
     print(b1.value + b2.value)
     return 0
 ~
@@ -120,7 +120,7 @@ type Counter:
 ~
 
 func main() -> int
-    var c: Counter = Counter(42)
+    c: Counter = Counter(42)
     print(c.describe())
     return 0
 ~
@@ -146,7 +146,7 @@ func double<T: Numeric>(x: T) -> int
 ~
 
 func main() -> int
-    var num: Number = Number(21)
+    num: Number = Number(21)
     print(double<Number>(num))
     return 0
 ~
@@ -165,7 +165,7 @@ matrix Grid[10, 10]:
 ~
 
 func main() -> int
-    var g: Grid = Grid.new()
+    g: Grid = Grid.new()
     print(g.width())
     return 0
 ~
@@ -180,7 +180,7 @@ matrix Grid[5, 5]:
 ~
 
 func main() -> int
-    var g: Grid = Grid.new()
+    g: Grid = Grid.new()
     g.set(2, 3, 42)
     print(g.get(2, 3))
     return 0
@@ -196,7 +196,7 @@ matrix Grid[3, 3]:
 ~
 
 func main() -> int
-    var g: Grid = Grid.new()
+    g: Grid = Grid.new()
     print(g.get(1, 1))
     return 0
 ~
@@ -215,7 +215,7 @@ matrix Counter[2, 2]:
 ~
 
 func main() -> int
-    var c: Counter = Counter.new()
+    c: Counter = Counter.new()
     c.tick()
     print(c.get(0, 0) + c.get(1, 1))
     return 0
@@ -235,7 +235,7 @@ matrix Grid[3, 3]:
 ~
 
 func main() -> int
-    var g: Grid = Grid.new()
+    g: Grid = Grid.new()
     g.double()
     print(g.get(1, 1))
     return 0
@@ -250,7 +250,7 @@ class TestCollections:
         """Empty list creation."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = []
+    lst: List<int> = []
     print(lst.len())
     return 0
 ~
@@ -260,7 +260,7 @@ func main() -> int
         """List literal with elements."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [1, 2, 3]
+    lst: List<int> = [1, 2, 3]
     print(lst.len())
     return 0
 ~
@@ -270,7 +270,7 @@ func main() -> int
         """Access list elements by index."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [10, 20, 30]
+    lst: List<int> = [10, 20, 30]
     print(lst.get(1))
     return 0
 ~
@@ -280,7 +280,7 @@ func main() -> int
         """Append to list (value semantics - returns new list)."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [1, 2]
+    lst: List<int> = [1, 2]
     lst = lst.append(3)
     print(lst.len())
     return 0
@@ -291,8 +291,8 @@ func main() -> int
         """Iterate over list with for loop."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [1, 2, 3, 4]
-    var sum: int = 0
+    lst: List<int> = [1, 2, 3, 4]
+    sum: int = 0
     for x in lst
         sum += x
     ~
@@ -309,7 +309,7 @@ class TestListComprehensions:
         """Basic list comprehension."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [x * 2 for x in 0..3]
+    lst: List<int> = [x * 2 for x in 0..3]
     print(lst.len())
     return 0
 ~
@@ -319,7 +319,7 @@ func main() -> int
         """List comprehension with filter condition."""
         expect_output('''
 func main() -> int
-    var evens: List<int> = [x for x in 0..10 if x % 2 == 0]
+    evens: List<int> = [x for x in 0..10 if x % 2 == 0]
     print(evens.len())
     return 0
 ~
@@ -333,7 +333,7 @@ class TestMaps:
         """Empty map creation."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     print(m.len())
     return 0
 ~
@@ -343,7 +343,7 @@ func main() -> int
         """Map literal with entries."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10, 2: 20, 3: 30}
+    m: Map<int, int> = {1: 10, 2: 20, 3: 30}
     print(m.len())
     return 0
 ~
@@ -353,7 +353,7 @@ func main() -> int
         """Get value from map."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 100, 2: 200}
+    m: Map<int, int> = {1: 100, 2: 200}
     print(m.get(2))
     return 0
 ~
@@ -363,7 +363,7 @@ func main() -> int
         """Check if key exists in map."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {5: 50, 10: 100}
+    m: Map<int, int> = {5: 50, 10: 100}
     if m.has(5)
         print(1)
     ~
@@ -378,7 +378,7 @@ func main() -> int
         """Set value in map (value semantics - returns new map)."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10}
+    m: Map<int, int> = {1: 10}
     m = m.set(2, 20)
     print(m.get(2))
     return 0
@@ -389,7 +389,7 @@ func main() -> int
         """Remove key from map (value semantics - returns new map)."""
         expect_output('''
 func main() -> int
-    var m = {1: 10, 2: 20}
+    m = {1: 10, 2: 20}
     m = m.remove(1)
     print(m.len())
     return 0
@@ -404,7 +404,7 @@ class TestSets:
         """Set literal with elements."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 2, 3}
+    s: Set<int> = {1, 2, 3}
     print(s.len())
     return 0
 ~
@@ -414,7 +414,7 @@ func main() -> int
         """Check if element exists in set."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {10, 20, 30}
+    s: Set<int> = {10, 20, 30}
     if s.has(20)
         print(1)
     ~
@@ -429,7 +429,7 @@ func main() -> int
         """Add element to set (value semantics - returns new set)."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 2}
+    s: Set<int> = {1, 2}
     s = s.add(3)
     print(s.len())
     return 0
@@ -440,7 +440,7 @@ func main() -> int
         """Remove element from set (value semantics - returns new set)."""
         expect_output('''
 func main() -> int
-    var s = {1, 2, 3}
+    s = {1, 2, 3}
     s = s.remove(2)
     print(s.len())
     return 0
@@ -451,7 +451,7 @@ func main() -> int
         """Set should not allow duplicates."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 1, 2, 2, 3}
+    s: Set<int> = {1, 1, 2, 2, 3}
     print(s.len())
     return 0
 ~
@@ -465,8 +465,8 @@ class TestCollectionValueSemantics:
         """List.append returns new list, original is unchanged."""
         expect_output('''
 func main() -> int
-    var a: List<int> = [1, 2, 3]
-    var b: List<int> = a.append(4)
+    a: List<int> = [1, 2, 3]
+    b: List<int> = a.append(4)
     print(a.len())
     print(b.len())
     return 0
@@ -477,8 +477,8 @@ func main() -> int
         """Assigning a list creates an independent copy."""
         expect_output('''
 func main() -> int
-    var a: List<int> = [1, 2, 3]
-    var b: List<int> = a
+    a: List<int> = [1, 2, 3]
+    b: List<int> = a
     b = b.append(4)
     print(a.len())
     print(b.len())
@@ -490,8 +490,8 @@ func main() -> int
         """Map.set returns new map, original is unchanged."""
         expect_output('''
 func main() -> int
-    var a: Map<int, int> = {1: 10}
-    var b: Map<int, int> = a.set(2, 20)
+    a: Map<int, int> = {1: 10}
+    b: Map<int, int> = a.set(2, 20)
     print(a.len())
     print(b.len())
     return 0
@@ -502,8 +502,8 @@ func main() -> int
         """Assigning a map creates an independent copy."""
         expect_output('''
 func main() -> int
-    var a: Map<int, int> = {1: 10}
-    var b: Map<int, int> = a
+    a: Map<int, int> = {1: 10}
+    b: Map<int, int> = a
     b = b.set(2, 20)
     print(a.len())
     print(b.len())
@@ -515,8 +515,8 @@ func main() -> int
         """Set.add returns new set, original is unchanged."""
         expect_output('''
 func main() -> int
-    var a: Set<int> = {1, 2}
-    var b: Set<int> = a.add(3)
+    a: Set<int> = {1, 2}
+    b: Set<int> = a.add(3)
     print(a.len())
     print(b.len())
     return 0
@@ -527,8 +527,8 @@ func main() -> int
         """Assigning a set creates an independent copy."""
         expect_output('''
 func main() -> int
-    var a: Set<int> = {1, 2}
-    var b: Set<int> = a
+    a: Set<int> = {1, 2}
+    b: Set<int> = a
     b = b.add(3)
     print(a.len())
     print(b.len())
@@ -548,7 +548,7 @@ func apply(f: formula(int) -> int, x: int) -> int
 ~
 
 func main() -> int
-    var result: int = apply(formula(_ x: int) => x * 2, 21)
+    result: int = apply(formula(_ x: int) => x * 2, 21)
     print(result)
     return 0
 ~
@@ -558,7 +558,7 @@ func main() -> int
         """Lambda stored in variable."""
         expect_output('''
 func main() -> int
-    var double: formula(int) -> int = formula(_ x: int) => x * 2
+    double: formula(int) -> int = formula(_ x: int) => x * 2
     print(double(10))
     return 0
 ~
@@ -568,7 +568,7 @@ func main() -> int
         """Lambda with multiple parameters."""
         expect_output('''
 func main() -> int
-    var add: formula(int, int) -> int = formula(_ a: int, _ b: int) => a + b
+    add: formula(int, int) -> int = formula(_ a: int, _ b: int) => a + b
     print(add(15, 27))
     return 0
 ~
@@ -582,7 +582,7 @@ class TestRanges:
         """Range expression in for loop."""
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     for i in 0..5
         sum += i
     ~
@@ -595,9 +595,9 @@ func main() -> int
         """Range with variable bounds."""
         expect_output('''
 func main() -> int
-    var start: int = 1
-    var stop: int = 4
-    var sum: int = 0
+    start: int = 1
+    stop: int = 4
+    sum: int = 0
     for i in start..stop
         sum += i
     ~
@@ -623,7 +623,7 @@ class TestCollectionSize:
         # Size = 48 + 256 = 304
         expect_output('''
 func main() -> int
-    var lst: List<int> = []
+    lst: List<int> = []
     print(lst.size())
     return 0
 ~
@@ -635,7 +635,7 @@ func main() -> int
         # Size = 48 + 256 = 304 (same as empty - tail buffer is fixed size)
         expect_output('''
 func main() -> int
-    var lst: List<int> = [1, 2, 3]
+    lst: List<int> = [1, 2, 3]
     print(lst.size())
     return 0
 ~
@@ -647,7 +647,7 @@ func main() -> int
         # Size = 24 + 5 = 29
         expect_output('''
 func main() -> int
-    var s: string = "hello"
+    s: string = "hello"
     print(s.size())
     return 0
 ~
@@ -659,7 +659,7 @@ func main() -> int
         # Size = 24 + 0 = 24
         expect_output('''
 func main() -> int
-    var s: string = ""
+    s: string = ""
     print(s.size())
     return 0
 ~
@@ -671,7 +671,7 @@ func main() -> int
         # Empty map has no tree nodes, size = 16
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     print(m.size())
     return 0
 ~
@@ -682,7 +682,7 @@ func main() -> int
         # HAMT Map: 16 (header) + 2 elements * 32 (estimated per entry) = 80
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {1: 10, 2: 20}
+    m: Map<int, int> = {1: 10, 2: 20}
     print(m.size())
     return 0
 ~
@@ -693,7 +693,7 @@ func main() -> int
         # HAMT Set: 16 (header) + 3 elements * 32 (estimated per entry) = 112
         expect_output('''
 func main() -> int
-    var s: Set<int> = {1, 2, 3}
+    s: Set<int> = {1, 2, 3}
     print(s.size())
     return 0
 ~
@@ -703,7 +703,7 @@ func main() -> int
         """Verify .size() and .len() return different values."""
         expect_output('''
 func main() -> int
-    var lst: List<int> = [1, 2, 3]
+    lst: List<int> = [1, 2, 3]
     print(lst.len())
     print(lst.size())
     return 0
@@ -723,8 +723,8 @@ func modify_list(lst: List<int>) -> int
 ~
 
 func main() -> int
-    var original: List<int> = [1, 2, 3]
-    var new_len: int = modify_list(original)
+    original: List<int> = [1, 2, 3]
+    new_len: int = modify_list(original)
     print(original.len())
     print(new_len)
     return 0
@@ -740,8 +740,8 @@ func modify_map(m: Map<int, int>) -> int
 ~
 
 func main() -> int
-    var original: Map<int, int> = {1: 10, 2: 20}
-    var new_len: int = modify_map(original)
+    original: Map<int, int> = {1: 10, 2: 20}
+    new_len: int = modify_map(original)
     print(original.len())
     print(new_len)
     return 0
@@ -757,8 +757,8 @@ func modify_set(s: Set<int>) -> int
 ~
 
 func main() -> int
-    var original: Set<int> = {1, 2, 3}
-    var new_len: int = modify_set(original)
+    original: Set<int> = {1, 2, 3}
+    new_len: int = modify_set(original)
     print(original.len())
     print(new_len)
     return 0
@@ -773,7 +773,7 @@ func use_string(s: string) -> int
 ~
 
 func main() -> int
-    var original: string = "hello"
+    original: string = "hello"
     print(use_string(original))
     print(original.len())
     return 0
@@ -784,16 +784,16 @@ func main() -> int
         """Nested list modifications should not affect caller."""
         expect_output('''
 func modify_nested(lst: List<List<int>>) -> int
-    var inner: List<int> = lst.get(0)
+    inner: List<int> = lst.get(0)
     inner = inner.append(99)
     return inner.len()
 ~
 
 func main() -> int
-    var inner: List<int> = [1, 2]
-    var outer: List<List<int>> = [inner]
-    var new_len: int = modify_nested(outer)
-    var orig_inner: List<int> = outer.get(0)
+    inner: List<int> = [1, 2]
+    outer: List<List<int>> = [inner]
+    new_len: int = modify_nested(outer)
+    orig_inner: List<int> = outer.get(0)
     print(orig_inner.len())
     print(new_len)
     return 0

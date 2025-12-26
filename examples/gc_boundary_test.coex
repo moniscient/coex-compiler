@@ -2,8 +2,8 @@
 # Works at 500k, fails at 750k
 
 func main() -> int
-    var arr: List<int> = []
-    var i: int = 0
+    arr: List<int> = []
+    i: int = 0
 
     # Phase 1: Build to 500k (should work)
     for i in 0..500000

@@ -58,7 +58,7 @@ func main() -> int
         """set() on list with tree structure."""
         expect_output('''
 func main() -> int
-    var a: List<int> = []
+    a: List<int> = []
     for i in 0..100
         a = a.append(i)
     ~
@@ -92,7 +92,7 @@ class TestPersistentVectorAppend:
         """append() to empty list."""
         expect_output('''
 func main() -> int
-    var a: List<int> = []
+    a: List<int> = []
     b = a.append(42)
     print(a.len())
     print(b.len())
@@ -134,7 +134,7 @@ func main() -> int
         """Appending past 32 elements builds tree structure."""
         expect_output('''
 func main() -> int
-    var a: List<int> = []
+    a: List<int> = []
     for i in 0..50
         a = a.append(i)
     ~
@@ -195,7 +195,7 @@ func main() -> int
         """Large lists share most of their structure."""
         expect_output('''
 func main() -> int
-    var a: List<int> = []
+    a: List<int> = []
     for i in 0..1000
         a = a.append(i)
     ~

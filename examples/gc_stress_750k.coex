@@ -2,8 +2,8 @@
 # This test reliably triggers the GC stack overflow bug
 
 func main() -> int
-    var arr: List<int> = []
-    var i: int = 0
+    arr: List<int> = []
+    i: int = 0
     for i in 0..750000
         arr = arr.append(i)
     ~

@@ -553,14 +553,17 @@ class ASTBuilder:
         return '\n'.join(lines).strip()
 
     def visit_var_decl_stmt(self, ctx: CoexParser.VarDeclStmtContext) -> VarDecl:
-        """Visit a variable declaration statement"""
+        """Visit a variable declaration statement: [const] name [: type] = expr"""
+        # Check for const keyword
+        is_const = ctx.CONST() is not None
+
         name = ctx.IDENTIFIER().getText()
-        # Type annotation is optional now (for var x := expr syntax)
+        # Type annotation is optional
         type_ann = self.visit_type_expr(ctx.typeExpr()) if ctx.typeExpr() else None
         init = self.visit_expression(ctx.expression())
         # Check if this is a move assignment
         is_move = ctx.MOVE_ASSIGN() is not None
-        return VarDecl(name, type_ann, init, is_mutable=True, is_move=is_move)
+        return VarDecl(name, type_ann, init, is_const=is_const, is_move=is_move)
     
     def visit_simple_stmt(self, ctx: CoexParser.SimpleStmtContext) -> Stmt:
         """Visit a simple statement (expression or assignment)"""

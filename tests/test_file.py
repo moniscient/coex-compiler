@@ -26,7 +26,7 @@ class TestFileOpen:
 
         expect_output(f'''
 func main() -> int
-    var result: Result<File, string> = File.open("{test_file}", "r")
+    result: Result<File, string> = File.open("{test_file}", "r")
     if result.is_ok()
         print(1)
     else
@@ -40,7 +40,7 @@ func main() -> int
         """Opening non-existent file returns error."""
         expect_output('''
 func main() -> int
-    var result: Result<File, string> = File.open("/nonexistent/file.txt", "r")
+    result: Result<File, string> = File.open("/nonexistent/file.txt", "r")
     if result.is_err()
         print(1)
     else
@@ -61,10 +61,10 @@ class TestFileReadWrite:
 
         expect_output(f'''
 func main() -> int
-    var f: Result<File, string> = File.open("{test_file}", "r")
+    f: Result<File, string> = File.open("{test_file}", "r")
     if f.is_ok()
-        var file: File = f.unwrap()
-        var content: Result<string, string> = file.read_all()
+        file: File = f.unwrap()
+        content: Result<string, string> = file.read_all()
         if content.is_ok()
             print(content.unwrap())
         ~
@@ -80,9 +80,9 @@ func main() -> int
 
         expect_output(f'''
 func main() -> int
-    var f: Result<File, string> = File.open("{test_file}", "w")
+    f: Result<File, string> = File.open("{test_file}", "w")
     if f.is_ok()
-        var file: File = f.unwrap()
+        file: File = f.unwrap()
         file.writeln("hello from coex")
         file.close()
         print(1)
@@ -109,9 +109,9 @@ class TestFileClose:
         # Use Result<int, string> since () is not a valid type in the grammar
         expect_output(f'''
 func main() -> int
-    var f: Result<File, string> = File.open("{test_file}", "r")
+    f: Result<File, string> = File.open("{test_file}", "r")
     if f.is_ok()
-        var file: File = f.unwrap()
+        file: File = f.unwrap()
         file.close()
         print(1)
     ~

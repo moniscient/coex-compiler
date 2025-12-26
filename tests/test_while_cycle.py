@@ -12,7 +12,7 @@ class TestWhileLoop:
         """Test basic while loop with counter"""
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     while count < 5
         count += 1
     ~
@@ -25,7 +25,7 @@ func main() -> int
         """Test while loop that never executes"""
         expect_output('''
 func main() -> int
-    var count: int = 10
+    count: int = 10
     while count < 5
         count += 1
     ~
@@ -38,7 +38,7 @@ func main() -> int
         """Test while loop with break"""
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     while true
         count += 1
         if count >= 3
@@ -54,8 +54,8 @@ func main() -> int
         """Test while loop with continue"""
         expect_output('''
 func main() -> int
-    var count: int = 0
-    var sum: int = 0
+    count: int = 0
+    sum: int = 0
     while count < 5
         count += 1
         if count == 3
@@ -72,10 +72,10 @@ func main() -> int
         """Test nested while loops"""
         expect_output('''
 func main() -> int
-    var i: int = 0
-    var sum: int = 0
+    i: int = 0
+    sum: int = 0
     while i < 3
-        var j: int = 0
+        j: int = 0
         while j < 3
             sum += 1
             j += 1
@@ -91,8 +91,8 @@ func main() -> int
         """Test while loop with complex condition"""
         expect_output('''
 func main() -> int
-    var x: int = 0
-    var y: int = 10
+    x: int = 0
+    y: int = 10
     while x < 5 and y > 5
         x += 1
         y -= 1
@@ -111,9 +111,9 @@ class TestCycleBasic:
         """Test basic cycle with external counter"""
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     while count < 5 cycle
-        var x: int = 1
+        x: int = 1
         count += 1
     ~
     print(count)
@@ -125,9 +125,9 @@ func main() -> int
         """Test cycle that never executes"""
         expect_output('''
 func main() -> int
-    var count: int = 10
+    count: int = 10
     while count < 5 cycle
-        var x: int = 1
+        x: int = 1
         count += 1
     ~
     print(count)
@@ -144,8 +144,8 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var sum: int = 0
-    var i: int = 0
+    sum: int = 0
+    i: int = 0
     while i < 4 cycle
         # Use outer variable directly for computation
         sum += i * 2
@@ -163,15 +163,15 @@ class TestCycleDoubleBuffer:
     def test_cycle_read_previous_generation(self, expect_output):
         """Test that cycle vars read from previous generation
 
-        When a cycle var is read, it reads from the read buffer (previous gen).
+        When a cycle is read, it reads from the read buffer (previous gen).
         This is the key synchronous dataflow behavior.
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var last_a: int = 0
+    iteration: int = 0
+    last_a: int = 0
     while iteration < 3 cycle
-        var a: int = 0
+        a: int = 0
         # 'a' reads from read buffer, writes to write buffer
         # After VarDecl, write buffer has 0, read buffer still has previous (or 0 initially)
         last_a = a  # Reads from READ buffer
@@ -191,12 +191,12 @@ func main() -> int
         """Test that writes within same generation aren't visible to reads"""
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var result: int = 0
+    iteration: int = 0
+    result: int = 0
     while iteration < 2 cycle
-        var a: int = 1
+        a: int = 1
         a = 100  # Write to write buffer
-        var b: int = a  # Reads from READ buffer, should still be 0 (not 100)
+        b: int = a  # Reads from READ buffer, should still be 0 (not 100)
         result = b
         iteration += 1
     ~
@@ -214,10 +214,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var result: int = 0
+    iteration: int = 0
+    result: int = 0
     while iteration < 3 cycle
-        var counter: int = 0
+        counter: int = 0
         # Each iteration: counter = counter(read buffer) + 1
         # Iter 0: read=0, write=1
         # Iter 1: read=1 (swapped), write=2
@@ -239,9 +239,9 @@ class TestCycleControlFlow:
         """Test break inside cycle"""
         expect_output('''
 func main() -> int
-    var count: int = 0
+    count: int = 0
     while true cycle
-        var x: int = 1
+        x: int = 1
         count += 1
         if count >= 3
             break
@@ -260,10 +260,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var count: int = 0
-    var sum: int = 0
+    count: int = 0
+    sum: int = 0
     while count < 5 cycle
-        var x: int = count  # Writes count to x's write buffer
+        x: int = count  # Writes count to x's write buffer
         count += 1
         # x reads from read buffer (previous gen), not write buffer
         # So x is always the PREVIOUS iteration's count value
@@ -306,7 +306,7 @@ class TestCycleNestedControlFlow:
         So in iter 0: sum_write gets overwritten 4 times, ending with sum_read + 3 = 0+3=3
         Actually += is compound assignment, let me re-trace.
 
-        For cycle var compound assignment (sum += i):
+        For cycle compound assignment (sum += i):
         - reads old_val from READ buffer
         - computes old_val + i
         - writes to WRITE buffer
@@ -342,10 +342,10 @@ class TestCycleNestedControlFlow:
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var total: int = 0
+    iteration: int = 0
+    total: int = 0
     while iteration < 3 cycle
-        # Use outer var to accumulate, avoid cycle var inside for
+        # Use outer to accumulate, avoid cycle var inside for
         for i in 0..4
             total += i
         ~
@@ -365,10 +365,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var result: int = 0
+    iteration: int = 0
+    result: int = 0
     while iteration < 5 cycle
-        var value: int = iteration  # Write iteration to value's write buffer
+        value: int = iteration  # Write iteration to value's write buffer
         # value reads from read buffer (previous iteration's value)
         # iter 0: value_read=0
         # iter 1: value_read=0
@@ -389,10 +389,10 @@ func main() -> int
         """Test that condition correctly reads outer scope"""
         expect_output('''
 func main() -> int
-    var limit: int = 5
-    var count: int = 0
+    limit: int = 5
+    count: int = 0
     while count < limit cycle
-        var x: int = 1
+        x: int = 1
         count += 1
         if count == 3
             limit = 3
@@ -407,7 +407,7 @@ func main() -> int
 class TestCycleLanguageBindings:
     """Tests for language-bound variables inside cycle (should NOT be double-buffered)
 
-    The principle: variables explicitly created by the user (via var or assignment)
+    The principle: variables explicitly created by the user (via or assignment)
     are double-buffered in a cycle. Variables bound by language constructs
     (for loop vars, tuple destructuring, match bindings) are NOT double-buffered.
     """
@@ -425,8 +425,8 @@ func get_pair(_ n: int) -> (int, int)
 ~
 
 func main() -> int
-    var iteration: int = 0
-    var total: int = 0
+    iteration: int = 0
+    total: int = 0
     while iteration < 3 cycle
         # (x, y) are bound by tuple destructuring - should work normally
         (x, y) = get_pair(iteration)
@@ -452,8 +452,8 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var result: int = 0
+    iteration: int = 0
+    result: int = 0
     while iteration < 2 cycle
         # Destructure (10, 20) or (30, 40) based on iteration
         # Since iteration is outer var, it works normally
@@ -479,10 +479,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var total: int = 0
+    iteration: int = 0
+    total: int = 0
     while iteration < 3 cycle
-        var value: int = iteration * 10
+        value: int = iteration * 10
         # Use match with a catch-all pattern that binds a variable
         match value
             case n:
@@ -513,8 +513,8 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var result: int = 0
+    iteration: int = 0
+    result: int = 0
     while iteration < 3 cycle
         # iteration is outer var, so it has current value
         match iteration
@@ -541,8 +541,8 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var total: int = 0
+    iteration: int = 0
+    total: int = 0
     while iteration < 2 cycle
         for i in 0..3
             # i is bound by for loop - should work normally
@@ -569,10 +569,10 @@ class TestWhileCycleInteraction:
         """
         expect_output('''
 func main() -> int
-    var iteration: int = 0
-    var total: int = 0
+    iteration: int = 0
+    total: int = 0
     while iteration < 2 cycle
-        var sum: int = 0  # Write 0 to sum's write buffer
+        sum: int = 0  # Write 0 to sum's write buffer
         for j in 0..3
             # j is NOT a cycle var, so this works normally
             # sum += j: sum_write = sum_read + j
@@ -596,12 +596,12 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var outer: int = 0
-    var total: int = 0
+    outer: int = 0
+    total: int = 0
     while outer < 2
-        var inner: int = 0
+        inner: int = 0
         while inner < 3 cycle
-            var x: int = 1  # Write 1 to x's write buffer
+            x: int = 1  # Write 1 to x's write buffer
             total += x      # x reads from read buffer (0 initially, then 1)
             inner += 1
         ~

@@ -28,9 +28,9 @@ func main() -> int
         """Test llvm_ir expression with variable bindings and return"""
         expect_output('''
 func main() -> int
-    var x: int = 3
-    var y: int = 4
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 3
+    y: int = 4
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = add i64 %a, %b
         ret i64 %r
     """
@@ -43,9 +43,9 @@ func main() -> int
         """Test llvm_ir multiplication"""
         expect_output('''
 func main() -> int
-    var x: int = 6
-    var y: int = 7
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 6
+    y: int = 7
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = mul i64 %a, %b
         ret i64 %r
     """
@@ -58,10 +58,10 @@ func main() -> int
         """Test llvm_ir with multiple operations"""
         expect_output('''
 func main() -> int
-    var a: int = 3
-    var b: int = 4
-    var c: int = 5
-    var result: int = llvm_ir(a -> %x, b -> %y, c -> %z) -> %r: i64 """
+    a: int = 3
+    b: int = 4
+    c: int = 5
+    result: int = llvm_ir(a -> %x, b -> %y, c -> %z) -> %r: i64 """
         %t = mul i64 %x, %y
         %r = add i64 %t, %z
         ret i64 %r
@@ -79,9 +79,9 @@ class TestLlvmIrAdvanced:
         """Test llvm_ir subtraction"""
         expect_output('''
 func main() -> int
-    var x: int = 50
-    var y: int = 8
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 50
+    y: int = 8
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = sub i64 %a, %b
         ret i64 %r
     """
@@ -94,9 +94,9 @@ func main() -> int
         """Test llvm_ir bitwise AND"""
         expect_output('''
 func main() -> int
-    var x: int = 0xFF
-    var y: int = 0x0F
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 0xFF
+    y: int = 0x0F
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = and i64 %a, %b
         ret i64 %r
     """
@@ -109,9 +109,9 @@ func main() -> int
         """Test llvm_ir bitwise OR"""
         expect_output('''
 func main() -> int
-    var x: int = 0xF0
-    var y: int = 0x0F
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 0xF0
+    y: int = 0x0F
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = or i64 %a, %b
         ret i64 %r
     """
@@ -124,9 +124,9 @@ func main() -> int
         """Test llvm_ir left shift"""
         expect_output('''
 func main() -> int
-    var x: int = 1
-    var y: int = 4
-    var result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
+    x: int = 1
+    y: int = 4
+    result: int = llvm_ir(x -> %a, y -> %b) -> %r: i64 """
         %r = shl i64 %a, %b
         ret i64 %r
     """
@@ -139,7 +139,7 @@ func main() -> int
         """Test llvm_ir with no variable bindings"""
         expect_output('''
 func main() -> int
-    var result: int = llvm_ir -> %r: i64 """
+    result: int = llvm_ir -> %r: i64 """
         %r = add i64 20, 22
         ret i64 %r
     """
@@ -156,7 +156,7 @@ class TestLlvmIrInFunction:
         """Test llvm_ir inside a helper function"""
         expect_output('''
 func inline_add(a: int, b: int) -> int
-    var result: int = llvm_ir(a -> %x, b -> %y) -> %r: i64 """
+    result: int = llvm_ir(a -> %x, b -> %y) -> %r: i64 """
         %r = add i64 %x, %y
         ret i64 %r
     """
@@ -164,7 +164,7 @@ func inline_add(a: int, b: int) -> int
 ~
 
 func main() -> int
-    var x: int = inline_add(10, 32)
+    x: int = inline_add(10, 32)
     print(x)
     return 0
 ~
@@ -174,7 +174,7 @@ func main() -> int
         """Test multiple calls to function with inline IR"""
         expect_output('''
 func inline_mul(a: int, b: int) -> int
-    var result: int = llvm_ir(a -> %x, b -> %y) -> %r: i64 """
+    result: int = llvm_ir(a -> %x, b -> %y) -> %r: i64 """
         %r = mul i64 %x, %y
         ret i64 %r
     """
@@ -182,8 +182,8 @@ func inline_mul(a: int, b: int) -> int
 ~
 
 func main() -> int
-    var x: int = inline_mul(2, 3)
-    var y: int = inline_mul(x, 7)
+    x: int = inline_mul(2, 3)
+    y: int = inline_mul(x, 7)
     print(y)
     return 0
 ~

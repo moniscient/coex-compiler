@@ -364,7 +364,7 @@ func inner() -> int
 ~
 
 func main() -> int
-    var result = 0
+    result = 0
     for i in 0..100
         result = inner()
     ~
@@ -377,7 +377,7 @@ func main() -> int
         """Overwriting variable cleans up old value."""
         expect_output('''
 func main() -> int
-    var x = [1, 2, 3]
+    x = [1, 2, 3]
     x = [4, 5, 6]
     x = [7, 8, 9]
     print(x.get(0))
@@ -389,7 +389,7 @@ func main() -> int
         """Conditional paths with different collections."""
         expect_output('''
 func main() -> int
-    var x = [0]
+    x = [0]
     for i in 1..6
         if i % 2 == 0
             x = x.append(i)
@@ -404,7 +404,7 @@ func main() -> int
         """Map operations in loop (memory stress)."""
         expect_output('''
 func main() -> int
-    var m = {0: 0}
+    m = {0: 0}
     for i in 1..20
         m = m.set(i, i * i)
     ~
@@ -418,7 +418,7 @@ func main() -> int
         """Set operations in loop (memory stress)."""
         expect_output('''
 func main() -> int
-    var s = {0}
+    s = {0}
     for i in 1..20
         s = s.add(i)
     ~

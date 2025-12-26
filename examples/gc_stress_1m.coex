@@ -2,8 +2,8 @@
 # Stretch goal - should work after GC fix
 
 func main() -> int
-    var arr: List<int> = []
-    var i: int = 0
+    arr: List<int> = []
+    i: int = 0
     for i in 0..1000000
         arr = arr.append(i)
     ~

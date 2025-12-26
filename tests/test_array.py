@@ -16,8 +16,8 @@ class TestArrayCreation:
         """Create an Array from a List using packed()."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [1, 2, 3]
+    arr: Array<int> = list.packed()
     print(arr.len())
     return 0
 ~
@@ -27,8 +27,8 @@ func main() -> int
         """Create an Array from an empty List."""
         expect_output('''
 func main() -> int
-    var list: List<int> = []
-    var arr: Array<int> = list.packed()
+    list: List<int> = []
+    arr: Array<int> = list.packed()
     print(arr.len())
     return 0
 ~
@@ -38,8 +38,8 @@ func main() -> int
         """Create an Array from a Set using packed()."""
         expect_output('''
 func main() -> int
-    var s: Set<int> = {10, 20, 30}
-    var arr: Array<int> = s.packed()
+    s: Set<int> = {10, 20, 30}
+    arr: Array<int> = s.packed()
     print(arr.len())
     return 0
 ~
@@ -53,8 +53,8 @@ class TestArrayGet:
         """Get first element from Array."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [100, 200, 300]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [100, 200, 300]
+    arr: Array<int> = list.packed()
     print(arr.get(0))
     return 0
 ~
@@ -64,8 +64,8 @@ func main() -> int
         """Get middle element from Array."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [10, 20, 30]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [10, 20, 30]
+    arr: Array<int> = list.packed()
     print(arr.get(1))
     return 0
 ~
@@ -75,8 +75,8 @@ func main() -> int
         """Get last element from Array."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [5, 10, 15, 20]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [5, 10, 15, 20]
+    arr: Array<int> = list.packed()
     print(arr.get(3))
     return 0
 ~
@@ -86,8 +86,8 @@ func main() -> int
         """Access Array element using [] syntax."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [42, 43, 44]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [42, 43, 44]
+    arr: Array<int> = list.packed()
     print(arr[1])
     return 0
 ~
@@ -101,9 +101,9 @@ class TestArraySet:
         """set() returns a new array, original unchanged."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var arr1: Array<int> = list.packed()
-    var arr2: Array<int> = arr1.set(1, 99)
+    list: List<int> = [1, 2, 3]
+    arr1: Array<int> = list.packed()
+    arr2: Array<int> = arr1.set(1, 99)
     print(arr1.get(1))
     print(arr2.get(1))
     return 0
@@ -114,8 +114,8 @@ func main() -> int
         """Set first element in new array."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [10, 20, 30]
-    var arr: Array<int> = list.packed().set(0, 100)
+    list: List<int> = [10, 20, 30]
+    arr: Array<int> = list.packed().set(0, 100)
     print(arr.get(0))
     print(arr.get(1))
     return 0
@@ -130,9 +130,9 @@ class TestArrayAppend:
         """append() returns a new array with element added."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2]
-    var arr1: Array<int> = list.packed()
-    var arr2: Array<int> = arr1.append(3)
+    list: List<int> = [1, 2]
+    arr1: Array<int> = list.packed()
+    arr2: Array<int> = arr1.append(3)
     print(arr1.len())
     print(arr2.len())
     return 0
@@ -143,8 +143,8 @@ func main() -> int
         """Appended element is accessible."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [10, 20]
-    var arr: Array<int> = list.packed().append(30)
+    list: List<int> = [10, 20]
+    arr: Array<int> = list.packed().append(30)
     print(arr.get(2))
     return 0
 ~
@@ -158,9 +158,9 @@ class TestArrayIteration:
         """Iterate over Array with for loop."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var arr: Array<int> = list.packed()
-    var sum: int = 0
+    list: List<int> = [1, 2, 3]
+    arr: Array<int> = list.packed()
+    sum: int = 0
     for x in arr
         sum = sum + x
     ~
@@ -173,8 +173,8 @@ func main() -> int
         """Iterate over Array directly from packed()."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [10, 20, 30]
-    var total: int = 0
+    list: List<int> = [10, 20, 30]
+    total: int = 0
     for x in list.packed()
         total = total + x
     ~
@@ -191,9 +191,9 @@ class TestArrayUnpacked:
         """Convert Array back to List."""
         expect_output('''
 func main() -> int
-    var list1: List<int> = [1, 2, 3]
-    var arr: Array<int> = list1.packed()
-    var list2: List<int> = arr.unpacked()
+    list1: List<int> = [1, 2, 3]
+    arr: Array<int> = list1.packed()
+    list2: List<int> = arr.unpacked()
     print(list2.len())
     return 0
 ~
@@ -203,9 +203,9 @@ func main() -> int
         """Unpacked List has same values as original."""
         expect_output('''
 func main() -> int
-    var list1: List<int> = [10, 20, 30]
-    var arr: Array<int> = list1.packed()
-    var list2: List<int> = arr.unpacked()
+    list1: List<int> = [10, 20, 30]
+    arr: Array<int> = list1.packed()
+    list2: List<int> = arr.unpacked()
     print(list2.get(0))
     print(list2.get(1))
     print(list2.get(2))
@@ -217,10 +217,10 @@ func main() -> int
         """Roundtrip: List -> Array -> List preserves data."""
         expect_output('''
 func main() -> int
-    var original: List<int> = [5, 10, 15, 20]
-    var arr: Array<int> = original.packed()
-    var restored: List<int> = arr.unpacked()
-    var sum: int = 0
+    original: List<int> = [5, 10, 15, 20]
+    arr: Array<int> = original.packed()
+    restored: List<int> = arr.unpacked()
+    sum: int = 0
     for x in restored
         sum = sum + x
     ~
@@ -237,8 +237,8 @@ class TestArraySize:
         """len() returns element count."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3, 4, 5]
-    var arr: Array<int> = list.packed()
+    list: List<int> = [1, 2, 3, 4, 5]
+    arr: Array<int> = list.packed()
     print(arr.len())
     return 0
 ~
@@ -248,9 +248,9 @@ func main() -> int
         """size() returns memory footprint."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var arr: Array<int> = list.packed()
-    var s: int = arr.size()
+    list: List<int> = [1, 2, 3]
+    arr: Array<int> = list.packed()
+    s: int = arr.size()
     # Size should be 32 (header: 4 x 8-byte fields) + 3 * 8 (data) = 56
     print(s)
     return 0
@@ -265,10 +265,10 @@ class TestArrayValueSemantics:
         """Assigning an Array creates an independent copy."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var arr1: Array<int> = list.packed()
-    var arr2: Array<int> = arr1
-    var arr3: Array<int> = arr2.set(0, 100)
+    list: List<int> = [1, 2, 3]
+    arr1: Array<int> = list.packed()
+    arr2: Array<int> = arr1
+    arr3: Array<int> = arr2.set(0, 100)
     # arr1 and arr2 should still have original value at index 0
     print(arr1.get(0))
     print(arr2.get(0))

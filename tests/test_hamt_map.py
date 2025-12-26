@@ -26,7 +26,7 @@ func main() -> int
 func main() -> int
     m = {1: 10, 2: 20, 3: 30}
     print(m.len())
-    var empty: Map<int, int> = {}
+    empty: Map<int, int> = {}
     print(empty.len())
     return 0
 ~
@@ -93,7 +93,7 @@ func main() -> int
         """Map with many entries (requires multiple levels)."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     for i in 0..100
         m = m.set(i, i * 10)
     ~
@@ -109,7 +109,7 @@ func main() -> int
         """Empty map works correctly."""
         expect_output('''
 func main() -> int
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     print(m.len())
     print(m.has(1))
     return 0

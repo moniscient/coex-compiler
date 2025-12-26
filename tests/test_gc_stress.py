@@ -31,11 +31,11 @@ class TestGCLargeScaleStress:
         """
         expect_output('''
 func main() -> int
-    var live: Map<int, int> = {0: 0}
-    var count: int = 0
+    live: Map<int, int> = {0: 0}
+    count: int = 0
 
     for i in 0..100000
-        var temp: Map<int, int> = {i: i * 2}
+        temp: Map<int, int> = {i: i * 2}
         count = count + 1
         if i % 1000 == 0
             gc()
@@ -60,7 +60,7 @@ func main() -> int
         """
         expect_output('''
 func build_large_map(size: int) -> Map<int, int>
-    var m: Map<int, int> = {}
+    m: Map<int, int> = {}
     for i in 0..size
         m = m.set(i, i * 3)
     ~
@@ -69,11 +69,11 @@ func build_large_map(size: int) -> Map<int, int>
 
 func main() -> int
     for round in 0..10
-        var big: Map<int, int> = build_large_map(10000)
+        big: Map<int, int> = build_large_map(10000)
         gc()
     ~
 
-    var final: Map<int, int> = build_large_map(100)
+    final: Map<int, int> = build_large_map(100)
     print(final.get(50))
     print(final.len())
     return 0
@@ -89,11 +89,11 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var live: Set<int> = {999999}
-    var count: int = 0
+    live: Set<int> = {999999}
+    count: int = 0
 
     for i in 0..100000
-        var temp: Set<int> = {i, i + 1, i + 2}
+        temp: Set<int> = {i, i + 1, i + 2}
         count = count + 1
         if i % 1000 == 0
             gc()
@@ -118,10 +118,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var keeper: Map<int, int> = {1: 1, 2: 2, 3: 3}
+    keeper: Map<int, int> = {1: 1, 2: 2, 3: 3}
 
     for i in 0..50000
-        var garbage: Map<int, int> = {i: i, i+1: i+1}
+        garbage: Map<int, int> = {i: i, i+1: i+1}
         gc()
     ~
 
@@ -141,10 +141,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var final_sum: int = 0
+    final_sum: int = 0
 
     for round in 0..100
-        var m: Map<int, int> = {}
+        m: Map<int, int> = {}
         for i in 0..1000
             m = m.set(i, round)
         ~
@@ -171,10 +171,10 @@ class TestGCMemoryBoundedStress:
         """
         expect_output('''
 func main() -> int
-    var survivor: Map<int, int> = {42: 42}
+    survivor: Map<int, int> = {42: 42}
 
     for i in 0..100000
-        var temp: Map<int, int> = {i: i * i}
+        temp: Map<int, int> = {i: i * i}
         if i % 100 == 0
             gc()
         ~
@@ -193,14 +193,14 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var live_map: Map<int, int> = {1: 10}
-    var live_set: Set<int> = {100}
-    var live_list: List<int> = [1000]
+    live_map: Map<int, int> = {1: 10}
+    live_set: Set<int> = {100}
+    live_list: List<int> = [1000]
 
     for i in 0..10000
-        var temp_map: Map<int, int> = {i: i}
-        var temp_set: Set<int> = {i, i + 1}
-        var temp_list: List<int> = [i, i + 1, i + 2]
+        temp_map: Map<int, int> = {i: i}
+        temp_set: Set<int> = {i, i + 1}
+        temp_list: List<int> = [i, i + 1, i + 2]
 
         if i % 100 == 0
             gc()
@@ -231,10 +231,10 @@ class TestGCStringMapStress:
         """
         expect_output('''
 func main() -> int
-    var live: Map<string, int> = {"keep": 999}
+    live: Map<string, int> = {"keep": 999}
 
     for i in 0..1000
-        var temp: Map<string, int> = {"a": i, "b": i + 1}
+        temp: Map<string, int> = {"a": i, "b": i + 1}
         gc()
     ~
 

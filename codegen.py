@@ -108,6 +108,9 @@ class CodeGenerator:
         # Move tracking for use-after-move detection
         self.moved_vars: set = set()  # Set of variable names that have been moved
 
+        # Const binding tracking for reassignment checking
+        self.const_bindings: set = set()  # Set of const variable names
+
         # List and channel runtime support
         self.list_type = None
         self.channel_type = None
@@ -9169,14 +9172,33 @@ class CodeGenerator:
             self._generate_expression(stmt.expr)
     
     def _generate_var_decl(self, stmt: VarDecl):
-        """Generate a local variable declaration"""
-        # Check: var (mutable) declarations are prohibited in formulas
-        if stmt.is_mutable and self.current_function is not None:
+        """Generate a local variable declaration or reassignment"""
+        # Formulas require const bindings for purity
+        if not stmt.is_const and self.current_function is not None:
             if self.current_function.kind == FunctionKind.FORMULA:
                 raise RuntimeError(
-                    f"Mutable variable 'var {stmt.name}' is not allowed in formula '{self.current_function.name}'. "
-                    f"Formulas must be pure - use immutable bindings (without 'var') instead."
+                    f"Formula '{self.current_function.name}' requires const bindings. "
+                    f"Use 'const {stmt.name} = ...' instead of '{stmt.name} = ...'."
                 )
+
+        # Handle reassignment vs new binding based on 'const' keyword:
+        # - const x = ...: ALWAYS create new binding (shadows if name exists)
+        # - x = ...: reassign if exists, create new if not
+        if not stmt.is_const and stmt.name in self.locals:
+            # Variable exists and this is NOT a const declaration -> reassignment
+            # Check if target is a const binding
+            if stmt.name in self.const_bindings:
+                raise RuntimeError(
+                    f"Cannot reassign const binding '{stmt.name}'. "
+                    f"Remove 'const' from the declaration to make it rebindable."
+                )
+            # Perform reassignment
+            self._generate_var_reassignment(stmt)
+            return
+
+        # Track const bindings
+        if stmt.is_const:
+            self.const_bindings.add(stmt.name)
 
         # Check if this is a cycle variable - write to write buffer
         ctx = self._get_cycle_context()
@@ -9382,6 +9404,67 @@ class CodeGenerator:
         if move_source_name:
             self.moved_vars.add(move_source_name)
 
+    def _generate_var_reassignment(self, stmt: VarDecl):
+        """Generate reassignment to an existing variable (x = value where x exists)"""
+        # Get the existing alloca
+        alloca = self.locals[stmt.name]
+
+        # Track if we need to mark source as moved
+        move_source_name = None
+        if stmt.is_move and isinstance(stmt.initializer, Identifier):
+            move_source_name = stmt.initializer.name
+
+        # Generate the value
+        value = self._generate_expression(stmt.initializer)
+
+        # Get expected type from alloca
+        expected_type = alloca.type.pointee
+
+        # Cast if needed
+        value = self._cast_value(value, expected_type)
+
+        # Handle value semantics for collections
+        coex_type = self.var_coex_types.get(stmt.name)
+        if coex_type and self._is_collection_coex_type(coex_type):
+            if stmt.is_move:
+                value = self._generate_move_or_eager_copy(value, coex_type)
+            else:
+                value = self._generate_deep_copy(value, coex_type)
+        elif isinstance(value.type, ir.PointerType):
+            pointee = value.type.pointee
+            if hasattr(pointee, 'name'):
+                if pointee.name == "struct.List":
+                    if not stmt.is_move:
+                        value = self.builder.call(self.list_copy, [value])
+                elif pointee.name == "struct.Set":
+                    if not stmt.is_move:
+                        value = self.builder.call(self.set_copy, [value])
+                elif pointee.name == "struct.Map":
+                    if not stmt.is_move:
+                        value = self.builder.call(self.map_copy, [value])
+                elif pointee.name == "struct.String":
+                    if not stmt.is_move:
+                        value = self.builder.call(self.string_copy, [value])
+                elif pointee.name == "struct.Array":
+                    if not stmt.is_move:
+                        value = self.builder.call(self.array_copy, [value])
+
+        # Store the value
+        self.builder.store(value, alloca)
+
+        # Update GC root if needed
+        if stmt.name in self.gc_root_indices and self.gc is not None:
+            root_idx = self.gc_root_indices[stmt.name]
+            self.gc.set_root(self.builder, self.gc_roots, root_idx, value)
+
+        # Mark source as moved
+        if move_source_name:
+            self.moved_vars.add(move_source_name)
+
+        # Clear moved status for target (variable is now valid again)
+        if stmt.name in self.moved_vars:
+            self.moved_vars.discard(stmt.name)
+
     def _infer_tuple_info(self, expr: Expr) -> Optional[PyList[tuple]]:
         """Infer tuple field info from an expression"""
         if isinstance(expr, TupleExpr):
@@ -9469,6 +9552,14 @@ class CodeGenerator:
             target_name = stmt.target.name
             if target_name in self.moved_vars:
                 self.moved_vars.discard(target_name)
+
+        # Check if target is a const binding
+        if isinstance(stmt.target, Identifier):
+            if stmt.target.name in self.const_bindings:
+                raise RuntimeError(
+                    f"Cannot reassign const binding '{stmt.target.name}'. "
+                    f"Remove 'const' from the declaration to make it rebindable."
+                )
 
         # Check if target is a cycle variable - write to write buffer
         if isinstance(stmt.target, Identifier):

@@ -34,7 +34,7 @@ func get_pid() -> int
 ~
 
 func main() -> int
-    var pid: int = get_pid()
+    pid: int = get_pid()
     if pid > 0
         print(1)
     else
@@ -53,8 +53,8 @@ func my_abs(x: int) -> int
 ~
 
 func main() -> int
-    var a: int = my_abs(-10)
-    var b: int = my_abs(-20)
+    a: int = my_abs(-10)
+    b: int = my_abs(-20)
     print(a + b)
     return 0
 ~
@@ -73,7 +73,7 @@ func c_floor(x: float) -> float
 ~
 
 func main() -> int
-    var result: float = c_floor(3.7)
+    result: float = c_floor(3.7)
     if result == 3.0
         print(1)
     else
@@ -157,7 +157,7 @@ func c_abs(x: int) -> int
 ~
 
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
     sum = sum + c_abs(-1)
     sum = sum + c_abs(-2)
     sum = sum + c_abs(-3)

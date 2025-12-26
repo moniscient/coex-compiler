@@ -3,8 +3,8 @@
 
 func test_size(_ size: int) -> int
     # Allocate and fill an array
-    var arr: List<int> = []
-    var i: int = 0
+    arr: List<int> = []
+    i: int = 0
     for i in 0..size
         arr = arr.append(i)
     ~
@@ -16,26 +16,26 @@ func test_size(_ size: int) -> int
     ~
 
     # Sum all elements: sum of 0..n-1 = n*(n-1)/2
-    var sum: int = 0
+    sum: int = 0
     for x in arr
         sum = sum + x
     ~
 
     # Verify sum
-    var expected: int = size * (size - 1) / 2
+    expected: int = size * (size - 1) / 2
     if sum != expected
         print(-2)
         return -2
     ~
 
     # Square each element and sum (test math operations)
-    var sq_sum: int = 0
+    sq_sum: int = 0
     for x in arr
         sq_sum = sq_sum + (x * x)
     ~
 
     # Verify: sum of squares 0^2 + 1^2 + ... + (n-1)^2 = (n-1)*n*(2n-1)/6
-    var expected_sq: int = (size - 1) * size * (2 * size - 1) / 6
+    expected_sq: int = (size - 1) * size * (2 * size - 1) / 6
     if sq_sum != expected_sq
         print(-3)
         return -3
@@ -46,7 +46,7 @@ func test_size(_ size: int) -> int
 
 func main() -> int
     print(10)
-    var result: int = test_size(10)
+    result: int = test_size(10)
     if result != 0
         return result
     ~

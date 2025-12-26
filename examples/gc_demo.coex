@@ -6,7 +6,7 @@ type Node:
 
 # Create objects that become garbage
 func create_garbage() -> int
-    var garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     return 0
 ~
 
@@ -29,8 +29,8 @@ func main() -> int
     print(3)
 
     # Create live objects that should survive GC
-    var node1: Node = create_node(5)
-    var node2: Node = create_node(4)
+    node1: Node = create_node(5)
+    node2: Node = create_node(4)
     gc()
     print(node1.value)
 

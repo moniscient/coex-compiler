@@ -257,8 +257,8 @@ llvmTypeHint
     ;
 
 varDeclStmt
-    : VAR IDENTIFIER COLON typeExpr (ASSIGN | MOVE_ASSIGN) expression
-    | VAR IDENTIFIER (ASSIGN | MOVE_ASSIGN) expression
+    : CONST? IDENTIFIER COLON typeExpr (ASSIGN | MOVE_ASSIGN) expression
+    | CONST? IDENTIFIER (ASSIGN | MOVE_ASSIGN) expression
     ;
 
 // Tuple destructuring: (a, b) = expr
@@ -665,6 +665,7 @@ TIMEOUT     : 'timeout' ;
 
 // Variable declaration
 VAR         : 'var' ;
+CONST       : 'const' ;
 
 // Async
 AWAIT       : 'await' ;

@@ -30,9 +30,9 @@ class TestDualHeapBasics:
         """
         expect_output('''
 func main() -> int
-    var items: List<int> = [1, 2, 3, 4, 5]
-    var m: Map<int, int> = {1: 10, 2: 20}
-    var s: Set<int> = {100, 200, 300}
+    items: List<int> = [1, 2, 3, 4, 5]
+    m: Map<int, int> = {1: 10, 2: 20}
+    s: Set<int> = {100, 200, 300}
 
     gc()
 
@@ -53,8 +53,8 @@ func main() -> int
         """
         expect_output('''
 func create_garbage() -> int
-    var garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    var more: Map<int, int> = {1: 1, 2: 2, 3: 3}
+    garbage: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    more: Map<int, int> = {1: 1, 2: 2, 3: 3}
     return 0
 ~
 
@@ -81,10 +81,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var keeper: List<int> = [1, 2, 3]
+    keeper: List<int> = [1, 2, 3]
 
     for round in 0..20
-        var temp: Map<int, int> = {round: round * 10}
+        temp: Map<int, int> = {round: round * 10}
         gc()
     ~
 
@@ -122,13 +122,13 @@ type Container:
 
 func main() -> int
     # Phase 1: Create object in first heap
-    var original: List<int> = [10, 20, 30]
+    original: List<int> = [10, 20, 30]
 
     # Phase 2: gc() - in async model, swaps heaps
     gc()
 
     # Phase 3: Create new object referencing the original
-    var container: Container = Container(items: original, count: 3)
+    container: Container = Container(items: original, count: 3)
 
     # Phase 4: gc() again - original must survive via container reference
     gc()
@@ -156,15 +156,15 @@ type Link:
 
 func main() -> int
     # Create first link
-    var link1: Link = Link(value: 1, data: [10, 11, 12])
+    link1: Link = Link(value: 1, data: [10, 11, 12])
     gc()
 
     # Create second link (may be in different heap)
-    var link2: Link = Link(value: 2, data: [20, 21, 22])
+    link2: Link = Link(value: 2, data: [20, 21, 22])
     gc()
 
     # Create third link
-    var link3: Link = Link(value: 3, data: [30, 31, 32])
+    link3: Link = Link(value: 3, data: [30, 31, 32])
     gc()
 
     # All links should survive - all are reachable
@@ -184,7 +184,7 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var lists: Map<int, List<int>> = {}
+    lists: Map<int, List<int>> = {}
 
     lists = lists.set(1, [10, 11, 12])
     gc()
@@ -195,9 +195,9 @@ func main() -> int
     lists = lists.set(3, [30, 31, 32])
     gc()
 
-    var l1: List<int> = lists.get(1)
-    var l2: List<int> = lists.get(2)
-    var l3: List<int> = lists.get(3)
+    l1: List<int> = lists.get(1)
+    l2: List<int> = lists.get(2)
+    l3: List<int> = lists.get(3)
 
     print(l1.get(0))
     print(l2.get(1))
@@ -239,9 +239,9 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var before: List<int> = [1, 2, 3]
+    before: List<int> = [1, 2, 3]
     gc_async()
-    var after: List<int> = [4, 5, 6]
+    after: List<int> = [4, 5, 6]
 
     # Both lists should be accessible
     print(before.len())
@@ -262,10 +262,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var keeper: Map<int, int> = {1: 100}
+    keeper: Map<int, int> = {1: 100}
 
     for i in 0..100
-        var temp: List<int> = [i, i + 1, i + 2]
+        temp: List<int> = [i, i + 1, i + 2]
         gc_async()
     ~
 
@@ -295,15 +295,15 @@ type Node:
 ~
 
 func main() -> int
-    var nodes: List<int> = []
+    nodes: List<int> = []
 
     for i in 0..50
-        var node: Node = Node(value: i, children: [i * 10, i * 10 + 1])
+        node: Node = Node(value: i, children: [i * 10, i * 10 + 1])
         gc()
     ~
 
     # Create final structure that references heap objects
-    var final: Node = Node(value: 999, children: [1, 2, 3, 4, 5])
+    final: Node = Node(value: 999, children: [1, 2, 3, 4, 5])
     gc()
 
     print(final.value)
@@ -322,10 +322,10 @@ func main() -> int
         """
         expect_output('''
 func main() -> int
-    var sum: int = 0
+    sum: int = 0
 
     for i in 0..500
-        var m: Map<int, int> = {i: i * 2}
+        m: Map<int, int> = {i: i * 2}
         sum = sum + m.get(i)
         gc()
     ~
@@ -349,7 +349,7 @@ func main() -> int
     gc()
     gc()
 
-    var x: int = 42
+    x: int = 42
     gc()
 
     print(x)

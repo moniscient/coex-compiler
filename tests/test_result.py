@@ -23,7 +23,7 @@ class TestResultBasics:
         """Result.ok() creates an Ok variant that returns true for is_ok()."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.ok(42)
+    r: Result<int, string> = Result.ok(42)
     if r.is_ok()
         print(1)
     else
@@ -37,7 +37,7 @@ func main() -> int
         """Result.ok() creates an Ok variant that returns false for is_err()."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.ok(42)
+    r: Result<int, string> = Result.ok(42)
     if r.is_err()
         print(1)
     else
@@ -51,7 +51,7 @@ func main() -> int
         """Result.err() creates an Err variant that returns true for is_err()."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.err("failed")
+    r: Result<int, string> = Result.err("failed")
     if r.is_err()
         print(1)
     else
@@ -65,7 +65,7 @@ func main() -> int
         """Result.err() creates an Err variant that returns false for is_ok()."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.err("failed")
+    r: Result<int, string> = Result.err("failed")
     if r.is_ok()
         print(1)
     else
@@ -79,7 +79,7 @@ func main() -> int
         """unwrap() on Ok returns the value."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.ok(42)
+    r: Result<int, string> = Result.ok(42)
     print(r.unwrap())
     return 0
 ~
@@ -89,7 +89,7 @@ func main() -> int
         """unwrap_or() on Ok returns the value, ignoring default."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.ok(42)
+    r: Result<int, string> = Result.ok(42)
     print(r.unwrap_or(0))
     return 0
 ~
@@ -99,7 +99,7 @@ func main() -> int
         """unwrap_or() on Err returns the default."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.err("failed")
+    r: Result<int, string> = Result.err("failed")
     print(r.unwrap_or(99))
     return 0
 ~
@@ -113,7 +113,7 @@ class TestResultMatch:
         """Match on Ok variant extracts the value."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.ok(42)
+    r: Result<int, string> = Result.ok(42)
     match r
         case Ok(v):
             print(v)
@@ -130,7 +130,7 @@ func main() -> int
         """Match on Err variant extracts the error."""
         expect_output('''
 func main() -> int
-    var r: Result<int, string> = Result.err("oops")
+    r: Result<int, string> = Result.err("oops")
     match r
         case Ok(v):
             print(0)
@@ -158,7 +158,7 @@ func divide(a: int, b: int) -> Result<int, string>
 ~
 
 func main() -> int
-    var r: Result<int, string> = divide(10, 2)
+    r: Result<int, string> = divide(10, 2)
     print(r.unwrap())
     return 0
 ~
@@ -175,7 +175,7 @@ func divide(a: int, b: int) -> Result<int, string>
 ~
 
 func main() -> int
-    var r: Result<int, string> = divide(10, 0)
+    r: Result<int, string> = divide(10, 0)
     if r.is_err()
         print(1)
     else
@@ -200,9 +200,9 @@ func double(x: int) -> Result<int, string>
 ~
 
 func main() -> int
-    var r1: Result<int, string> = parse_int("42")
+    r1: Result<int, string> = parse_int("42")
     if r1.is_ok()
-        var r2: Result<int, string> = double(r1.unwrap())
+        r2: Result<int, string> = double(r1.unwrap())
         print(r2.unwrap())
     ~
     return 0
@@ -217,7 +217,7 @@ class TestResultTypes:
         """Result can hold float values."""
         expect_output('''
 func main() -> int
-    var r: Result<float, string> = Result.ok(3.14)
+    r: Result<float, string> = Result.ok(3.14)
     if r.is_ok()
         print(1)
     ~
@@ -229,7 +229,7 @@ func main() -> int
         """Result can hold bool values."""
         expect_output('''
 func main() -> int
-    var r: Result<bool, string> = Result.ok(true)
+    r: Result<bool, string> = Result.ok(true)
     if r.unwrap()
         print(1)
     else
@@ -243,7 +243,7 @@ func main() -> int
         """Result can hold string values."""
         expect_output('''
 func main() -> int
-    var r: Result<string, string> = Result.ok("hello")
+    r: Result<string, string> = Result.ok("hello")
     print(r.unwrap())
     return 0
 ~
@@ -253,7 +253,7 @@ func main() -> int
         """Result can have int as error type."""
         expect_output('''
 func main() -> int
-    var r: Result<string, int> = Result.err(404)
+    r: Result<string, int> = Result.err(404)
     if r.is_err()
         print(1)
     ~

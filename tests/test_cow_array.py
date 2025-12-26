@@ -7,8 +7,8 @@ class TestArrayCOW:
         """Array can be created by type conversion from List via packed()."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
     print(a.get(0))
     print(a.get(1))
     print(a.get(2))
@@ -21,9 +21,9 @@ func main() -> int
         """Assignment should not copy - both variables share buffer."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
     print(b.get(0))
     print(b.get(1))
     print(b.get(2))
@@ -35,9 +35,9 @@ func main() -> int
         """Mutation via set() should copy, leaving original unchanged."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
     b = b.set(1, 99)
     print(a.get(1))
     print(b.get(1))
@@ -49,9 +49,9 @@ func main() -> int
         """Mutation via append() should copy, leaving original unchanged."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
+    list: List<int> = [1, 2]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
     b = b.append(3)
     print(a.len())
     print(b.len())
@@ -63,8 +63,8 @@ func main() -> int
         """When sole owner (refcount=1), mutation should be in-place."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
     a = a.set(0, 10)
     a = a.set(1, 20)
     a = a.set(2, 30)
@@ -79,11 +79,11 @@ func main() -> int
         """Multiple assignments should all share until mutation."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
-    var c: Array<int> = a
-    var d: Array<int> = b
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
+    c: Array<int> = a
+    d: Array<int> = b
     c = c.set(0, 99)
     print(a.get(0))
     print(b.get(0))
@@ -97,9 +97,9 @@ func main() -> int
         """After COW copy, the copies are fully independent."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
+    list: List<int> = [1, 2]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
     b = b.set(0, 10)
     a = a.set(0, 20)
     print(a.get(0))
@@ -112,14 +112,14 @@ func main() -> int
         """COW should work correctly when passing to functions."""
         expect_output('''
 func modify(arr: Array<int>) -> int
-    var local: Array<int> = arr.set(0, 99)
+    local: Array<int> = arr.set(0, 99)
     return local.get(0)
 ~
 
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
-    var result: int = modify(a)
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
+    result: int = modify(a)
     print(a.get(0))
     print(result)
     return 0
@@ -130,10 +130,10 @@ func main() -> int
         """Iteration (read-only) should not trigger copy."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
-    var sum: int = 0
+    list: List<int> = [1, 2, 3]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
+    sum: int = 0
     for x in b
         sum = sum + x
     ~
@@ -147,9 +147,9 @@ func main() -> int
         """len() is read-only, should not trigger copy."""
         expect_output('''
 func main() -> int
-    var list: List<int> = [1, 2, 3, 4, 5]
-    var a: Array<int> = list.packed()
-    var b: Array<int> = a
+    list: List<int> = [1, 2, 3, 4, 5]
+    a: Array<int> = list.packed()
+    b: Array<int> = a
     print(b.len())
     b = b.set(0, 99)
     print(a.len())
@@ -162,9 +162,9 @@ func main() -> int
         """COW should work with Array<string>."""
         expect_output('''
 func main() -> int
-    var list: List<string> = ["hello", "world"]
-    var a: Array<string> = list.packed()
-    var b: Array<string> = a
+    list: List<string> = ["hello", "world"]
+    a: Array<string> = list.packed()
+    b: Array<string> = a
     b = b.set(0, "goodbye")
     print(a.get(0))
     print(b.get(0))

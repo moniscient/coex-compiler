@@ -26,7 +26,7 @@ extern type Handle:
 ~
 
 func main() -> int
-    var h: Handle = Handle(fd: 42)
+    h: Handle = Handle(fd: 42)
     h.close()
     return 0
 ~
@@ -48,7 +48,7 @@ extern type Resource:
 ~
 
 func main() -> int
-    var r: Resource = Resource(value: 42)
+    r: Resource = Resource(value: 42)
     print(r.get_value())
     r.close()
     return 0
@@ -91,7 +91,7 @@ func make_handle() -> Handle
 ~
 
 func main() -> int
-    var h: Handle = make_handle()
+    h: Handle = make_handle()
     h.close()
     return 0
 ~
@@ -129,7 +129,7 @@ extern type Handle:
 ~
 
 func main() -> int
-    var handles: List<Handle> = []
+    handles: List<Handle> = []
     return 0
 ~
 ''', "cannot be stored")
@@ -178,7 +178,7 @@ func use_handle(h: Handle) -> int
 ~
 
 func main() -> int
-    var h: Handle = Handle(fd: 21)
+    h: Handle = Handle(fd: 21)
     print(use_handle(h))
     h.close()
     return 0
@@ -201,7 +201,7 @@ task process(h: Handle)
 ~
 
 func main() -> int
-    var h: Handle = Handle(fd: 99)
+    h: Handle = Handle(fd: 99)
     process(h)
     h.close()
     return 0

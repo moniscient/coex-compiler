@@ -129,7 +129,7 @@ class TestVariables:
     def test_var_declaration(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 42
+    x: int = 42
     print(x)
     return 0
 ~
@@ -138,7 +138,7 @@ func main() -> int
     def test_var_mutation(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 10
+    x: int = 10
     x = 20
     print(x)
     return 0
@@ -148,7 +148,7 @@ func main() -> int
     def test_compound_plus_assign(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 10
+    x: int = 10
     x += 5
     print(x)
     return 0
@@ -158,7 +158,7 @@ func main() -> int
     def test_compound_minus_assign(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 20
+    x: int = 20
     x -= 7
     print(x)
     return 0
@@ -168,7 +168,7 @@ func main() -> int
     def test_compound_star_assign(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 6
+    x: int = 6
     x *= 7
     print(x)
     return 0
@@ -178,9 +178,9 @@ func main() -> int
     def test_multiple_variables(self, expect_output):
         expect_output('''
 func main() -> int
-    var a: int = 10
-    var b: int = 20
-    var c: int = a + b
+    a: int = 10
+    b: int = 20
+    c: int = a + b
     print(c)
     return 0
 ~
@@ -189,12 +189,94 @@ func main() -> int
     def test_variable_in_expression(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 5
-    var y: int = 3
+    x: int = 5
+    y: int = 3
     print(x * y + 2)
     return 0
 ~
 ''', "17\n")
+
+
+class TestConstBindings:
+    """Tests for const binding behavior."""
+
+    def test_bare_identifier_rebindable(self, expect_output):
+        """Bare identifier declarations are rebindable by default."""
+        expect_output('''
+func main() -> int
+    x = 5
+    print(x)
+    x = 10
+    print(x)
+    return 0
+~
+''', "5\n10\n")
+
+    def test_const_cannot_reassign(self, expect_compile_error):
+        """Reassigning a const binding should fail."""
+        expect_compile_error('''
+func main() -> int
+    const x = 5
+    x = 10
+    return 0
+~
+''', "Cannot reassign const")
+
+    def test_const_with_type_annotation(self, expect_output):
+        """Const works with type annotations."""
+        expect_output('''
+func main() -> int
+    const x: int = 42
+    print(x)
+    return 0
+~
+''', "42\n")
+
+    def test_const_move(self, expect_output):
+        """Const binding with move operator works."""
+        expect_output('''
+func main() -> int
+    a = [1, 2, 3]
+    const b := a
+    print(b.len())
+    return 0
+~
+''', "3\n")
+
+    def test_const_move_no_reassign(self, expect_compile_error):
+        """Cannot reassign const binding even after move."""
+        expect_compile_error('''
+func main() -> int
+    a = [1, 2, 3]
+    const b := a
+    b = [4, 5, 6]
+    return 0
+~
+''', "Cannot reassign const")
+
+    def test_rebind_after_first_declaration(self, expect_output):
+        """Variable can be rebound after first declaration."""
+        expect_output('''
+func main() -> int
+    x = 1
+    x = 2
+    x = 3
+    print(x)
+    return 0
+~
+''', "3\n")
+
+    def test_const_in_expression(self, expect_output):
+        """Const bindings can be used in expressions."""
+        expect_output('''
+func main() -> int
+    const a = 10
+    const b = 20
+    const sum = a + b
+    print(sum)
+    return 0
+~
+''', "30\n")
 
 
 class TestComparisons:
@@ -213,7 +295,7 @@ func main() -> int
     def test_less_than_false(self, expect_output):
         expect_output('''
 func main() -> int
-    var result: int = 0
+    result: int = 0
     if 5 < 3
         result = 1
     ~
@@ -265,7 +347,7 @@ func main() -> int
     def test_equality_false(self, expect_output):
         expect_output('''
 func main() -> int
-    var result: int = 0
+    result: int = 0
     if 5 == 3
         result = 1
     ~
@@ -301,7 +383,7 @@ func main() -> int
     def test_and_true_false(self, expect_output):
         expect_output('''
 func main() -> int
-    var result: int = 0
+    result: int = 0
     if true and false
         result = 1
     ~
@@ -323,7 +405,7 @@ func main() -> int
     def test_or_false_false(self, expect_output):
         expect_output('''
 func main() -> int
-    var result: int = 0
+    result: int = 0
     if false or false
         result = 1
     ~
@@ -345,7 +427,7 @@ func main() -> int
     def test_not_true(self, expect_output):
         expect_output('''
 func main() -> int
-    var result: int = 0
+    result: int = 0
     if not true
         result = 1
     ~
@@ -383,7 +465,7 @@ func main() -> int
 var FACTOR: int = 10
 
 func main() -> int
-    var x: int = 5
+    x: int = 5
     print(x * FACTOR)
     return 0
 ~
@@ -407,7 +489,7 @@ class TestTernaryExpression:
     def test_ternary_true_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = true ? 10 ; 20
+    x: int = true ? 10 ; 20
     print(x)
     return 0
 ~
@@ -416,7 +498,7 @@ func main() -> int
     def test_ternary_false_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = false ? 10 ; 20
+    x: int = false ? 10 ; 20
     print(x)
     return 0
 ~
@@ -425,9 +507,9 @@ func main() -> int
     def test_ternary_with_comparison(self, expect_output):
         expect_output('''
 func main() -> int
-    var a: int = 5
-    var b: int = 3
-    var max: int = a > b ? a ; b
+    a: int = 5
+    b: int = 3
+    max: int = a > b ? a ; b
     print(max)
     return 0
 ~
@@ -436,8 +518,8 @@ func main() -> int
     def test_ternary_nested(self, expect_output):
         expect_output('''
 func main() -> int
-    var x: int = 5
-    var result: int = x < 0 ? -1 ; x == 0 ? 0 ; 1
+    x: int = 5
+    result: int = x < 0 ? -1 ; x == 0 ? 0 ; 1
     print(result)
     return 0
 ~

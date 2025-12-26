@@ -2,7 +2,7 @@
 # Tests the new mark-sweep GC at scale
 
 func main() -> int
-    var arr: List<int> = []
+    arr: List<int> = []
     for i in 0..10000000
         arr = arr.append(i)
     ~
