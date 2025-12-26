@@ -447,42 +447,6 @@ func main() -> int
 ''', "1\n")
 
 
-class TestGlobalVariables:
-    """Tests for global variable declarations."""
-    
-    def test_global_read(self, expect_output):
-        expect_output('''
-var MAGIC: int = 42
-
-func main() -> int
-    print(MAGIC)
-    return 0
-~
-''', "42\n")
-    
-    def test_global_in_expression(self, expect_output):
-        expect_output('''
-var FACTOR: int = 10
-
-func main() -> int
-    x: int = 5
-    print(x * FACTOR)
-    return 0
-~
-''', "50\n")
-    
-    def test_multiple_globals(self, expect_output):
-        expect_output('''
-var A: int = 10
-var B: int = 20
-
-func main() -> int
-    print(A + B)
-    return 0
-~
-''', "30\n")
-
-
 class TestTernaryExpression:
     """Tests for ternary conditional expressions."""
     
@@ -524,3 +488,17 @@ func main() -> int
     return 0
 ~
 ''', "1\n")
+
+
+class TestNoGlobalVariables:
+    """Tests that global variables are rejected."""
+
+    def test_global_variable_rejected(self, expect_compile_error):
+        """Global variables should be rejected by the parser."""
+        expect_compile_error('''
+var x: int = 10
+
+func main() -> int
+    return x
+~
+''')

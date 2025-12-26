@@ -88,21 +88,41 @@ formula compute(a: int) -> int
 ~
 ```
 
-### Shared Mutation
+### No Global Variables
 
-Shared mutation requires atomic types. When multiple tasks must coordinate through shared state, they do so through atomic_int, atomic_float, atomic_bool, or atomic_ref<T>. These are the only mechanism for shared mutable state in Coex.
+Coex does not support global mutable state of any kind. All state must be:
+- Declared within functions
+- Passed explicitly as parameters
+- Shared via atomic types passed as parameters (for concurrent access)
+
+This ensures all data dependencies are visible in function signatures.
 
 ```coex
-var counter: atomic_int = 0    # Module-level shared state (var required for globals)
+# WRONG - global variables are not allowed
+# var counter = 0
 
-task increment()
-    counter.increment()        # Shared mutation
+# CORRECT - pass state explicitly
+func main() -> int
+    counter = 0
+    counter = increment(counter)
+    print(counter)
+    return 0
+~
+
+func increment(c: int) -> int
+    return c + 1
 ~
 ```
 
-There are no global mutable variables (except atomics), no mutable references passed between functions, and no out-parameters. Functions receive values and return values. If a function must mutate shared state, it receives an atomic handle and the mutation is explicit in both the type signature and the call site.
+For concurrent coordination, create atomic types in `main()` and pass them to tasks:
 
-This design makes sharing visible. Code that contains no atomic types cannot exhibit data races, and the presence of atomics signals "concurrent coordination happens here."
+```coex
+func main() -> int
+    counter: atomic_int = 0
+    # Pass counter to concurrent tasks
+    return counter.load()
+~
+```
 
 
 ### Block Termination

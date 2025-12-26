@@ -305,15 +305,6 @@ class CoexListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by CoexParser#globalVarDecl.
-    def enterGlobalVarDecl(self, ctx:CoexParser.GlobalVarDeclContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#globalVarDecl.
-    def exitGlobalVarDecl(self, ctx:CoexParser.GlobalVarDeclContext):
-        pass
-
-
     # Enter a parse tree produced by CoexParser#block.
     def enterBlock(self, ctx:CoexParser.BlockContext):
         pass

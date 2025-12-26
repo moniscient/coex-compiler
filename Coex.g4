@@ -49,7 +49,6 @@ declaration
     | typeDecl
     | traitDecl
     | matrixDecl
-    | globalVarDecl
     ;
 
 // ----------------------------------------------------------------------------
@@ -185,14 +184,6 @@ matrixInitDecl
 
 matrixMethodDecl
     : FORMULA IDENTIFIER LPAREN parameterList? RPAREN returnType? NEWLINE* block
-    ;
-
-// ----------------------------------------------------------------------------
-// Global Variable Declarations
-// ----------------------------------------------------------------------------
-
-globalVarDecl
-    : VAR IDENTIFIER COLON typeExpr ASSIGN expression
     ;
 
 // ----------------------------------------------------------------------------

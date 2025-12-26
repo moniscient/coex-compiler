@@ -73,10 +73,7 @@ def print_ast(program, indent=0):
         print("  " * indent + msg)
     
     p("Program")
-    
-    for g in program.globals:
-        p(f"  GlobalVar: {g.name}: {g.type_annotation}")
-    
+
     for f in program.functions:
         params = ", ".join(f"{p.name}: {p.type_annotation}" for p in f.params)
         p(f"  Function {f.kind.name} {f.name}({params}) -> {f.return_type}")

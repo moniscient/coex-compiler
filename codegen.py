@@ -49,7 +49,6 @@ class CodeGenerator:
         self.builder: Optional[ir.IRBuilder] = None
         
         # Symbol tables
-        self.globals: Dict[str, ir.GlobalVariable] = {}
         self.locals: Dict[str, ir.AllocaInst] = {}
         self.functions: Dict[str, ir.Function] = {}
         
@@ -7665,11 +7664,7 @@ class CodeGenerator:
         for type_decl in program.types:
             if not type_decl.type_params:  # Skip generic types (checked at monomorphization)
                 self._check_trait_implementations(type_decl)
-        
-        # Generate global variables
-        for global_var in program.globals:
-            self._generate_global_var(global_var)
-        
+
         # Register matrices BEFORE function generation (so main() can use them)
         for matrix_decl in program.matrices:
             self._register_matrix(matrix_decl)
@@ -8447,9 +8442,6 @@ class CodeGenerator:
             if name in self.locals:
                 llvm_type = self.locals[name].type.pointee
                 return self._llvm_type_to_coex(llvm_type)
-            elif name in self.globals:
-                llvm_type = self.globals[name].type.pointee
-                return self._llvm_type_to_coex(llvm_type)
         elif isinstance(expr, ListExpr):
             if expr.elements:
                 elem_type = self._infer_type_from_expr(expr.elements[0])
@@ -8704,23 +8696,6 @@ class CodeGenerator:
             if name == field_name:
                 return i
         return None
-    
-    def _generate_global_var(self, decl: GlobalVarDecl):
-        """Generate a global variable"""
-        llvm_type = self._get_llvm_type(decl.type_annotation)
-        global_var = ir.GlobalVariable(self.module, llvm_type, name=decl.name)
-        
-        # Set initializer
-        if isinstance(decl.initializer, IntLiteral):
-            global_var.initializer = ir.Constant(llvm_type, decl.initializer.value)
-        elif isinstance(decl.initializer, FloatLiteral):
-            global_var.initializer = ir.Constant(llvm_type, decl.initializer.value)
-        elif isinstance(decl.initializer, BoolLiteral):
-            global_var.initializer = ir.Constant(llvm_type, 1 if decl.initializer.value else 0)
-        else:
-            global_var.initializer = ir.Constant(llvm_type, 0)
-        
-        self.globals[decl.name] = global_var
 
     def _get_clink_symbol(self, func: FunctionDecl) -> Optional[str]:
         """Check if function has @clink annotation and return the C symbol name."""
@@ -9791,8 +9766,6 @@ class CodeGenerator:
             name = expr.name
             if name in self.locals:
                 return self.locals[name]
-            elif name in self.globals:
-                return self.globals[name]
             else:
                 # Check if it's a field access in a method context
                 if self.current_type and "self" in self.locals:
@@ -10151,7 +10124,7 @@ class CodeGenerator:
                 if isinstance(stmt.target, Identifier) and stmt.op == AssignOp.ASSIGN:
                     name = stmt.target.name
                     # Only count as declaration if not already known
-                    if name not in declared and name not in self.locals and name not in self.globals:
+                    if name not in declared and name not in self.locals:
                         declared[name] = None
             elif isinstance(stmt, IfStmt):
                 # Recurse into branches
@@ -10264,7 +10237,7 @@ class CodeGenerator:
 
         # Also include vars that are written and used after the loop
         # For now, we conservatively include all written vars that existed before the loop
-        pre_existing = set(self.locals.keys()) | set(self.globals.keys())
+        pre_existing = set(self.locals.keys())
         escaping = written & pre_existing
 
         return list(loop_carried | escaping)
@@ -11444,8 +11417,6 @@ class CodeGenerator:
 
         if name in self.locals:
             return self.builder.load(self.locals[name], name=name)
-        elif name in self.globals:
-            return self.builder.load(self.globals[name], name=name)
         elif name in self.functions:
             return self.functions[name]
         else:

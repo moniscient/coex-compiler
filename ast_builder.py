@@ -31,8 +31,6 @@ class ASTBuilder:
                 decl = self.visit_declaration(child)
                 if isinstance(decl, FunctionDecl):
                     program.functions.append(decl)
-                elif isinstance(decl, GlobalVarDecl):
-                    program.globals.append(decl)
                 elif isinstance(decl, TypeDecl):
                     program.types.append(decl)
                 elif isinstance(decl, TraitDecl):
@@ -75,18 +73,16 @@ class ASTBuilder:
     def visit_declaration(self, ctx: CoexParser.DeclarationContext):
         """Visit a top-level declaration"""
         child = ctx.getChild(0)
-        
+
         if isinstance(child, CoexParser.FunctionDeclContext):
             return self.visit_function_decl(child)
-        elif isinstance(child, CoexParser.GlobalVarDeclContext):
-            return self.visit_global_var_decl(child)
         elif isinstance(child, CoexParser.TypeDeclContext):
             return self.visit_type_decl(child)
         elif isinstance(child, CoexParser.TraitDeclContext):
             return self.visit_trait_decl(child)
         elif isinstance(child, CoexParser.MatrixDeclContext):
             return self.visit_matrix_decl(child)
-        
+
         return None
     
     def visit_function_decl(self, ctx: CoexParser.FunctionDeclContext) -> FunctionDecl:
@@ -169,13 +165,6 @@ class ASTBuilder:
         name = ctx.IDENTIFIER().getText()
         type_ann = self.visit_type_expr(ctx.typeExpr())
         return Parameter(name, type_ann, positional)
-    
-    def visit_global_var_decl(self, ctx: CoexParser.GlobalVarDeclContext) -> GlobalVarDecl:
-        """Visit a global variable declaration"""
-        name = ctx.IDENTIFIER().getText()
-        type_ann = self.visit_type_expr(ctx.typeExpr())
-        init = self.visit_expression(ctx.expression())
-        return GlobalVarDecl(name, type_ann, init)
     
     def visit_type_decl(self, ctx: CoexParser.TypeDeclContext) -> TypeDecl:
         """Visit a type declaration"""

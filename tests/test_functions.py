@@ -255,20 +255,6 @@ func main() -> int
     return 0
 ~
 ''', "25\n")
-    
-    def test_global_used_in_function(self, expect_output):
-        expect_output('''
-var MULTIPLIER: int = 10
-
-func scale(x: int) -> int
-    return x * MULTIPLIER
-~
-
-func main() -> int
-    print(scale(5))
-    return 0
-~
-''', "50\n")
 
 
 class TestMixedFunctionKinds:

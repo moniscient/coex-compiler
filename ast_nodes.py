@@ -669,13 +669,6 @@ class TypeParam:
 
 
 @dataclass
-class GlobalVarDecl:
-    name: str
-    type_annotation: Type
-    initializer: Expr
-
-
-@dataclass
 class FieldDecl:
     """Field in a type declaration"""
     name: str
@@ -742,7 +735,6 @@ class ReplaceDecl:
 class Program:
     imports: List[ImportDecl] = field(default_factory=list)
     replaces: List['ReplaceDecl'] = field(default_factory=list)
-    globals: List[GlobalVarDecl] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)
     matrices: List[MatrixDecl] = field(default_factory=list)

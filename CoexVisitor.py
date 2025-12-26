@@ -174,11 +174,6 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by CoexParser#globalVarDecl.
-    def visitGlobalVarDecl(self, ctx:CoexParser.GlobalVarDeclContext):
-        return self.visitChildren(ctx)
-
-
     # Visit a parse tree produced by CoexParser#block.
     def visitBlock(self, ctx:CoexParser.BlockContext):
         return self.visitChildren(ctx)
