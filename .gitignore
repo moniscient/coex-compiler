@@ -32,6 +32,12 @@ htmlcov/
 *.out
 *.exe
 
+# Compiled example binaries (Mach-O executables without extension)
+examples/factorial
+examples/stress_array_1m
+/hello
+/stress_array_1m
+
 # LLVM IR dumps (debugging artifacts)
 *.ll
 
