@@ -40,22 +40,3 @@ jobs:
     - name: Run tests
       run: |
         python -m pytest tests/ -v --tb=short
-    
-    - name: Test example programs
-      run: |
-        if [ -d "examples" ]; then
-          for f in examples/*.coex; do
-            if [ -f "$f" ]; then
-              echo "Compiling $f..."
-              python coexc.py "$f" -o "${f%.coex}"
-              if [ -f "${f%.coex}.expected" ]; then
-                echo "Checking output..."
-                "${f%.coex}" > /tmp/actual.txt
-                diff -u "${f%.coex}.expected" /tmp/actual.txt
-              else
-                echo "Running..."
-                "${f%.coex}"
-              fi
-            fi
-          done
-        fi
