@@ -3508,6 +3508,27 @@ class CodeGenerator:
             return True
         return False
 
+    def _get_receiver_type(self, expr: Expr) -> Optional[Type]:
+        """Get the Coex type of a receiver expression (handles chained method calls).
+
+        For expressions like a.set(0, x).set(1, y):
+        - The outermost call has callee.object = a.set(0, x) (another CallExpr)
+        - We recursively find the innermost Identifier to get its type
+        """
+        if isinstance(expr, Identifier):
+            # Direct variable reference
+            if expr.name in self.var_coex_types:
+                return self.var_coex_types[expr.name]
+            return None
+        elif isinstance(expr, CallExpr):
+            # Chained method call: recurse into the callee's object
+            if isinstance(expr.callee, MemberExpr):
+                return self._get_receiver_type(expr.callee.object)
+        elif isinstance(expr, MemberExpr):
+            # Member expression without call
+            return self._get_receiver_type(expr.object)
+        return None
+
     def _needs_deep_copy(self, coex_type: Type) -> bool:
         """Check if a type needs deep copy (has nested collections)."""
         if isinstance(coex_type, ListType):
@@ -9443,6 +9464,29 @@ class CodeGenerator:
                 # Infer type from literal expression
                 inferred_coex_type = self._infer_type_from_expr(stmt.initializer)
                 self.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(stmt.initializer, MethodCallExpr):
+                # If initializer is a method call on a collection (e.g., list.set()),
+                # propagate the type from the receiver
+                if isinstance(stmt.initializer.object, Identifier):
+                    receiver_name = stmt.initializer.object.name
+                    if receiver_name in self.var_coex_types:
+                        receiver_type = self.var_coex_types[receiver_name]
+                        # Methods that return same collection type
+                        if stmt.initializer.method in ("set", "append", "remove", "pop", "insert"):
+                            inferred_coex_type = receiver_type
+                            self.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(stmt.initializer, CallExpr):
+                # Check if this is a method call (callee is MemberExpr: obj.method(...))
+                if isinstance(stmt.initializer.callee, MemberExpr):
+                    callee_member = stmt.initializer.callee
+                    method_name = callee_member.member
+                    # Find the innermost receiver (handles chained calls like a.set(0, x).set(1, y))
+                    receiver_type = self._get_receiver_type(callee_member.object)
+                    if receiver_type:
+                        # Methods that return same collection type
+                        if method_name in ("set", "append", "remove", "pop", "insert"):
+                            inferred_coex_type = receiver_type
+                            self.var_coex_types[stmt.name] = inferred_coex_type
 
             if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
                 # Use move semantics for := operator, deep copy for =
@@ -9876,6 +9920,31 @@ class CodeGenerator:
             coex_type = self._infer_type_from_expr(stmt.value)
             if isinstance(stmt.target, Identifier):
                 self.var_coex_types[stmt.target.name] = coex_type
+        # If source is a method call on a collection (e.g., list.set(), list.append()),
+        # propagate the type from the receiver
+        if coex_type is None and isinstance(stmt.value, MethodCallExpr):
+            if isinstance(stmt.value.object, Identifier):
+                receiver_name = stmt.value.object.name
+                if receiver_name in self.var_coex_types:
+                    receiver_type = self.var_coex_types[receiver_name]
+                    # Methods that return same collection type: set, append, remove, etc.
+                    if stmt.value.method in ("set", "append", "remove", "pop", "insert"):
+                        coex_type = receiver_type
+                        if isinstance(stmt.target, Identifier):
+                            self.var_coex_types[stmt.target.name] = coex_type
+        if coex_type is None and isinstance(stmt.value, CallExpr):
+            # Check if this is a method call (callee is MemberExpr: obj.method(...))
+            if isinstance(stmt.value.callee, MemberExpr):
+                callee_member = stmt.value.callee
+                method_name = callee_member.member
+                # Find the innermost receiver (handles chained calls like a.set(0, x).set(1, y))
+                receiver_type = self._get_receiver_type(callee_member.object)
+                if receiver_type:
+                    # Methods that return same collection type
+                    if method_name in ("set", "append", "remove", "pop", "insert"):
+                        coex_type = receiver_type
+                        if isinstance(stmt.target, Identifier):
+                            self.var_coex_types[stmt.target.name] = coex_type
 
         # Determine whether to use move or copy semantics
         is_move = stmt.op == AssignOp.MOVE_ASSIGN
@@ -12671,9 +12740,9 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
-                    # Calculate element size
+                    # Calculate element size (min 1 byte for sub-byte types like bool)
                     if isinstance(elem_type, ir.IntType):
-                        size = elem_type.width // 8
+                        size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
                     elif isinstance(elem_type, ir.PointerType):
@@ -12681,7 +12750,7 @@ class CodeGenerator:
                     elif isinstance(elem_type, ir.LiteralStructType):
                         # For tuples/structs, sum up element sizes
                         size = sum(
-                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                             for e in elem_type.elements
                         )
                     else:
@@ -12704,16 +12773,16 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
-                    # Calculate element size
+                    # Calculate element size (min 1 byte for sub-byte types like bool)
                     if isinstance(elem_type, ir.IntType):
-                        size = elem_type.width // 8
+                        size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
                     elif isinstance(elem_type, ir.PointerType):
                         size = 8
                     elif isinstance(elem_type, ir.LiteralStructType):
                         size = sum(
-                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                             for e in elem_type.elements
                         )
                     else:
@@ -12744,16 +12813,16 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[1])
                     elem_type = elem_val.type
 
-                    # Calculate element size
+                    # Calculate element size (min 1 byte for sub-byte types like bool)
                     if isinstance(elem_type, ir.IntType):
-                        size = elem_type.width // 8
+                        size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
                     elif isinstance(elem_type, ir.PointerType):
                         size = 8
                     elif isinstance(elem_type, ir.LiteralStructType):
                         size = sum(
-                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                             for e in elem_type.elements
                         )
                     else:
@@ -12781,16 +12850,16 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[1])
                     elem_type = elem_val.type
 
-                    # Calculate element size
+                    # Calculate element size (min 1 byte for sub-byte types like bool)
                     if isinstance(elem_type, ir.IntType):
-                        size = elem_type.width // 8
+                        size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
                     elif isinstance(elem_type, ir.PointerType):
                         size = 8
                     elif isinstance(elem_type, ir.LiteralStructType):
                         size = sum(
-                            e.width // 8 if isinstance(e, ir.IntType) else 8
+                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                             for e in elem_type.elements
                         )
                     else:
@@ -13186,10 +13255,10 @@ class CodeGenerator:
         # Generate first element to determine type
         first_elem = self._generate_expression(expr.elements[0])
         elem_type = first_elem.type
-        
-        # Calculate element size
+
+        # Calculate element size (min 1 byte for sub-byte types like bool)
         if isinstance(elem_type, ir.IntType):
-            size = elem_type.width // 8
+            size = max(1, elem_type.width // 8)
         elif isinstance(elem_type, ir.DoubleType):
             size = 8
         elif isinstance(elem_type, ir.PointerType):
@@ -13197,12 +13266,12 @@ class CodeGenerator:
         elif isinstance(elem_type, ir.LiteralStructType):
             # For tuples/structs, sum up element sizes
             size = sum(
-                e.width // 8 if isinstance(e, ir.IntType) else 8
+                max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                 for e in elem_type.elements
             )
         else:
             size = 8
-        
+
         elem_size = ir.Constant(ir.IntType(64), size)
         
         # Create new list
@@ -14475,9 +14544,9 @@ class CodeGenerator:
         self.current_cell_y = saved_cell_y
     
     def _get_type_size(self, llvm_type: ir.Type) -> int:
-        """Get size of LLVM type in bytes"""
+        """Get size of LLVM type in bytes (min 1 byte for sub-byte types like bool)"""
         if isinstance(llvm_type, ir.IntType):
-            return llvm_type.width // 8
+            return max(1, llvm_type.width // 8)
         elif isinstance(llvm_type, ir.DoubleType):
             return 8
         elif isinstance(llvm_type, ir.FloatType):
