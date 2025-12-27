@@ -1,0 +1,195 @@
+#@ [MOVE] Variable 'stopping' is not used after this assignment. Consider: best_stopping := stopping (move instead of copy)
+#@ [MOVE] Variable 'avg_yield' is not used after this assignment. Consider: best_yield := avg_yield (move instead of copy)
+#@ [MOVE] Variable 'new_state' is not used after this assignment. Consider: rng_state := new_state (move instead of copy)
+#@ [MOVE] Variable 'initial_seed' is not used after this assignment. Consider: rng_state := initial_seed (move instead of copy)
+#@ [MOVE] Variable 'new_state' is not used after this assignment. Consider: state := new_state (move instead of copy)
+#@ [MOVE] Variable 'rng_state' is not used after this assignment. Consider: state := rng_state (move instead of copy)
+#@ [MOVE] Variable 'cards' is not used after this assignment. Consider: shuffled := cards (move instead of copy)
+#@ [KIND] Function 'has_seen' appears to be pure. Consider using 'formula' for compiler optimizations.
+#@ [PERF] Loop modifies 'seen' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+#@ [PERF] Loop modifies 'cards' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Flip7 Monte Carlo Simulator
+# A demonstration of the Coex programming language
+#
+# This program simulates the Flip7 card game to find optimal stopping strategies.
+# In Flip7, players draw cards trying to accumulate points. Drawing a duplicate
+# number causes a "bust" (score 0). Getting 7 unique numbers grants a 15-point bonus.
+#
+# Deck composition: 1 zero, 1 one, 2 twos, 3 threes, ..., 12 twelves = 79 number cards
+#
+# NOTE: For even better performance, consider using Array type instead of
+# List since Arrays support in-place mutation.
+
+# =============================================================================
+# Random Number Generator (Linear Congruential Generator)
+# =============================================================================
+
+func rng_next(state: int) -> (int, int)
+    # MINSTD parameters: a=48271, m=2^31-1
+    new_state = (state * 48271) % 2147483647
+    if new_state < 0
+        new_state = 0 - new_state ~
+    if new_state == 0
+        new_state = 1 ~
+    return (new_state, new_state) ~
+
+func rng_range(state: int, max_val: int) -> (int, int)
+    (val, new_state) = rng_next(state)
+    result = val % max_val
+    return (result, new_state) ~
+
+# =============================================================================
+# Deck Operations
+# =============================================================================
+
+# Create the standard Flip7 number deck
+func create_number_deck() -> [int]
+    cards: [int] = []
+    cards = cards.append(0)
+    cards = cards.append(1)
+    for value in 2..13
+        for i in 0..value
+            cards = cards.append(value) ~ ~
+    return cards ~
+
+# Fisher-Yates shuffle algorithm
+func shuffle_deck(cards: [int], rng_state: int) -> ([int], int)
+    shuffled: [int] = cards
+    state: int = rng_state
+    n: int = shuffled.len()
+    i: int = n - 1
+    while i > 0
+        (j, new_state) = rng_range(state, i + 1)
+        state = new_state
+        val_i: int = shuffled.get(i)
+        val_j: int = shuffled.get(j)
+        shuffled = shuffled.set(i, val_j)
+        shuffled = shuffled.set(j, val_i)
+        i = i - 1 ~
+    return (shuffled, state) ~
+
+# =============================================================================
+# Hand Tracking (using int list: 0=not seen, 1=seen)
+# =============================================================================
+
+func create_empty_seen() -> [int]
+    seen: [int] = []
+    for i in 0..13
+        seen = seen.append(0) ~
+    return seen ~
+
+func has_seen(seen: [int], value: int) -> bool
+    return seen.get(value) > 0 ~
+
+func mark_seen(seen: [int], value: int) -> [int]
+    return seen.set(value, 1) ~
+
+# =============================================================================
+# Round Simulation
+# =============================================================================
+
+# Simulate one round with the given stopping point strategy
+# Returns: (score, cards_drawn, got_flip7_flag)
+# - score: 0 if busted, otherwise sum of cards (+ 15 bonus if flip7)
+# - got_flip7_flag: 1 if achieved flip7, 0 otherwise
+func simulate_round(deck: [int], stopping_point: int) -> (int, int, int)
+    seen: [int] = create_empty_seen()
+    total: int = 0
+    count: int = 0
+    deck_idx: int = 0
+    deck_size: int = deck.len()
+    
+    while deck_idx < deck_size
+        card_value: int = deck.get(deck_idx)
+        deck_idx = deck_idx + 1
+        
+        # Check for duplicate - bust!
+        if has_seen(seen, card_value)
+            return (0, count + 1, 0) ~
+        
+        # Add card to hand
+        seen = mark_seen(seen, card_value)
+        total = total + card_value
+        count = count + 1
+        
+        # Check for Flip 7 bonus
+        if count >= 7
+            return (total + 15, count, 1)  ~
+        
+        # Check stopping condition
+        if total >= stopping_point
+            return (total, count, 0) ~ ~
+    
+    return (total, count, 0) ~
+
+# =============================================================================
+# Monte Carlo Simulation
+# =============================================================================
+
+# Run simulation for a specific stopping point
+# Returns: (total_yield, bust_count, flip7_count, total_cards)
+func run_simulation(stopping_point: int, num_trials: int, initial_seed: int) -> (int, int, int, int)
+    total_yield: int = 0
+    bust_count: int = 0
+    flip7_count: int = 0
+    total_cards: int = 0
+    rng_state: int = initial_seed
+    base_deck: [int] = create_number_deck()
+    
+    for trial in 0..num_trials
+        (deck, new_state) = shuffle_deck(base_deck, rng_state)
+        rng_state = new_state
+        (score, cards, got_flip7) = simulate_round(deck, stopping_point)
+        total_yield = total_yield + score
+        total_cards = total_cards + cards
+        if score == 0
+            bust_count = bust_count + 1 ~
+        if got_flip7 > 0
+            flip7_count = flip7_count + 1  ~ ~
+    
+    return (total_yield, bust_count, flip7_count, total_cards) ~
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+func main() -> int
+    print("Flip7 Monte Carlo Simulator")
+    print("===========================")
+    print("")
+    print("Testing stopping points 20-24 with 100000 trials each")
+    print("")
+
+    num_trials: int = 100000
+    seed: int = 12345
+    best_stopping: int = 20
+    best_yield: int = 0
+    
+    for stopping in 20..25
+        (total_yield, bust_count, flip7_count, total_cards) = run_simulation(stopping, num_trials, seed + stopping)
+        avg_yield: int = total_yield / num_trials
+        bust_pct: int = (bust_count * 100) / num_trials
+        flip7_pct: int = (flip7_count * 100) / num_trials
+        
+        print("Stopping point:")
+        print(stopping)
+        print("Average yield:")
+        print(avg_yield)
+        print("Bust rate %:")
+        print(bust_pct)
+        print("Flip7 rate %:")
+        print(flip7_pct)
+        print("---")
+        
+        if avg_yield > best_yield
+            best_yield = avg_yield
+            best_stopping = stopping ~ ~
+    
+    print("")
+    print("=== RESULTS ===")
+    print("Best stopping point:")
+    print(best_stopping)
+    print("Best average yield:")
+    print(best_yield)
+    
+    return 0 ~
