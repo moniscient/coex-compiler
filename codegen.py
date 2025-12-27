@@ -211,15 +211,16 @@ class CodeGenerator:
         self._create_set_type()
 
         # Create Array type and helpers (dense, contiguous collection)
-        # struct Array { i8* data, i64 len, i64 cap, i64 elem_size }
-        # Data pointer first for fast dereferencing (*array_ptr yields data directly)
+        # struct Array { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+        # Owner pointer first, offset enables slice views without data copying.
         # NOTE: No refcount - GC handles memory, COW done via always-copy semantics
         self.array_struct = ir.global_context.get_identified_type("struct.Array")
         self.array_struct.set_body(
-            ir.IntType(8).as_pointer(),  # data (field 0)
-            ir.IntType(64),  # len (field 1)
-            ir.IntType(64),  # cap (field 2)
-            ir.IntType(64),  # elem_size (field 3)
+            ir.IntType(8).as_pointer(),  # owner (field 0) - pointer to data buffer
+            ir.IntType(64),  # offset (field 1) - byte offset into owner's data
+            ir.IntType(64),  # len (field 2) - element count
+            ir.IntType(64),  # cap (field 3) - capacity
+            ir.IntType(64),  # elem_size (field 4) - element size in bytes
         )
         self._create_array_helpers()
 
@@ -1669,8 +1670,8 @@ class CodeGenerator:
     def _implement_array_new(self):
         """Implement array_new: allocate a new array with given capacity and element size.
 
-        Struct layout: { i8* data, i64 len, i64 cap, i64 elem_size }
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Struct layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_new
         func.args[0].name = "cap"
@@ -1682,8 +1683,8 @@ class CodeGenerator:
         cap = func.args[0]
         elem_size = func.args[1]
 
-        # Allocate Array struct (32 bytes: 4 x 8-byte fields, no refcount)
-        array_size_const = ir.Constant(ir.IntType(64), 32)
+        # Allocate Array struct (40 bytes: 5 x 8-byte fields)
+        array_size_const = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY)
         raw_ptr = builder.call(self.gc.gc_alloc, [array_size_const, type_id])
         array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
@@ -1693,21 +1694,25 @@ class CodeGenerator:
         array_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY_DATA)
         data_ptr = builder.call(self.gc.gc_alloc, [data_size, array_data_type_id])
 
-        # Initialize fields (no refcount - GC handles memory)
-        # data (field 0)
-        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_ptr, data_field_ptr)
+        # Initialize fields
+        # owner (field 0)
+        owner_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(data_ptr, owner_field_ptr)
 
-        # len = 0 (field 1)
-        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # offset = 0 (field 1) - new arrays own their data from the start
+        offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+
+        # len = 0 (field 2)
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(ir.Constant(ir.IntType(64), 0), len_ptr)
 
-        # cap (field 2)
-        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # cap (field 3)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         builder.store(cap, cap_ptr)
 
-        # elem_size (field 3)
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # elem_size (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         builder.store(elem_size, elem_size_ptr)
 
         builder.ret(array_ptr)
@@ -1715,7 +1720,7 @@ class CodeGenerator:
     def _implement_array_get(self):
         """Implement array_get: return pointer to element at index.
 
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_get
         func.args[0].name = "arr"
@@ -1727,17 +1732,20 @@ class CodeGenerator:
         array_ptr = func.args[0]
         index = func.args[1]
 
-        # Get elem_size (field 3)
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Get elem_size (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Get data pointer (field 0)
-        data_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        data = builder.load(data_field_ptr)
+        # Compute data pointer: owner + offset
+        owner_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner = builder.load(owner_field_ptr)
+        offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        base_offset = builder.load(offset_ptr)
+        data = builder.gep(owner, [base_offset])
 
-        # Calculate offset: index * elem_size
-        offset = builder.mul(index, elem_size)
-        result = builder.gep(data, [offset])
+        # Calculate element offset: index * elem_size
+        elem_offset = builder.mul(index, elem_size)
+        result = builder.gep(data, [elem_offset])
 
         builder.ret(result)
 
@@ -1747,7 +1755,7 @@ class CodeGenerator:
         This implements value semantics - always creates a new array copy.
         No COW optimization - GC handles memory reclamation.
 
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_set
         func.args[0].name = "arr"
@@ -1764,24 +1772,28 @@ class CodeGenerator:
         value_ptr = func.args[2]
         elem_size = func.args[3]
 
-        # Get old array's len and cap (no refcount check - always copy)
-        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Get old array's len (field 2) and cap (field 3)
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
-        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        old_cap_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         old_cap = builder.load(old_cap_ptr)
 
-        # Create new array with same capacity
+        # Create new array with same capacity (array_new sets offset=0)
         new_arr = builder.call(self.array_new, [old_cap, elem_size])
 
-        # Set new array's len to old len (field 1)
-        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Set new array's len to old len (field 2)
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(old_len, new_len_ptr)
 
-        # Copy all data from old to new
-        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_data = builder.load(old_data_ptr)
+        # Compute old data pointer: owner + offset
+        old_owner_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_owner = builder.load(old_owner_ptr)
+        old_offset_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        old_offset = builder.load(old_offset_ptr)
+        old_data = builder.gep(old_owner, [old_offset])
 
+        # New array has offset=0, so just load owner directly
         new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         new_data = builder.load(new_data_ptr)
 
@@ -1789,8 +1801,8 @@ class CodeGenerator:
         builder.call(self.memcpy, [new_data, old_data, copy_size])
 
         # Overwrite the element at index
-        offset = builder.mul(index, elem_size)
-        dest = builder.gep(new_data, [offset])
+        elem_offset = builder.mul(index, elem_size)
+        dest = builder.gep(new_data, [elem_offset])
         builder.call(self.memcpy, [dest, value_ptr, elem_size])
 
         builder.ret(new_arr)
@@ -1801,7 +1813,7 @@ class CodeGenerator:
         This implements value semantics - always creates a new array copy.
         No COW optimization - GC handles memory reclamation.
 
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_append
         func.args[0].name = "arr"
@@ -1816,24 +1828,28 @@ class CodeGenerator:
         value_ptr = func.args[1]
         elem_size = func.args[2]
 
-        # Get old array's len (field 1)
-        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Get old array's len (field 2)
+        old_len_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
         # New capacity = old_len + 1 (always create new array)
         new_cap = builder.add(old_len, ir.Constant(ir.IntType(64), 1))
 
-        # Create new array
+        # Create new array (array_new sets offset=0)
         new_arr = builder.call(self.array_new, [new_cap, elem_size])
 
-        # Set new array's len = old_len + 1 (field 1)
-        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Set new array's len = old_len + 1 (field 2)
+        new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(new_cap, new_len_ptr)
 
-        # Copy old data to new (field 0)
-        old_data_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_data = builder.load(old_data_ptr)
+        # Compute old data pointer: owner + offset
+        old_owner_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_owner = builder.load(old_owner_ptr)
+        old_offset_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        old_offset = builder.load(old_offset_ptr)
+        old_data = builder.gep(old_owner, [old_offset])
 
+        # New array has offset=0, so just load owner directly
         new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         new_data = builder.load(new_data_ptr)
 
@@ -1841,8 +1857,8 @@ class CodeGenerator:
         builder.call(self.memcpy, [new_data, old_data, copy_size])
 
         # Append the new element
-        offset = builder.mul(old_len, elem_size)
-        dest = builder.gep(new_data, [offset])
+        elem_offset = builder.mul(old_len, elem_size)
+        dest = builder.gep(new_data, [elem_offset])
         builder.call(self.memcpy, [dest, value_ptr, elem_size])
 
         builder.ret(new_arr)
@@ -1850,7 +1866,7 @@ class CodeGenerator:
     def _implement_array_len(self):
         """Implement array_len: return array length.
 
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_len
         func.args[0].name = "arr"
@@ -1860,8 +1876,8 @@ class CodeGenerator:
 
         array_ptr = func.args[0]
 
-        # Get len field (field 1)
-        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Get len field (field 2)
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         length = builder.load(len_ptr)
 
         builder.ret(length)
@@ -1869,9 +1885,9 @@ class CodeGenerator:
     def _implement_array_size(self):
         """Implement array_size: return total memory footprint in bytes.
 
-        Size = 32 (header, 4 x 8-byte fields) + cap * elem_size (data array)
+        Size = 40 (header, 5 x 8-byte fields) + cap * elem_size (data array)
 
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
         """
         func = self.array_size
         func.args[0].name = "arr"
@@ -1881,25 +1897,25 @@ class CodeGenerator:
 
         array_ptr = func.args[0]
 
-        # Get cap field (field 2)
-        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get cap field (field 3)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         cap = builder.load(cap_ptr)
 
-        # Get elem_size field (field 3)
-        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        # Get elem_size field (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Size = 32 (header) + cap * elem_size
+        # Size = 40 (header) + cap * elem_size
         data_size = builder.mul(cap, elem_size)
-        total_size = builder.add(ir.Constant(ir.IntType(64), 32), data_size)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 40), data_size)
 
         builder.ret(total_size)
 
     def _implement_array_copy(self):
         """Implement array_copy: return same pointer for structural sharing.
 
-        Array layout: { i8* data, i64 len, i64 cap, i64 elem_size }
-        Field indices: data=0, len=1, cap=2, elem_size=3
+        Array layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
 
         With GC-managed memory, copying is just pointer sharing.
         GC keeps shared arrays alive; mutation creates new arrays.
@@ -1957,13 +1973,16 @@ class CodeGenerator:
         # Create new Array with same capacity as List length
         array_ptr = self.builder.call(self.array_new, [list_len, elem_size])
 
-        # Set Array len = list_len (field 1 in Array layout)
-        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Set Array len = list_len (field 2 in Array layout)
+        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         self.builder.store(list_len, array_len_ptr)
 
-        # Array data is field 0 (Array layout)
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_data = self.builder.load(array_data_ptr)
+        # Array data: compute owner + offset (fields 0 and 1)
+        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner = self.builder.load(array_owner_ptr)
+        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        array_offset = self.builder.load(array_offset_ptr)
+        array_data = self.builder.gep(array_owner, [array_offset])
 
         # For Persistent Vector List, we can't just memcpy - we need to iterate
         # through the list using list_get since data may be in tree structure.
@@ -2033,16 +2052,19 @@ class CodeGenerator:
         list_data_ptr = self.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         list_data = self.builder.load(list_data_ptr)
 
-        # Get array data pointer (field 0 in Array struct)
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_data = self.builder.load(array_data_ptr)
+        # Get array data pointer: compute owner + offset (fields 0 and 1)
+        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner = self.builder.load(array_owner_ptr)
+        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        array_offset = self.builder.load(array_offset_ptr)
+        array_data = self.builder.gep(array_owner, [array_offset])
 
         # Copy list data to array: len * 8 bytes
         copy_size = self.builder.mul(set_len, elem_size)
         self.builder.call(self.memcpy, [array_data, list_data, copy_size])
 
-        # Set array len (field 1 in Array layout)
-        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Set array len (field 2 in Array layout)
+        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         self.builder.store(set_len, arr_len_ptr)
 
         return array_ptr
@@ -2063,13 +2085,16 @@ class CodeGenerator:
         # Get Array length
         array_len = self.builder.call(self.array_len, [array_ptr])
 
-        # Get Array elem_size (field 3 in Array layout)
-        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        # Get Array elem_size (field 4 in Array layout)
+        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
-        # Get Array data (field 0)
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_data = self.builder.load(array_data_ptr)
+        # Get Array data: compute owner + offset (fields 0 and 1)
+        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner = self.builder.load(array_owner_ptr)
+        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        array_offset = self.builder.load(array_offset_ptr)
+        array_data = self.builder.gep(array_owner, [array_offset])
 
         # Create new empty List with same elem_size
         list_ptr = self.builder.call(self.list_new, [elem_size])
@@ -2131,13 +2156,16 @@ class CodeGenerator:
         # Get Array length
         array_len = self.builder.call(self.array_len, [array_ptr])
 
-        # Get Array elem_size (field 3 in Array layout)
-        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        # Get Array elem_size (field 4 in Array layout)
+        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
-        # Get Array data (field 0)
-        array_data_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_data = self.builder.load(array_data_ptr)
+        # Get Array data: compute owner + offset (fields 0 and 1)
+        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner = self.builder.load(array_owner_ptr)
+        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        array_offset = self.builder.load(array_offset_ptr)
+        array_data = self.builder.gep(array_owner, [array_offset])
 
         # Create new empty Set with flags indicating element type
         flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
@@ -2191,22 +2219,27 @@ class CodeGenerator:
     def _create_string_type(self):
         """Create the String struct type and helper functions.
 
-        String layout with COW (Copy-on-Write):
-            Field 0: i8* data     - pointer to UTF-8 bytes (separate allocation)
-            Field 1: i64 len      - number of UTF-8 codepoints (what .len() returns)
-            Field 2: i64 size     - byte count (for memory operations)
+        String layout with slice views:
+            Field 0: i8* owner    - pointer to data buffer (GC-allocated)
+            Field 1: i64 offset   - byte offset into owner's data
+            Field 2: i64 len      - number of UTF-8 codepoints (what .len() returns)
+            Field 3: i64 size     - byte size of this string's extent
 
         A String* points to the struct. Data is stored separately.
-        Total struct size = 24 bytes (3 x 8-byte fields)
+        Total struct size = 32 bytes (4 x 8-byte fields)
+
+        Slice views share the owner pointer with their parent, using offset
+        to point into the parent's data buffer. This enables zero-copy slicing.
 
         Strings are immutable and GC-managed. No refcounting needed.
         """
-        # String struct - immutable, GC-managed
+        # String struct - immutable, GC-managed, supports slice views
         self.string_struct = ir.global_context.get_identified_type("struct.String")
         self.string_struct.set_body(
-            ir.IntType(8).as_pointer(),  # data (field 0 - fast access)
-            ir.IntType(64),  # len - codepoint count (field 1)
-            ir.IntType(64),  # size - byte count (field 2)
+            ir.IntType(8).as_pointer(),  # owner (field 0) - pointer to data buffer
+            ir.IntType(64),  # offset (field 1) - byte offset into owner's data
+            ir.IntType(64),  # len - codepoint count (field 2)
+            ir.IntType(64),  # size - byte count (field 3)
         )
         
         string_ptr = self.string_struct.as_pointer()
@@ -2305,9 +2338,10 @@ class CodeGenerator:
         self._register_string_methods()
     
     def _implement_string_data(self):
-        """Get pointer to data portion (field 0 of string struct).
+        """Get pointer to actual data (owner + offset).
 
-        New layout: { i8* data, i64 refcount, i64 len, i64 size, i64 cap }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Returns owner + offset to get the actual data pointer.
         """
         func = self.string_data
         func.args[0].name = "s"
@@ -2317,18 +2351,26 @@ class CodeGenerator:
 
         s = func.args[0]
 
-        # Load data pointer from field 0
-        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Load owner pointer from field 0
+        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+
+        # Load offset from field 1
+        offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+
+        # Compute data pointer: owner + offset
+        data_ptr = builder.gep(owner_ptr, [offset])
 
         builder.ret(data_ptr)
     
     def _implement_string_new(self):
         """Create String from data pointer, byte length, and char count.
 
-        Layout: { i8* data, i64 len, i64 size }
-        - Allocates 24 bytes for struct via GC
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        - Allocates 32 bytes for struct via GC
         - Allocates byte_len bytes for data via GC
+        - Sets offset to 0 (new strings own their data from the start)
         - Strings are immutable, GC-managed
         """
         func = self.string_new
@@ -2343,8 +2385,8 @@ class CodeGenerator:
         byte_len = func.args[1]
         char_count = func.args[2]
 
-        # Allocate 24 bytes for String struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 24)
+        # Allocate 32 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
@@ -2356,16 +2398,20 @@ class CodeGenerator:
         # Copy source data to buffer
         builder.call(self.memcpy, [data_buf, data, byte_len])
 
-        # Store data pointer at field 0
-        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_buf, data_ptr_ptr)
+        # Store owner pointer at field 0
+        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(data_buf, owner_ptr_ptr)
 
-        # Store len (codepoint count) at field 1
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Store offset = 0 at field 1 (new strings start at beginning of buffer)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+
+        # Store len (codepoint count) at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(char_count, len_ptr)
 
-        # Store size (byte count) at field 2
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Store size (byte count) at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         builder.store(byte_len, size_ptr)
 
         builder.ret(string_ptr)
@@ -2381,7 +2427,7 @@ class CodeGenerator:
         UTF-8 codepoint counting: A byte starts a new codepoint if it's NOT
         a continuation byte (10xxxxxx). So we count bytes where (byte & 0xC0) != 0x80.
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_from_literal
         func.args[0].name = "cstr"
@@ -2435,8 +2481,8 @@ class CodeGenerator:
         final_byte_len = builder.load(byte_len_ptr)
         final_char_count = builder.load(char_count_ptr)
 
-        # Allocate 24 bytes for String struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 24)
+        # Allocate 32 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
@@ -2448,24 +2494,28 @@ class CodeGenerator:
         data_buf = builder.call(self.gc.gc_alloc, [final_byte_len, string_data_type_id])
         builder.call(self.memcpy, [data_buf, cstr, final_byte_len])
 
-        # Store data pointer at field 0
-        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_buf, data_ptr_ptr)
+        # Store owner pointer at field 0
+        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(data_buf, owner_ptr_ptr)
 
-        # Store len (codepoint count) at field 1
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Store offset = 0 at field 1 (new strings start at beginning of buffer)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+
+        # Store len (codepoint count) at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(final_char_count, len_ptr)
 
-        # Store size (byte count) at field 2
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Store size (byte count) at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         builder.store(final_byte_len, size_ptr)
 
         builder.ret(string_ptr)
     
     def _implement_string_len(self):
-        """Return string length (codepoint count at field 1).
+        """Return string length (codepoint count at field 2).
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_len
         func.args[0].name = "s"
@@ -2474,16 +2524,16 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
-        # Read len (codepoint count) from field 1
-        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Read len (codepoint count) from field 2
+        len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         length = builder.load(len_ptr)
         builder.ret(length)
 
     def _implement_string_size(self):
         """Return string total memory footprint in bytes.
 
-        Size = 24 (struct) + size (data bytes)
-        Layout: { i8* data, i64 len, i64 size }
+        Size = 32 (struct) + size (data bytes)
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_size
         func.args[0].name = "s"
@@ -2492,18 +2542,18 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
-        # Read size (byte count) from field 2
-        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Read size (byte count) from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
 
-        # Total size = 24 (struct) + size (data bytes)
-        total_size = builder.add(ir.Constant(ir.IntType(64), 24), byte_size)
+        # Total size = 32 (struct) + size (data bytes)
+        total_size = builder.add(ir.Constant(ir.IntType(64), 32), byte_size)
         builder.ret(total_size)
 
     def _implement_string_byte_size(self):
-        """Return string byte size (field 2) - internal use.
+        """Return string byte size (field 3) - internal use.
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_byte_size
         func.args[0].name = "s"
@@ -2512,8 +2562,8 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
-        # Read size (byte count) from field 2
-        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Read size (byte count) from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
         builder.ret(byte_size)
 
@@ -2521,7 +2571,7 @@ class CodeGenerator:
         """Get byte at index with bounds checking.
 
         Returns 0 if index is out of bounds (safe default).
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_get
         func.args[0].name = "s"
@@ -2536,8 +2586,8 @@ class CodeGenerator:
         s = func.args[0]
         index = func.args[1]
 
-        # Get byte size from field 2 (use byte size for bounds check)
-        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get byte size from field 3 (use byte size for bounds check)
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
 
         # Bounds check: 0 <= index < size (byte size)
@@ -2547,9 +2597,12 @@ class CodeGenerator:
         builder.cbranch(is_invalid, out_of_bounds, in_bounds)
 
         builder.position_at_end(in_bounds)
-        # Get data pointer from field 0
-        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Compute data pointer: owner + offset
+        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data_ptr = builder.gep(owner_ptr, [offset])
 
         # Get byte at index
         byte_ptr = builder.gep(data_ptr, [index])
@@ -2562,13 +2615,16 @@ class CodeGenerator:
         builder.ret(ir.Constant(ir.IntType(64), 0))
     
     def _implement_string_slice(self):
-        """Extract substring [start, end) by byte indices.
+        """Create a slice VIEW that shares the parent's data buffer.
+
+        This is a zero-copy operation. The slice descriptor points to the
+        same owner buffer as the source, with an adjusted offset.
 
         Clamps indices to valid range for safety.
         Note: This slices by byte index. For proper UTF-8 handling, the slice
         boundaries should align with codepoint boundaries.
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_slice
         func.args[0].name = "s"
@@ -2588,8 +2644,8 @@ class CodeGenerator:
         start = func.args[1]
         end = func.args[2]
 
-        # Get byte size from field 2
-        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
 
         # Clamp start: max(0, min(start, byte_size))
@@ -2602,13 +2658,20 @@ class CodeGenerator:
         end_clamped = builder.select(builder.icmp_signed(">", end_clamped, byte_size), byte_size, end_clamped)
         end_clamped = builder.select(builder.icmp_signed("<", end_clamped, start_clamped), start_clamped, end_clamped)
 
-        # Calculate new byte length
+        # Calculate new byte length (size of slice)
         new_byte_len = builder.sub(end_clamped, start_clamped)
 
-        # Get source data pointer from field 0
-        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
-        slice_start = builder.gep(data_ptr, [start_clamped])
+        # Load source owner and offset
+        source_owner_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        source_owner = builder.load(source_owner_ptr)
+        source_offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        source_offset = builder.load(source_offset_ptr)
+
+        # Calculate new offset: source.offset + start_clamped
+        new_offset = builder.add(source_offset, start_clamped)
+
+        # Compute data pointer for codepoint counting
+        slice_start = builder.gep(source_owner, [new_offset])
 
         # Count codepoints in the slice (scan for non-continuation bytes)
         idx_ptr = builder.alloca(ir.IntType(64), name="idx")
@@ -2644,15 +2707,36 @@ class CodeGenerator:
         builder.position_at_end(count_done)
         final_char_count = builder.load(char_count_ptr)
 
-        # Create new string with byte_len and char_count
-        result = builder.call(self.string_new, [slice_start, new_byte_len, final_char_count])
-        builder.ret(result)
+        # Allocate new String descriptor (32 bytes) - NO data copy!
+        struct_size = ir.Constant(ir.IntType(64), 32)
+        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
+
+        # Store owner (shared with source - this is the slice view!)
+        new_owner_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(source_owner, new_owner_ptr)
+
+        # Store new offset
+        new_offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(new_offset, new_offset_ptr)
+
+        # Store len (codepoint count) at field 2
+        new_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(final_char_count, new_len_ptr)
+
+        # Store size (byte count) at field 3
+        new_size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(new_byte_len, new_size_ptr)
+
+        builder.ret(string_ptr)
     
     def _implement_string_concat(self):
         """Concatenate two strings.
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         Creates a new immutable string, GC-managed.
+        Result has offset=0 (owns its data from the start).
         """
         func = self.string_concat
         func.args[0].name = "a"
@@ -2664,26 +2748,26 @@ class CodeGenerator:
         a = func.args[0]
         b = func.args[1]
 
-        # Get size (byte count) from both strings (field 2)
-        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get size (byte count) from both strings (field 3)
+        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         a_size = builder.load(a_size_ptr)
 
-        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         b_size = builder.load(b_size_ptr)
 
-        # Get len (codepoint count) from both strings (field 1)
-        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Get len (codepoint count) from both strings (field 2)
+        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         a_len = builder.load(a_len_ptr)
 
-        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         b_len = builder.load(b_len_ptr)
 
         # Total byte size and codepoint count
         total_size = builder.add(a_size, b_size)
         total_len = builder.add(a_len, b_len)
 
-        # Allocate 24 bytes for String struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 24)
+        # Allocate 32 bytes for String struct via GC
+        struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
         raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
@@ -2692,27 +2776,37 @@ class CodeGenerator:
         string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
         dest_data = builder.call(self.gc.gc_alloc, [total_size, string_data_type_id])
 
-        # Copy a's data
-        a_data_ptr_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_data = builder.load(a_data_ptr_ptr)
+        # Compute a's data pointer: owner + offset
+        a_owner_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_owner = builder.load(a_owner_ptr)
+        a_offset_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        a_offset = builder.load(a_offset_ptr)
+        a_data = builder.gep(a_owner, [a_offset])
         builder.call(self.memcpy, [dest_data, a_data, a_size])
 
-        # Copy b's data after a
+        # Compute b's data pointer: owner + offset
         b_dest = builder.gep(dest_data, [a_size])
-        b_data_ptr_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_data = builder.load(b_data_ptr_ptr)
+        b_owner_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_owner = builder.load(b_owner_ptr)
+        b_offset_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        b_offset = builder.load(b_offset_ptr)
+        b_data = builder.gep(b_owner, [b_offset])
         builder.call(self.memcpy, [b_dest, b_data, b_size])
 
-        # Store data pointer at field 0
-        data_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(dest_data, data_ptr_ptr)
+        # Store owner pointer at field 0
+        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(dest_data, owner_ptr_ptr)
 
-        # Store len at field 1
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Store offset = 0 at field 1 (new strings own their data from the start)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+
+        # Store len at field 2
+        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(total_len, len_ptr)
 
-        # Store size at field 2
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Store size at field 3
+        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         builder.store(total_size, size_ptr)
 
         builder.ret(string_ptr)
@@ -2720,8 +2814,8 @@ class CodeGenerator:
     def _implement_string_eq(self):
         """Compare two strings for equality.
 
-        Layout: { i8* data, i64 len, i64 size }
-        Compare by byte size (field 2) and then byte-by-byte.
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Compare by byte size (field 3) and then byte-by-byte.
         """
         func = self.string_eq
         func.args[0].name = "a"
@@ -2739,11 +2833,11 @@ class CodeGenerator:
         a = func.args[0]
         b = func.args[1]
 
-        # Get byte sizes from field 2
-        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get byte sizes from field 3
+        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         a_size = builder.load(a_size_ptr)
 
-        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         b_size = builder.load(b_size_ptr)
 
         # Check if sizes are equal
@@ -2751,12 +2845,19 @@ class CodeGenerator:
         builder.cbranch(size_eq, check_data, not_equal)
 
         builder.position_at_end(check_data)
-        # Get data pointers from field 0
-        a_data_ptr_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_data = builder.load(a_data_ptr_ptr)
+        # Compute a's data pointer: owner + offset
+        a_owner_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_owner = builder.load(a_owner_ptr)
+        a_offset_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        a_offset = builder.load(a_offset_ptr)
+        a_data = builder.gep(a_owner, [a_offset])
 
-        b_data_ptr_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_data = builder.load(b_data_ptr_ptr)
+        # Compute b's data pointer: owner + offset
+        b_owner_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_owner = builder.load(b_owner_ptr)
+        b_offset_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        b_offset = builder.load(b_offset_ptr)
+        b_data = builder.gep(b_owner, [b_offset])
 
         # Compare bytes
         idx_ptr = builder.alloca(ir.IntType(64), name="idx")
@@ -2788,8 +2889,8 @@ class CodeGenerator:
     def _implement_string_contains(self):
         """Check if string contains substring (naive search).
 
-        Layout: { i8* data, i64 len, i64 size }
-        Uses byte size (field 2) for comparisons.
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Uses byte size (field 3) for comparisons.
         """
         func = self.string_contains
         func.args[0].name = "s"
@@ -2809,19 +2910,26 @@ class CodeGenerator:
         s = func.args[0]
         needle = func.args[1]
 
-        # Get byte sizes from field 2
-        s_size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get byte sizes from field 3
+        s_size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         s_size = builder.load(s_size_ptr)
 
-        needle_size_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        needle_size_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         needle_size = builder.load(needle_size_ptr)
 
-        # Get data pointers from field 0
-        s_data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        s_data = builder.load(s_data_ptr_ptr)
+        # Compute s's data pointer: owner + offset
+        s_owner_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        s_owner = builder.load(s_owner_ptr)
+        s_offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        s_offset = builder.load(s_offset_ptr)
+        s_data = builder.gep(s_owner, [s_offset])
 
-        needle_data_ptr_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        needle_data = builder.load(needle_data_ptr_ptr)
+        # Compute needle's data pointer: owner + offset
+        needle_owner_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        needle_owner = builder.load(needle_owner_ptr)
+        needle_offset_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        needle_offset = builder.load(needle_offset_ptr)
+        needle_data = builder.gep(needle_owner, [needle_offset])
 
         # Empty needle always matches
         empty_needle = builder.icmp_signed("==", needle_size, ir.Constant(ir.IntType(64), 0))
@@ -2886,7 +2994,7 @@ class CodeGenerator:
     def _implement_string_print(self):
         """Print string to stdout using POSIX write (no null terminator needed).
 
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
         """
         func = self.string_print
         func.args[0].name = "s"
@@ -2896,13 +3004,16 @@ class CodeGenerator:
 
         s = func.args[0]
 
-        # Get byte size from field 2
-        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
 
-        # Get data pointer from field 0
-        data_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Compute data pointer: owner + offset
+        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data_ptr = builder.gep(owner_ptr, [offset])
 
         # write(1, data, size) - fd 1 is stdout
         stdout_fd = ir.Constant(ir.IntType(32), 1)
@@ -2933,8 +3044,8 @@ class CodeGenerator:
     def _implement_string_hash(self):
         """Compute hash of string content using FNV-1a algorithm.
 
-        Layout: { i8* data, i64 len, i64 size }
-        Hash is computed over the bytes (field 2 = size, field 0 = data).
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Hash is computed over the bytes (field 3 = size, fields 0+1 = owner+offset).
         """
         func = self.string_hash
         func.args[0].name = "s"
@@ -2961,11 +3072,15 @@ class CodeGenerator:
         builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(init_loop)
-        # Get data pointer (field 0) and byte size (field 2)
-        data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Compute data pointer: owner + offset
+        owner_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data_ptr = builder.gep(owner_ptr, [offset])
 
-        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         size = builder.load(size_ptr)
 
         # FNV-1a: hash = offset_basis, then for each byte: hash ^= byte; hash *= prime
@@ -3013,7 +3128,10 @@ class CodeGenerator:
         """Implement string_setrange: return new string with [start, end) replaced by source.
 
         Creates a new string: prefix[0:start] + source + suffix[end:size]
-        Layout: { i8* data, i64 len, i64 size }
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+
+        Note: This always creates a fresh allocation since it combines data from
+        multiple sources. The result has offset=0.
         """
         func = self.string_setrange
         func.args[0].name = "s"
@@ -3035,17 +3153,23 @@ class CodeGenerator:
         end = func.args[2]
         source = func.args[3]
 
-        # Get source string byte size and data
-        source_size_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # Get source string byte size (field 3) and compute data pointer (owner + offset)
+        source_size_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         source_size = builder.load(source_size_ptr)
-        source_data_ptr_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        source_data = builder.load(source_data_ptr_ptr)
+        source_owner_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        source_owner = builder.load(source_owner_ptr)
+        source_offset_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        source_offset = builder.load(source_offset_ptr)
+        source_data = builder.gep(source_owner, [source_offset])
 
-        # Get original string byte size and data
-        orig_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        # Get original string byte size (field 3) and compute data pointer (owner + offset)
+        orig_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         orig_size = builder.load(orig_size_ptr)
-        orig_data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        orig_data = builder.load(orig_data_ptr_ptr)
+        orig_owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        orig_owner = builder.load(orig_owner_ptr)
+        orig_offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        orig_offset = builder.load(orig_offset_ptr)
+        orig_data = builder.gep(orig_owner, [orig_offset])
 
         # Clamp bounds
         start_neg = builder.icmp_signed("<", start, zero)
@@ -12312,14 +12436,17 @@ class CodeGenerator:
         # Call array_new to create the array
         array_ptr = self.builder.call(self.array_new, [capacity, elem_size])
 
-        # Set len = capacity (we're initializing all elements)
-        len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Set len = capacity (we're initializing all elements) - field 2
+        len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         self.builder.store(capacity, len_ptr)
 
         # Fill the array with the initial value
-        # Get data pointer
-        data_ptr_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        data_ptr = self.builder.load(data_ptr_ptr)
+        # Get data pointer: compute owner + offset (fields 0 and 1)
+        owner_ptr_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_ptr = self.builder.load(owner_ptr_ptr)
+        offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset_val = self.builder.load(offset_ptr)
+        data_ptr = self.builder.gep(owner_ptr, [offset_val])
 
         # Loop to initialize all elements
         current_func = self.builder.block.parent
