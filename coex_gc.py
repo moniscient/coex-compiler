@@ -1451,6 +1451,11 @@ class GarbageCollector:
         mark_set = func.append_basic_block("mark_set")
         mark_string = func.append_basic_block("mark_string")
         mark_channel = func.append_basic_block("mark_channel")
+        mark_pv_node = func.append_basic_block("mark_pv_node")
+        pv_node_loop = func.append_basic_block("pv_node_loop")
+        pv_node_check = func.append_basic_block("pv_node_check")
+        pv_node_mark_child = func.append_basic_block("pv_node_mark_child")
+        pv_node_next = func.append_basic_block("pv_node_next")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -1587,6 +1592,7 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_SET), mark_set)
         switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), mark_string)
         switch.add_case(ir.Constant(self.i64, self.TYPE_CHANNEL), mark_channel)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), mark_pv_node)
 
         # Actual map marking (in builtin_switch block)
         builder.position_at_end(builtin_switch)
@@ -1668,6 +1674,52 @@ class GarbageCollector:
         buffer_ptr = builder.load(buffer_ptr_ptr)
         builder.call(func, [buffer_ptr])  # Recursive call
         builder.branch(done)
+
+        # Mark PVNode: iterate through 32 children and mark each non-null one
+        # PVNode struct: { i8* children[32] }
+        builder.position_at_end(mark_pv_node)
+        # Store ptr for use in loop
+        pv_ptr_alloca = builder.alloca(self.i8_ptr, name="pv_ptr")
+        builder.store(ptr, pv_ptr_alloca)
+        # Child index
+        pv_idx = builder.alloca(self.i64, name="pv_idx")
+        builder.store(ir.Constant(self.i64, 0), pv_idx)
+        builder.branch(pv_node_loop)
+
+        # PVNode loop: for i in 0..32
+        builder.position_at_end(pv_node_loop)
+        idx = builder.load(pv_idx)
+        done_children = builder.icmp_unsigned(">=", idx, ir.Constant(self.i64, 32))
+        builder.cbranch(done_children, done, pv_node_check)
+
+        # Check if child is non-null
+        builder.position_at_end(pv_node_check)
+        pv_ptr_val = builder.load(pv_ptr_alloca)
+        # PVNode is just an array of 32 pointers at the user data area
+        pv_children = builder.bitcast(pv_ptr_val, self.i8_ptr_ptr)
+        child_idx = builder.load(pv_idx)
+        child_ptr_ptr = builder.gep(pv_children, [child_idx], inbounds=False)
+        child_ptr = builder.load(child_ptr_ptr)
+        is_child_null = builder.icmp_unsigned("==", child_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_child_null, pv_node_next, pv_node_mark_child)
+
+        # Mark child (child_ptr was loaded and checked in pv_node_check)
+        builder.position_at_end(pv_node_mark_child)
+        # Re-load the child pointer for this block
+        pv_ptr_val2 = builder.load(pv_ptr_alloca)
+        pv_children2 = builder.bitcast(pv_ptr_val2, self.i8_ptr_ptr)
+        child_idx2 = builder.load(pv_idx)
+        child_ptr_ptr2 = builder.gep(pv_children2, [child_idx2], inbounds=False)
+        child_to_mark = builder.load(child_ptr_ptr2)
+        builder.call(func, [child_to_mark])  # Recursive call to gc_mark_object
+        builder.branch(pv_node_next)
+
+        # Increment index and continue
+        builder.position_at_end(pv_node_next)
+        curr_idx = builder.load(pv_idx)
+        next_idx = builder.add(curr_idx, ir.Constant(self.i64, 1))
+        builder.store(next_idx, pv_idx)
+        builder.branch(pv_node_loop)
 
         builder.position_at_end(done)
         builder.ret_void()

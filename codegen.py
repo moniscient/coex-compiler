@@ -9193,6 +9193,19 @@ class CodeGenerator:
                 elif isinstance(stmt, MatchStmt):
                     for arm in stmt.arms:
                         visit_stmts(arm.body)
+                elif isinstance(stmt, TupleDestructureStmt):
+                    # Check if value is a function call with a tuple return type
+                    if isinstance(stmt.value, CallExpr) and isinstance(stmt.value.callee, Identifier):
+                        func_name = stmt.value.callee.name
+                        if func_name in self.func_decls:
+                            func_decl = self.func_decls[func_name]
+                            if func_decl.return_type and isinstance(func_decl.return_type, TupleType):
+                                # Check which tuple elements are heap types
+                                for i, name in enumerate(stmt.names):
+                                    if i < len(func_decl.return_type.elements):
+                                        _, elem_type = func_decl.return_type.elements[i]
+                                        if self._is_heap_type(elem_type):
+                                            heap_vars.append(name)
 
         visit_stmts(stmts)
         return heap_vars
@@ -9698,7 +9711,7 @@ class CodeGenerator:
         """Generate code for tuple destructuring: (a, b) = expr"""
         # Generate the tuple value
         tuple_val = self._generate_expression(stmt.value)
-        
+
         # Check if it's a struct type (tuple)
         if isinstance(tuple_val.type, ir.LiteralStructType):
             # Extract each element and assign to a variable
@@ -9711,6 +9724,11 @@ class CodeGenerator:
                     alloca = self.builder.alloca(elem_type, name=name)
                     self.builder.store(elem_val, alloca)
                     self.locals[name] = alloca
+
+                    # Register as GC root if this is a heap type
+                    if name in self.gc_root_indices and self.gc is not None:
+                        root_idx = self.gc_root_indices[name]
+                        self.gc.set_root(self.builder, self.gc_roots, root_idx, elem_val)
         else:
             # Not a tuple - error case, but for robustness create dummy vars
             for name in stmt.names:
