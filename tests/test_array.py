@@ -276,3 +276,104 @@ func main() -> int
     return 0
 ~
 ''', "1\n1\n100\n")
+
+
+class TestArraySlice:
+    """Tests for Array slicing with zero-copy views."""
+
+    def test_array_slice_basic(self, expect_output):
+        """Basic array slicing [start:end]."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30, 40, 50]
+    arr: Array<int> = list.packed()
+    slice: Array<int> = arr[1:4]
+    print(slice.len())
+    print(slice.get(0))
+    print(slice.get(1))
+    print(slice.get(2))
+    return 0
+~
+''', "3\n20\n30\n40\n")
+
+    def test_array_slice_open_start(self, expect_output):
+        """Array slicing with open start [:end]."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30, 40, 50]
+    arr: Array<int> = list.packed()
+    slice: Array<int> = arr[:3]
+    print(slice.len())
+    print(slice.get(0))
+    print(slice.get(2))
+    return 0
+~
+''', "3\n10\n30\n")
+
+    def test_array_slice_open_end(self, expect_output):
+        """Array slicing with open end [start:]."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30, 40, 50]
+    arr: Array<int> = list.packed()
+    slice: Array<int> = arr[2:]
+    print(slice.len())
+    print(slice.get(0))
+    print(slice.get(2))
+    return 0
+~
+''', "3\n30\n50\n")
+
+    def test_array_slice_full(self, expect_output):
+        """Full array slice [:]."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30]
+    arr: Array<int> = list.packed()
+    slice: Array<int> = arr[:]
+    print(slice.len())
+    print(slice.get(0))
+    print(slice.get(2))
+    return 0
+~
+''', "3\n10\n30\n")
+
+    def test_array_slice_empty(self, expect_output):
+        """Empty array slice."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30]
+    arr: Array<int> = list.packed()
+    slice: Array<int> = arr[1:1]
+    print(slice.len())
+    return 0
+~
+''', "0\n")
+
+    def test_array_slice_view_semantics(self, expect_output):
+        """Array slice with := preserves view."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [10, 20, 30, 40, 50]
+    arr: Array<int> = list.packed()
+    slice := arr[1:4]
+    print(slice.len())
+    print(slice.get(0))
+    return 0
+~
+''', "3\n20\n")
+
+    def test_array_slice_nested(self, expect_output):
+        """Nested array slices."""
+        expect_output('''
+func main() -> int
+    list: List<int> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    arr: Array<int> = list.packed()
+    s1: Array<int> = arr[2:8]
+    s2: Array<int> = s1[1:4]
+    print(s2.len())
+    print(s2.get(0))
+    print(s2.get(2))
+    return 0
+~
+''', "3\n3\n5\n")

@@ -1661,6 +1661,11 @@ class CodeGenerator:
         array_deep_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
         self.array_deep_copy = ir.Function(self.module, array_deep_copy_ty, name="coex_array_deep_copy")
 
+        # array_getrange(arr: Array*, start: i64, end: i64) -> Array*
+        # Returns a VIEW (not a copy) of elements [start, end)
+        array_getrange_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i64])
+        self.array_getrange = ir.Function(self.module, array_getrange_ty, name="coex_array_getrange")
+
         # Implement all functions
         self._implement_array_new()
         self._implement_array_get()
@@ -1670,6 +1675,7 @@ class CodeGenerator:
         self._implement_array_size()
         self._implement_array_copy()
         self._implement_array_deep_copy()
+        self._implement_array_getrange()
         self._register_array_methods()
 
     def _implement_array_new(self):
@@ -2012,6 +2018,89 @@ class CodeGenerator:
 
         builder.ret(array_ptr)
 
+    def _implement_array_getrange(self):
+        """Create a slice VIEW of an array (zero-copy).
+
+        Returns a new Array descriptor that shares the parent's data buffer.
+        Layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+
+        The slice's offset = parent.offset + (start * elem_size)
+        The slice's len = end - start
+        The slice shares the same owner pointer (zero-copy).
+        """
+        func = self.array_getrange
+        func.args[0].name = "arr"
+        func.args[1].name = "start"
+        func.args[2].name = "end"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        arr = func.args[0]
+        start = func.args[1]
+        end = func.args[2]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+
+        # Load source fields
+        src_owner_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner = builder.load(src_owner_ptr)
+
+        src_offset_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_offset = builder.load(src_offset_ptr)
+
+        src_len_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        src_elem_size_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        src_elem_size = builder.load(src_elem_size_ptr)
+
+        # Clamp start to [0, len]
+        start_neg = builder.icmp_signed("<", start, zero)
+        start_over = builder.icmp_signed(">", start, src_len)
+        start_clamped = builder.select(start_neg, zero, builder.select(start_over, src_len, start))
+
+        # Clamp end to [start, len]
+        end_under = builder.icmp_signed("<", end, start_clamped)
+        end_over = builder.icmp_signed(">", end, src_len)
+        end_clamped = builder.select(end_under, start_clamped, builder.select(end_over, src_len, end))
+
+        # Calculate new length
+        new_len = builder.sub(end_clamped, start_clamped)
+
+        # Calculate new offset: src_offset + (start * elem_size)
+        start_bytes = builder.mul(start_clamped, src_elem_size)
+        new_offset = builder.add(src_offset, start_bytes)
+
+        # Allocate new Array descriptor (40 bytes) - NO data copy!
+        struct_size = ir.Constant(i64, 40)
+        type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
+
+        # Store owner (shared with source - this is the slice view!)
+        new_owner_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(src_owner, new_owner_ptr)
+
+        # Store new offset
+        new_offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_offset, new_offset_ptr)
+
+        # Store new len
+        new_len_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(new_len, new_len_ptr)
+
+        # Store cap = len (slices have no extra capacity)
+        new_cap_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(new_len, new_cap_ptr)
+
+        # Store elem_size (same as source)
+        new_elem_size_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(src_elem_size, new_elem_size_ptr)
+
+        builder.ret(array_ptr)
+
     def _register_array_methods(self):
         """Register Array as a type with methods."""
         self.type_registry["Array"] = self.array_struct
@@ -2021,6 +2110,7 @@ class CodeGenerator:
             "get": "coex_array_get",
             "len": "coex_array_len",
             "size": "coex_array_size",
+            "getrange": "coex_array_getrange",
             # "set" and "append" handled specially (need alloca + return new array)
         }
 
@@ -2031,6 +2121,7 @@ class CodeGenerator:
         self.functions["coex_array_len"] = self.array_len
         self.functions["coex_array_size"] = self.array_size
         self.functions["coex_array_copy"] = self.array_copy
+        self.functions["coex_array_getrange"] = self.array_getrange
 
     def _list_to_array(self, list_ptr: ir.Value) -> ir.Value:
         """Convert a List to an Array (List.packed() -> Array).
