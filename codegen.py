@@ -3424,29 +3424,15 @@ class CodeGenerator:
     def _needs_parameter_copy(self, coex_type: Type) -> bool:
         """Check if a parameter type needs to be copied on function entry.
 
-        With immutable heap semantics, most function parameters don't need copying
-        because sharing references is equivalent to copying - no binding can observe
-        mutations through another binding (mutation operations return new objects).
+        With immutable heap semantics, function parameters never need copying.
+        All heap types (collections, strings, UDTs) are immutable:
+        - Collections: mutation operations return new objects
+        - Strings: immutable
+        - UDTs: field assignment creates new struct (copy-on-write)
 
-        EXCEPTION: User-defined types (UDTs) have mutable field assignment
-        (e.g., `p.x = 99`), so they still require copying to preserve value semantics.
+        Sharing references is semantically equivalent to copying because no
+        binding can observe mutations through another binding.
         """
-        if coex_type is None:
-            return False
-        # Collections (List, Set, Map, Array, String) are immutable - no copy needed
-        # UDTs have mutable fields - must copy
-        if isinstance(coex_type, NamedType):
-            if coex_type.name == "string":
-                return False  # Strings are immutable
-            if coex_type.name in self.type_fields:
-                # User-defined type with mutable fields - needs copy
-                if not (hasattr(self, 'enum_variants') and coex_type.name in self.enum_variants):
-                    return True
-        if isinstance(coex_type, TupleType):
-            # Tuples need copy if any element needs copy
-            for _, elem_type in coex_type.elements:
-                if self._needs_parameter_copy(elem_type):
-                    return True
         return False
 
     def _is_heap_type(self, coex_type: Type) -> bool:
@@ -3556,43 +3542,18 @@ class CodeGenerator:
     def _generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
         """Generate code to 'deep-copy' a value based on its Coex type.
 
-        With immutable heap semantics, most heap-allocated values don't need copying.
-        Sharing references is equivalent to copying because mutation operations
-        return new objects.
+        With immutable heap semantics, heap-allocated values don't need copying.
+        Sharing references is semantically equivalent to copying because no
+        binding can observe mutations through another binding:
+        - Collections: mutation operations return new objects
+        - Strings: immutable
+        - UDTs: field assignment creates new struct (copy-on-write)
 
-        EXCEPTION: User-defined types (UDTs) have mutable field assignment,
-        so they still require actual copying to preserve value semantics.
+        This function returns value unchanged for all types.
         """
-        # Primitives have value semantics already (stack-allocated)
-        if self._is_primitive_coex_type(coex_type):
-            return value
-
-        # String: immutable, no copy needed
-        if isinstance(coex_type, NamedType) and coex_type.name == "string":
-            return value
-
-        # List<T>: immutable (append returns new list), no copy needed
-        if isinstance(coex_type, ListType):
-            return value
-
-        # Set<T>: immutable (add/remove return new sets), no copy needed
-        if isinstance(coex_type, SetType):
-            return value
-
-        # Map<K,V>: immutable (set/remove return new maps), no copy needed
-        if isinstance(coex_type, MapType):
-            return value
-
-        # Array<T>: immutable (set/append return new arrays), no copy needed
-        if isinstance(coex_type, ArrayType):
-            return value
-
-        # User-defined types: have mutable fields, MUST deep copy
-        if isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
-            if not (hasattr(self, 'enum_variants') and coex_type.name in self.enum_variants):
-                return self._generate_type_deep_copy(value, coex_type)
-
-        # Fallback: return as-is
+        # All types: return value unchanged
+        # - Primitives are stack-allocated value types
+        # - Heap types are immutable - sharing is equivalent to copying
         return value
 
     def _generate_list_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
@@ -3628,40 +3589,12 @@ class CodeGenerator:
         return src
 
     def _generate_type_deep_copy(self, src: ir.Value, coex_type: NamedType) -> ir.Value:
-        """Deep copy a user-defined type.
+        """Deep copy a user-defined type (identity function with immutable heap semantics).
 
-        UDTs have mutable field assignment, so we must create an actual copy
-        to preserve value semantics. Collection fields within the UDT don't
-        need deep copying since collections are immutable.
+        With copy-on-write field assignment, UDTs are now immutable like collections.
+        Sharing the reference is semantically equivalent to copying.
         """
-        type_name = coex_type.name
-        if type_name not in self.type_fields:
-            return src
-
-        # Don't deep copy enums - they have different structure (tag + payload)
-        if hasattr(self, 'enum_variants') and type_name in self.enum_variants:
-            return src
-
-        i32 = ir.IntType(32)
-        struct_type = self.type_registry[type_name]
-
-        # Allocate new struct via GC with correct type ID for proper marking
-        struct_size = ir.Constant(ir.IntType(64), struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
-        type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
-        dst = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
-
-        # Copy each field - no need to deep copy collection fields since they're immutable
-        for i, (field_name, field_type) in enumerate(self.type_fields[type_name]):
-            # Load source field
-            src_field_ptr = self.builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
-            field_val = self.builder.load(src_field_ptr)
-
-            # Store to destination (collections are shared, not copied)
-            dst_field_ptr = self.builder.gep(dst, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
-            self.builder.store(field_val, dst_field_ptr)
-
-        return dst
+        return src
 
     def _register_string_methods(self):
         """Register String as a type with methods for method call resolution"""
@@ -9840,6 +9773,12 @@ class CodeGenerator:
             self._generate_tuple_assignment(stmt.target, value)
             return
 
+        # Handle immutable field assignment: p.x = value
+        # Creates a new struct with the updated field (copy-on-write semantics)
+        if isinstance(stmt.target, MemberExpr):
+            self._generate_immutable_field_assignment(stmt.target, value, stmt.op)
+            return
+
         # Handle indexed assignment for user-defined types: obj[idx] = value -> obj.set(idx, value)
         if isinstance(stmt.target, IndexExpr):
             obj = self._generate_expression(stmt.target.object)
@@ -9992,7 +9931,7 @@ class CodeGenerator:
                 if i < len(value.type.elements):
                     elem_type = value.type.elements[i]
                     elem_val = self.builder.extract_value(value, i)
-                    
+
                     # Get the variable name from the element expression
                     if isinstance(elem_expr, Identifier):
                         var_name = elem_expr.name
@@ -10003,6 +9942,104 @@ class CodeGenerator:
                             alloca = self.builder.alloca(elem_type, name=var_name)
                             self.builder.store(elem_val, alloca)
                             self.locals[var_name] = alloca
+
+    def _generate_immutable_field_assignment(self, target: MemberExpr, new_value: ir.Value, op: AssignOp):
+        """Generate immutable field assignment: p.x = value
+
+        Instead of mutating the struct in place, creates a new struct with:
+        - The changed field set to the new value
+        - All other fields copied from the old struct (reference sharing)
+        - The variable rebound to point to the new struct
+
+        This implements copy-on-write semantics for UDTs, making them immutable
+        like collections. The old struct becomes garbage and will be collected.
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get the old struct
+        old_struct = self._generate_expression(target.object)
+        type_name = self._get_type_name_from_ptr(old_struct.type)
+
+        if type_name is None or type_name not in self.type_fields:
+            # Fallback for unknown types - shouldn't happen
+            raise RuntimeError(f"Cannot assign to field of unknown type: {type_name}")
+
+        # Get field info
+        field_idx = self._get_field_index(type_name, target.member)
+        if field_idx is None:
+            raise RuntimeError(f"Unknown field '{target.member}' in type '{type_name}'")
+
+        fields = self.type_fields[type_name]
+        struct_type = self.type_registry[type_name]
+
+        # Handle compound assignment (+=, -=, etc.)
+        if op not in (AssignOp.ASSIGN, AssignOp.MOVE_ASSIGN):
+            old_field_ptr = self.builder.gep(old_struct, [ir.Constant(i32, 0), ir.Constant(i32, field_idx)], inbounds=True)
+            old_field_val = self.builder.load(old_field_ptr)
+
+            if op == AssignOp.PLUS_ASSIGN:
+                if isinstance(new_value.type, ir.DoubleType):
+                    new_value = self.builder.fadd(old_field_val, new_value)
+                else:
+                    new_value = self.builder.add(old_field_val, new_value)
+            elif op == AssignOp.MINUS_ASSIGN:
+                if isinstance(new_value.type, ir.DoubleType):
+                    new_value = self.builder.fsub(old_field_val, new_value)
+                else:
+                    new_value = self.builder.sub(old_field_val, new_value)
+            elif op == AssignOp.STAR_ASSIGN:
+                if isinstance(new_value.type, ir.DoubleType):
+                    new_value = self.builder.fmul(old_field_val, new_value)
+                else:
+                    new_value = self.builder.mul(old_field_val, new_value)
+            elif op == AssignOp.SLASH_ASSIGN:
+                if isinstance(new_value.type, ir.DoubleType):
+                    new_value = self.builder.fdiv(old_field_val, new_value)
+                else:
+                    new_value = self.builder.sdiv(old_field_val, new_value)
+            elif op == AssignOp.PERCENT_ASSIGN:
+                new_value = self.builder.srem(old_field_val, new_value)
+
+        # Allocate new struct via GC
+        struct_size = ir.Constant(i64, struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
+        type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        new_struct = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
+
+        # Copy all fields from old struct to new struct
+        for i, (field_name, field_type) in enumerate(fields):
+            if i == field_idx:
+                # This is the changed field - store new value
+                dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
+                # Cast value if needed
+                expected_type = struct_type.elements[i]
+                cast_value = self._cast_value(new_value, expected_type)
+                self.builder.store(cast_value, dst_field_ptr)
+            else:
+                # Copy field from old struct (reference sharing for heap types)
+                src_field_ptr = self.builder.gep(old_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
+                field_val = self.builder.load(src_field_ptr)
+                dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
+                self.builder.store(field_val, dst_field_ptr)
+
+        # Rebind the variable to point to the new struct
+        # The object must be an Identifier for us to rebind it
+        if isinstance(target.object, Identifier):
+            var_name = target.object.name
+            if var_name in self.locals:
+                self.builder.store(new_struct, self.locals[var_name])
+
+                # Update GC root if this is a tracked heap variable
+                if var_name in self.gc_root_indices and self.gc is not None:
+                    root_idx = self.gc_root_indices[var_name]
+                    self.gc.set_root(self.builder, self.gc_roots, root_idx, new_struct)
+        elif isinstance(target.object, MemberExpr):
+            # Nested field assignment: a.b.x = value
+            # Recursively create new structs up the chain
+            self._generate_immutable_field_assignment(target.object, new_struct, AssignOp.ASSIGN)
+        else:
+            raise RuntimeError(f"Cannot rebind field assignment target: {type(target.object)}")
 
     def _generate_slice_assignment(self, stmt: SliceAssignment):
         """Generate code for slice assignment: obj[start:end] = source
