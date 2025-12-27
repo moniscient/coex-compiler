@@ -457,8 +457,19 @@ postfixOp
     : DOT IDENTIFIER
     | DOT INTEGER_LITERAL                                     // Tuple index access: t.0, t.1
     | DOT IDENTIFIER genericArgs? LPAREN argumentList? RPAREN
-    | LBRACKET expressionList RBRACKET
+    | LBRACKET sliceOrIndex RBRACKET                          // Index or slice
     | LPAREN argumentList? RPAREN
+    ;
+
+// Distinguish between slice [start:end] and index [i] or [i, j]
+sliceOrIndex
+    : sliceExpr                                               // Slice: [start:end], [:end], [start:], [:]
+    | expression (COMMA expression)*                          // Index: [i] or multi-index [i, j]
+    ;
+
+// Slice expression with optional start and end bounds
+sliceExpr
+    : expression? COLON expression?
     ;
 
 // Primary expressions

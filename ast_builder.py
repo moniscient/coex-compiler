@@ -578,12 +578,23 @@ class ASTBuilder:
     def visit_simple_stmt(self, ctx: CoexParser.SimpleStmtContext) -> Stmt:
         """Visit a simple statement (expression or assignment)"""
         exprs = ctx.expression()
-        
+
         if len(exprs) == 2 and ctx.assignOp():
             # Assignment
             target = self.visit_expression(exprs[0])
             value = self.visit_expression(exprs[1])
             op = self.visit_assign_op(ctx.assignOp())
+
+            # Check if target is a slice expression - convert to SliceAssignment
+            if isinstance(target, SliceExpr):
+                return SliceAssignment(
+                    target=target.object,
+                    start=target.start,
+                    end=target.end,
+                    value=value,
+                    op=op
+                )
+
             return Assignment(target, op, value)
         else:
             # Expression statement
@@ -956,7 +967,11 @@ class ASTBuilder:
                 # Member access: obj.field
                 return MemberExpr(base, member)
         elif ctx.LBRACKET():
-            # Index access: obj[index] or obj[i, j]
+            # Index or slice access: obj[index], obj[i, j], or obj[start:end]
+            slice_or_index = ctx.sliceOrIndex()
+            if slice_or_index:
+                return self.visit_slice_or_index(base, slice_or_index)
+            # Fallback for backward compatibility
             indices = []
             if ctx.expressionList():
                 for expr in ctx.expressionList().expression():
@@ -971,7 +986,47 @@ class ASTBuilder:
             return CallExpr(base, args, named_args)
         
         return base
-    
+
+    def visit_slice_or_index(self, base: Expr, ctx: CoexParser.SliceOrIndexContext) -> Expr:
+        """Visit a slice or index access: obj[i], obj[i, j], or obj[start:end]"""
+        # Check if this is a slice expression (has COLON)
+        slice_expr = ctx.sliceExpr()
+        if slice_expr:
+            # Slice: obj[start:end], obj[:end], obj[start:], obj[:]
+            start = None
+            end = None
+
+            # sliceExpr is: expression? COLON expression?
+            exprs = slice_expr.expression()
+            if len(exprs) == 0:
+                # [:] - empty slice, both None
+                pass
+            elif len(exprs) == 1:
+                # Either [start:] or [:end]
+                # Check if COLON comes first
+                colon = slice_expr.COLON()
+                expr_token = exprs[0]
+                # Get start position of COLON and expression
+                colon_start = colon.symbol.start
+                expr_start = expr_token.start.start
+                if expr_start < colon_start:
+                    # [start:]
+                    start = self.visit_expression(exprs[0])
+                else:
+                    # [:end]
+                    end = self.visit_expression(exprs[0])
+            else:
+                # [start:end]
+                start = self.visit_expression(exprs[0])
+                end = self.visit_expression(exprs[1])
+
+            return SliceExpr(object=base, start=start, end=end)
+        else:
+            # Index: obj[i] or obj[i, j]
+            exprs = ctx.expression()
+            indices = [self.visit_expression(e) for e in exprs]
+            return IndexExpr(base, indices)
+
     def visit_argument_list(self, ctx: CoexParser.ArgumentListContext) -> Tuple[PyList[Expr], Dict[str, Expr]]:
         """Visit an argument list, returning (positional_args, named_args)"""
         positional_args = []

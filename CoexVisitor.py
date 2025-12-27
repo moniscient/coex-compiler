@@ -429,6 +429,16 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#sliceOrIndex.
+    def visitSliceOrIndex(self, ctx:CoexParser.SliceOrIndexContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#sliceExpr.
+    def visitSliceExpr(self, ctx:CoexParser.SliceExprContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#primaryExpr.
     def visitPrimaryExpr(self, ctx:CoexParser.PrimaryExprContext):
         return self.visitChildren(ctx)

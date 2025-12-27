@@ -764,6 +764,24 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#sliceOrIndex.
+    def enterSliceOrIndex(self, ctx:CoexParser.SliceOrIndexContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#sliceOrIndex.
+    def exitSliceOrIndex(self, ctx:CoexParser.SliceOrIndexContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#sliceExpr.
+    def enterSliceExpr(self, ctx:CoexParser.SliceExprContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#sliceExpr.
+    def exitSliceExpr(self, ctx:CoexParser.SliceExprContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#primaryExpr.
     def enterPrimaryExpr(self, ctx:CoexParser.PrimaryExprContext):
         pass

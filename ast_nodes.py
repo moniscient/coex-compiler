@@ -301,6 +301,18 @@ class IndexExpr(Expr):
 
 
 @dataclass
+class SliceExpr(Expr):
+    """Slice access: obj[start:end]
+
+    Either start or end may be None (omitted).
+    Negative values are relative to collection end.
+    """
+    object: Expr
+    start: Optional[Expr]  # None means 0
+    end: Optional[Expr]    # None means len
+
+
+@dataclass
 class ListExpr(Expr):
     elements: List[Expr]
 
@@ -485,6 +497,20 @@ class Assignment(Stmt):
     target: Expr
     op: AssignOp
     value: Expr
+
+
+@dataclass
+class SliceAssignment(Stmt):
+    """Slice assignment: obj[start:end] = source
+
+    Replaces elements in range [start, end) with elements from source.
+    Returns a new collection (value semantics).
+    """
+    target: Expr           # The collection being sliced
+    start: Optional[Expr]  # None means 0
+    end: Optional[Expr]    # None means len
+    value: Expr            # Source collection
+    op: AssignOp           # Should be ASSIGN or MOVE_ASSIGN
 
 
 @dataclass

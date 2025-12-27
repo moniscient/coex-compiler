@@ -310,6 +310,16 @@ class CodeGenerator:
         list_set_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i8_ptr, i64])
         self.list_set = ir.Function(self.module, list_set_ty, name="coex_list_set")
 
+        # list_getrange(list: List*, start: i64, end: i64) -> List*
+        # Returns a NEW list with elements [start, end)
+        list_getrange_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i64])
+        self.list_getrange = ir.Function(self.module, list_getrange_ty, name="coex_list_getrange")
+
+        # list_setrange(list: List*, start: i64, end: i64, source: List*) -> List*
+        # Returns a NEW list with elements [start, end) replaced by elements from source
+        list_setrange_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i64, list_ptr])
+        self.list_setrange = ir.Function(self.module, list_setrange_ty, name="coex_list_setrange")
+
         # NOTE: list_to_array is declared after Array type exists (in _create_conversion_helpers)
 
         # Now implement these functions inline
@@ -320,6 +330,8 @@ class CodeGenerator:
         self._implement_list_len()
         self._implement_list_size()
         self._implement_list_copy()
+        self._implement_list_getrange()
+        self._implement_list_setrange()
         self._register_list_methods()
     
     def _implement_list_new(self):
@@ -1389,6 +1401,197 @@ class CodeGenerator:
         # No refcount increment needed - GC handles shared tree nodes
         builder.ret(dst)
 
+    def _implement_list_getrange(self):
+        """Implement list_getrange: return new list with elements [start, end)."""
+        func = self.list_getrange
+        func.args[0].name = "list"
+        func.args[1].name = "start"
+        func.args[2].name = "end"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+        list_ptr_type = self.list_struct.as_pointer()
+
+        src_list = func.args[0]
+        start = func.args[1]
+        end = func.args[2]
+
+        # Get source list length and element size
+        src_len = builder.call(self.list_len, [src_list])
+        elem_size_ptr = builder.gep(src_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        # Clamp start to [0, len]
+        start_neg = builder.icmp_signed("<", start, zero)
+        start_over = builder.icmp_signed(">", start, src_len)
+        start_clamped = builder.select(start_neg, zero, builder.select(start_over, src_len, start))
+
+        # Clamp end to [start, len]
+        end_under = builder.icmp_signed("<", end, start_clamped)
+        end_over = builder.icmp_signed(">", end, src_len)
+        end_clamped = builder.select(end_under, start_clamped, builder.select(end_over, src_len, end))
+
+        # Calculate result length
+        result_len = builder.sub(end_clamped, start_clamped)
+
+        # Create new empty list
+        new_list = builder.call(self.list_new, [elem_size])
+
+        # Loop: copy elements from start to end
+        loop_header = func.append_basic_block("loop_header")
+        loop_body = func.append_basic_block("loop_body")
+        loop_exit = func.append_basic_block("loop_exit")
+
+        i_ptr = builder.alloca(i64, name="i")
+        builder.store(zero, i_ptr)
+        result_ptr = builder.alloca(list_ptr_type, name="result")
+        builder.store(new_list, result_ptr)
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_header)
+        i = builder.load(i_ptr)
+        cond = builder.icmp_signed("<", i, result_len)
+        builder.cbranch(cond, loop_body, loop_exit)
+
+        builder.position_at_end(loop_body)
+        src_idx = builder.add(start_clamped, i)
+        elem_ptr = builder.call(self.list_get, [src_list, src_idx])
+        current_result = builder.load(result_ptr)
+        new_result = builder.call(self.list_append, [current_result, elem_ptr, elem_size])
+        builder.store(new_result, result_ptr)
+        next_i = builder.add(i, one)
+        builder.store(next_i, i_ptr)
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_exit)
+        final_result = builder.load(result_ptr)
+        builder.ret(final_result)
+
+    def _implement_list_setrange(self):
+        """Implement list_setrange: return new list with [start, end) replaced by source."""
+        func = self.list_setrange
+        func.args[0].name = "list"
+        func.args[1].name = "start"
+        func.args[2].name = "end"
+        func.args[3].name = "source"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+        list_ptr_type = self.list_struct.as_pointer()
+
+        orig_list = func.args[0]
+        start = func.args[1]
+        end = func.args[2]
+        source = func.args[3]
+
+        # Get lengths and element size
+        orig_len = builder.call(self.list_len, [orig_list])
+        source_len = builder.call(self.list_len, [source])
+        elem_size_ptr = builder.gep(orig_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        # Clamp bounds
+        start_neg = builder.icmp_signed("<", start, zero)
+        start_over = builder.icmp_signed(">", start, orig_len)
+        start_clamped = builder.select(start_neg, zero, builder.select(start_over, orig_len, start))
+
+        end_under = builder.icmp_signed("<", end, start_clamped)
+        end_over = builder.icmp_signed(">", end, orig_len)
+        end_clamped = builder.select(end_under, start_clamped, builder.select(end_over, orig_len, end))
+
+        # Calculate how many elements to copy from source: min(end-start, source.len())
+        range_len = builder.sub(end_clamped, start_clamped)
+        copy_len = builder.select(
+            builder.icmp_signed("<", source_len, range_len),
+            source_len,
+            range_len
+        )
+
+        # Create result list
+        result = builder.call(self.list_new, [elem_size])
+        result_ptr = builder.alloca(list_ptr_type, name="result")
+        builder.store(result, result_ptr)
+
+        # Phase 1: Copy elements [0, start) from original
+        phase1_header = func.append_basic_block("phase1_header")
+        phase1_body = func.append_basic_block("phase1_body")
+        phase1_exit = func.append_basic_block("phase1_exit")
+
+        i_ptr = builder.alloca(i64, name="i")
+        builder.store(zero, i_ptr)
+        builder.branch(phase1_header)
+
+        builder.position_at_end(phase1_header)
+        i = builder.load(i_ptr)
+        cond = builder.icmp_signed("<", i, start_clamped)
+        builder.cbranch(cond, phase1_body, phase1_exit)
+
+        builder.position_at_end(phase1_body)
+        elem_ptr = builder.call(self.list_get, [orig_list, i])
+        current = builder.load(result_ptr)
+        updated = builder.call(self.list_append, [current, elem_ptr, elem_size])
+        builder.store(updated, result_ptr)
+        builder.store(builder.add(i, one), i_ptr)
+        builder.branch(phase1_header)
+
+        # Phase 2: Copy elements [0, copy_len) from source
+        builder.position_at_end(phase1_exit)
+        phase2_header = func.append_basic_block("phase2_header")
+        phase2_body = func.append_basic_block("phase2_body")
+        phase2_exit = func.append_basic_block("phase2_exit")
+
+        builder.store(zero, i_ptr)
+        builder.branch(phase2_header)
+
+        builder.position_at_end(phase2_header)
+        i = builder.load(i_ptr)
+        cond = builder.icmp_signed("<", i, copy_len)
+        builder.cbranch(cond, phase2_body, phase2_exit)
+
+        builder.position_at_end(phase2_body)
+        elem_ptr = builder.call(self.list_get, [source, i])
+        current = builder.load(result_ptr)
+        updated = builder.call(self.list_append, [current, elem_ptr, elem_size])
+        builder.store(updated, result_ptr)
+        builder.store(builder.add(i, one), i_ptr)
+        builder.branch(phase2_header)
+
+        # Phase 3: Copy elements [end, orig_len) from original
+        builder.position_at_end(phase2_exit)
+        phase3_header = func.append_basic_block("phase3_header")
+        phase3_body = func.append_basic_block("phase3_body")
+        phase3_exit = func.append_basic_block("phase3_exit")
+
+        builder.store(end_clamped, i_ptr)
+        builder.branch(phase3_header)
+
+        builder.position_at_end(phase3_header)
+        i = builder.load(i_ptr)
+        cond = builder.icmp_signed("<", i, orig_len)
+        builder.cbranch(cond, phase3_body, phase3_exit)
+
+        builder.position_at_end(phase3_body)
+        elem_ptr = builder.call(self.list_get, [orig_list, i])
+        current = builder.load(result_ptr)
+        updated = builder.call(self.list_append, [current, elem_ptr, elem_size])
+        builder.store(updated, result_ptr)
+        builder.store(builder.add(i, one), i_ptr)
+        builder.branch(phase3_header)
+
+        builder.position_at_end(phase3_exit)
+        final_result = builder.load(result_ptr)
+        builder.ret(final_result)
+
     def _register_list_methods(self):
         """Register List as a type with methods."""
         self.type_registry["List"] = self.list_struct
@@ -1399,8 +1602,10 @@ class CodeGenerator:
             # "append" handled specially in _generate_method_call (needs alloca for element)
             "len": "coex_list_len",
             "size": "coex_list_size",
+            "getrange": "coex_list_getrange",
+            "setrange": "coex_list_setrange",
         }
-        
+
         self.functions["coex_list_new"] = self.list_new
         self.functions["coex_list_get"] = self.list_get
         self.functions["coex_list_append"] = self.list_append
@@ -1408,6 +1613,8 @@ class CodeGenerator:
         self.functions["coex_list_len"] = self.list_len
         self.functions["coex_list_size"] = self.list_size
         self.functions["coex_list_copy"] = self.list_copy
+        self.functions["coex_list_getrange"] = self.list_getrange
+        self.functions["coex_list_setrange"] = self.list_setrange
 
     def _create_array_helpers(self):
         """Create helper functions for Array operations.
@@ -2032,7 +2239,15 @@ class CodeGenerator:
         # string_slice(s: String*, start: i64, end: i64) -> String*
         string_slice_ty = ir.FunctionType(string_ptr, [string_ptr, i64, i64])
         self.string_slice = ir.Function(self.module, string_slice_ty, name="coex_string_slice")
-        
+
+        # string_getrange is an alias for string_slice (for consistency with slice syntax)
+        self.string_getrange = self.string_slice
+
+        # string_setrange(s: String*, start: i64, end: i64, source: String*) -> String*
+        # Returns a new string with bytes [start, end) replaced by source
+        string_setrange_ty = ir.FunctionType(string_ptr, [string_ptr, i64, i64, string_ptr])
+        self.string_setrange = ir.Function(self.module, string_setrange_ty, name="coex_string_setrange")
+
         # string_concat(a: String*, b: String*) -> String*
         string_concat_ty = ir.FunctionType(string_ptr, [string_ptr, string_ptr])
         self.string_concat = ir.Function(self.module, string_concat_ty, name="coex_string_concat")
@@ -2084,6 +2299,7 @@ class CodeGenerator:
         self._implement_string_print()
         self._implement_string_copy()
         self._implement_string_hash()
+        self._implement_string_setrange()
 
         # Register String type methods
         self._register_string_methods()
@@ -2793,6 +3009,118 @@ class CodeGenerator:
         final_hash = builder.load(hash_ptr)
         builder.ret(final_hash)
 
+    def _implement_string_setrange(self):
+        """Implement string_setrange: return new string with [start, end) replaced by source.
+
+        Creates a new string: prefix[0:start] + source + suffix[end:size]
+        Layout: { i8* data, i64 len, i64 size }
+        """
+        func = self.string_setrange
+        func.args[0].name = "s"
+        func.args[1].name = "start"
+        func.args[2].name = "end"
+        func.args[3].name = "source"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+
+        s = func.args[0]
+        start = func.args[1]
+        end = func.args[2]
+        source = func.args[3]
+
+        # Get source string byte size and data
+        source_size_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        source_size = builder.load(source_size_ptr)
+        source_data_ptr_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        source_data = builder.load(source_data_ptr_ptr)
+
+        # Get original string byte size and data
+        orig_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        orig_size = builder.load(orig_size_ptr)
+        orig_data_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        orig_data = builder.load(orig_data_ptr_ptr)
+
+        # Clamp bounds
+        start_neg = builder.icmp_signed("<", start, zero)
+        start_over = builder.icmp_signed(">", start, orig_size)
+        start_clamped = builder.select(start_neg, zero, builder.select(start_over, orig_size, start))
+
+        end_under = builder.icmp_signed("<", end, start_clamped)
+        end_over = builder.icmp_signed(">", end, orig_size)
+        end_clamped = builder.select(end_under, start_clamped, builder.select(end_over, orig_size, end))
+
+        # Calculate new byte size: start + source_size + (orig_size - end)
+        suffix_len = builder.sub(orig_size, end_clamped)
+        new_size = builder.add(start_clamped, source_size)
+        new_size = builder.add(new_size, suffix_len)
+
+        # Allocate new data buffer
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        new_data = builder.call(self.gc.gc_alloc, [new_size, type_id])
+
+        # Copy prefix: [0, start)
+        builder.call(self.memcpy, [new_data, orig_data, start_clamped])
+
+        # Copy source
+        dest_after_prefix = builder.gep(new_data, [start_clamped])
+        builder.call(self.memcpy, [dest_after_prefix, source_data, source_size])
+
+        # Copy suffix: [end, orig_size)
+        dest_after_source = builder.gep(new_data, [builder.add(start_clamped, source_size)])
+        source_suffix = builder.gep(orig_data, [end_clamped])
+        builder.call(self.memcpy, [dest_after_source, source_suffix, suffix_len])
+
+        # Count codepoints in the new string (scan for non-continuation bytes)
+        count_loop = func.append_basic_block("count_loop")
+        count_body = func.append_basic_block("count_body")
+        inc_char = func.append_basic_block("inc_char")
+        after_inc = func.append_basic_block("after_inc")
+        count_done = func.append_basic_block("count_done")
+
+        idx_ptr = builder.alloca(i64, name="idx")
+        char_count_ptr = builder.alloca(i64, name="char_count")
+        builder.store(zero, idx_ptr)
+        builder.store(zero, char_count_ptr)
+        builder.branch(count_loop)
+
+        builder.position_at_end(count_loop)
+        idx = builder.load(idx_ptr)
+        done_counting = builder.icmp_signed(">=", idx, new_size)
+        builder.cbranch(done_counting, count_done, count_body)
+
+        builder.position_at_end(count_body)
+        byte_ptr = builder.gep(new_data, [idx])
+        byte_val = builder.load(byte_ptr)
+        # Check if this byte starts a codepoint: (byte & 0xC0) != 0x80
+        masked = builder.and_(byte_val, ir.Constant(ir.IntType(8), 0xC0))
+        is_continuation = builder.icmp_unsigned("==", masked, ir.Constant(ir.IntType(8), 0x80))
+        builder.cbranch(is_continuation, after_inc, inc_char)
+
+        builder.position_at_end(inc_char)
+        curr_count = builder.load(char_count_ptr)
+        new_count = builder.add(curr_count, one)
+        builder.store(new_count, char_count_ptr)
+        builder.branch(after_inc)
+
+        builder.position_at_end(after_inc)
+        new_idx = builder.add(idx, one)
+        builder.store(new_idx, idx_ptr)
+        builder.branch(count_loop)
+
+        builder.position_at_end(count_done)
+        final_char_count = builder.load(char_count_ptr)
+
+        # Create new string
+        result = builder.call(self.string_new, [new_data, new_size, final_char_count])
+        builder.ret(result)
+
     # ============================================================
     # Deep Copy Support for Value Semantics
     # ============================================================
@@ -3358,6 +3686,8 @@ class CodeGenerator:
             "contains": "coex_string_contains",
             "print": "coex_string_print",
             "data": "coex_string_data",
+            "getrange": "coex_string_slice",  # Alias for slice syntax
+            "setrange": "coex_string_setrange",
         }
 
         # Also store function references for direct access
@@ -3371,6 +3701,7 @@ class CodeGenerator:
         self.functions["coex_string_print"] = self.string_print
         self.functions["coex_string_data"] = self.string_data
         self.functions["coex_string_copy"] = self.string_copy
+        self.functions["coex_string_setrange"] = self.string_setrange
 
     def _create_map_type(self):
         """Create the Map type and helper functions using HAMT (Hash Array Mapped Trie).
@@ -9127,6 +9458,8 @@ class CodeGenerator:
             self._generate_tuple_destructure(stmt)
         elif isinstance(stmt, Assignment):
             self._generate_assignment(stmt)
+        elif isinstance(stmt, SliceAssignment):
+            self._generate_slice_assignment(stmt)
         elif isinstance(stmt, ReturnStmt):
             self._generate_return(stmt)
         elif isinstance(stmt, PrintStmt):
@@ -9766,7 +10099,70 @@ class CodeGenerator:
                             alloca = self.builder.alloca(elem_type, name=var_name)
                             self.builder.store(elem_val, alloca)
                             self.locals[var_name] = alloca
-    
+
+    def _generate_slice_assignment(self, stmt: SliceAssignment):
+        """Generate code for slice assignment: obj[start:end] = source
+
+        Calls .setrange(start, end, source) on the object.
+        Returns a new collection (value semantics).
+        """
+        obj = self._generate_expression(stmt.target)
+        source = self._generate_expression(stmt.value)
+        i64 = ir.IntType(64)
+
+        # Get collection length for bounds normalization
+        length = self._get_collection_length(obj)
+
+        # Normalize start
+        if stmt.start is None:
+            start = ir.Constant(i64, 0)
+        else:
+            start = self._generate_expression(stmt.start)
+            start = self._cast_value(start, i64)
+            start = self._normalize_slice_index(start, length)
+
+        # Normalize end
+        if stmt.end is None:
+            end = length
+        else:
+            end = self._generate_expression(stmt.end)
+            end = self._cast_value(end, i64)
+            end = self._normalize_slice_index(end, length)
+
+        # Call setrange method
+        type_name = self._get_type_name_from_ptr(obj.type)
+        new_collection = None
+
+        if type_name and type_name in self.type_methods:
+            method_map = self.type_methods[type_name]
+            if "setrange" in method_map:
+                mangled = method_map["setrange"]
+                func = self.functions[mangled]
+                new_collection = self.builder.call(func, [obj, start, end, source])
+
+        # Fallback: check for direct list_setrange
+        if new_collection is None:
+            if isinstance(obj.type, ir.PointerType):
+                pointee = obj.type.pointee
+                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                    new_collection = self.builder.call(self.list_setrange, [obj, start, end, source])
+                elif hasattr(pointee, 'name') and pointee.name == "struct.String":
+                    new_collection = self.builder.call(self.string_setrange, [obj, start, end, source])
+
+        if new_collection is None:
+            raise RuntimeError(f"Type '{type_name}' does not support slice assignment (no setrange method)")
+
+        # Store back to the variable (value semantics)
+        if isinstance(stmt.target, Identifier):
+            var_name = stmt.target.name
+            if var_name in self.locals:
+                self.builder.store(new_collection, self.locals[var_name])
+
+                # Update GC root if this is a tracked heap variable
+                if var_name in self.gc_root_indices and self.gc is not None:
+                    root_idx = self.gc_root_indices[var_name]
+                    self.gc.set_root(self.builder, self.gc_roots, root_idx, new_collection)
+
     def _get_lvalue(self, expr: Expr) -> Optional[ir.Value]:
         """Get pointer to an lvalue expression"""
         if isinstance(expr, Identifier):
@@ -10319,6 +10715,12 @@ class CodeGenerator:
             self._collect_expr_reads(expr.object, read)
             for idx in expr.indices:
                 self._collect_expr_reads(idx, read)
+        elif isinstance(expr, SliceExpr):
+            self._collect_expr_reads(expr.object, read)
+            if expr.start:
+                self._collect_expr_reads(expr.start, read)
+            if expr.end:
+                self._collect_expr_reads(expr.end, read)
         elif isinstance(expr, ListExpr):
             for elem in expr.elements:
                 self._collect_expr_reads(elem, read)
@@ -11353,7 +11755,10 @@ class CodeGenerator:
         
         elif isinstance(expr, IndexExpr):
             return self._generate_index(expr)
-        
+
+        elif isinstance(expr, SliceExpr):
+            return self._generate_slice(expr)
+
         elif isinstance(expr, TernaryExpr):
             return self._generate_ternary(expr)
         
@@ -12704,7 +13109,90 @@ class CodeGenerator:
             return self.builder.load(ptr)
         
         return ir.Constant(ir.IntType(64), 0)
-    
+
+    def _generate_slice(self, expr: SliceExpr) -> ir.Value:
+        """Generate code for slice read: obj[start:end]
+
+        Calls .getrange(start, end) on the object.
+        Handles negative indices and omitted bounds.
+        """
+        obj = self._generate_expression(expr.object)
+        i64 = ir.IntType(64)
+
+        # Get collection length for bounds normalization
+        length = self._get_collection_length(obj)
+
+        # Normalize start
+        if expr.start is None:
+            start = ir.Constant(i64, 0)
+        else:
+            start = self._generate_expression(expr.start)
+            start = self._cast_value(start, i64)
+            start = self._normalize_slice_index(start, length)
+
+        # Normalize end
+        if expr.end is None:
+            end = length
+        else:
+            end = self._generate_expression(expr.end)
+            end = self._cast_value(end, i64)
+            end = self._normalize_slice_index(end, length)
+
+        # Call getrange method
+        type_name = self._get_type_name_from_ptr(obj.type)
+        if type_name and type_name in self.type_methods:
+            method_map = self.type_methods[type_name]
+            if "getrange" in method_map:
+                mangled = method_map["getrange"]
+                func = self.functions[mangled]
+                return self.builder.call(func, [obj, start, end])
+
+        # Fallback: check for direct list_getrange
+        if isinstance(obj.type, ir.PointerType):
+            pointee = obj.type.pointee
+            if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                return self.builder.call(self.list_getrange, [obj, start, end])
+            elif hasattr(pointee, 'name') and pointee.name == "struct.String":
+                return self.builder.call(self.string_getrange, [obj, start, end])
+
+        raise RuntimeError(f"Type '{type_name}' does not support slice access (no getrange method)")
+
+    def _normalize_slice_index(self, index: ir.Value, length: ir.Value) -> ir.Value:
+        """Normalize a slice index, handling negative values.
+
+        If index < 0, returns length + index (i.e., -1 becomes length-1).
+        """
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+
+        is_negative = self.builder.icmp_signed("<", index, zero)
+        normalized = self.builder.add(length, index)
+
+        return self.builder.select(is_negative, normalized, index)
+
+    def _get_collection_length(self, obj: ir.Value) -> ir.Value:
+        """Get the length of a collection for slice bounds normalization."""
+        type_name = self._get_type_name_from_ptr(obj.type)
+
+        if isinstance(obj.type, ir.PointerType):
+            pointee = obj.type.pointee
+            if hasattr(pointee, 'name'):
+                if pointee.name == "struct.List":
+                    return self.builder.call(self.list_len, [obj])
+                elif pointee.name == "struct.String":
+                    return self.builder.call(self.string_len, [obj])
+                elif pointee.name == "struct.Array":
+                    return self.builder.call(self.array_len, [obj])
+
+        # Try type_methods lookup
+        if type_name and type_name in self.type_methods:
+            if "len" in self.type_methods[type_name]:
+                mangled = self.type_methods[type_name]["len"]
+                func = self.functions[mangled]
+                return self.builder.call(func, [obj])
+
+        return ir.Constant(ir.IntType(64), 0)
+
     def _generate_ternary(self, expr: TernaryExpr) -> ir.Value:
         """Generate code for ternary expression"""
         func = self.builder.function
