@@ -53,8 +53,8 @@ def compile_coex(compiler_root):
                 f.write(source)
             
             coexc = os.path.join(compiler_root, "coexc.py")
-            cmd = [sys.executable, coexc, source_path]
-            
+            cmd = [sys.executable, coexc, source_path, "--no-commentary"]
+
             if emit_ir:
                 cmd.append("--emit-ir")
             else:
@@ -154,7 +154,7 @@ class CompiledBinary:
 
         coexc = os.path.join(self.compiler_root, "coexc.py")
         result = subprocess.run(
-            [sys.executable, coexc, source_path, "-o", self.binary_path],
+            [sys.executable, coexc, source_path, "--no-commentary", "-o", self.binary_path],
             capture_output=True,
             text=True,
             cwd=self.compiler_root
