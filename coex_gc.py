@@ -802,7 +802,9 @@ class GarbageCollector:
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
         self.type_info[self.TYPE_LIST] = {'size': 32, 'ref_offsets': [24]}
         self.type_descriptors['List'] = self.TYPE_LIST
-        self.type_info[self.TYPE_STRING] = {'size': 8, 'ref_offsets': []}
+        # String: { i8* owner, i64 offset, i64 len, i64 size } = 32 bytes
+        # For slice views, owner points to the shared data buffer (traced via mark_string)
+        self.type_info[self.TYPE_STRING] = {'size': 32, 'ref_offsets': [0]}
         self.type_descriptors['String'] = self.TYPE_STRING
         # Map/Set now use HAMT (24 bytes: root pointer + len + flags)
         # HAMT nodes are gc_alloc'd; we mark them via gc_mark_hamt
@@ -816,7 +818,9 @@ class GarbageCollector:
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
         self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': [32]}
         self.type_descriptors['Channel'] = self.TYPE_CHANNEL
-        self.type_info[self.TYPE_ARRAY] = {'size': 32, 'ref_offsets': [24]}
+        # Array: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size } = 40 bytes
+        # For slice views, owner points to the shared data buffer (traced via mark_array)
+        self.type_info[self.TYPE_ARRAY] = {'size': 40, 'ref_offsets': [0]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
 
     def register_type(self, type_name: str, size: int, ref_offsets: PyList[int]) -> int:
@@ -1617,14 +1621,15 @@ class GarbageCollector:
         builder.call(func, [tail_ptr])  # Recursive call
         builder.branch(done)
 
-        # Mark Array: data pointer at field 0
-        # Array struct: { i8* data (0), i64 len (1), i64 cap (2), i64 elem_size (3) }
+        # Mark Array: owner pointer at field 0
+        # Array struct: { i8* owner (0), i64 offset (1), i64 len (2), i64 cap (3), i64 elem_size (4) }
+        # For slice views, owner points to the shared data buffer
         builder.position_at_end(mark_array)
-        array_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64]).as_pointer()
+        array_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64, self.i64]).as_pointer()
         array_typed = builder.bitcast(ptr, array_ptr_type)
-        data_ptr_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
-        builder.call(func, [data_ptr])  # Recursive call
+        owner_ptr_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
         builder.branch(done)
 
         # Mark Set: HAMT-based, root at offset 0
@@ -1644,14 +1649,15 @@ class GarbageCollector:
         builder.call(self.gc_mark_hamt, [set_root_ptr, set_flags])
         builder.branch(done)
 
-        # Mark String: data pointer at field 0
-        # String struct: { i8* data (0), i64 len (1), i64 size (2) }
+        # Mark String: owner pointer at field 0
+        # String struct: { i8* owner (0), i64 offset (1), i64 len (2), i64 size (3) }
+        # For slice views, owner points to the shared data buffer
         builder.position_at_end(mark_string)
-        string_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64]).as_pointer()
+        string_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64]).as_pointer()
         string_typed = builder.bitcast(ptr, string_ptr_type)
-        string_data_ptr_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        string_data_ptr = builder.load(string_data_ptr_ptr)
-        builder.call(func, [string_data_ptr])  # Recursive call
+        owner_ptr_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
         builder.branch(done)
 
         # Mark Channel: buffer pointer at offset 32 (4th i64 field)

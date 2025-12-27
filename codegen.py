@@ -1657,6 +1657,10 @@ class CodeGenerator:
         array_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
         self.array_copy = ir.Function(self.module, array_copy_ty, name="coex_array_copy")
 
+        # array_deep_copy(arr: Array*) -> Array* (creates independent copy with new buffer)
+        array_deep_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
+        self.array_deep_copy = ir.Function(self.module, array_deep_copy_ty, name="coex_array_deep_copy")
+
         # Implement all functions
         self._implement_array_new()
         self._implement_array_get()
@@ -1665,6 +1669,7 @@ class CodeGenerator:
         self._implement_array_len()
         self._implement_array_size()
         self._implement_array_copy()
+        self._implement_array_deep_copy()
         self._register_array_methods()
 
     def _implement_array_new(self):
@@ -1930,6 +1935,82 @@ class CodeGenerator:
 
         # Just return the same pointer - GC handles memory management
         builder.ret(src)
+
+    def _implement_array_deep_copy(self):
+        """Create an independent copy of an array with its own data buffer.
+
+        This is used by the = operator to ensure slice views become independent copies.
+        Layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+
+        1. Allocate new Array descriptor (40 bytes)
+        2. Compute source data size: len * elem_size
+        3. Allocate new data buffer
+        4. Copy bytes from (source.owner + source.offset) to new buffer
+        5. Set new descriptor: owner=new_buffer, offset=0, len=source.len, cap=source.len, elem_size=source.elem_size
+        """
+        func = self.array_deep_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Load source fields
+        src_owner_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner = builder.load(src_owner_ptr)
+
+        src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_offset = builder.load(src_offset_ptr)
+
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        src_elem_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        src_elem_size = builder.load(src_elem_size_ptr)
+
+        # Compute source data pointer: owner + offset
+        src_data = builder.gep(src_owner, [src_offset])
+
+        # Compute data size: len * elem_size
+        data_size = builder.mul(src_len, src_elem_size)
+
+        # Allocate new data buffer
+        type_id = ir.Constant(i32, self.gc.TYPE_ARRAY_DATA)
+        new_data = builder.call(self.gc.gc_alloc, [data_size, type_id])
+
+        # Copy data from source to new buffer
+        builder.call(self.memcpy, [new_data, src_data, data_size])
+
+        # Allocate new Array descriptor (40 bytes)
+        struct_size = ir.Constant(i64, 40)
+        array_type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, array_type_id])
+        array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
+
+        # Store owner = new_data (independent buffer)
+        new_owner_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_data, new_owner_ptr)
+
+        # Store offset = 0 (fresh allocation, not a view)
+        new_offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), new_offset_ptr)
+
+        # Store len = source.len
+        new_len_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_len, new_len_ptr)
+
+        # Store cap = source.len (copy has no extra capacity)
+        new_cap_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(src_len, new_cap_ptr)
+
+        # Store elem_size = source.elem_size
+        new_elem_size_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        builder.store(src_elem_size, new_elem_size_ptr)
+
+        builder.ret(array_ptr)
 
     def _register_array_methods(self):
         """Register Array as a type with methods."""
@@ -2309,6 +2390,10 @@ class CodeGenerator:
         string_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
         self.string_copy = ir.Function(self.module, string_copy_ty, name="coex_string_copy")
 
+        # string_deep_copy(s: String*) -> String* (creates independent copy with new buffer)
+        string_deep_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
+        self.string_deep_copy = ir.Function(self.module, string_deep_copy_ty, name="coex_string_deep_copy")
+
         # string_byte_size(s: String*) -> i64 (return byte size, internal use)
         string_byte_size_ty = ir.FunctionType(i64, [string_ptr])
         self.string_byte_size = ir.Function(self.module, string_byte_size_ty, name="coex_string_byte_size")
@@ -2331,6 +2416,7 @@ class CodeGenerator:
         self._implement_string_contains()
         self._implement_string_print()
         self._implement_string_copy()
+        self._implement_string_deep_copy()
         self._implement_string_hash()
         self._implement_string_setrange()
 
@@ -3041,6 +3127,75 @@ class CodeGenerator:
         # Simply return the same pointer - GC handles memory
         builder.ret(func.args[0])
 
+    def _implement_string_deep_copy(self):
+        """Create an independent copy of a string with its own data buffer.
+
+        This is used by the = operator to ensure slice views become independent copies.
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+
+        1. Allocate new String descriptor (32 bytes)
+        2. Allocate new data buffer (source.size bytes)
+        3. Copy bytes from (source.owner + source.offset) to new buffer
+        4. Set new descriptor: owner=new_buffer, offset=0, len=source.len, size=source.size
+        """
+        func = self.string_deep_copy
+        func.args[0].name = "src"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        src = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Load source fields
+        src_owner_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner = builder.load(src_owner_ptr)
+
+        src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        src_offset = builder.load(src_offset_ptr)
+
+        src_len_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        src_len = builder.load(src_len_ptr)
+
+        src_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_size = builder.load(src_size_ptr)
+
+        # Compute source data pointer: owner + offset
+        src_data = builder.gep(src_owner, [src_offset])
+
+        # Allocate new data buffer (src_size bytes)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        new_data = builder.call(self.gc.gc_alloc, [src_size, type_id])
+
+        # Copy data from source to new buffer
+        builder.call(self.memcpy, [new_data, src_data, src_size])
+
+        # Allocate new String descriptor (32 bytes)
+        struct_size = ir.Constant(i64, 32)
+        string_type_id = ir.Constant(i32, self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, string_type_id])
+        string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
+
+        # Store owner = new_data (independent buffer)
+        new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(new_data, new_owner_ptr)
+
+        # Store offset = 0 (fresh allocation, not a view)
+        new_offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), new_offset_ptr)
+
+        # Store len = source.len
+        new_len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(src_len, new_len_ptr)
+
+        # Store size = source.size
+        new_size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(src_size, new_size_ptr)
+
+        builder.ret(string_ptr)
+
     def _implement_string_hash(self):
         """Compute hash of string content using FNV-1a algorithm.
 
@@ -3390,14 +3545,18 @@ class CodeGenerator:
         return value
 
     def _generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Generate code to deep-copy a value based on its Coex type."""
+        """Generate code to deep-copy a value based on its Coex type.
+
+        This is called for the = operator to create independent copies.
+        For slice views, this creates a new buffer instead of sharing.
+        """
         # Primitives have value semantics already
         if self._is_primitive_coex_type(coex_type):
             return value
 
-        # String: shallow copy is sufficient (strings are immutable)
+        # String: deep copy to create independent buffer (for slice views)
         if isinstance(coex_type, NamedType) and coex_type.name == "string":
-            return self.builder.call(self.string_copy, [value])
+            return self.builder.call(self.string_deep_copy, [value])
 
         # List<T>: deep copy if T is a collection, shallow otherwise
         if isinstance(coex_type, ListType):
@@ -3417,12 +3576,12 @@ class CodeGenerator:
         if isinstance(coex_type, MapType):
             return value
 
-        # Array<T>: deep copy if T is a collection, shallow otherwise
+        # Array<T>: deep copy to create independent buffer (for slice views)
         if isinstance(coex_type, ArrayType):
             if self._needs_deep_copy(coex_type):
                 return self._generate_array_deep_copy(value, coex_type.element_type)
             else:
-                return self.builder.call(self.array_copy, [value])
+                return self.builder.call(self.array_deep_copy, [value])
 
         # User-defined types: copy struct, recursively deep-copy collection fields
         # Exclude enums - they have different structure and don't need deep copy

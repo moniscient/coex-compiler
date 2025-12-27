@@ -216,12 +216,10 @@ func main() -> int
 class TestSliceViewVsCopy:
     """Test the semantic difference between := (view) and = (copy).
 
-    IMPORTANT: These tests verify that = creates truly independent copies
-    while := preserves views. Currently both operators behave identically,
-    so these tests document the expected future behavior.
+    These tests verify that = creates truly independent copies
+    while := preserves views.
     """
 
-    @pytest.mark.xfail(reason="Slice views not yet implemented - := and = currently identical")
     def test_string_copy_is_independent(self, expect_output):
         """With =, modifying the copy doesn't affect original slice source.
 
@@ -241,13 +239,11 @@ func main() -> int
 ~
 ''', "Hello\nWorld\n")
 
-    @pytest.mark.xfail(reason="Slice views not yet implemented - need memory introspection")
     def test_view_shares_buffer_with_parent(self, expect_output):
         """With :=, the slice shares memory with the parent.
 
-        This test would ideally verify buffer sharing, but since strings
-        are immutable, we can only verify the behavior is correct.
-        The real test is in stress tests where memory usage differs.
+        Since strings are immutable, we verify correct behavior.
+        The implementation uses zero-copy views internally.
         """
         expect_output('''
 func main() -> int
@@ -263,16 +259,12 @@ func main() -> int
 class TestSliceViewPerformance:
     """Tests that verify slice views are zero-copy.
 
-    These tests would be extremely slow or fail with copy-based slicing
-    but should be fast with proper view-based slicing.
+    These tests are fast with view-based slicing because views share
+    the parent's data buffer instead of copying.
     """
 
-    @pytest.mark.xfail(reason="Slice views not yet implemented - this would be O(n^2) with copies")
     def test_many_slices_of_large_string_fast(self, expect_output):
         """Creating many slices of a large string should be O(n), not O(n^2).
-
-        With copy-based slicing, this creates 1000 copies of a 10000-char string,
-        resulting in 10M bytes allocated and O(n^2) time.
 
         With view-based slicing, this creates 1000 tiny descriptors sharing
         one 10000-byte buffer, resulting in O(n) time.
@@ -300,13 +292,12 @@ func main() -> int
 ~
 ''', "done\n")
 
-    @pytest.mark.xfail(reason="Slice views not yet implemented - this would be O(n^2) with copies")
     def test_sliding_window_slices_fast(self, expect_output):
         """Sliding window over large string should be O(n) with views.
 
         This pattern is common in text processing - scanning through a
-        large string taking small slices. With copies, each slice copies
-        data. With views, each slice just creates a descriptor.
+        large string taking small slices. With views, each slice just
+        creates a descriptor pointing into the original buffer.
         """
         expect_output('''
 func make_large_string(n: int) -> string
