@@ -9720,10 +9720,19 @@ class CodeGenerator:
                     elem_type = tuple_val.type.elements[i]
                     # Extract the element
                     elem_val = self.builder.extract_value(tuple_val, i)
-                    # Create a local variable
-                    alloca = self.builder.alloca(elem_type, name=name)
-                    self.builder.store(elem_val, alloca)
-                    self.locals[name] = alloca
+
+                    # Reuse existing alloca if variable already exists (avoids stack leak in loops)
+                    if name in self.locals:
+                        alloca = self.locals[name]
+                        # Cast value if needed (e.g., if alloca type differs)
+                        if alloca.type.pointee != elem_type:
+                            elem_val = self._cast_value(elem_val, alloca.type.pointee)
+                        self.builder.store(elem_val, alloca)
+                    else:
+                        # First time seeing this variable - allocate
+                        alloca = self.builder.alloca(elem_type, name=name)
+                        self.builder.store(elem_val, alloca)
+                        self.locals[name] = alloca
 
                     # Register as GC root if this is a heap type
                     if name in self.gc_root_indices and self.gc is not None:
@@ -9732,9 +9741,13 @@ class CodeGenerator:
         else:
             # Not a tuple - error case, but for robustness create dummy vars
             for name in stmt.names:
-                alloca = self.builder.alloca(ir.IntType(64), name=name)
-                self.builder.store(ir.Constant(ir.IntType(64), 0), alloca)
-                self.locals[name] = alloca
+                if name in self.locals:
+                    alloca = self.locals[name]
+                    self.builder.store(ir.Constant(ir.IntType(64), 0), alloca)
+                else:
+                    alloca = self.builder.alloca(ir.IntType(64), name=name)
+                    self.builder.store(ir.Constant(ir.IntType(64), 0), alloca)
+                    self.locals[name] = alloca
     
     def _cast_value(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
         """Cast value to target type if needed"""
@@ -14644,7 +14657,11 @@ class CodeGenerator:
                     var_names.add(case.var_name)
                     for s in case.body:
                         collect_from_stmt(s)
-        
+            elif isinstance(stmt, TupleDestructureStmt):
+                # Collect all variable names from tuple destructuring
+                for name in stmt.names:
+                    var_names.add(name)
+
         for stmt in stmts:
             collect_from_stmt(stmt)
         
