@@ -955,7 +955,7 @@ class ASTBuilder:
                 member = ctx.INTEGER_LITERAL().getText()
                 return MemberExpr(base, member)
             
-            member = ctx.IDENTIFIER().getText()
+            member = ctx.methodName().getText()
             if ctx.LPAREN() is not None:
                 # Method call: obj.method(args)
                 args = []

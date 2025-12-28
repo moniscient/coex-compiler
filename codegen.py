@@ -164,6 +164,30 @@ class CodeGenerator:
                                       ir.IntType(64)])
         self.memset = ir.Function(self.module, memset_ty, name="memset")
 
+        # strtoll for string to int conversion
+        strtoll_ty = ir.FunctionType(ir.IntType(64),
+                                      [ir.IntType(8).as_pointer(),
+                                       ir.IntType(8).as_pointer().as_pointer(),
+                                       ir.IntType(32)])
+        self.strtoll = ir.Function(self.module, strtoll_ty, name="strtoll")
+
+        # strtod for string to float conversion
+        strtod_ty = ir.FunctionType(ir.DoubleType(),
+                                     [ir.IntType(8).as_pointer(),
+                                      ir.IntType(8).as_pointer().as_pointer()])
+        self.strtod = ir.Function(self.module, strtod_ty, name="strtod")
+
+        # snprintf for int/float to string conversion
+        snprintf_ty = ir.FunctionType(ir.IntType(32),
+                                       [ir.IntType(8).as_pointer(),
+                                        ir.IntType(64),
+                                        ir.IntType(8).as_pointer()],
+                                       var_arg=True)
+        self.snprintf = ir.Function(self.module, snprintf_ty, name="snprintf")
+
+        # strtoll with base for hex parsing
+        # Already declared above as strtoll
+
         # Initialize garbage collector (must be before struct helpers that use gc_alloc)
         self.gc = GarbageCollector(self.module, self)
         self.gc.generate_gc_runtime()
@@ -175,6 +199,13 @@ class CodeGenerator:
         self._true_str = self._create_global_string("true\n", "true_str")
         self._false_str = self._create_global_string("false\n", "false_str")
         self._nil_str = self._create_global_string("nil\n", "nil_str")
+
+        # Format strings for String.from() conversions (no newline)
+        self._int_conv_fmt = self._create_global_string("%lld", "int_conv_fmt")
+        self._float_conv_fmt = self._create_global_string("%g", "float_conv_fmt")
+        self._hex_conv_fmt = self._create_global_string("%llx", "hex_conv_fmt")
+        self._true_conv_str = self._create_global_string("true", "true_conv_str")
+        self._false_conv_str = self._create_global_string("false", "false_conv_str")
         
         # Create Persistent Vector Node structure (for List's tree structure)
         # struct PVNode { void* children[32] }
@@ -2413,6 +2444,38 @@ class CodeGenerator:
         string_hash_ty = ir.FunctionType(i64, [string_ptr])
         self.string_hash = ir.Function(self.module, string_hash_ty, name="coex_string_hash")
 
+        # Optional types for parsing results
+        int_optional = ir.LiteralStructType([ir.IntType(1), i64])
+        float_optional = ir.LiteralStructType([ir.IntType(1), ir.DoubleType()])
+
+        # string_to_int(s: String*) -> int? (parse string as integer, nil on failure)
+        string_to_int_ty = ir.FunctionType(int_optional, [string_ptr])
+        self.string_to_int = ir.Function(self.module, string_to_int_ty, name="coex_string_to_int")
+
+        # string_to_float(s: String*) -> float? (parse string as float, nil on failure)
+        string_to_float_ty = ir.FunctionType(float_optional, [string_ptr])
+        self.string_to_float = ir.Function(self.module, string_to_float_ty, name="coex_string_to_float")
+
+        # string_to_int_hex(s: String*) -> int? (parse hex string as integer, nil on failure)
+        string_to_int_hex_ty = ir.FunctionType(int_optional, [string_ptr])
+        self.string_to_int_hex = ir.Function(self.module, string_to_int_hex_ty, name="coex_string_to_int_hex")
+
+        # string_from_int(n: i64) -> String* (convert int to string)
+        string_from_int_ty = ir.FunctionType(string_ptr, [i64])
+        self.string_from_int = ir.Function(self.module, string_from_int_ty, name="coex_string_from_int")
+
+        # string_from_float(f: double) -> String* (convert float to string)
+        string_from_float_ty = ir.FunctionType(string_ptr, [ir.DoubleType()])
+        self.string_from_float = ir.Function(self.module, string_from_float_ty, name="coex_string_from_float")
+
+        # string_from_bool(b: i1) -> String* (convert bool to string)
+        string_from_bool_ty = ir.FunctionType(string_ptr, [ir.IntType(1)])
+        self.string_from_bool = ir.Function(self.module, string_from_bool_ty, name="coex_string_from_bool")
+
+        # string_from_hex(n: i64) -> String* (convert int to hex string)
+        string_from_hex_ty = ir.FunctionType(string_ptr, [i64])
+        self.string_from_hex = ir.Function(self.module, string_from_hex_ty, name="coex_string_from_hex")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
@@ -2430,6 +2493,13 @@ class CodeGenerator:
         self._implement_string_deep_copy()
         self._implement_string_hash()
         self._implement_string_setrange()
+        self._implement_string_to_int()
+        self._implement_string_to_float()
+        self._implement_string_to_int_hex()
+        self._implement_string_from_int()
+        self._implement_string_from_float()
+        self._implement_string_from_bool()
+        self._implement_string_from_hex()
 
         # Register String type methods
         self._register_string_methods()
@@ -3411,6 +3481,336 @@ class CodeGenerator:
         result = builder.call(self.string_new, [new_data, new_size, final_char_count])
         builder.ret(result)
 
+    def _implement_string_to_int(self):
+        """Parse string as integer using strtoll.
+
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Returns int? - Some(value) on success, nil on failure.
+        """
+        func = self.string_to_int
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        success_block = func.append_basic_block("success")
+        fail_block = func.append_basic_block("fail")
+
+        builder = ir.IRBuilder(entry)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8 = ir.IntType(8)
+        i8_ptr = i8.as_pointer()
+        int_optional = ir.LiteralStructType([i1, i64])
+
+        s = func.args[0]
+
+        # Get string byte size (field 3) - if 0, return nil
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        size = builder.load(size_ptr)
+        is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
+
+        # Get data pointer: owner + offset
+        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner = builder.load(owner_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data = builder.gep(owner, [offset])
+
+        # Allocate endptr on stack
+        endptr_alloca = builder.alloca(i8_ptr, name="endptr")
+
+        # Call strtoll(data, &endptr, 10) for base-10 parsing
+        base_10 = ir.Constant(i32, 10)
+        result = builder.call(self.strtoll, [data, endptr_alloca, base_10])
+
+        # Check if conversion succeeded: endptr != data and *endptr is end of string or whitespace
+        endptr = builder.load(endptr_alloca)
+        no_conversion = builder.icmp_unsigned("==", endptr, data)
+        failed = builder.or_(is_empty, no_conversion)
+        builder.cbranch(failed, fail_block, success_block)
+
+        # Success: return Some(result)
+        builder.position_at_end(success_block)
+        some_result = ir.Constant(int_optional, ir.Undefined)
+        some_result = builder.insert_value(some_result, ir.Constant(i1, 1), 0)
+        some_result = builder.insert_value(some_result, result, 1)
+        builder.ret(some_result)
+
+        # Fail: return nil
+        builder.position_at_end(fail_block)
+        nil_result = ir.Constant(int_optional, ir.Undefined)
+        nil_result = builder.insert_value(nil_result, ir.Constant(i1, 0), 0)
+        nil_result = builder.insert_value(nil_result, ir.Constant(i64, 0), 1)
+        builder.ret(nil_result)
+
+    def _implement_string_to_float(self):
+        """Parse string as float using strtod.
+
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Returns float? - Some(value) on success, nil on failure.
+        """
+        func = self.string_to_float
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        success_block = func.append_basic_block("success")
+        fail_block = func.append_basic_block("fail")
+
+        builder = ir.IRBuilder(entry)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8 = ir.IntType(8)
+        i8_ptr = i8.as_pointer()
+        double = ir.DoubleType()
+        float_optional = ir.LiteralStructType([i1, double])
+
+        s = func.args[0]
+
+        # Get string byte size (field 3) - if 0, return nil
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        size = builder.load(size_ptr)
+        is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
+
+        # Get data pointer: owner + offset
+        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner = builder.load(owner_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data = builder.gep(owner, [offset])
+
+        # Allocate endptr on stack
+        endptr_alloca = builder.alloca(i8_ptr, name="endptr")
+
+        # Call strtod(data, &endptr)
+        result = builder.call(self.strtod, [data, endptr_alloca])
+
+        # Check if conversion succeeded: endptr != data
+        endptr = builder.load(endptr_alloca)
+        no_conversion = builder.icmp_unsigned("==", endptr, data)
+        failed = builder.or_(is_empty, no_conversion)
+        builder.cbranch(failed, fail_block, success_block)
+
+        # Success: return Some(result)
+        builder.position_at_end(success_block)
+        some_result = ir.Constant(float_optional, ir.Undefined)
+        some_result = builder.insert_value(some_result, ir.Constant(i1, 1), 0)
+        some_result = builder.insert_value(some_result, result, 1)
+        builder.ret(some_result)
+
+        # Fail: return nil
+        builder.position_at_end(fail_block)
+        nil_result = ir.Constant(float_optional, ir.Undefined)
+        nil_result = builder.insert_value(nil_result, ir.Constant(i1, 0), 0)
+        nil_result = builder.insert_value(nil_result, ir.Constant(double, 0.0), 1)
+        builder.ret(nil_result)
+
+    def _implement_string_to_int_hex(self):
+        """Parse hex string as integer using strtoll with base 16.
+
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Returns int? - Some(value) on success, nil on failure.
+        """
+        func = self.string_to_int_hex
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        success_block = func.append_basic_block("success")
+        fail_block = func.append_basic_block("fail")
+
+        builder = ir.IRBuilder(entry)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8 = ir.IntType(8)
+        i8_ptr = i8.as_pointer()
+
+        int_optional = ir.LiteralStructType([i1, i64])
+
+        s = func.args[0]
+
+        # Get string byte size (field 3) - if 0, return nil
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        size = builder.load(size_ptr)
+        is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
+
+        # Get data pointer: owner + offset
+        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner = builder.load(owner_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data = builder.gep(owner, [offset])
+
+        # Allocate endptr on stack
+        endptr_alloca = builder.alloca(i8_ptr, name="endptr")
+
+        # Call strtoll(data, &endptr, 16) for base-16 parsing
+        base_16 = ir.Constant(i32, 16)
+        result = builder.call(self.strtoll, [data, endptr_alloca, base_16])
+
+        # Check if conversion succeeded: endptr != data
+        endptr = builder.load(endptr_alloca)
+        no_conversion = builder.icmp_unsigned("==", endptr, data)
+        failed = builder.or_(is_empty, no_conversion)
+        builder.cbranch(failed, fail_block, success_block)
+
+        # Success: return Some(result)
+        builder.position_at_end(success_block)
+        some_result = ir.Constant(int_optional, ir.Undefined)
+        some_result = builder.insert_value(some_result, ir.Constant(i1, 1), 0)
+        some_result = builder.insert_value(some_result, result, 1)
+        builder.ret(some_result)
+
+        # Fail: return nil
+        builder.position_at_end(fail_block)
+        nil_result = ir.Constant(int_optional, ir.Undefined)
+        nil_result = builder.insert_value(nil_result, ir.Constant(i1, 0), 0)
+        nil_result = builder.insert_value(nil_result, ir.Constant(i64, 0), 1)
+        builder.ret(nil_result)
+
+    def _implement_string_from_int(self):
+        """Convert integer to string using snprintf.
+
+        Returns a new String* containing the decimal representation.
+        """
+        func = self.string_from_int
+        func.args[0].name = "n"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        n = func.args[0]
+
+        # Allocate a small buffer on the stack (32 bytes is plenty for any i64)
+        buf_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+
+        # Call snprintf(buf, 32, "%lld", n)
+        fmt_ptr = builder.bitcast(self._int_conv_fmt, i8_ptr)
+        len_result = builder.call(self.snprintf, [buf, buf_size, fmt_ptr, n])
+
+        # Convert to i64 for string length (snprintf returns i32)
+        str_len = builder.zext(len_result, i64)
+
+        # Create String from the buffer
+        result = builder.call(self.string_new, [buf, str_len, str_len])
+        builder.ret(result)
+
+    def _implement_string_from_float(self):
+        """Convert float to string using snprintf.
+
+        Returns a new String* containing the decimal representation.
+        Uses %g format for compact output.
+        """
+        func = self.string_from_float
+        func.args[0].name = "f"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        f = func.args[0]
+
+        # Allocate a buffer (64 bytes for float representation)
+        buf_size = ir.Constant(i64, 64)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+
+        # Call snprintf(buf, 64, "%g", f)
+        fmt_ptr = builder.bitcast(self._float_conv_fmt, i8_ptr)
+        len_result = builder.call(self.snprintf, [buf, buf_size, fmt_ptr, f])
+
+        # Convert to i64 for string length
+        str_len = builder.zext(len_result, i64)
+
+        # Create String from the buffer
+        result = builder.call(self.string_new, [buf, str_len, str_len])
+        builder.ret(result)
+
+    def _implement_string_from_bool(self):
+        """Convert bool to string.
+
+        Returns "true" or "false" as a String*.
+        """
+        func = self.string_from_bool
+        func.args[0].name = "b"
+
+        entry = func.append_basic_block("entry")
+        true_block = func.append_basic_block("true_case")
+        false_block = func.append_basic_block("false_case")
+        merge_block = func.append_basic_block("merge")
+
+        builder = ir.IRBuilder(entry)
+
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        b = func.args[0]
+        builder.cbranch(b, true_block, false_block)
+
+        # True case: return "true"
+        builder.position_at_end(true_block)
+        true_ptr = builder.bitcast(self._true_conv_str, i8_ptr)
+        true_result = builder.call(self.string_from_literal, [true_ptr])
+        builder.branch(merge_block)
+
+        # False case: return "false"
+        builder.position_at_end(false_block)
+        false_ptr = builder.bitcast(self._false_conv_str, i8_ptr)
+        false_result = builder.call(self.string_from_literal, [false_ptr])
+        builder.branch(merge_block)
+
+        # Merge
+        builder.position_at_end(merge_block)
+        phi = builder.phi(self.string_struct.as_pointer())
+        phi.add_incoming(true_result, true_block)
+        phi.add_incoming(false_result, false_block)
+        builder.ret(phi)
+
+    def _implement_string_from_hex(self):
+        """Convert integer to hex string using snprintf.
+
+        Returns a new String* containing the lowercase hex representation.
+        """
+        func = self.string_from_hex
+        func.args[0].name = "n"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        n = func.args[0]
+
+        # Allocate a buffer (32 bytes for hex representation)
+        buf_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+
+        # Call snprintf(buf, 32, "%llx", n)
+        fmt_ptr = builder.bitcast(self._hex_conv_fmt, i8_ptr)
+        len_result = builder.call(self.snprintf, [buf, buf_size, fmt_ptr, n])
+
+        # Convert to i64 for string length
+        str_len = builder.zext(len_result, i64)
+
+        # Create String from the buffer
+        result = builder.call(self.string_new, [buf, str_len, str_len])
+        builder.ret(result)
+
     # ============================================================
     # Deep Copy Support for Value Semantics
     # ============================================================
@@ -3635,6 +4035,9 @@ class CodeGenerator:
             "data": "coex_string_data",
             "getrange": "coex_string_slice",  # Alias for slice syntax
             "setrange": "coex_string_setrange",
+            "int": "coex_string_to_int",
+            "float": "coex_string_to_float",
+            "int_hex": "coex_string_to_int_hex",
         }
 
         # Also store function references for direct access
@@ -3649,6 +4052,17 @@ class CodeGenerator:
         self.functions["coex_string_data"] = self.string_data
         self.functions["coex_string_copy"] = self.string_copy
         self.functions["coex_string_setrange"] = self.string_setrange
+        self.functions["coex_string_to_int"] = self.string_to_int
+        self.functions["coex_string_to_float"] = self.string_to_float
+        self.functions["coex_string_to_int_hex"] = self.string_to_int_hex
+
+        # Static methods for String.from() and String.from_hex()
+        self.functions["String_from"] = self.string_from_int  # Default; dispatch handles types
+        self.functions["String_from_hex"] = self.string_from_hex
+        self.functions["coex_string_from_int"] = self.string_from_int
+        self.functions["coex_string_from_float"] = self.string_from_float
+        self.functions["coex_string_from_bool"] = self.string_from_bool
+        self.functions["coex_string_from_hex"] = self.string_from_hex
 
     def _create_map_type(self):
         """Create the Map type and helper functions using HAMT (Hash Array Mapped Trie).
@@ -9574,8 +9988,20 @@ class CodeGenerator:
             alloca = self.builder.alloca(llvm_type, name=stmt.name)
 
         # Generate initializer
+        # Handle nil assignment to optional type
+        if isinstance(stmt.initializer, NilLiteral) and isinstance(stmt.type_annotation, OptionalType):
+            # Generate nil optional directly: {has_value=false, value=0}
+            inner_type = self._get_llvm_type(stmt.type_annotation.inner)
+            init_value = ir.Constant(llvm_type, ir.Undefined)
+            init_value = self.builder.insert_value(init_value, ir.Constant(ir.IntType(1), 0), 0)
+            if isinstance(inner_type, ir.IntType):
+                init_value = self.builder.insert_value(init_value, ir.Constant(inner_type, 0), 1)
+            elif isinstance(inner_type, ir.DoubleType):
+                init_value = self.builder.insert_value(init_value, ir.Constant(inner_type, 0.0), 1)
+            else:
+                init_value = self.builder.insert_value(init_value, ir.Constant(inner_type, None), 1)
         # Handle empty {} which parses as MapExpr but might need to be Set or Map based on type annotation
-        if isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
+        elif isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
             if isinstance(stmt.type_annotation, SetType):
                 # Empty {} with Set type annotation -> generate empty set
                 i64 = ir.IntType(64)
@@ -9776,6 +10202,45 @@ class CodeGenerator:
         # Int to pointer (for loading pointers from i64 collections)
         if isinstance(value.type, ir.IntType) and isinstance(target_type, ir.PointerType):
             return self.builder.inttoptr(value, target_type)
+
+        # Value to optional struct {i1, T} - wrap value in Some
+        # Check this BEFORE the nil case so actual values get wrapped correctly
+        if isinstance(target_type, ir.LiteralStructType) and len(target_type.elements) == 2:
+            if isinstance(target_type.elements[0], ir.IntType) and target_type.elements[0].width == 1:
+                inner_type = target_type.elements[1]
+                # Check if value type matches inner type (or can be cast)
+                if value.type == inner_type:
+                    # Wrap value in Some: {has_value=true, value=val}
+                    result = ir.Constant(target_type, ir.Undefined)
+                    result = self.builder.insert_value(result, ir.Constant(ir.IntType(1), 1), 0)
+                    result = self.builder.insert_value(result, value, 1)
+                    return result
+                # Check for int size mismatch (e.g., i64 value to optional with i64 inner)
+                elif isinstance(value.type, ir.IntType) and isinstance(inner_type, ir.IntType):
+                    # Cast the int value to match inner type
+                    if value.type.width < inner_type.width:
+                        casted = self.builder.sext(value, inner_type)
+                    elif value.type.width > inner_type.width:
+                        casted = self.builder.trunc(value, inner_type)
+                    else:
+                        casted = value
+                    result = ir.Constant(target_type, ir.Undefined)
+                    result = self.builder.insert_value(result, ir.Constant(ir.IntType(1), 1), 0)
+                    result = self.builder.insert_value(result, casted, 1)
+                    return result
+                # Check if value is nil constant (i64 0 from NilLiteral)
+                elif isinstance(value, ir.Constant) and isinstance(value.type, ir.IntType):
+                    if value.constant == 0:
+                        # This is nil - create {has_value=false, value=0}
+                        result = ir.Constant(target_type, ir.Undefined)
+                        result = self.builder.insert_value(result, ir.Constant(ir.IntType(1), 0), 0)
+                        if isinstance(inner_type, ir.IntType):
+                            result = self.builder.insert_value(result, ir.Constant(inner_type, 0), 1)
+                        elif isinstance(inner_type, ir.DoubleType):
+                            result = self.builder.insert_value(result, ir.Constant(inner_type, 0.0), 1)
+                        else:
+                            result = self.builder.insert_value(result, ir.Constant(inner_type, None), 1)
+                        return result
 
         return value
     
@@ -10239,6 +10704,32 @@ class CodeGenerator:
     def _generate_return(self, stmt: ReturnStmt):
         """Generate a return statement"""
         if stmt.value:
+            # Special handling for returning nil to an optional type
+            func = self.builder.function
+            ret_type = func.function_type.return_type
+
+            if isinstance(stmt.value, NilLiteral) and isinstance(ret_type, ir.LiteralStructType):
+                # Check if return type is an optional (has i1 flag + value)
+                if len(ret_type.elements) == 2 and isinstance(ret_type.elements[0], ir.IntType):
+                    if ret_type.elements[0].width == 1:
+                        # Generate nil optional directly: {has_value=false, value=0}
+                        inner_type = ret_type.elements[1]
+                        value = ir.Constant(ret_type, ir.Undefined)
+                        value = self.builder.insert_value(value, ir.Constant(ir.IntType(1), 0), 0)
+                        if isinstance(inner_type, ir.IntType):
+                            value = self.builder.insert_value(value, ir.Constant(inner_type, 0), 1)
+                        elif isinstance(inner_type, ir.DoubleType):
+                            value = self.builder.insert_value(value, ir.Constant(inner_type, 0.0), 1)
+                        else:
+                            value = self.builder.insert_value(value, ir.Constant(inner_type, None), 1)
+
+                        # Pop GC frame before returning
+                        if self.gc_frame is not None and self.gc is not None:
+                            self.gc.pop_frame(self.builder, self.gc_frame)
+
+                        self.builder.ret(value)
+                        return
+
             value = self._generate_expression(stmt.value)
 
             # In matrix formula context, write to buffer and continue loop
@@ -10246,11 +10737,13 @@ class CodeGenerator:
                 self._generate_matrix_return(value)
                 # Branch to x_loop_inc (next cell)
                 # Find the increment block
-                func = self.builder.function
                 for block in func.blocks:
                     if block.name == "x_loop_inc":
                         self.builder.branch(block)
                         return
+
+            # Cast to function return type if needed (e.g., wrap in optional)
+            value = self._cast_value(value, ret_type)
 
             # Pop GC frame before returning
             if self.gc_frame is not None and self.gc is not None:
@@ -11953,7 +12446,20 @@ class CodeGenerator:
         elif expr.op == BinaryOp.GE:
             return self.builder.fcmp_ordered(">=", left, right) if is_float else self.builder.icmp_signed(">=", left, right)
         elif expr.op == BinaryOp.NULL_COALESCE:
-            # a ?? b -> a if a != nil else b
+            # a ?? b -> if a has value, return unwrapped a, else return b
+            # Handle optional types (struct {i1, T})
+            if isinstance(left.type, ir.LiteralStructType) and len(left.type.elements) == 2:
+                if isinstance(left.type.elements[0], ir.IntType) and left.type.elements[0].width == 1:
+                    # This is an optional type - extract has_value and value
+                    has_value = self.builder.extract_value(left, 0, name="has_value")
+                    value = self.builder.extract_value(left, 1, name="opt_value")
+                    return self.builder.select(has_value, value, right)
+            # Handle pointer types (nil = null pointer)
+            elif isinstance(left.type, ir.PointerType):
+                null_ptr = ir.Constant(left.type, None)
+                is_not_null = self.builder.icmp_unsigned("!=", left, null_ptr)
+                return self.builder.select(is_not_null, left, right)
+            # Fallback: treat as boolean check
             cond = self._to_bool(left)
             return self.builder.select(cond, left, right)
         
@@ -12608,6 +13114,29 @@ class CodeGenerator:
                 # Static method call: Type.method()
                 if expr.method == "new":
                     return self._generate_type_new(type_name, expr.args)
+
+                # Special handling for String.from() - dispatch based on argument type
+                if type_name == "String" and expr.method == "from" and expr.args:
+                    arg_val = self._generate_expression(expr.args[0])
+                    arg_type = arg_val.type
+
+                    # Dispatch based on argument type
+                    if isinstance(arg_type, ir.IntType):
+                        if arg_type.width == 1:
+                            # Boolean
+                            return self.builder.call(self.string_from_bool, [arg_val])
+                        else:
+                            # Integer (i64, i32, etc.)
+                            arg_val = self._cast_value(arg_val, ir.IntType(64))
+                            return self.builder.call(self.string_from_int, [arg_val])
+                    elif isinstance(arg_type, ir.DoubleType):
+                        # Float
+                        return self.builder.call(self.string_from_float, [arg_val])
+                    else:
+                        # Default to int conversion
+                        arg_val = self._cast_value(arg_val, ir.IntType(64))
+                        return self.builder.call(self.string_from_int, [arg_val])
+
                 # Look for static methods (factory methods)
                 mangled = f"{type_name}_{expr.method}"
                 if mangled in self.functions:

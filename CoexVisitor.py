@@ -429,6 +429,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#methodName.
+    def visitMethodName(self, ctx:CoexParser.MethodNameContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#sliceOrIndex.
     def visitSliceOrIndex(self, ctx:CoexParser.SliceOrIndexContext):
         return self.visitChildren(ctx)

@@ -454,11 +454,22 @@ postfixExpr
     ;
 
 postfixOp
-    : DOT IDENTIFIER
+    : DOT methodName
     | DOT INTEGER_LITERAL                                     // Tuple index access: t.0, t.1
-    | DOT IDENTIFIER genericArgs? LPAREN argumentList? RPAREN
+    | DOT methodName genericArgs? LPAREN argumentList? RPAREN
     | LBRACKET sliceOrIndex RBRACKET                          // Index or slice
     | LPAREN argumentList? RPAREN
+    ;
+
+// Method names can be identifiers or type keywords (for .int(), .float(), .string(), .bool())
+methodName
+    : IDENTIFIER
+    | INT_TYPE
+    | FLOAT_TYPE
+    | BOOL_TYPE
+    | STRING_TYPE
+    | BYTE_TYPE
+    | CHAR_TYPE
     ;
 
 // Distinguish between slice [start:end] and index [i] or [i, j]
