@@ -391,9 +391,9 @@ expression
     : ternaryExpr
     ;
 
-// Ternary conditional: expr ? expr ; expr (semicolon/else part is optional)
+// Ternary conditional: expr ? expr ; expr (continuation) or expr ? expr ! expr (exit/return)
 ternaryExpr
-    : orExpr (QUESTION ternaryExpr (SEMI ternaryExpr)?)?
+    : orExpr (QUESTION ternaryExpr (SEMI | BANG) ternaryExpr)?
     ;
 
 // Logical OR
@@ -766,6 +766,7 @@ ASSIGN      : '=' ;
 QUESTION    : '?' ;
 SEMI        : ';' ;
 DOT         : '.' ;
+BANG        : '!' ;  // Exit variant separator for ternary (NEQ != matches first)
 
 // Delimiters
 LPAREN      : '(' ;

@@ -268,6 +268,7 @@ class TernaryExpr(Expr):
     condition: Expr
     then_expr: Expr
     else_expr: Expr
+    is_exit: bool = False  # True for ! variant (return else_expr), False for ; variant
 
 
 @dataclass

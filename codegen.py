@@ -10887,6 +10887,16 @@ class CodeGenerator:
         elif isinstance(value.type, ir.DoubleType):
             return self.builder.fcmp_ordered("!=", value, ir.Constant(value.type, 0.0))
         elif isinstance(value.type, ir.PointerType):
+            # Check if this is a Result pointer - convert to bool based on tag
+            if hasattr(self, 'result_struct') and value.type == self.result_struct.as_pointer():
+                # Result<T, E> -> bool: true if Ok (tag == 0), false if Err (tag == 1)
+                tag_ptr = self.builder.gep(value, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 0)  # tag field
+                ])
+                tag = self.builder.load(tag_ptr)
+                return self.builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+            # Regular pointer: true if non-null
             null = ir.Constant(value.type, None)
             return self.builder.icmp_unsigned("!=", value, null)
         return value
@@ -13792,43 +13802,72 @@ class CodeGenerator:
         return ir.Constant(ir.IntType(64), 0)
 
     def _generate_ternary(self, expr: TernaryExpr) -> ir.Value:
-        """Generate code for ternary expression"""
+        """Generate code for ternary expression
+
+        For ; variant (continuation): both branches merge, result is phi of both values
+        For ! variant (exit): else branch returns from function, result is then value only
+        """
         func = self.builder.function
-        
+
         then_block = func.append_basic_block("tern_then")
         else_block = func.append_basic_block("tern_else")
-        merge_block = func.append_basic_block("tern_merge")
-        
+
         cond = self._generate_expression(expr.condition)
         cond = self._to_bool(cond)
-        
+
         self.builder.cbranch(cond, then_block, else_block)
-        
+
         self.builder.position_at_end(then_block)
         then_val = self._generate_expression(expr.then_expr)
         then_block = self.builder.block
-        self.builder.branch(merge_block)
-        
-        self.builder.position_at_end(else_block)
-        else_val = self._generate_expression(expr.else_expr)
-        else_block = self.builder.block
-        self.builder.branch(merge_block)
-        
-        self.builder.position_at_end(merge_block)
-        
-        # Ensure same type
-        if then_val.type != else_val.type:
-            if isinstance(then_val.type, ir.IntType) and isinstance(else_val.type, ir.IntType):
-                max_width = max(then_val.type.width, else_val.type.width)
-                target = ir.IntType(max_width)
-                then_val = self._cast_value(then_val, target)
-                else_val = self._cast_value(else_val, target)
-        
-        phi = self.builder.phi(then_val.type)
-        phi.add_incoming(then_val, then_block)
-        phi.add_incoming(else_val, else_block)
-        
-        return phi
+
+        if expr.is_exit:
+            # Exit variant: else branch returns, no merge needed
+            merge_block = func.append_basic_block("tern_merge")
+            self.builder.branch(merge_block)
+
+            self.builder.position_at_end(else_block)
+            else_val = self._generate_expression(expr.else_expr)
+
+            # Cast else_val to function return type if needed
+            ret_type = func.function_type.return_type
+            else_val = self._cast_value(else_val, ret_type)
+
+            # Pop GC frame before returning
+            if self.gc_frame is not None and self.gc is not None:
+                self.gc.pop_frame(self.builder, self.gc_frame)
+
+            # Return from function
+            self.builder.ret(else_val)
+
+            # Continue in merge block with then_val
+            self.builder.position_at_end(merge_block)
+            return then_val
+        else:
+            # Continuation variant: both branches merge
+            merge_block = func.append_basic_block("tern_merge")
+            self.builder.branch(merge_block)
+
+            self.builder.position_at_end(else_block)
+            else_val = self._generate_expression(expr.else_expr)
+            else_block = self.builder.block
+            self.builder.branch(merge_block)
+
+            self.builder.position_at_end(merge_block)
+
+            # Ensure same type
+            if then_val.type != else_val.type:
+                if isinstance(then_val.type, ir.IntType) and isinstance(else_val.type, ir.IntType):
+                    max_width = max(then_val.type.width, else_val.type.width)
+                    target = ir.IntType(max_width)
+                    then_val = self._cast_value(then_val, target)
+                    else_val = self._cast_value(else_val, target)
+
+            phi = self.builder.phi(then_val.type)
+            phi.add_incoming(then_val, then_block)
+            phi.add_incoming(else_val, else_block)
+
+            return phi
     
     def _generate_list(self, expr: ListExpr) -> ir.Value:
         """Generate code for list literal: [1, 2, 3]"""
