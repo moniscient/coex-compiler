@@ -113,9 +113,8 @@ class CodeGenerator:
         # Placeholder variable tracking for loop pre-allocation
         self.placeholder_vars: set = set()  # Set of pre-allocated placeholder variable names
 
-        # List and channel runtime support
+        # List runtime support
         self.list_type = None
-        self.channel_type = None
 
         # Module system support
         self.loaded_modules: Dict[str, ModuleInfo] = {}  # module_name -> ModuleInfo
@@ -260,21 +259,6 @@ class CodeGenerator:
 
         # Create atomic_ref type and helpers
         self._create_atomic_ref_type()
-        
-        # Create channel struct type (simple queue implementation)
-        # struct Channel { i64 len, i64 cap, i64 head, i64 tail, i8* data, i1 closed }
-        self.channel_struct = ir.global_context.get_identified_type("struct.Channel")
-        self.channel_struct.set_body(
-            ir.IntType(64),  # len
-            ir.IntType(64),  # cap
-            ir.IntType(64),  # head
-            ir.IntType(64),  # tail
-            ir.IntType(8).as_pointer(),  # data
-            ir.IntType(1)    # closed
-        )
-        
-        # Create channel helper functions
-        self._create_channel_helpers()
 
         # Create Result type and helpers
         # struct.Result { i64 tag, i64 ok_value, i64 err_value }
@@ -3842,7 +3826,6 @@ class CodeGenerator:
         - Collections (List, Set, Map, Array)
         - String (heap-allocated)
         - User-defined types (all heap-allocated)
-        - Channels
 
         NOT tracked (stack types):
         - int, float, bool, byte, char
@@ -3860,8 +3843,8 @@ class CodeGenerator:
         if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
             return True
         if isinstance(coex_type, NamedType):
-            # String and Channel are heap-allocated
-            if coex_type.name in ("string", "Channel"):
+            # String is heap-allocated
+            if coex_type.name == "string":
                 return True
             # User-defined types are heap-allocated
             if coex_type.name in self.type_fields:
@@ -7208,322 +7191,6 @@ class CodeGenerator:
         self.string_counter += 1
         global_str = self._create_global_string(value, name)
         return self.builder.bitcast(global_str, ir.IntType(8).as_pointer())
-    
-    # ========================================================================
-    # Channel Implementation
-    # ========================================================================
-    
-    def _create_channel_helpers(self):
-        """Create channel runtime functions for sequential execution.
-        
-        Channel structure:
-        - len: current number of items in buffer
-        - cap: capacity (0 = unbuffered, stores single value)
-        - head: read index (circular buffer)
-        - tail: write index (circular buffer)
-        - data: buffer for values (stores i64 values)
-        - closed: boolean flag
-        """
-        chan_ptr = self.channel_struct.as_pointer()
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-        i1 = ir.IntType(1)
-        
-        # Register Channel in type registry
-        self.type_registry["Channel"] = self.channel_struct
-        self.type_methods["Channel"] = {}
-        
-        # channel_new(capacity: i64) -> Channel*
-        self._create_channel_new(chan_ptr, i64)
-        
-        # channel_send(chan: Channel*, value: i64)
-        self._create_channel_send(chan_ptr, i64)
-        
-        # channel_receive(chan: Channel*) -> i64 (returns 0 if closed/empty)
-        self._create_channel_receive(chan_ptr, i64)
-        
-        # channel_close(chan: Channel*)
-        self._create_channel_close(chan_ptr)
-    
-    def _create_channel_new(self, chan_ptr: ir.Type, i64: ir.Type):
-        """Create channel constructor: allocates and initializes channel."""
-        func_type = ir.FunctionType(chan_ptr, [i64])
-        func = ir.Function(self.module, func_type, name="coex_channel_new")
-        self.channel_new = func
-        self.functions["coex_channel_new"] = func
-        self.type_methods["Channel"]["new"] = "coex_channel_new"
-        
-        func.args[0].name = "capacity"
-        
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-        
-        capacity = func.args[0]
-        
-        # Allocate channel struct (48 bytes = 6 * 8) via GC
-        struct_size = ir.Constant(i64, 48)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
-        chan = builder.bitcast(raw_ptr, chan_ptr)
-        
-        # Initialize len = 0
-        len_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 0)
-        ], inbounds=True)
-        builder.store(ir.Constant(i64, 0), len_field)
-        
-        # Initialize cap
-        cap_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 1)
-        ], inbounds=True)
-        builder.store(capacity, cap_field)
-        
-        # Initialize head = 0
-        head_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(i64, 0), head_field)
-        
-        # Initialize tail = 0
-        tail_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 3)
-        ], inbounds=True)
-        builder.store(ir.Constant(i64, 0), tail_field)
-        
-        # Allocate data buffer: max(capacity, 1) * 8 bytes
-        # (even unbuffered channels need space for one value)
-        one = ir.Constant(i64, 1)
-        is_unbuffered = builder.icmp_signed("==", capacity, ir.Constant(i64, 0))
-        actual_cap = builder.select(is_unbuffered, one, capacity)
-        elem_size = ir.Constant(i64, 8)
-        buffer_size = builder.mul(actual_cap, elem_size)
-        channel_buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL_BUFFER)
-        data_raw = builder.call(self.gc.gc_alloc, [buffer_size, channel_buffer_type_id])
-        
-        data_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 4)
-        ], inbounds=True)
-        builder.store(data_raw, data_field)
-        
-        # Initialize closed = false
-        closed_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 5)
-        ], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(1), 0), closed_field)
-        
-        builder.ret(chan)
-    
-    def _create_channel_send(self, chan_ptr: ir.Type, i64: ir.Type):
-        """Create channel send: adds value to buffer, growing if needed."""
-        func_type = ir.FunctionType(ir.VoidType(), [chan_ptr, i64])
-        func = ir.Function(self.module, func_type, name="coex_channel_send")
-        self.channel_send = func
-        self.functions["coex_channel_send"] = func
-        self.type_methods["Channel"]["send"] = "coex_channel_send"
-        
-        func.args[0].name = "chan"
-        func.args[1].name = "value"
-        
-        entry = func.append_basic_block("entry")
-        check_full = func.append_basic_block("check_full")
-        grow_buffer = func.append_basic_block("grow_buffer")
-        do_send = func.append_basic_block("do_send")
-        done = func.append_basic_block("done")
-        
-        builder = ir.IRBuilder(entry)
-        
-        chan = func.args[0]
-        value = func.args[1]
-        
-        # Check if closed
-        closed_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 5)
-        ], inbounds=True)
-        is_closed = builder.load(closed_field)
-        builder.cbranch(is_closed, done, check_full)
-        
-        # Check if buffer is full
-        builder.position_at_end(check_full)
-        
-        len_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 0)
-        ], inbounds=True)
-        cap_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 1)
-        ], inbounds=True)
-        data_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 4)
-        ], inbounds=True)
-        
-        current_len = builder.load(len_field)
-        cap = builder.load(cap_field)
-        
-        # Handle unbuffered (cap=0) as cap=1
-        one = ir.Constant(i64, 1)
-        is_unbuffered = builder.icmp_signed("==", cap, ir.Constant(i64, 0))
-        actual_cap = builder.select(is_unbuffered, one, cap)
-        
-        # Check if full: len >= actual_cap
-        is_full = builder.icmp_signed(">=", current_len, actual_cap)
-        builder.cbranch(is_full, grow_buffer, do_send)
-        
-        # Grow buffer: double capacity, realloc, copy
-        builder.position_at_end(grow_buffer)
-        
-        old_data = builder.load(data_field)
-        old_cap = builder.load(cap_field)
-        
-        # New capacity = max(old_cap * 2, 16)
-        new_cap = builder.mul(actual_cap, ir.Constant(i64, 2))
-        min_cap = ir.Constant(i64, 16)
-        use_min = builder.icmp_signed("<", new_cap, min_cap)
-        new_cap = builder.select(use_min, min_cap, new_cap)
-        
-        # Allocate new buffer
-        elem_size = ir.Constant(i64, 8)
-        new_size = builder.mul(new_cap, elem_size)
-        channel_buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_CHANNEL_BUFFER)
-        new_data = builder.call(self.gc.gc_alloc, [new_size, channel_buffer_type_id])
-
-        # Copy old data: memcpy(new_data, old_data, current_len * 8)
-        copy_size = builder.mul(current_len, elem_size)
-        builder.call(self.memcpy, [new_data, old_data, copy_size])
-
-        # Old buffer will be reclaimed by GC
-        
-        # Update channel fields
-        builder.store(new_cap, cap_field)
-        builder.store(new_data, data_field)
-        
-        builder.branch(do_send)
-        
-        # Do send: store at index = current_len
-        builder.position_at_end(do_send)
-        
-        # Reload after potential growth
-        current_len2 = builder.load(len_field)
-        data = builder.load(data_field)
-        
-        # Calculate slot: data + (len * 8)
-        elem_size_const = ir.Constant(i64, 8)
-        offset = builder.mul(current_len2, elem_size_const)
-        slot_ptr = builder.gep(data, [offset])
-        slot_i64_ptr = builder.bitcast(slot_ptr, i64.as_pointer())
-        builder.store(value, slot_i64_ptr)
-        
-        # Increment len
-        one_const = ir.Constant(i64, 1)
-        new_len = builder.add(current_len2, one_const)
-        builder.store(new_len, len_field)
-        
-        builder.branch(done)
-        
-        builder.position_at_end(done)
-        builder.ret_void()
-    
-    def _create_channel_receive(self, chan_ptr: ir.Type, i64: ir.Type):
-        """Create channel receive: removes and returns value from buffer."""
-        func_type = ir.FunctionType(i64, [chan_ptr])
-        func = ir.Function(self.module, func_type, name="coex_channel_receive")
-        self.channel_receive = func
-        self.functions["coex_channel_receive"] = func
-        self.type_methods["Channel"]["receive"] = "coex_channel_receive"
-        
-        func.args[0].name = "chan"
-        
-        entry = func.append_basic_block("entry")
-        check_len = func.append_basic_block("check_len")
-        do_receive = func.append_basic_block("do_receive")
-        return_nil = func.append_basic_block("return_nil")
-        
-        builder = ir.IRBuilder(entry)
-        
-        chan = func.args[0]
-        
-        # Check if has items
-        len_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 0)
-        ], inbounds=True)
-        
-        current_len = builder.load(len_field)
-        has_items = builder.icmp_signed(">", current_len, ir.Constant(i64, 0))
-        builder.cbranch(has_items, do_receive, check_len)
-        
-        # No items - return nil
-        builder.position_at_end(check_len)
-        builder.branch(return_nil)
-        
-        # Do receive
-        builder.position_at_end(do_receive)
-        
-        head_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 2)
-        ], inbounds=True)
-        data_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 4)
-        ], inbounds=True)
-        
-        head = builder.load(head_field)
-        data = builder.load(data_field)
-        
-        # Read from data[head]
-        one = ir.Constant(i64, 1)
-        offset = builder.mul(head, ir.Constant(i64, 8))
-        slot_ptr = builder.gep(data, [offset])
-        slot_i64_ptr = builder.bitcast(slot_ptr, i64.as_pointer())
-        value = builder.load(slot_i64_ptr)
-        
-        # Increment head (no modulo - linear buffer)
-        new_head = builder.add(head, one)
-        builder.store(new_head, head_field)
-        
-        # Decrement len
-        current_len2 = builder.load(len_field)
-        new_len = builder.sub(current_len2, one)
-        builder.store(new_len, len_field)
-        
-        builder.ret(value)
-        
-        # Return nil (0)
-        builder.position_at_end(return_nil)
-        builder.ret(ir.Constant(i64, 0))
-    
-    def _create_channel_close(self, chan_ptr: ir.Type):
-        """Create channel close: marks channel as closed."""
-        func_type = ir.FunctionType(ir.VoidType(), [chan_ptr])
-        func = ir.Function(self.module, func_type, name="coex_channel_close")
-        self.channel_close = func
-        self.functions["coex_channel_close"] = func
-        self.type_methods["Channel"]["close"] = "coex_channel_close"
-        
-        func.args[0].name = "chan"
-        
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-        
-        chan = func.args[0]
-        
-        closed_field = builder.gep(chan, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), 5)
-        ], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(1), 1), closed_field)
-        
-        builder.ret_void()
-
     def _create_result_helpers(self):
         """Create Result type helper functions.
 
@@ -8145,10 +7812,6 @@ class CodeGenerator:
             # Arrays are pointers to Array struct
             return self.array_struct.as_pointer()
 
-        elif isinstance(coex_type, ChannelType):
-            # Channels are pointers to Channel struct
-            return self.channel_struct.as_pointer()
-        
         elif isinstance(coex_type, TupleType):
             # Tuple is a struct of its elements
             elem_types = [self._get_llvm_type(t) for _, t in coex_type.elements]
@@ -8190,7 +7853,7 @@ class CodeGenerator:
         if isinstance(coex_type, PrimitiveType):
             # Only string is a reference among primitives
             return coex_type.name == "string"
-        elif isinstance(coex_type, (ListType, MapType, SetType, ChannelType, ResultType)):
+        elif isinstance(coex_type, (ListType, MapType, SetType, ResultType)):
             return True
         elif isinstance(coex_type, NamedType):
             # User-defined types are pointers
@@ -9765,10 +9428,6 @@ class CodeGenerator:
             self._generate_continue()
         elif isinstance(stmt, MatchStmt):
             self._generate_match(stmt)
-        elif isinstance(stmt, SelectStmt):
-            self._generate_select(stmt)
-        elif isinstance(stmt, WithinStmt):
-            self._generate_within(stmt)
         elif isinstance(stmt, LlvmIrStmt):
             self._generate_llvm_ir_block(stmt)
         elif isinstance(stmt, ExprStmt):
@@ -12133,131 +11792,6 @@ class CodeGenerator:
         # Default: match
         return ir.Constant(ir.IntType(1), 1)
     
-    def _generate_select(self, stmt: SelectStmt):
-        """Generate a select statement (sequential implementation).
-        
-        Sequential semantics:
-        - Check each channel in order (based on strategy)
-        - Execute the first case whose channel has data (len > 0)
-        - If no channel has data, fall through (no blocking)
-        
-        Strategies:
-        - DEFAULT/PRIORITY: check cases in declaration order
-        - FAIR: round-robin (for sequential, same as default)
-        - RANDOM: check in random order (deterministic for reproducibility)
-        """
-        if not stmt.cases:
-            return
-        
-        func = self.builder.function
-        i64 = ir.IntType(64)
-        
-        # Pre-allocate variables for all cases BEFORE any branches
-        # This ensures the allocas dominate all uses
-        case_allocas = {}
-        for case in stmt.cases:
-            if case.var_name not in self.locals:
-                var_alloca = self.builder.alloca(i64, name=case.var_name)
-                self.locals[case.var_name] = var_alloca
-                case_allocas[case.var_name] = var_alloca
-            else:
-                case_allocas[case.var_name] = self.locals[case.var_name]
-        
-        # Create blocks for each case and final merge
-        case_check_blocks = []
-        case_body_blocks = []
-        for i, case in enumerate(stmt.cases):
-            case_check_blocks.append(func.append_basic_block(f"select_check_{i}"))
-            case_body_blocks.append(func.append_basic_block(f"select_body_{i}"))
-        
-        select_end = func.append_basic_block("select_end")
-        
-        # Determine case order based on strategy
-        case_order = list(range(len(stmt.cases)))
-        if stmt.strategy == SelectStrategy.RANDOM:
-            # For deterministic testing, use a simple shuffle based on case count
-            # In real concurrent impl, would use actual randomness
-            import random
-            random.seed(len(stmt.cases))  # Deterministic for testing
-            random.shuffle(case_order)
-        # FAIR would need persistent state; for sequential, treat as default
-        # PRIORITY is same as default (first case has highest priority)
-        
-        # Branch to first check
-        self.builder.branch(case_check_blocks[0])
-        
-        # Generate check and body for each case
-        for idx, case_idx in enumerate(case_order):
-            case = stmt.cases[case_idx]
-            check_block = case_check_blocks[idx]
-            body_block = case_body_blocks[idx]
-            next_check = case_check_blocks[idx + 1] if idx + 1 < len(case_order) else select_end
-            
-            # Check block: see if channel has data
-            self.builder.position_at_end(check_block)
-            channel = self._generate_expression(case.channel)
-            
-            # Load channel len field (field 0)
-            len_field = self.builder.gep(channel, [
-                ir.Constant(ir.IntType(32), 0),
-                ir.Constant(ir.IntType(32), 0)
-            ], inbounds=True)
-            chan_len = self.builder.load(len_field)
-            
-            # Check if len > 0
-            has_data = self.builder.icmp_signed(">", chan_len, ir.Constant(i64, 0))
-            self.builder.cbranch(has_data, body_block, next_check)
-            
-            # Body block: receive value and execute case body
-            self.builder.position_at_end(body_block)
-            
-            # Receive from channel
-            received = self.builder.call(self.channel_receive, [channel])
-            
-            # Store in pre-allocated variable
-            var_alloca = case_allocas[case.var_name]
-            self.builder.store(received, var_alloca)
-            
-            # Execute case body
-            for s in case.body:
-                self._generate_statement(s)
-                if self.builder.block.is_terminated:
-                    break
-            
-            # Branch to end (if not already terminated by break/return)
-            if not self.builder.block.is_terminated:
-                self.builder.branch(select_end)
-        
-        # Continue from select_end
-        self.builder.position_at_end(select_end)
-    
-    def _generate_within(self, stmt: WithinStmt):
-        """Generate a within statement (sequential implementation).
-        
-        Sequential semantics:
-        - Execute the body (can't actually timeout without threads/preemption)
-        - The else clause is never executed in sequential mode
-        - The timeout expression is evaluated but ignored
-        
-        In concurrent mode, this would set up a deadline and cancel
-        if exceeded, branching to the else clause.
-        """
-        # Evaluate timeout expression (for side effects, though typically none)
-        # This ensures the expression is valid even if we don't use it
-        if stmt.timeout:
-            self._generate_expression(stmt.timeout)
-        
-        # In sequential mode, just execute the body
-        # No timeout can occur because there's no preemption
-        for s in stmt.body:
-            self._generate_statement(s)
-            if self.builder.block.is_terminated:
-                break
-        
-        # Note: else_body is intentionally not executed in sequential mode
-        # because without threading, the body will always complete
-        # (unless it has an infinite loop, but that's a bug)
-    
     # ========================================================================
     # Expression Generation
     # ========================================================================
@@ -12656,13 +12190,6 @@ class CodeGenerator:
                     self.builder.call(self.gc.gc_set_trace_level, [level])
                 return ir.Constant(ir.IntType(64), 0)
 
-            # Phase 3: High watermark GC builtins
-            if name == "gc_install_watermark":
-                # Install watermark at current frame depth
-                # GC will trigger when returning to this depth
-                self.builder.call(self.gc.gc_install_watermark, [])
-                return ir.Constant(ir.IntType(64), 0)
-
             if name == "print":
                 # print(value) - generate appropriate print based on type
                 if expr.args:
@@ -13011,19 +12538,6 @@ class CodeGenerator:
                 return self.builder.call(func, [])
             return ir.Constant(ir.IntType(8).as_pointer(), None)
         
-        # Check if this is a Channel type (or generic Channel<T>)
-        if type_name == "Channel" or type_name.startswith("Channel_"):
-            # Channel.new() or Channel.new(buffer: N)
-            # Default capacity is 0 (unbuffered)
-            capacity = ir.Constant(ir.IntType(64), 0)
-            
-            # Check for buffer argument
-            if args:
-                capacity = self._generate_expression(args[0])
-                capacity = self._cast_value(capacity, ir.IntType(64))
-            
-            return self.builder.call(self.channel_new, [capacity])
-        
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
 
@@ -13273,34 +12787,6 @@ class CodeGenerator:
         if method == "new":
             # Type.new() - already handled above for known types
             return ir.Constant(ir.IntType(8).as_pointer(), None)
-        
-        if method == "send":
-            # channel.send(value) - call channel_send
-            if expr.args and isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.Channel":
-                    value = self._generate_expression(expr.args[0])
-                    value = self._cast_value(value, ir.IntType(64))
-                    self.builder.call(self.channel_send, [obj, value])
-                    return ir.Constant(ir.IntType(64), 0)
-            return ir.Constant(ir.IntType(64), 0)
-        
-        if method == "receive":
-            # channel.receive() - call channel_receive
-            if isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.Channel":
-                    return self.builder.call(self.channel_receive, [obj])
-            return ir.Constant(ir.IntType(64), 0)
-        
-        if method == "close":
-            # channel.close() - call channel_close
-            if isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.Channel":
-                    self.builder.call(self.channel_close, [obj])
-                    return ir.Constant(ir.IntType(64), 0)
-            return ir.Constant(ir.IntType(64), 0)
         
         if method == "append":
             # list.append(value) - returns a NEW list with value appended (value semantics)
@@ -15238,17 +14724,6 @@ class CodeGenerator:
             elif isinstance(stmt, MatchStmt):
                 for arm in stmt.arms:
                     for s in arm.body:
-                        collect_from_stmt(s)
-            elif isinstance(stmt, WithinStmt):
-                for s in stmt.body:
-                    collect_from_stmt(s)
-                if stmt.else_body:
-                    for s in stmt.else_body:
-                        collect_from_stmt(s)
-            elif isinstance(stmt, SelectStmt):
-                for case in stmt.cases:
-                    var_names.add(case.var_name)
-                    for s in case.body:
                         collect_from_stmt(s)
             elif isinstance(stmt, TupleDestructureStmt):
                 # Collect all variable names from tuple destructuring

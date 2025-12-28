@@ -158,19 +158,6 @@ class GarbageCollector:
         self.gc_stats_collect = None
         self.gc_set_trace_level = None
 
-        # ============================================================
-        # Phase 3: High Watermark Tracking
-        # ============================================================
-
-        # Watermark depth - GC triggers when frame depth returns to this level
-        self.gc_watermark_depth = None
-
-        # Flag indicating if a watermark is currently installed
-        self.gc_watermark_installed = None
-
-        # Function to install watermark at current depth
-        self.gc_install_watermark = None
-
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
         self._create_types()
@@ -207,21 +194,6 @@ class GarbageCollector:
         self._implement_gc_dump_object()
         self._implement_gc_validate_heap()
         self._implement_gc_set_trace_level()
-        # Phase 3: High watermark tracking
-        self._implement_gc_install_watermark()
-        # Phase 5: Thread registry
-        self._implement_gc_register_thread()
-        self._implement_gc_unregister_thread()
-        self._implement_gc_get_thread_entry()
-        self._implement_gc_get_current_thread_entry()
-        # Phase 6: Watermark mechanism enhancement
-        self._implement_gc_install_watermarks()
-        self._implement_gc_clear_watermarks()
-        self._implement_gc_sync_thread_depth()
-        # Phase 7: First trace pass
-        self._implement_gc_scan_roots_watermark()
-        self._implement_gc_first_trace()
-        self._implement_gc_count_roots()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -320,23 +292,6 @@ class GarbageCollector:
             self.i64,    # 144: total_block_wait_ns
         ])
 
-        # ============================================================
-        # Phase 5: Thread Registry Types
-        # ============================================================
-
-        # ThreadEntry: Per-thread GC state for multi-threading support
-        # Currently single-threaded, but this prepares for future threading
-        # All fields are i64 for cross-platform consistency
-        self.thread_entry_type = ir.LiteralStructType([
-            self.i64,     # 0: thread_id - platform thread ID (0 for main thread in stub)
-            self.i8_ptr,  # 8: shadow_stack_chain - pointer to this thread's gc_frame_top
-            self.i64,     # 16: watermark - current watermark depth (0 if none)
-            self.i64,     # 24: watermark_active - watermark is set and collection ongoing
-            self.i64,     # 32: stack_depth - current shadow stack depth
-            self.i64,     # 40: blocked - thread is blocked waiting for GC
-            self.i8_ptr,  # 48: alloc_buffer - thread's allocation buffer (future use)
-            self.i8_ptr,  # 56: next - next thread in registry linked list
-        ])
 
     def _create_globals(self):
         """Create GC global variables"""
@@ -475,22 +430,6 @@ class GarbageCollector:
         self.gc_stats.linkage = 'internal'
 
         # ============================================================
-        # Phase 3: High Watermark Tracking Globals
-        # ============================================================
-
-        # Watermark depth - GC triggers when frame depth returns to this level
-        # THREAD-LOCAL in multi-threaded implementation
-        self.gc_watermark_depth = ir.GlobalVariable(self.module, self.i64, name="gc_watermark_depth")
-        self.gc_watermark_depth.initializer = ir.Constant(self.i64, 0)
-        self.gc_watermark_depth.linkage = 'internal'
-
-        # Flag indicating if a watermark is currently installed
-        # THREAD-LOCAL in multi-threaded implementation
-        self.gc_watermark_installed = ir.GlobalVariable(self.module, self.i1, name="gc_watermark_installed")
-        self.gc_watermark_installed.initializer = ir.Constant(self.i1, 0)
-        self.gc_watermark_installed.linkage = 'internal'
-
-        # ============================================================
         # Phase 4: Mark Bit Inversion
         # ============================================================
         # Instead of clearing mark bits during sweep, we invert the meaning.
@@ -503,24 +442,6 @@ class GarbageCollector:
         self.gc_current_mark_value = ir.GlobalVariable(self.module, self.i64, name="gc_current_mark_value")
         self.gc_current_mark_value.initializer = ir.Constant(self.i64, 1)
         self.gc_current_mark_value.linkage = 'internal'
-
-        # ============================================================
-        # Phase 5: Thread Registry Globals
-        # ============================================================
-
-        # Head of thread registry linked list
-        # Points to first ThreadEntry (main thread in single-threaded mode)
-        # In multi-threaded mode, new threads add entries to this list
-        self.gc_thread_registry = ir.GlobalVariable(
-            self.module, self.thread_entry_type.as_pointer(), name="gc_thread_registry")
-        self.gc_thread_registry.initializer = ir.Constant(
-            self.thread_entry_type.as_pointer(), None)
-        self.gc_thread_registry.linkage = 'internal'
-
-        # Count of registered threads (for debugging and iteration)
-        self.gc_thread_count = ir.GlobalVariable(self.module, self.i64, name="gc_thread_count")
-        self.gc_thread_count.initializer = ir.Constant(self.i64, 0)
-        self.gc_thread_count.linkage = 'internal'
 
         # ============================================================
         # Phase 9: User Type Descriptor Tables
@@ -725,78 +646,6 @@ class GarbageCollector:
         gc_set_trace_level_ty = ir.FunctionType(self.void, [self.i64])
         self.gc_set_trace_level = ir.Function(self.module, gc_set_trace_level_ty, name="coex_gc_set_trace_level")
 
-        # ============================================================
-        # Phase 3: High Watermark Tracking Function Declarations
-        # ============================================================
-
-        # gc_install_watermark() -> void
-        # Install watermark at current frame depth - GC triggers when we return to this depth
-        gc_install_watermark_ty = ir.FunctionType(self.void, [])
-        self.gc_install_watermark = ir.Function(self.module, gc_install_watermark_ty, name="coex_gc_install_watermark")
-
-        # ============================================================
-        # Phase 5: Thread Registry Function Declarations
-        # ============================================================
-
-        # gc_register_thread(thread_id: i64) -> i8* (pointer to ThreadEntry)
-        # Register a thread with the GC system
-        gc_register_thread_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [self.i64])
-        self.gc_register_thread = ir.Function(self.module, gc_register_thread_ty, name="coex_gc_register_thread")
-
-        # gc_unregister_thread(thread_id: i64) -> void
-        # Unregister a thread from the GC system
-        gc_unregister_thread_ty = ir.FunctionType(self.void, [self.i64])
-        self.gc_unregister_thread = ir.Function(self.module, gc_unregister_thread_ty, name="coex_gc_unregister_thread")
-
-        # gc_get_thread_entry(thread_id: i64) -> i8* (pointer to ThreadEntry or null)
-        # Get the ThreadEntry for a given thread ID
-        gc_get_thread_entry_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [self.i64])
-        self.gc_get_thread_entry = ir.Function(self.module, gc_get_thread_entry_ty, name="coex_gc_get_thread_entry")
-
-        # gc_get_current_thread_entry() -> i8* (pointer to ThreadEntry)
-        # Get the ThreadEntry for the current (main) thread - convenience for single-threaded
-        gc_get_current_thread_entry_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [])
-        self.gc_get_current_thread_entry = ir.Function(self.module, gc_get_current_thread_entry_ty, name="coex_gc_get_current_thread_entry")
-
-        # ============================================================
-        # Phase 6: Watermark Mechanism Enhancement Declarations
-        # ============================================================
-
-        # gc_install_watermarks() -> void
-        # Install watermarks on all registered threads at their current stack depth
-        gc_install_watermarks_ty = ir.FunctionType(self.void, [])
-        self.gc_install_watermarks = ir.Function(self.module, gc_install_watermarks_ty, name="coex_gc_install_watermarks")
-
-        # gc_clear_watermarks() -> void
-        # Clear watermarks on all registered threads
-        gc_clear_watermarks_ty = ir.FunctionType(self.void, [])
-        self.gc_clear_watermarks = ir.Function(self.module, gc_clear_watermarks_ty, name="coex_gc_clear_watermarks")
-
-        # gc_sync_thread_depth() -> void
-        # Sync global gc_frame_depth to current thread's ThreadEntry.stack_depth
-        gc_sync_thread_depth_ty = ir.FunctionType(self.void, [])
-        self.gc_sync_thread_depth = ir.Function(self.module, gc_sync_thread_depth_ty, name="coex_gc_sync_thread_depth")
-
-        # ============================================================
-        # Phase 7: First Trace Pass Function Declarations
-        # ============================================================
-
-        # gc_scan_roots_watermark() -> i64
-        # Scan shadow stack up to watermark depth, marking all roots
-        # Returns number of roots marked
-        gc_scan_roots_watermark_ty = ir.FunctionType(self.i64, [])
-        self.gc_scan_roots_watermark = ir.Function(self.module, gc_scan_roots_watermark_ty, name="coex_gc_scan_roots_watermark")
-
-        # gc_first_trace() -> void
-        # Orchestrate the first trace pass: enumerate roots and mark reachable objects
-        gc_first_trace_ty = ir.FunctionType(self.void, [])
-        self.gc_first_trace = ir.Function(self.module, gc_first_trace_ty, name="coex_gc_first_trace")
-
-        # gc_count_roots() -> i64
-        # Count total roots in shadow stack (for debugging/stats)
-        gc_count_roots_ty = ir.FunctionType(self.i64, [])
-        self.gc_count_roots = ir.Function(self.module, gc_count_roots_ty, name="coex_gc_count_roots")
-
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
@@ -992,27 +841,6 @@ class GarbageCollector:
         ], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), heap_b_count_ptr)
 
-        # ============================================================
-        # Spawn GC thread as detached
-        # PTHREAD_CREATE_DETACHED = 1 on most systems
-        # ============================================================
-
-        # Allocate thread attribute
-        # Phase 9: Disable background GC thread for synchronous collection model
-        # The high watermark GC uses synchronous collection via gc_collect(),
-        # so we don't need the background thread. This avoids potential race
-        # conditions and simplifies the implementation.
-        #
-        # The pthread infrastructure is kept in place for future use if we
-        # want to re-enable async collection.
-        pass  # Thread spawn disabled
-
-        # ============================================================
-        # Phase 5: Register main thread with the GC system
-        # Thread ID 0 is used for the main thread in single-threaded mode
-        # ============================================================
-        builder.call(self.gc_register_thread, [ir.Constant(self.i64, 0)])
-
         builder.ret_void()
 
     def _implement_gc_push_frame(self):
@@ -1048,30 +876,19 @@ class GarbageCollector:
         # Update frame top
         builder.store(raw_frame, self.gc_frame_top)
 
-        # Increment frame depth (Phase 0/2 preparation)
+        # Increment frame depth
         depth = builder.load(self.gc_frame_depth)
         new_depth = builder.add(depth, ir.Constant(self.i64, 1))
         builder.store(new_depth, self.gc_frame_depth)
 
-        # Phase 6: Sync depth to ThreadEntry
-        builder.call(self.gc_sync_thread_depth, [])
-
         builder.ret(raw_frame)
 
     def _implement_gc_pop_frame(self):
-        """Pop a frame from the shadow stack.
-
-        Phase 3: Also checks if we've returned to the watermark depth,
-        and if so, triggers a garbage collection.
-        """
+        """Pop a frame from the shadow stack."""
         func = self.gc_pop_frame
         func.args[0].name = "frame_ptr"
 
         entry = func.append_basic_block("entry")
-        check_watermark = func.append_basic_block("check_watermark")
-        trigger_gc = func.append_basic_block("trigger_gc")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
         frame_ptr = func.args[0]
@@ -1082,41 +899,14 @@ class GarbageCollector:
         parent = builder.load(parent_ptr)
         builder.store(parent, self.gc_frame_top)
 
-        # Decrement frame depth (Phase 0/2/3)
+        # Decrement frame depth
         depth = builder.load(self.gc_frame_depth)
         new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
         builder.store(new_depth, self.gc_frame_depth)
 
-        # Phase 6: Sync depth to ThreadEntry
-        builder.call(self.gc_sync_thread_depth, [])
-
         # Free the frame
         builder.call(self.codegen.free, [frame_ptr])
 
-        # Phase 3: Check if we've hit the watermark
-        builder.branch(check_watermark)
-
-        builder.position_at_end(check_watermark)
-        # Check if watermark is installed
-        watermark_installed = builder.load(self.gc_watermark_installed)
-        builder.cbranch(watermark_installed, trigger_gc, done)
-
-        builder.position_at_end(trigger_gc)
-        # Check if new_depth <= watermark_depth (we've returned to or past the watermark)
-        watermark_depth = builder.load(self.gc_watermark_depth)
-        at_watermark = builder.icmp_unsigned("<=", new_depth, watermark_depth)
-
-        with builder.if_then(at_watermark):
-            # Clear the watermark (one-shot trigger) - global state
-            builder.store(ir.Constant(self.i1, 0), self.gc_watermark_installed)
-            # Trigger garbage collection
-            builder.call(self.gc_collect, [])
-            # Phase 6: Clear watermarks on all ThreadEntries
-            builder.call(self.gc_clear_watermarks, [])
-
-        builder.branch(done)
-
-        builder.position_at_end(done)
         builder.ret_void()
 
     def _implement_gc_set_root(self):
@@ -1166,8 +956,7 @@ class GarbageCollector:
         #
         # Safe collection points are:
         # 1. Explicit gc() calls in user code
-        # 2. gc_install_watermark() for high-watermark collection
-        # 3. Future: function entry/exit with proper safe-point checks
+        # 2. gc_safepoint() at function entry
         builder.branch(do_alloc)
 
         # Allocate memory
@@ -2116,14 +1905,69 @@ class GarbageCollector:
         # Cast to i8**
         return builder.bitcast(roots_alloca, self.i8_ptr_ptr)
 
+    def push_frame_inline(self, builder: ir.IRBuilder, num_roots: int, roots: ir.Value) -> ir.Value:
+        """Push a GC frame using stack allocation (avoids malloc fragmentation).
+
+        Allocates the frame structure on the stack instead of heap.
+        Returns pointer to the stack-allocated frame for later pop.
+        """
+        # Allocate frame struct on stack (parent: i8*, num_roots: i64, roots: i8**)
+        frame_alloca = builder.alloca(self.gc_frame_type, name="gc_frame")
+
+        # Get old top
+        old_top = builder.load(self.gc_frame_top)
+
+        # Set parent = old_top
+        parent_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(old_top, parent_ptr)
+
+        # Set num_roots
+        num_roots_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(ir.Constant(self.i64, num_roots), num_roots_ptr)
+
+        # Set roots pointer
+        roots_ptr_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(roots, roots_ptr_ptr)
+
+        # Update gc_frame_top to point to this frame
+        raw_frame = builder.bitcast(frame_alloca, self.i8_ptr)
+        builder.store(raw_frame, self.gc_frame_top)
+
+        # Increment frame depth
+        depth = builder.load(self.gc_frame_depth)
+        new_depth = builder.add(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, self.gc_frame_depth)
+
+        return raw_frame
+
+    def pop_frame_inline(self, builder: ir.IRBuilder, frame: ir.Value):
+        """Pop a GC frame (stack-allocated version - no free needed)."""
+        frame_typed = builder.bitcast(frame, self.gc_frame_type.as_pointer())
+
+        # Get parent and set as new top
+        parent_ptr = builder.gep(frame_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, self.gc_frame_top)
+
+        # Decrement frame depth
+        depth = builder.load(self.gc_frame_depth)
+        new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, self.gc_frame_depth)
+
     def push_frame(self, builder: ir.IRBuilder, num_roots: int, roots: ir.Value) -> ir.Value:
-        """Push a GC frame. Returns frame pointer for later pop."""
-        num_roots_val = ir.Constant(self.i64, num_roots)
-        return builder.call(self.gc_push_frame, [num_roots_val, roots])
+        """Push a GC frame. Returns frame pointer for later pop.
+
+        Uses stack-allocated frames to avoid malloc fragmentation from
+        millions of small allocations.
+        """
+        return self.push_frame_inline(builder, num_roots, roots)
 
     def pop_frame(self, builder: ir.IRBuilder, frame: ir.Value):
-        """Pop a GC frame."""
-        builder.call(self.gc_pop_frame, [frame])
+        """Pop a GC frame.
+
+        Uses stack-allocated frames - no free needed.
+        """
+        self.pop_frame_inline(builder, frame)
 
     def set_root(self, builder: ir.IRBuilder, roots: ir.Value, index: int, value: ir.Value):
         """Set a root slot to a value."""
@@ -3160,762 +3004,3 @@ class GarbageCollector:
         level = func.args[0]
         builder.store(level, self.gc_trace_level)
         builder.ret_void()
-
-    # ============================================================
-    # Phase 3: High Watermark Tracking Implementation
-    # ============================================================
-
-    def _implement_gc_install_watermark(self):
-        """Install watermark at current frame depth.
-
-        When gc_pop_frame detects that frame_depth has returned to
-        watermark_depth, it will trigger a garbage collection.
-
-        This is the key mechanism for the high watermark GC:
-        1. Program calls gc_install_watermark() at a safe point (e.g., top of main loop)
-        2. Watermark is set to current frame depth
-        3. Program continues, creating allocations
-        4. When returning to the watermark depth (unwinding back to that point),
-           GC is triggered to collect objects that are no longer reachable
-        """
-        func = self.gc_install_watermark
-
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        # Get current frame depth
-        current_depth = builder.load(self.gc_frame_depth)
-
-        # Store as watermark depth
-        builder.store(current_depth, self.gc_watermark_depth)
-
-        # Set watermark installed flag
-        builder.store(ir.Constant(self.i1, 1), self.gc_watermark_installed)
-
-        # Phase 6: Also install watermarks on all ThreadEntries
-        builder.call(self.gc_install_watermarks, [])
-
-        builder.ret_void()
-
-    # ============================================================
-    # Phase 5: Thread Registry Implementations
-    # ============================================================
-
-    def _implement_gc_register_thread(self):
-        """Register a thread with the GC system.
-
-        Allocates a ThreadEntry, initializes it, and adds it to the registry.
-        For single-threaded mode, this is called once for the main thread.
-
-        Returns pointer to the new ThreadEntry.
-        """
-        func = self.gc_register_thread
-
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        thread_id = func.args[0]
-
-        # Allocate ThreadEntry (using malloc for simplicity, this is GC metadata)
-        entry_size = ir.Constant(self.i64, 64)  # 8 fields * 8 bytes
-        entry_ptr_raw = builder.call(self.codegen.malloc, [entry_size])
-        entry_ptr = builder.bitcast(entry_ptr_raw, self.thread_entry_type.as_pointer())
-
-        # Initialize fields:
-        # 0: thread_id
-        thread_id_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        builder.store(thread_id, thread_id_ptr)
-
-        # 1: shadow_stack_chain - point to gc_frame_top global
-        # In single-threaded mode, all threads share gc_frame_top
-        # Cast the global variable address to i8*
-        frame_top_addr = builder.bitcast(self.gc_frame_top, self.i8_ptr)
-        shadow_stack_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        builder.store(frame_top_addr, shadow_stack_ptr)
-
-        # 2: watermark = 0 (no watermark)
-        watermark_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), watermark_ptr)
-
-        # 3: watermark_active = 0
-        watermark_active_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), watermark_active_ptr)
-
-        # 4: stack_depth = 0
-        stack_depth_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), stack_depth_ptr)
-
-        # 5: blocked = 0
-        blocked_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), blocked_ptr)
-
-        # 6: alloc_buffer = null (future use)
-        alloc_buffer_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i8_ptr, None), alloc_buffer_ptr)
-
-        # 7: next = current registry head
-        old_head = builder.load(self.gc_thread_registry)
-        old_head_raw = builder.bitcast(old_head, self.i8_ptr)
-        next_ptr = builder.gep(entry_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        builder.store(old_head_raw, next_ptr)
-
-        # Update registry head to point to new entry
-        builder.store(entry_ptr, self.gc_thread_registry)
-
-        # Increment thread count
-        old_count = builder.load(self.gc_thread_count)
-        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.gc_thread_count)
-
-        builder.ret(entry_ptr)
-
-    def _implement_gc_unregister_thread(self):
-        """Unregister a thread from the GC system.
-
-        Removes the ThreadEntry from the registry and frees it.
-        For single-threaded mode, this is called at program exit.
-        """
-        func = self.gc_unregister_thread
-
-        entry = func.append_basic_block("entry")
-        search_loop = func.append_basic_block("search_loop")
-        found = func.append_basic_block("found")
-        not_found = func.append_basic_block("not_found")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        thread_id = func.args[0]
-
-        # prev = null, curr = registry head
-        prev = builder.alloca(self.thread_entry_type.as_pointer(), name="prev")
-        builder.store(ir.Constant(self.thread_entry_type.as_pointer(), None), prev)
-
-        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
-        head = builder.load(self.gc_thread_registry)
-        builder.store(head, curr)
-
-        builder.branch(search_loop)
-
-        # Search loop
-        builder.position_at_end(search_loop)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        builder.cbranch(is_null, not_found, found)
-
-        # Check if this is the thread we're looking for
-        builder.position_at_end(found)
-        curr_id_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        curr_id = builder.load(curr_id_ptr)
-        is_match = builder.icmp_unsigned("==", curr_id, thread_id)
-
-        # If match, remove from list
-        remove_block = func.append_basic_block("remove")
-        next_iter = func.append_basic_block("next_iter")
-        builder.cbranch(is_match, remove_block, next_iter)
-
-        # Remove from list
-        builder.position_at_end(remove_block)
-        # Get next pointer
-        next_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        next_raw = builder.load(next_ptr)
-        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
-
-        # Update prev->next or registry head
-        prev_val = builder.load(prev)
-        is_head = builder.icmp_unsigned("==", prev_val,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        update_head = func.append_basic_block("update_head")
-        update_prev = func.append_basic_block("update_prev")
-        after_update = func.append_basic_block("after_update")
-        builder.cbranch(is_head, update_head, update_prev)
-
-        # Update registry head
-        builder.position_at_end(update_head)
-        builder.store(next_entry, self.gc_thread_registry)
-        builder.branch(after_update)
-
-        # Update prev->next
-        builder.position_at_end(update_prev)
-        prev_next_ptr = builder.gep(prev_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        builder.store(next_raw, prev_next_ptr)
-        builder.branch(after_update)
-
-        # Free the entry and decrement count
-        builder.position_at_end(after_update)
-        curr_raw = builder.bitcast(curr_val, self.i8_ptr)
-        builder.call(self.codegen.free, [curr_raw])
-        old_count = builder.load(self.gc_thread_count)
-        new_count = builder.sub(old_count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.gc_thread_count)
-        builder.branch(done)
-
-        # Move to next entry
-        builder.position_at_end(next_iter)
-        builder.store(curr_val, prev)
-        next_ptr2 = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        next_raw2 = builder.load(next_ptr2)
-        next_entry2 = builder.bitcast(next_raw2, self.thread_entry_type.as_pointer())
-        builder.store(next_entry2, curr)
-        builder.branch(search_loop)
-
-        # Not found - do nothing
-        builder.position_at_end(not_found)
-        builder.branch(done)
-
-        builder.position_at_end(done)
-        builder.ret_void()
-
-    def _implement_gc_get_thread_entry(self):
-        """Get the ThreadEntry for a given thread ID.
-
-        Searches the registry for a matching thread_id.
-        Returns pointer to ThreadEntry or null if not found.
-        """
-        func = self.gc_get_thread_entry
-
-        entry = func.append_basic_block("entry")
-        search_loop = func.append_basic_block("search_loop")
-        check_match = func.append_basic_block("check_match")
-        found = func.append_basic_block("found")
-        next_iter = func.append_basic_block("next_iter")
-        not_found = func.append_basic_block("not_found")
-
-        builder = ir.IRBuilder(entry)
-
-        thread_id = func.args[0]
-
-        # curr = registry head
-        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
-        head = builder.load(self.gc_thread_registry)
-        builder.store(head, curr)
-
-        builder.branch(search_loop)
-
-        # Search loop
-        builder.position_at_end(search_loop)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        builder.cbranch(is_null, not_found, check_match)
-
-        # Check if this is the thread we're looking for
-        builder.position_at_end(check_match)
-        curr_id_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        curr_id = builder.load(curr_id_ptr)
-        is_match = builder.icmp_unsigned("==", curr_id, thread_id)
-        builder.cbranch(is_match, found, next_iter)
-
-        # Found - return entry
-        builder.position_at_end(found)
-        builder.ret(curr_val)
-
-        # Move to next entry
-        builder.position_at_end(next_iter)
-        next_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        next_raw = builder.load(next_ptr)
-        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
-        builder.store(next_entry, curr)
-        builder.branch(search_loop)
-
-        # Not found - return null
-        builder.position_at_end(not_found)
-        builder.ret(ir.Constant(self.thread_entry_type.as_pointer(), None))
-
-    def _implement_gc_get_current_thread_entry(self):
-        """Get the ThreadEntry for the current (main) thread.
-
-        In single-threaded mode, this just returns the first entry in the registry.
-        In multi-threaded mode, this would use thread-local storage or thread ID lookup.
-        """
-        func = self.gc_get_current_thread_entry
-
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        # In single-threaded mode, just return the registry head
-        # (which is the only entry - the main thread)
-        head = builder.load(self.gc_thread_registry)
-        builder.ret(head)
-
-    # ============================================================
-    # Phase 6: Watermark Mechanism Enhancement Implementations
-    # ============================================================
-
-    def _implement_gc_install_watermarks(self):
-        """Install watermarks on all registered threads.
-
-        For each thread in the registry:
-        1. Set thread.watermark = thread.stack_depth (or global gc_frame_depth)
-        2. Set thread.watermark_active = 1
-
-        This is called at the start of a GC cycle to mark the point
-        where threads should block if they try to unwind past.
-        """
-        func = self.gc_install_watermarks
-
-        entry = func.append_basic_block("entry")
-        loop = func.append_basic_block("loop")
-        process = func.append_basic_block("process")
-        next_thread = func.append_basic_block("next_thread")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        # curr = registry head
-        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
-        head = builder.load(self.gc_thread_registry)
-        builder.store(head, curr)
-
-        builder.branch(loop)
-
-        # Loop through all threads
-        builder.position_at_end(loop)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        builder.cbranch(is_null, done, process)
-
-        # Process this thread - set watermark
-        builder.position_at_end(process)
-
-        # Get current global frame depth (in single-threaded mode, all threads share this)
-        current_depth = builder.load(self.gc_frame_depth)
-
-        # Set thread.watermark = current_depth
-        watermark_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(current_depth, watermark_ptr)
-
-        # Set thread.watermark_active = 1
-        watermark_active_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 1), watermark_active_ptr)
-
-        # Also sync stack_depth field
-        stack_depth_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        builder.store(current_depth, stack_depth_ptr)
-
-        builder.branch(next_thread)
-
-        # Move to next thread
-        builder.position_at_end(next_thread)
-        next_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        next_raw = builder.load(next_ptr)
-        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
-        builder.store(next_entry, curr)
-        builder.branch(loop)
-
-        builder.position_at_end(done)
-        builder.ret_void()
-
-    def _implement_gc_clear_watermarks(self):
-        """Clear watermarks on all registered threads.
-
-        For each thread in the registry:
-        1. Set thread.watermark = 0
-        2. Set thread.watermark_active = 0
-
-        This is called at the end of a GC cycle to allow blocked threads
-        to continue.
-        """
-        func = self.gc_clear_watermarks
-
-        entry = func.append_basic_block("entry")
-        loop = func.append_basic_block("loop")
-        process = func.append_basic_block("process")
-        next_thread = func.append_basic_block("next_thread")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        # Also clear the global watermark state
-        builder.store(ir.Constant(self.i64, 0), self.gc_watermark_depth)
-        builder.store(ir.Constant(self.i1, 0), self.gc_watermark_installed)
-
-        # curr = registry head
-        curr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr")
-        head = builder.load(self.gc_thread_registry)
-        builder.store(head, curr)
-
-        builder.branch(loop)
-
-        # Loop through all threads
-        builder.position_at_end(loop)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        builder.cbranch(is_null, done, process)
-
-        # Process this thread - clear watermark
-        builder.position_at_end(process)
-
-        # Set thread.watermark = 0
-        watermark_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), watermark_ptr)
-
-        # Set thread.watermark_active = 0
-        watermark_active_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), watermark_active_ptr)
-
-        builder.branch(next_thread)
-
-        # Move to next thread
-        builder.position_at_end(next_thread)
-        next_ptr = builder.gep(curr_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        next_raw = builder.load(next_ptr)
-        next_entry = builder.bitcast(next_raw, self.thread_entry_type.as_pointer())
-        builder.store(next_entry, curr)
-        builder.branch(loop)
-
-        builder.position_at_end(done)
-        builder.ret_void()
-
-    def _implement_gc_sync_thread_depth(self):
-        """Sync global gc_frame_depth to current thread's ThreadEntry.stack_depth.
-
-        This keeps the ThreadEntry in sync with the global frame depth counter.
-        In single-threaded mode, there's only one thread so this is straightforward.
-        In multi-threaded mode, each thread would update its own entry.
-        """
-        func = self.gc_sync_thread_depth
-
-        entry = func.append_basic_block("entry")
-        has_entry = func.append_basic_block("has_entry")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        # Get current thread entry
-        thread_entry = builder.load(self.gc_thread_registry)
-        is_null = builder.icmp_unsigned("==", thread_entry,
-                                         ir.Constant(self.thread_entry_type.as_pointer(), None))
-        builder.cbranch(is_null, done, has_entry)
-
-        builder.position_at_end(has_entry)
-        # Get current global frame depth
-        current_depth = builder.load(self.gc_frame_depth)
-
-        # Update thread.stack_depth
-        stack_depth_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        builder.store(current_depth, stack_depth_ptr)
-
-        builder.branch(done)
-
-        builder.position_at_end(done)
-        builder.ret_void()
-
-    # ============================================================
-    # Phase 7: First Trace Pass Implementations
-    # ============================================================
-
-    def _implement_gc_scan_roots_watermark(self):
-        """Scan shadow stack up to watermark depth, marking all roots.
-
-        This is the watermark-aware version of gc_scan_roots.
-        It only scans frames at depth <= watermark_depth, skipping
-        frames above the watermark (which contain objects allocated
-        after watermark installation that are birth-marked).
-
-        Returns the number of roots marked.
-        """
-        func = self.gc_scan_roots_watermark
-
-        entry = func.append_basic_block("entry")
-        frame_loop = func.append_basic_block("frame_loop")
-        check_depth = func.append_basic_block("check_depth")
-        process_frame = func.append_basic_block("process_frame")
-        root_loop = func.append_basic_block("root_loop")
-        check_root = func.append_basic_block("check_root")
-        mark_root = func.append_basic_block("mark_root")
-        next_root = func.append_basic_block("next_root")
-        next_frame = func.append_basic_block("next_frame")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        # Count of roots marked
-        roots_marked = builder.alloca(self.i64, name="roots_marked")
-        builder.store(ir.Constant(self.i64, 0), roots_marked)
-
-        # Current frame depth (counting down from gc_frame_depth)
-        curr_depth = builder.alloca(self.i64, name="curr_depth")
-        total_depth = builder.load(self.gc_frame_depth)
-        builder.store(total_depth, curr_depth)
-
-        # Current frame pointer
-        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
-        top = builder.load(self.gc_frame_top)
-        builder.store(top, curr_frame)
-
-        builder.branch(frame_loop)
-
-        # Frame loop: while curr_frame != null
-        builder.position_at_end(frame_loop)
-        frame_val = builder.load(curr_frame)
-        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, check_depth)
-
-        # Check if we've gone past the watermark depth
-        builder.position_at_end(check_depth)
-        depth_val = builder.load(curr_depth)
-        watermark_depth = builder.load(self.gc_watermark_depth)
-        wm_installed = builder.load(self.gc_watermark_installed)
-
-        # gc_frame_depth starts at 0, increments on push, decrements on pop
-        # When watermark is installed, watermark_depth = current gc_frame_depth
-        # We want to scan frames that existed at watermark time (depth <= watermark_depth)
-        # As we walk the stack, we're going from current top towards older frames
-        # The frame at top has depth = gc_frame_depth, next frame has depth = gc_frame_depth-1, etc.
-        #
-        # If gc_frame_depth = 5 and watermark_depth = 3:
-        # - Frame at depth 5: newer than watermark, skip
-        # - Frame at depth 4: newer than watermark, skip
-        # - Frame at depth 3: at watermark, scan
-        # - Frame at depth 2: older than watermark, scan
-        # etc.
-        #
-        # So we should scan when depth <= watermark_depth
-        # And skip when depth > watermark_depth
-
-        past_watermark = builder.icmp_unsigned(">", depth_val, watermark_depth)
-        should_skip = builder.and_(wm_installed, past_watermark)
-        builder.cbranch(should_skip, next_frame, process_frame)
-
-        # Process frame - scan its roots
-        builder.position_at_end(process_frame)
-        # Re-load frame_val since we need it here
-        frame_val_pf = builder.load(curr_frame)
-        frame = builder.bitcast(frame_val_pf, self.gc_frame_type.as_pointer())
-
-        # Get num_roots
-        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        num_roots = builder.load(num_roots_ptr)
-
-        # Get roots array
-        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        roots = builder.load(roots_ptr_ptr)
-
-        # Root index
-        root_idx = builder.alloca(self.i64, name="root_idx")
-        builder.store(ir.Constant(self.i64, 0), root_idx)
-
-        builder.branch(root_loop)
-
-        # Root loop: for i in 0..num_roots
-        builder.position_at_end(root_loop)
-        i = builder.load(root_idx)
-        done_roots = builder.icmp_unsigned(">=", i, num_roots)
-        builder.cbranch(done_roots, next_frame, check_root)
-
-        # Check if root is non-null
-        builder.position_at_end(check_root)
-        i_val = builder.load(root_idx)
-        root_slot = builder.gep(roots, [i_val], inbounds=True)
-        root_ptr = builder.load(root_slot)
-
-        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_root_null, next_root, mark_root)
-
-        # Mark non-null root
-        builder.position_at_end(mark_root)
-        builder.call(self.gc_mark_object, [root_ptr])
-
-        # Increment roots marked count
-        count = builder.load(roots_marked)
-        new_count = builder.add(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, roots_marked)
-
-        builder.branch(next_root)
-
-        # Next root
-        builder.position_at_end(next_root)
-        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
-        builder.store(next_i, root_idx)
-        builder.branch(root_loop)
-
-        # Move to next (older) frame - reload curr_frame since we may have
-        # come from check_depth (skip) or root_loop (after processing)
-        builder.position_at_end(next_frame)
-        frame_val_nf = builder.load(curr_frame)
-        frame_nf = builder.bitcast(frame_val_nf, self.gc_frame_type.as_pointer())
-        parent_ptr = builder.gep(frame_nf, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        parent = builder.load(parent_ptr)
-        builder.store(parent, curr_frame)
-
-        # Decrement depth as we go to older frames
-        d = builder.load(curr_depth)
-        new_d = builder.sub(d, ir.Constant(self.i64, 1))
-        builder.store(new_d, curr_depth)
-
-        builder.branch(frame_loop)
-
-        # Return count of roots marked
-        builder.position_at_end(done)
-        result = builder.load(roots_marked)
-        builder.ret(result)
-
-    def _implement_gc_first_trace(self):
-        """Orchestrate the first trace pass.
-
-        This is the entry point for the trace phase of GC:
-        1. Scan roots from shadow stack (respecting watermark)
-        2. Mark all reachable objects
-        3. Update statistics
-
-        Objects are birth-marked, so we use mark bit inversion to
-        identify garbage (objects with the OLD mark value).
-        """
-        func = self.gc_first_trace
-
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        # Call watermark-aware root scanning
-        # This will mark all objects reachable from roots at or below watermark
-        roots_marked = builder.call(self.gc_scan_roots_watermark, [])
-
-        # Update statistics: objects_marked_last_cycle
-        # Note: gc_mark_object increments this internally, but we track roots here
-        # The stats field is at offset 40 in gc_stats
-        # Actually, we should update a different stat - root count
-        # For now, just call scan_roots_watermark
-
-        builder.ret_void()
-
-    def _implement_gc_count_roots(self):
-        """Count total roots in shadow stack (for debugging/stats).
-
-        Counts all non-null roots across all frames without marking them.
-        """
-        func = self.gc_count_roots
-
-        entry = func.append_basic_block("entry")
-        frame_loop = func.append_basic_block("frame_loop")
-        process_frame = func.append_basic_block("process_frame")
-        root_loop = func.append_basic_block("root_loop")
-        check_root = func.append_basic_block("check_root")
-        count_root = func.append_basic_block("count_root")
-        next_root = func.append_basic_block("next_root")
-        next_frame = func.append_basic_block("next_frame")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        # Count of roots
-        root_count = builder.alloca(self.i64, name="root_count")
-        builder.store(ir.Constant(self.i64, 0), root_count)
-
-        # Current frame pointer
-        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
-        top = builder.load(self.gc_frame_top)
-        builder.store(top, curr_frame)
-
-        builder.branch(frame_loop)
-
-        # Frame loop: while curr_frame != null
-        builder.position_at_end(frame_loop)
-        frame_val = builder.load(curr_frame)
-        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, process_frame)
-
-        # Process frame
-        builder.position_at_end(process_frame)
-        frame = builder.bitcast(frame_val, self.gc_frame_type.as_pointer())
-
-        # Get num_roots
-        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        num_roots = builder.load(num_roots_ptr)
-
-        # Get roots array
-        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        roots = builder.load(roots_ptr_ptr)
-
-        # Root index
-        root_idx = builder.alloca(self.i64, name="root_idx")
-        builder.store(ir.Constant(self.i64, 0), root_idx)
-
-        builder.branch(root_loop)
-
-        # Root loop: for i in 0..num_roots
-        builder.position_at_end(root_loop)
-        i = builder.load(root_idx)
-        done_roots = builder.icmp_unsigned(">=", i, num_roots)
-        builder.cbranch(done_roots, next_frame, check_root)
-
-        # Check if root is non-null
-        builder.position_at_end(check_root)
-        i_val = builder.load(root_idx)
-        root_slot = builder.gep(roots, [i_val], inbounds=True)
-        root_ptr = builder.load(root_slot)
-
-        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_root_null, next_root, count_root)
-
-        # Count non-null root
-        builder.position_at_end(count_root)
-        count = builder.load(root_count)
-        new_count = builder.add(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, root_count)
-        builder.branch(next_root)
-
-        # Next root
-        builder.position_at_end(next_root)
-        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
-        builder.store(next_i, root_idx)
-        builder.branch(root_loop)
-
-        # Move to next frame
-        builder.position_at_end(next_frame)
-        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        parent = builder.load(parent_ptr)
-        builder.store(parent, curr_frame)
-        builder.branch(frame_loop)
-
-        # Return count
-        builder.position_at_end(done)
-        result = builder.load(root_count)
-        builder.ret(result)
