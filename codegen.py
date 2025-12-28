@@ -13113,7 +13113,15 @@ class CodeGenerator:
 
                 # Special handling for List.get and Array.get - returns i8* that needs dereferencing
                 if type_name == "List" or type_name == "Array":
-                    typed_ptr = self.builder.bitcast(result, ir.IntType(64).as_pointer())
+                    # Get element type from Coex type tracking
+                    elem_llvm_type = ir.IntType(64)  # default
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
+                                elem_llvm_type = self._get_llvm_type(coex_type.element_type)
+                    typed_ptr = self.builder.bitcast(result, elem_llvm_type.as_pointer())
                     return self.builder.load(typed_ptr)
 
                 return result
@@ -13129,7 +13137,17 @@ class CodeGenerator:
                     index = self._cast_value(index, ir.IntType(64))
 
                 elem_ptr = self.builder.call(self.array_get, [obj, index])
-                typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+
+                # Get element type from Coex type tracking
+                elem_llvm_type = ir.IntType(64)  # default
+                if isinstance(expr.object, Identifier):
+                    var_name = expr.object.name
+                    if var_name in self.var_coex_types:
+                        coex_type = self.var_coex_types[var_name]
+                        if isinstance(coex_type, ArrayType):
+                            elem_llvm_type = self._get_llvm_type(coex_type.element_type)
+
+                typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                 return self.builder.load(typed_ptr)
 
         # Check if this is a List
@@ -13140,12 +13158,19 @@ class CodeGenerator:
                 # Ensure index is i64
                 if index.type != ir.IntType(64):
                     index = self._cast_value(index, ir.IntType(64))
-                
+
                 elem_ptr = self.builder.call(self.list_get, [obj, index])
-                
-                # For now, assume int64 elements - load as i64
-                # A proper implementation would track element types
-                typed_ptr = self.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+
+                # Get element type from Coex type tracking
+                elem_llvm_type = ir.IntType(64)  # default
+                if isinstance(expr.object, Identifier):
+                    var_name = expr.object.name
+                    if var_name in self.var_coex_types:
+                        coex_type = self.var_coex_types[var_name]
+                        if isinstance(coex_type, ListType):
+                            elem_llvm_type = self._get_llvm_type(coex_type.element_type)
+
+                typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                 return self.builder.load(typed_ptr)
             
             # String indexing

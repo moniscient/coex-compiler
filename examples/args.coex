@@ -1,0 +1,5 @@
+func main(args: [string]) -> int
+    for s in 0..args.len()
+        print(args[s])
+    ~
+~

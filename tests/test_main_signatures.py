@@ -53,7 +53,7 @@ func main(args: [string]) -> int
         assert proc.stdout.strip() == "4", f"Expected 4 args, got: {proc.stdout.strip()}"
 
     def test_main_with_args_access(self, compile_binary):
-        """Main can access individual arguments."""
+        """Main can access individual arguments via .get() method."""
         binary = compile_binary('''
 func main(args: [string]) -> int
     if args.len() > 1
@@ -65,6 +65,35 @@ func main(args: [string]) -> int
         assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
         proc = binary.run("hello")
         assert proc.stdout.strip() == "hello", f"Expected 'hello', got: {proc.stdout.strip()}"
+
+    def test_main_with_args_index_access(self, compile_binary):
+        """Main can access individual arguments via [] indexing."""
+        binary = compile_binary('''
+func main(args: [string]) -> int
+    if args.len() > 1
+        print(args[1])
+    ~
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run("hello")
+        assert proc.stdout.strip() == "hello", f"Expected 'hello', got: {proc.stdout.strip()}"
+
+    def test_main_with_args_loop(self, compile_binary):
+        """Main can iterate over arguments using index and print them."""
+        binary = compile_binary('''
+func main(args: [string]) -> int
+    for i in 1..args.len()
+        print(args[i])
+    ~
+    return 0
+~
+''')
+        assert binary.compile_success, f"Compilation failed:\n{binary.compile_output}"
+        proc = binary.run("one", "two", "three")
+        lines = proc.stdout.strip().split("\n")
+        assert lines == ["one", "two", "three"], f"Expected ['one', 'two', 'three'], got: {lines}"
 
 
 class TestMainWithStdio:
