@@ -272,6 +272,14 @@ class TernaryExpr(Expr):
 
 
 @dataclass
+class AsExpr(Expr):
+    """Type cast expression: expr as Type or expr as Type?"""
+    expr: Expr
+    target_type: Type
+    is_optional: bool = False  # True for Type?, returns nil on failure
+
+
+@dataclass
 class CallExpr(Expr):
     callee: Expr
     args: List[Expr]

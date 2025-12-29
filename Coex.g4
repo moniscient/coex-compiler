@@ -459,6 +459,7 @@ postfixOp
     | DOT methodName genericArgs? LPAREN argumentList? RPAREN
     | LBRACKET sliceOrIndex RBRACKET                          // Index or slice
     | LPAREN argumentList? RPAREN
+    | AS typeExpr                                             // Type cast: j as Person, j as int?
     ;
 
 // Method names can be identifiers or type keywords (for .int(), .float(), .string(), .bool())
@@ -673,6 +674,7 @@ MATCH       : 'match' ;
 CASE        : 'case' ;
 SELECT      : 'select' ;
 WITHIN      : 'within' ;
+AS          : 'as' ;
 
 // Control flow modifiers
 BREAK       : 'break' ;

@@ -986,7 +986,15 @@ class ASTBuilder:
             if ctx.argumentList():
                 args, named_args = self.visit_argument_list(ctx.argumentList())
             return CallExpr(base, args, named_args)
-        
+        elif ctx.AS():
+            # Type cast: expr as Type or expr as Type?
+            type_expr = self.visit_type_expr(ctx.typeExpr())
+            is_optional = False
+            # Check if the type is optional (Type?)
+            if isinstance(type_expr, OptionalType):
+                is_optional = True
+            return AsExpr(base, type_expr, is_optional)
+
         return base
 
     def visit_slice_or_index(self, base: Expr, ctx: CoexParser.SliceOrIndexContext) -> Expr:
