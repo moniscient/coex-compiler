@@ -453,7 +453,7 @@ class TestTernaryExpression:
     def test_ternary_true_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    x: int = true ? 10 ; 20
+    x: int = true ? 10 : 20
     print(x)
     return 0
 ~
@@ -462,7 +462,7 @@ func main() -> int
     def test_ternary_false_branch(self, expect_output):
         expect_output('''
 func main() -> int
-    x: int = false ? 10 ; 20
+    x: int = false ? 10 : 20
     print(x)
     return 0
 ~
@@ -473,7 +473,7 @@ func main() -> int
 func main() -> int
     a: int = 5
     b: int = 3
-    max: int = a > b ? a ; b
+    max: int = a > b ? a : b
     print(max)
     return 0
 ~
@@ -483,11 +483,114 @@ func main() -> int
         expect_output('''
 func main() -> int
     x: int = 5
-    result: int = x < 0 ? -1 ; x == 0 ? 0 ; 1
+    result: int = x < 0 ? -1 : x == 0 ? 0 : 1
     print(result)
     return 0
 ~
 ''', "1\n")
+
+
+class TestColonBlockBegin:
+    """Tests for colon as optional block-begin marker."""
+
+    def test_function_with_colon(self, expect_output):
+        """Colon can mark start of function block."""
+        expect_output('''
+func main() -> int: x = 1; y = 2; print(x + y); return 0 ~
+''', "3\n")
+
+    def test_if_with_colon(self, expect_output):
+        """Colon can mark start of if block."""
+        expect_output('''
+func main() -> int: x = 5; if x > 0: print(x) ~; return 0 ~
+''', "5\n")
+
+    def test_if_else_with_colon(self, expect_output):
+        """Colon works with if-else on single line."""
+        expect_output('''
+func main() -> int: x = -1; if x > 0: print(1) else: print(0) ~; return 0 ~
+''', "0\n")
+
+    def test_for_with_colon(self, expect_output):
+        """Colon can mark start of for block."""
+        expect_output('''
+func main() -> int: sum = 0; for i in [1, 2, 3]: sum += i ~; print(sum); return 0 ~
+''', "6\n")
+
+    def test_while_with_colon(self, expect_output):
+        """Colon can mark start of while block."""
+        expect_output('''
+func main() -> int: x = 3; while x > 0: print(x); x -= 1 ~; return 0 ~
+''', "3\n2\n1\n")
+
+    def test_ternary_with_colon_block(self, expect_output):
+        """Ternary inside block-begin colon context works."""
+        expect_output('''
+func main() -> int: x = 5 > 3 ? 10 : 20; print(x); return 0 ~
+''', "10\n")
+
+    def test_ternary_as_if_condition_with_colon(self, expect_output):
+        """Ternary as if condition followed by colon block-begin."""
+        expect_output('''
+func main() -> int: if true ? true : false: print(1) ~; return 0 ~
+''', "1\n")
+
+
+class TestSemicolonStatementTerminator:
+    """Tests for semicolon as optional statement terminator."""
+
+    def test_semicolon_between_statements(self, expect_output):
+        """Semicolon can separate statements on the same line."""
+        expect_output('''
+func main() -> int
+    x = 1; y = 2; z = 3
+    print(x + y + z)
+    return 0
+~
+''', "6\n")
+
+    def test_semicolon_with_newlines(self, expect_output):
+        """Semicolon works alongside newlines."""
+        expect_output('''
+func main() -> int
+    x = 10;
+    y = 20
+    print(x + y)
+    return 0
+~
+''', "30\n")
+
+    def test_semicolon_in_if_block(self, expect_output):
+        """Semicolon works in if blocks."""
+        expect_output('''
+func main() -> int
+    x = 5
+    if x > 0
+        a = 1; b = 2; print(a + b)
+    ~
+    return 0
+~
+''', "3\n")
+
+    def test_semicolon_multiple_prints(self, expect_output):
+        """Multiple prints separated by semicolons."""
+        expect_output('''
+func main() -> int
+    print(1); print(2); print(3)
+    return 0
+~
+''', "1\n2\n3\n")
+
+    def test_mixed_semicolons_and_newlines(self, expect_output):
+        """Mix of semicolons and newlines works correctly."""
+        expect_output('''
+func main() -> int
+    a = 1; b = 2
+    c = 3; d = 4
+    print(a + b + c + d)
+    return 0
+~
+''', "10\n")
 
 
 class TestNoGlobalVariables:

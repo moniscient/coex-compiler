@@ -179,6 +179,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#stmtSep.
+    def visitStmtSep(self, ctx:CoexParser.StmtSepContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#blockTerminator.
     def visitBlockTerminator(self, ctx:CoexParser.BlockTerminatorContext):
         return self.visitChildren(ctx)

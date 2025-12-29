@@ -77,14 +77,14 @@ func main() -> int
 
 
 class TestTernaryContinuation:
-    """Tests to ensure ; variant (continuation) still works."""
+    """Tests to ensure : variant (continuation) still works."""
 
     def test_ternary_continuation_true(self, expect_output):
         """Continuation variant returns then_expr when true."""
         expect_output('''
 func main() -> int
     x = 5
-    result = x > 0 ? 1 ; -1
+    result = x > 0 ? 1 : -1
     print(result)
     return 0
 ~
@@ -95,7 +95,7 @@ func main() -> int
         expect_output('''
 func main() -> int
     x = -5
-    result = x > 0 ? 1 ; -1
+    result = x > 0 ? 1 : -1
     print(result)
     return 0
 ~
@@ -140,8 +140,8 @@ func main() -> int
     ok: Result<int, string> = Result.ok(42)
     err: Result<int, string> = Result.err("fail")
 
-    a = ok ? 1 ; 0
-    b = err ? 1 ; 0
+    a = ok ? 1 : 0
+    b = err ? 1 : 0
 
     print(a)
     print(b)
@@ -285,7 +285,7 @@ class TestTernaryEdgeCases:
         expect_output('''
 func outer(x: int) -> int
     # outer is continuation, inner is exit
-    result = x > 0 ? (x > 10 ? x ! 5) ; 0
+    result = x > 0 ? (x > 10 ? x ! 5) : 0
     return result
 ~
 

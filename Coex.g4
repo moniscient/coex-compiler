@@ -61,7 +61,7 @@ annotation
     ;
 
 functionDecl
-    : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? NEWLINE* block
+    : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* block
     | EXTERN IDENTIFIER LPAREN parameterList? RPAREN returnType? NEWLINE* blockTerminator  // extern has no body
     ;
 
@@ -135,7 +135,7 @@ enumCaseParam
     ;
 
 methodDecl
-    : functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? NEWLINE* block
+    : functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* block
     ;
 
 // ----------------------------------------------------------------------------
@@ -185,7 +185,7 @@ matrixInitDecl
     ;
 
 matrixMethodDecl
-    : FORMULA IDENTIFIER LPAREN parameterList? RPAREN returnType? NEWLINE* block
+    : FORMULA IDENTIFIER LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* block
     ;
 
 // ----------------------------------------------------------------------------
@@ -193,7 +193,13 @@ matrixMethodDecl
 // ----------------------------------------------------------------------------
 
 block
-    : NEWLINE* (statement (NEWLINE+ statement)*)? NEWLINE* blockTerminator
+    : NEWLINE* (statement (stmtSep statement)*)? NEWLINE* blockTerminator
+    ;
+
+// Statement separator: newline(s) or semicolon (with optional trailing newlines)
+stmtSep
+    : NEWLINE+
+    | SEMI NEWLINE*
     ;
 
 blockTerminator
@@ -276,7 +282,7 @@ ifStmt
 
 // Block without terminator (for if/else bodies)
 ifBlock
-    : NEWLINE* (statement (NEWLINE+ statement)*)? NEWLINE*
+    : COLON? NEWLINE* (statement (stmtSep statement)*)? NEWLINE*
     ;
 
 elseIfClause
@@ -296,23 +302,23 @@ bindingPattern
 
 // For-in loop with destructuring support
 forStmt
-    : FOR bindingPattern IN expression NEWLINE* block
+    : FOR bindingPattern IN expression COLON? NEWLINE* block
     ;
 
 // For-assign pattern: results = for i in items expr ~
 forAssignStmt
-    : IDENTIFIER ASSIGN FOR bindingPattern IN expression expression NEWLINE* block
+    : IDENTIFIER ASSIGN FOR bindingPattern IN expression expression COLON? NEWLINE* block
     ;
 
 // While loop (standard while condition)
 whileStmt
-    : WHILE expression NEWLINE* block
+    : WHILE expression COLON? NEWLINE* block
     ;
 
 // Cycle statement (double-buffered synchronous iteration)
 // Condition is in outer scope; body variables are double-buffered
 cycleStmt
-    : WHILE expression CYCLE NEWLINE* block
+    : WHILE expression CYCLE COLON? NEWLINE* block
     ;
 
 // Match statement (pattern matching)
@@ -325,7 +331,7 @@ matchBody
     ;
 
 matchCase
-    : CASE pattern COLON NEWLINE* (statement (NEWLINE+ statement)*)? NEWLINE* blockTerminator
+    : CASE pattern COLON NEWLINE* (statement (stmtSep statement)*)? NEWLINE* blockTerminator
     ;
 
 pattern
@@ -359,7 +365,7 @@ selectBody
     ;
 
 selectCase
-    : CASE IDENTIFIER LARROW expression NEWLINE* (statement (NEWLINE+ statement)*)? NEWLINE* blockTerminator
+    : CASE IDENTIFIER LARROW expression COLON? NEWLINE* (statement (stmtSep statement)*)? NEWLINE* blockTerminator
     ;
 
 // Within statement (temporal constraints)
@@ -391,9 +397,9 @@ expression
     : ternaryExpr
     ;
 
-// Ternary conditional: expr ? expr ; expr (continuation) or expr ? expr ! expr (exit/return)
+// Ternary conditional: expr ? expr : expr (continuation) or expr ? expr ! expr (exit/return)
 ternaryExpr
-    : orExpr (QUESTION ternaryExpr (SEMI | BANG) ternaryExpr)?
+    : orExpr (QUESTION ternaryExpr (COLON | BANG) ternaryExpr)?
     ;
 
 // Logical OR

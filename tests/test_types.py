@@ -212,7 +212,7 @@ class TestConditionalExpression:
     def test_conditional_simple(self, expect_output):
         expect_output('''
 func main() -> int
-    result: int = 5 > 3 ? 1 ; 0
+    result: int = 5 > 3 ? 1 : 0
     print(result)
     return 0
 ~
@@ -222,7 +222,7 @@ func main() -> int
         expect_output('''
 func main() -> int
     x: int = 10
-    print(x > 0 ? x ; 0)
+    print(x > 0 ? x : 0)
     return 0
 ~
 ''', "10\n")

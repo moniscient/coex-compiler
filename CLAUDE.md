@@ -26,7 +26,7 @@ Write benchmarks that show the possibility of pathologically long run time compa
 ## Architecture
 
 ```
-source.coex → ANTLR4 Parser → Parse Tree → AST Builder → AST → CodeGen → LLVM IR → clang → executable
+source.coex â†’ ANTLR4 Parser â†’ Parse Tree â†’ AST Builder â†’ AST â†’ CodeGen â†’ LLVM IR â†’ clang â†’ executable
 ```
 
 | File | Purpose |
@@ -60,6 +60,22 @@ b = b.append(4)    # b is now [1, 2, 3, 4]; a is unchanged
 There is no aliasing in Coex. Two bindings never refer to "the same" mutable storage such that modifications through one are visible through the other. This guarantee is foundational to Coex's concurrency safety: a task that receives a value as a parameter owns that value exclusively and cannot observe modifications from other tasks.
 
 The compiler may implement value semantics through copy-on-write, structural sharing, or other optimizations, but the observable behavior is always as if a full copy occurred at assignment.
+
+### Slice Views and the := Operator
+
+Strings and Arrays support zero-copy slice views. When you slice a string or array, the result can share the underlying data buffer. The assignment operator determines behavior:
+
+```coex
+var text = load_file("huge.txt")     # 1GB string
+var line1 := text[0:100]             # := preserves view (shares buffer)
+var line2 = text[100:200]            # = creates independent copy
+```
+
+The `=` operator always creates an independent copy with no hidden aliasing. This is the safe default.
+
+The `:=` operator preserves the view, accepting that the slice keeps the parent buffer alive. This is "expert mode" for programmers who understand the memory model and want performance.
+
+Lifetime implication: A slice view keeps the entire parent buffer alive until all views are unreachable. To release a large buffer while keeping small extracts, use `=` to create independent copies.
 
 ### Bindings: `const` vs Rebindable
 
@@ -136,6 +152,34 @@ func main() -> int
 ~
 ```
 
+### Statement Separators
+Statements are separated by newlines. Semicolons can optionally be used to put multiple statements on one line:
+```coex
+func main() -> int
+    x = 1; y = 2; z = 3   # Multiple statements on one line
+    print(x + y + z)
+    return 0
+~
+```
+
+### Optional Block-Begin Colon
+Colons can optionally mark block begins, allowing single-line programs:
+```coex
+# Single-line function
+func main() -> int: x = 1; y = 2; print(x + y); return 0 ~
+
+# Single-line with nested blocks
+func main() -> int: if true: print(1) else: print(0) ~; return 0 ~
+
+# Traditional whitespace style still works
+func main() -> int
+    if true
+        print(1)
+    ~
+    return 0
+~
+```
+
 ### Function Kinds
 - `formula` - Pure functions (no side effects)
 - `func` - Regular imperative functions
@@ -163,7 +207,7 @@ func main() -> int
 - Set: `{1, 2, 3}`, methods: `.add`, `.has`, `.remove`, `.len()`
 - Lambdas: `formula(_ x: int) => x * 2`
 - Ranges: `start..stop` in for loops
-- Ternary: `cond ? then ; else`
+- Ternary: `cond ? then : else`
 - Module system: `import math`, `math.abs(-5)`, `replace abs with math.abs`
 
 **Note:** Collection operations use method syntax (`.len()`, `.append()`) not free functions.
@@ -230,10 +274,10 @@ Mark expected failures: `@pytest.mark.xfail(reason="description")`
 primitiveType: 'int' | 'float' | 'bool' | 'string' | 'byte' | 'char'
              | 'atomic_int' | 'atomic_float' | 'atomic_bool'
 
-// Expressions (precedence low→high)
-ternaryExpr → orExpr → andExpr → notExpr → nullCoalesceExpr
-→ comparisonExpr → rangeExpr → additiveExpr → multiplicativeExpr
-→ unaryExpr → postfixExpr → primaryExpr
+// Expressions (precedence lowâ†’high)
+ternaryExpr â†’ orExpr â†’ andExpr â†’ notExpr â†’ nullCoalesceExpr
+â†’ comparisonExpr â†’ rangeExpr â†’ additiveExpr â†’ multiplicativeExpr
+â†’ unaryExpr â†’ postfixExpr â†’ primaryExpr
 
 // Statements
 statement: varDeclStmt | ifStmt | forStmt | whileStmt | matchStmt

@@ -812,13 +812,13 @@ class ASTBuilder:
     
     def visit_ternary_expr(self, ctx: CoexParser.TernaryExprContext) -> Expr:
         """Visit a ternary expression"""
-        # Grammar: orExpr (QUESTION ternaryExpr (SEMI | BANG) ternaryExpr)?
+        # Grammar: orExpr (QUESTION ternaryExpr (COLON | BANG) ternaryExpr)?
         if ctx.QUESTION():
             condition = self.visit_or_expr(ctx.orExpr())
             ternary_exprs = ctx.ternaryExpr()
             then_expr = self.visit_ternary_expr(ternary_exprs[0])
             else_expr = self.visit_ternary_expr(ternary_exprs[1]) if len(ternary_exprs) > 1 else NilLiteral()
-            # Check if this is the exit variant (!) vs continuation (;)
+            # Check if this is the exit variant (!) vs continuation (:)
             is_exit = ctx.BANG() is not None
             return TernaryExpr(condition, then_expr, else_expr, is_exit)
         return self.visit_or_expr(ctx.orExpr())

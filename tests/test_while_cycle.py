@@ -457,7 +457,7 @@ func main() -> int
     while iteration < 2 cycle
         # Destructure (10, 20) or (30, 40) based on iteration
         # Since iteration is outer var, it works normally
-        (a, b) = iteration == 0 ? (10, 20) ; (30, 40)
+        (a, b) = iteration == 0 ? (10, 20) : (30, 40)
         # If a, b were double-buffered: a_read=0, b_read=0
         # But they should have actual values
         result = a * b

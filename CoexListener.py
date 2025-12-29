@@ -314,6 +314,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#stmtSep.
+    def enterStmtSep(self, ctx:CoexParser.StmtSepContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#stmtSep.
+    def exitStmtSep(self, ctx:CoexParser.StmtSepContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#blockTerminator.
     def enterBlockTerminator(self, ctx:CoexParser.BlockTerminatorContext):
         pass
