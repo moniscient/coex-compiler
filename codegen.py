@@ -240,6 +240,9 @@ class CodeGenerator:
         # Create Set type and helpers
         self._create_set_type()
 
+        # Create JSON type and helpers
+        self._create_json_type()
+
         # Create Array type and helpers (dense, contiguous collection)
         # struct Array { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
         # Owner pointer first, offset enables slice views without data copying.
@@ -6957,6 +6960,484 @@ class CodeGenerator:
         self.functions["coex_set_copy"] = self.set_copy
 
     # ========================================================================
+    # JSON Type Implementation
+    # ========================================================================
+
+    # JSON tag constants
+    JSON_TAG_NULL = 0
+    JSON_TAG_BOOL = 1
+    JSON_TAG_INT = 2
+    JSON_TAG_FLOAT = 3
+    JSON_TAG_STRING = 4
+    JSON_TAG_ARRAY = 5
+    JSON_TAG_OBJECT = 6
+
+    def _create_json_type(self):
+        """Create the JSON type and helper functions.
+
+        JSON values are tagged unions that can hold:
+        - null (tag=0)
+        - bool (tag=1)
+        - int (tag=2)
+        - float (tag=3)
+        - string (tag=4, value is String* pointer)
+        - array (tag=5, value is List* pointer holding [json])
+        - object (tag=6, value is Map* pointer with string keys and json values)
+
+        struct.Json { i8 tag, i64 value }
+        """
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Define the JSON struct: { i8 tag, i64 value }
+        self.json_struct = ir.global_context.get_identified_type("struct.Json")
+        self.json_struct.set_body(
+            i8,   # tag (field 0) - type discriminator
+            i64,  # value (field 1) - inline value or pointer as i64
+        )
+
+        # Declare constructor functions
+        json_ptr = self.json_struct.as_pointer()
+
+        # json_new_null() -> Json*
+        self.json_new_null = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, []),
+            name="coex_json_new_null"
+        )
+
+        # json_new_bool(i1 value) -> Json*
+        self.json_new_bool = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [ir.IntType(1)]),
+            name="coex_json_new_bool"
+        )
+
+        # json_new_int(i64 value) -> Json*
+        self.json_new_int = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [i64]),
+            name="coex_json_new_int"
+        )
+
+        # json_new_float(f64 value) -> Json*
+        self.json_new_float = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [ir.DoubleType()]),
+            name="coex_json_new_float"
+        )
+
+        # json_new_string(String* value) -> Json*
+        self.json_new_string = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [self.string_struct.as_pointer()]),
+            name="coex_json_new_string"
+        )
+
+        # json_new_array(List* value) -> Json*
+        self.json_new_array = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [self.list_struct.as_pointer()]),
+            name="coex_json_new_array"
+        )
+
+        # json_new_object(Map* value) -> Json*
+        self.json_new_object = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [self.map_struct.as_pointer()]),
+            name="coex_json_new_object"
+        )
+
+        # json_get_tag(Json*) -> i8
+        self.json_get_tag = ir.Function(
+            self.module,
+            ir.FunctionType(i8, [json_ptr]),
+            name="coex_json_get_tag"
+        )
+
+        # json_get_field(Json*, String*) -> Json* (returns null json if not found)
+        self.json_get_field = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, self.string_struct.as_pointer()]),
+            name="coex_json_get_field"
+        )
+
+        # json_get_index(Json*, i64) -> Json* (returns null json if out of bounds)
+        self.json_get_index = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, i64]),
+            name="coex_json_get_index"
+        )
+
+        # Implement the constructor functions
+        self._implement_json_new_null()
+        self._implement_json_new_bool()
+        self._implement_json_new_int()
+        self._implement_json_new_float()
+        self._implement_json_new_string()
+        self._implement_json_new_array()
+        self._implement_json_new_object()
+        self._implement_json_get_tag()
+        self._implement_json_get_field()
+        self._implement_json_get_index()
+
+        # Register JSON type and methods
+        self._register_json_methods()
+
+    def _implement_json_new_null(self):
+        """Implement json_new_null(): allocate a Json with null value."""
+        func = self.json_new_null
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct (9 bytes, but align to 16)
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_NULL (0)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_NULL), tag_ptr)
+
+        # Set value to 0 (unused for null)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_bool(self):
+        """Implement json_new_bool(i1): allocate a Json with bool value."""
+        func = self.json_new_bool
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_BOOL (1)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_BOOL), tag_ptr)
+
+        # Set value (extend i1 to i64)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.zext(func.args[0], i64)
+        builder.store(value_i64, value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_int(self):
+        """Implement json_new_int(i64): allocate a Json with int value."""
+        func = self.json_new_int
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_INT (2)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_INT), tag_ptr)
+
+        # Set value
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(func.args[0], value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_float(self):
+        """Implement json_new_float(f64): allocate a Json with float value."""
+        func = self.json_new_float
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_FLOAT (3)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_FLOAT), tag_ptr)
+
+        # Set value (bitcast f64 to i64)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.bitcast(func.args[0], i64)
+        builder.store(value_i64, value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_string(self):
+        """Implement json_new_string(String*): allocate a Json with string value."""
+        func = self.json_new_string
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_STRING (4)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_STRING), tag_ptr)
+
+        # Set value (store pointer as i64)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.ptrtoint(func.args[0], i64)
+        builder.store(value_i64, value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_array(self):
+        """Implement json_new_array(List*): allocate a Json with array value."""
+        func = self.json_new_array
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_ARRAY (5)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_ARRAY), tag_ptr)
+
+        # Set value (store pointer as i64)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.ptrtoint(func.args[0], i64)
+        builder.store(value_i64, value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_new_object(self):
+        """Implement json_new_object(Map*): allocate a Json with object value."""
+        func = self.json_new_object
+        func.args[0].name = "value"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Allocate Json struct
+        json_size = ir.Constant(i64, 16)
+        type_id = ir.Constant(i32, self.gc.TYPE_JSON)
+        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
+
+        # Set tag to JSON_TAG_OBJECT (6)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(ir.Constant(i8, self.JSON_TAG_OBJECT), tag_ptr)
+
+        # Set value (store pointer as i64)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.ptrtoint(func.args[0], i64)
+        builder.store(value_i64, value_ptr)
+
+        builder.ret(json_ptr)
+
+    def _implement_json_get_tag(self):
+        """Implement json_get_tag(Json*): return the type tag."""
+        func = self.json_get_tag
+        func.args[0].name = "json"
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+
+        # Get tag field
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        builder.ret(tag)
+
+    def _implement_json_get_field(self):
+        """Implement json_get_field(Json*, String*): get field from object, return null json if not found."""
+        func = self.json_get_field
+        func.args[0].name = "json"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Is object: extract Map* and look up key
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+
+        # Call map_get_string to get the value
+        result = builder.call(self.map_get_string, [map_ptr, func.args[1]])
+
+        # Check if found (result != 0, since 0 indicates not found for map_get)
+        # Actually, we need to handle this differently. map_get_string returns i64.
+        # For JSON, we store Json* as i64. If not found, we return json null.
+        # The issue is distinguishing "not found" from "found with value 0".
+        # For now, we'll assume 0 means not found (since Json* is never null/0).
+        is_found = builder.icmp_unsigned("!=", result, ir.Constant(i64, 0))
+        builder.cbranch(is_found, found, not_found)
+
+        # Found: convert i64 back to Json*
+        builder.position_at_end(found)
+        json_result = builder.inttoptr(result, self.json_struct.as_pointer())
+        builder.ret(json_result)
+
+        # Not found or not object: return json null
+        builder.position_at_end(not_object)
+        null_json_1 = builder.call(self.json_new_null, [])
+        builder.ret(null_json_1)
+
+        builder.position_at_end(not_found)
+        null_json_2 = builder.call(self.json_new_null, [])
+        builder.ret(null_json_2)
+
+    def _implement_json_get_index(self):
+        """Implement json_get_index(Json*, i64): get element from array, return null json if out of bounds."""
+        func = self.json_get_index
+        func.args[0].name = "json"
+        func.args[1].name = "index"
+
+        entry = func.append_basic_block("entry")
+        is_array = func.append_basic_block("is_array")
+        not_array = func.append_basic_block("not_array")
+        in_bounds = func.append_basic_block("in_bounds")
+        out_of_bounds = func.append_basic_block("out_of_bounds")
+
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if array
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        builder.cbranch(is_arr, is_array, not_array)
+
+        # Is array: extract List* and get element
+        builder.position_at_end(is_array)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        list_ptr = builder.inttoptr(value_i64, self.list_struct.as_pointer())
+
+        # Get list length
+        len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        list_len = builder.load(len_ptr)
+
+        # Check bounds
+        idx = func.args[1]
+        in_range = builder.icmp_signed("<", idx, list_len)
+        non_negative = builder.icmp_signed(">=", idx, ir.Constant(i64, 0))
+        valid = builder.and_(in_range, non_negative)
+        builder.cbranch(valid, in_bounds, out_of_bounds)
+
+        # In bounds: get element
+        builder.position_at_end(in_bounds)
+        result = builder.call(self.list_get, [list_ptr, idx])
+        # Result is i8*, cast to json pointer (stored as i64 in list)
+        result_i64 = builder.ptrtoint(result, i64)
+        json_result = builder.inttoptr(result_i64, self.json_struct.as_pointer())
+        builder.ret(json_result)
+
+        # Not array or out of bounds: return json null
+        builder.position_at_end(not_array)
+        null_json_1 = builder.call(self.json_new_null, [])
+        builder.ret(null_json_1)
+
+        builder.position_at_end(out_of_bounds)
+        null_json_2 = builder.call(self.json_new_null, [])
+        builder.ret(null_json_2)
+
+    def _register_json_methods(self):
+        """Register JSON as a type with methods."""
+        self.type_registry["Json"] = self.json_struct
+        self.type_fields["Json"] = []  # Internal structure, not user-accessible
+
+        self.type_methods["Json"] = {
+            "is_null": "coex_json_is_null",
+            "is_bool": "coex_json_is_bool",
+            "is_int": "coex_json_is_int",
+            "is_float": "coex_json_is_float",
+            "is_string": "coex_json_is_string",
+            "is_array": "coex_json_is_array",
+            "is_object": "coex_json_is_object",
+            "get": "coex_json_get_field",
+            "len": "coex_json_len",
+        }
+
+        self.functions["coex_json_new_null"] = self.json_new_null
+        self.functions["coex_json_new_bool"] = self.json_new_bool
+        self.functions["coex_json_new_int"] = self.json_new_int
+        self.functions["coex_json_new_float"] = self.json_new_float
+        self.functions["coex_json_new_string"] = self.json_new_string
+        self.functions["coex_json_new_array"] = self.json_new_array
+        self.functions["coex_json_new_object"] = self.json_new_object
+        self.functions["coex_json_get_tag"] = self.json_get_tag
+        self.functions["coex_json_get_field"] = self.json_get_field
+        self.functions["coex_json_get_index"] = self.json_get_index
+
+    # ========================================================================
     # Atomic Reference Type Implementation
     # ========================================================================
     
@@ -7775,6 +8256,7 @@ class CodeGenerator:
                 "string": self.string_struct.as_pointer(),
                 "byte": ir.IntType(8),
                 "char": ir.IntType(32),
+                "json": self.json_struct.as_pointer(),
             }
             return type_map.get(coex_type.name, ir.IntType(64))
         
@@ -8709,6 +9191,8 @@ class CodeGenerator:
                 value_type = self._infer_type_from_expr(expr.entries[0][1])
                 return MapType(key_type, value_type)
             return MapType(PrimitiveType("int"), PrimitiveType("int"))
+        elif isinstance(expr, JsonObjectExpr):
+            return PrimitiveType("json")
         elif isinstance(expr, SetExpr):
             if expr.elements:
                 elem_type = self._infer_type_from_expr(expr.elements[0])
@@ -8720,6 +9204,30 @@ class CodeGenerator:
             if func_name and func_name in self.type_fields:
                 # This is a user type constructor
                 return NamedType(func_name)
+        elif isinstance(expr, MemberExpr):
+            # Check if accessing a field on a JSON object
+            obj_type = self._infer_type_from_expr(expr.object)
+            if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
+                return PrimitiveType("json")
+            # For UDTs, look up the field type
+            if isinstance(obj_type, NamedType) and obj_type.name in self.type_fields:
+                for field_name, field_type in self.type_fields[obj_type.name]:
+                    if field_name == expr.member:
+                        return field_type
+        elif isinstance(expr, IndexExpr):
+            # Check if indexing a JSON object
+            obj_type = self._infer_type_from_expr(expr.object)
+            if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
+                return PrimitiveType("json")
+            # For lists, return element type
+            if isinstance(obj_type, ListType):
+                return obj_type.element_type
+            # For arrays, return element type
+            if isinstance(obj_type, ArrayType):
+                return obj_type.element_type
+            # For maps, return value type
+            if isinstance(obj_type, MapType):
+                return obj_type.value_type
 
         # Default
         return PrimitiveType("int")
@@ -8743,6 +9251,9 @@ class CodeGenerator:
             if hasattr(pointee, 'name'):
                 if pointee.name.startswith("struct."):
                     type_name = pointee.name[7:]
+                    # json is a primitive type, not a named type
+                    if type_name == "Json":
+                        return PrimitiveType("json")
                     return NamedType(type_name)
         return PrimitiveType("int")
     
@@ -9659,8 +10170,9 @@ class CodeGenerator:
                 init_value = self.builder.insert_value(init_value, ir.Constant(inner_type, 0.0), 1)
             else:
                 init_value = self.builder.insert_value(init_value, ir.Constant(inner_type, None), 1)
-        # Handle empty {} which parses as MapExpr but might need to be Set or Map based on type annotation
-        elif isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0:
+        # Handle empty {} which parses as JsonObjectExpr or MapExpr but might need to be Set or Map based on type annotation
+        elif (isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0) or \
+             (isinstance(stmt.initializer, JsonObjectExpr) and len(stmt.initializer.entries) == 0):
             if isinstance(stmt.type_annotation, SetType):
                 # Empty {} with Set type annotation -> generate empty set
                 i64 = ir.IntType(64)
@@ -9672,7 +10184,12 @@ class CodeGenerator:
                 flags = self._compute_map_flags(stmt.type_annotation.key_type, stmt.type_annotation.value_type)
                 init_value = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
             else:
+                # Default to JSON (which is what JsonObjectExpr([]) generates)
                 init_value = self._generate_expression(stmt.initializer)
+        # Handle assignment to json type - convert primitives to JSON
+        elif isinstance(stmt.type_annotation, PrimitiveType) and stmt.type_annotation.name == "json":
+            init_value = self._generate_expression(stmt.initializer)
+            init_value = self._convert_to_json(init_value, self._infer_type_from_expr(stmt.initializer))
         else:
             init_value = self._generate_expression(stmt.initializer)
 
@@ -11849,6 +12366,9 @@ class CodeGenerator:
         elif isinstance(expr, SetExpr):
             return self._generate_set(expr)
 
+        elif isinstance(expr, JsonObjectExpr):
+            return self._generate_json_object(expr)
+
         elif isinstance(expr, ListComprehension):
             return self._generate_list_comprehension(expr)
         
@@ -13068,13 +13588,20 @@ class CodeGenerator:
                 ], inbounds=True)
                 return self.builder.load(field_ptr)
         
+        # Handle JSON field access: j.field -> json_get_field(j, "field")
+        if type_name == "Json":
+            # Create a string constant from the member name
+            key_str = self._get_string_ptr(expr.member)
+            # Call json_get_field
+            return self.builder.call(self.json_get_field, [obj, key_str])
+
         # Handle known members for built-in types
         if expr.member == "width" or expr.member == "height":
             # Matrix dimensions
             return ir.Constant(ir.IntType(64), 0)
-        
+
         return ir.Constant(ir.IntType(64), 0)
-    
+
     def _get_tuple_field_info(self, expr: Expr) -> Optional[PyList[tuple]]:
         """Get field info for a tuple expression (name, type pairs)"""
         if isinstance(expr, Identifier):
@@ -13197,11 +13724,24 @@ class CodeGenerator:
 
                 typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                 return self.builder.load(typed_ptr)
-            
+
+            # JSON indexing: j["key"] or j[0]
+            if hasattr(pointee, 'name') and pointee.name == "struct.Json":
+                # Determine index type
+                index_coex_type = self._infer_type_from_expr(expr.indices[0])
+                if isinstance(index_coex_type, PrimitiveType) and index_coex_type.name == "string":
+                    # String key: call json_get_field
+                    return self.builder.call(self.json_get_field, [obj, index])
+                else:
+                    # Integer index: call json_get_index
+                    if index.type != ir.IntType(64):
+                        index = self._cast_value(index, ir.IntType(64))
+                    return self.builder.call(self.json_get_index, [obj, index])
+
             # String indexing
             ptr = self.builder.gep(obj, [index])
             return self.builder.load(ptr)
-        
+
         return ir.Constant(ir.IntType(64), 0)
 
     def _generate_slice(self, expr: SliceExpr) -> ir.Value:
@@ -13476,7 +14016,88 @@ class CodeGenerator:
                 set_ptr = self.builder.call(self.set_add, [set_ptr, elem_i64])
 
         return set_ptr
-    
+
+    def _generate_json_object(self, expr: JsonObjectExpr) -> ir.Value:
+        """Generate code for JSON object literal: {name: "Alice", age: 30}
+
+        Creates a Map<String, Json> internally, then wraps it in a Json object.
+        """
+        i64 = ir.IntType(64)
+
+        if not expr.entries:
+            # Empty JSON object: create empty map, wrap in json_new_object
+            flags = self.MAP_FLAG_KEY_IS_PTR | self.MAP_FLAG_VALUE_IS_PTR  # String keys, Json values
+            empty_map = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
+            return self.builder.call(self.json_new_object, [empty_map])
+
+        # Create map with string keys and json values
+        flags = self.MAP_FLAG_KEY_IS_PTR | self.MAP_FLAG_VALUE_IS_PTR
+        map_ptr = self.builder.call(self.map_new, [ir.Constant(i64, flags)])
+
+        # Add each entry
+        for key_str, value_expr in expr.entries:
+            # Generate the key as a string (it's already a literal string from parsing)
+            key_string = self._get_string_ptr(key_str)
+
+            # Generate the value expression
+            value = self._generate_expression(value_expr)
+
+            # Convert value to JSON if it isn't already
+            json_value = self._convert_to_json(value, value_expr)
+
+            # Cast json pointer to i64 for map storage
+            json_i64 = self.builder.ptrtoint(json_value, i64)
+
+            # Add to map using string-aware set
+            map_ptr = self.builder.call(self.map_set_string, [map_ptr, key_string, json_i64])
+
+        # Wrap the map in a Json object
+        return self.builder.call(self.json_new_object, [map_ptr])
+
+    def _convert_to_json(self, value: ir.Value, expr: Expr) -> ir.Value:
+        """Convert a value to a Json* pointer based on its type."""
+        # Check value type and call appropriate json_new_* constructor
+        if isinstance(value.type, ir.IntType):
+            if value.type.width == 1:
+                # Boolean
+                return self.builder.call(self.json_new_bool, [value])
+            elif value.type.width == 64:
+                # Integer
+                return self.builder.call(self.json_new_int, [value])
+            else:
+                # Extend to i64 for JSON
+                extended = self.builder.zext(value, ir.IntType(64))
+                return self.builder.call(self.json_new_int, [extended])
+        elif isinstance(value.type, ir.DoubleType):
+            # Float
+            return self.builder.call(self.json_new_float, [value])
+        elif isinstance(value.type, ir.PointerType):
+            if hasattr(value.type.pointee, 'name'):
+                if value.type.pointee.name == "struct.String":
+                    # String
+                    return self.builder.call(self.json_new_string, [value])
+                elif value.type.pointee.name == "struct.Json":
+                    # Already JSON, return as-is
+                    return value
+                elif value.type.pointee.name == "struct.List":
+                    # List -> JSON array
+                    return self.builder.call(self.json_new_array, [value])
+                elif value.type.pointee.name == "struct.Map":
+                    # Map -> JSON object
+                    return self.builder.call(self.json_new_object, [value])
+
+        # Handle NilLiteral
+        if isinstance(expr, NilLiteral):
+            return self.builder.call(self.json_new_null, [])
+
+        # Default: treat as int (may need extension for other types)
+        if isinstance(value.type, ir.IntType):
+            extended = self.builder.zext(value, ir.IntType(64)) if value.type.width < 64 else value
+            return self.builder.call(self.json_new_int, [extended])
+
+        # Fallback: create null JSON
+        return self.builder.call(self.json_new_null, [])
+
     def _generate_list_comprehension(self, expr: ListComprehension) -> ir.Value:
         """Generate code for list comprehension via desugaring.
         

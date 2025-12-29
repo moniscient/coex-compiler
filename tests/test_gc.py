@@ -355,7 +355,7 @@ func main() -> int
     live: Map<int, int> = {1: 100}
 
     for i in 0..50
-        temp: Map<int, int> = {i: i * 10}
+        temp: Map<int, int> = {(i): i * 10}
         gc()
     ~
 

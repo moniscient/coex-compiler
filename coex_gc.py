@@ -58,7 +58,8 @@ class GarbageCollector:
     TYPE_STRING_DATA = 11    # String character data buffer
     TYPE_CHANNEL_BUFFER = 12 # Channel data buffer
     TYPE_ARRAY_DATA = 13     # Array element data buffer
-    TYPE_FIRST_USER = 14     # First ID for user-defined types
+    TYPE_JSON = 14           # JSON value (tagged union: i8 tag, i64 value)
+    TYPE_FIRST_USER = 15     # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -671,6 +672,11 @@ class GarbageCollector:
         # For slice views, owner points to the shared data buffer (traced via mark_array)
         self.type_info[self.TYPE_ARRAY] = {'size': 40, 'ref_offsets': [0]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
+        # JSON: { i8 tag, i64 value } = 16 bytes (with padding)
+        # The value field at offset 8 may be a pointer (for string/array/object)
+        # We use gc_mark_json to handle the dynamic tracing based on tag
+        self.type_info[self.TYPE_JSON] = {'size': 16, 'ref_offsets': []}
+        self.type_descriptors['Json'] = self.TYPE_JSON
 
     def register_type(self, type_name: str, size: int, ref_offsets: PyList[int]) -> int:
         """Register a user-defined type and return its type_id"""
@@ -1241,6 +1247,9 @@ class GarbageCollector:
         mark_string = func.append_basic_block("mark_string")
         mark_channel = func.append_basic_block("mark_channel")
         mark_pv_node = func.append_basic_block("mark_pv_node")
+        mark_json = func.append_basic_block("mark_json")
+        mark_json_ptr = func.append_basic_block("mark_json_ptr")
+        mark_json_done = func.append_basic_block("mark_json_done")
         pv_node_loop = func.append_basic_block("pv_node_loop")
         pv_node_check = func.append_basic_block("pv_node_check")
         pv_node_mark_child = func.append_basic_block("pv_node_mark_child")
@@ -1382,6 +1391,7 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), mark_string)
         switch.add_case(ir.Constant(self.i64, self.TYPE_CHANNEL), mark_channel)
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), mark_pv_node)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON), mark_json)
 
         # Actual map marking (in builtin_switch block)
         builder.position_at_end(builtin_switch)
@@ -1509,6 +1519,32 @@ class GarbageCollector:
         next_idx = builder.add(curr_idx, ir.Constant(self.i64, 1))
         builder.store(next_idx, pv_idx)
         builder.branch(pv_node_loop)
+
+        # Mark JSON: check tag, if string/array/object then mark the value pointer
+        # JSON struct: { i8 tag (0), i64 value (1) }
+        # Tags 4 (string), 5 (array), 6 (object) have pointer values
+        builder.position_at_end(mark_json)
+        json_ptr_type = ir.LiteralStructType([self.i8, self.i64]).as_pointer()
+        json_typed = builder.bitcast(ptr, json_ptr_type)
+        json_tag_ptr = builder.gep(json_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        json_tag = builder.load(json_tag_ptr)
+        # Check if tag >= 4 (string, array, or object - all have pointer values)
+        is_ptr_type = builder.icmp_unsigned(">=", json_tag, ir.Constant(self.i8, 4))
+        builder.cbranch(is_ptr_type, mark_json_ptr, mark_json_done)
+
+        # Mark the pointer value
+        builder.position_at_end(mark_json_ptr)
+        # Reload json pointer (SSA requirement)
+        json_typed2 = builder.bitcast(ptr, json_ptr_type)
+        json_value_ptr = builder.gep(json_typed2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        json_value_i64 = builder.load(json_value_ptr)
+        json_child_ptr = builder.inttoptr(json_value_i64, self.i8_ptr)
+        builder.call(func, [json_child_ptr])  # Recursive call to mark the child
+        builder.branch(mark_json_done)
+
+        # JSON marking done
+        builder.position_at_end(mark_json_done)
+        builder.branch(done)
 
         builder.position_at_end(done)
         builder.ret_void()

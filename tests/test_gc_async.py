@@ -84,7 +84,7 @@ func main() -> int
     keeper: List<int> = [1, 2, 3]
 
     for round in 0..20
-        temp: Map<int, int> = {round: round * 10}
+        temp: Map<int, int> = {(round): round * 10}
         gc()
     ~
 
@@ -325,7 +325,7 @@ func main() -> int
     sum: int = 0
 
     for i in 0..500
-        m: Map<int, int> = {i: i * 2}
+        m: Map<int, int> = {(i): i * 2}
         sum = sum + m.get(i)
         gc()
     ~

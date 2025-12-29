@@ -548,12 +548,13 @@ expressionList
     : expression (COMMA expression)*
     ;
 
-// Map/Set literals and comprehensions
-// Map: {} or {key: value, ...} or {key: value for pattern in iterable if condition}
-// Set: {a, b, ...} or {expr for pattern in iterable if condition}
+// Map/Set/JSON literals and comprehensions
+// JSON: {} or {name: "Alice", age: 30} (bare identifier or string keys)
+// Map: {1: 10, 2: 20} or {(var): value} (expression keys, use parens for variables)
+// Set: {a, b, c} (values only, no colons)
 mapLiteral
-    : LBRACE RBRACE                                                  // Empty map
-    | LBRACE mapEntryList RBRACE                                     // Map literal
+    : LBRACE RBRACE                                                  // Empty JSON object
+    | LBRACE mapEntryList RBRACE                                     // JSON or Map literal
     | LBRACE expressionList RBRACE                                   // Set literal
     | LBRACE expression COLON expression comprehensionClauses RBRACE // Map comprehension
     | LBRACE expression comprehensionClauses RBRACE                  // Set comprehension
@@ -563,8 +564,13 @@ mapEntryList
     : mapEntry (COMMA mapEntry)*
     ;
 
+// Map entries with key type distinction for JSON vs Map disambiguation
+// Order matters: ANTLR uses ordered choice (PEG-style)
 mapEntry
-    : expression COLON expression
+    : IDENTIFIER COLON expression                     // JSON-style: bare identifier key
+    | stringLiteral COLON expression                  // JSON-style: quoted string key
+    | LPAREN expression RPAREN COLON expression       // Map-style: parenthesized variable key
+    | expression COLON expression                     // Map-style: expression key (int, etc.)
     ;
 
 // Lambda expressions: formula(_ x: int) => x * x
@@ -613,6 +619,7 @@ primitiveType
     | STRING_TYPE
     | BYTE_TYPE
     | CHAR_TYPE
+    | JSON_TYPE
     | ATOMIC_INT
     | ATOMIC_FLOAT
     | ATOMIC_BOOL
@@ -721,6 +728,7 @@ CHAR_TYPE       : 'char' ;
 ATOMIC_INT      : 'atomic_int' ;
 ATOMIC_FLOAT    : 'atomic_float' ;
 ATOMIC_BOOL     : 'atomic_bool' ;
+JSON_TYPE       : 'json' ;
 
 // ----------------------------------------------------------------------------
 // Operators and Punctuation

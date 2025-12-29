@@ -1127,7 +1127,7 @@ class ASTBuilder:
         return ListExpr(elements)
     
     def visit_map_literal(self, ctx: CoexParser.MapLiteralContext):
-        """Visit a map literal, set literal, or comprehension"""
+        """Visit a map literal, set literal, JSON object, or comprehension"""
         # Check for comprehensions first
         if ctx.comprehensionClauses():
             clauses = self.visit_comprehension_clauses(ctx.comprehensionClauses())
@@ -1143,14 +1143,55 @@ class ASTBuilder:
                 body = self.visit_expression(expressions[0])
                 return SetComprehension(body, clauses)
 
-        # Map literal: {key: value, ...}
+        # Map/JSON literal: {key: value, ...}
         if ctx.mapEntryList():
-            entries = []
+            json_entries = []  # (str, Expr) for JSON
+            map_entries = []   # (Expr, Expr) for Map
+            has_json_key = False
+            has_map_key = False
+
             for entry in ctx.mapEntryList().mapEntry():
-                key = self.visit_expression(entry.expression(0))
-                value = self.visit_expression(entry.expression(1))
-                entries.append((key, value))
-            return MapExpr(entries)
+                # Check which alternative matched in mapEntry:
+                # 1. IDENTIFIER COLON expression -> JSON-style bare identifier key
+                # 2. stringLiteral COLON expression -> Map-style string literal key
+                # 3. LPAREN expression RPAREN COLON expression -> Map-style parenthesized key
+                # 4. expression COLON expression -> Map-style expression key
+
+                if entry.IDENTIFIER():
+                    # JSON-style: bare identifier key (e.g., {name: "Alice"})
+                    key_str = entry.IDENTIFIER().getText()
+                    value = self.visit_expression(entry.expression(0))
+                    json_entries.append((key_str, value))
+                    has_json_key = True
+                elif entry.stringLiteral():
+                    # Map-style: string literal key (e.g., {"hello": 1})
+                    # This creates a Map with string keys, not a JSON object
+                    string_ctx = entry.stringLiteral()
+                    key_str = self._get_string_value(string_ctx)
+                    key = StringLiteral(key_str)
+                    value = self.visit_expression(entry.expression(0))
+                    map_entries.append((key, value))
+                    has_map_key = True
+                elif entry.LPAREN():
+                    # Map-style: parenthesized variable key {(x): value}
+                    key = self.visit_expression(entry.expression(0))
+                    value = self.visit_expression(entry.expression(1))
+                    map_entries.append((key, value))
+                    has_map_key = True
+                else:
+                    # Map-style: expression key {1: value}
+                    key = self.visit_expression(entry.expression(0))
+                    value = self.visit_expression(entry.expression(1))
+                    map_entries.append((key, value))
+                    has_map_key = True
+
+            if has_json_key and has_map_key:
+                raise SyntaxError("Cannot mix JSON-style (bare identifier) and Map-style (expression) keys in same literal")
+
+            if has_json_key:
+                return JsonObjectExpr(json_entries)
+            else:
+                return MapExpr(map_entries)
 
         # Set literal: {a, b, c}
         if ctx.expressionList():
@@ -1159,8 +1200,8 @@ class ASTBuilder:
                 elements.append(self.visit_expression(expr))
             return SetExpr(elements)
 
-        # Empty braces: {} -> empty map
-        return MapExpr([])
+        # Empty braces: {} -> empty JSON object
+        return JsonObjectExpr([])
     
     def visit_comprehension_clauses(self, ctx) -> PyList[ComprehensionClause]:
         """Visit comprehension clauses"""

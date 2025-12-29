@@ -52,7 +52,7 @@ func main() -> int
     count: int = 0
 
     for i in 0..1000000
-        temp: Map<int, int> = {i: i * 2}
+        temp: Map<int, int> = {(i): i * 2}
         count = count + 1
         if i % 1000 == 0
             gc()
@@ -122,7 +122,7 @@ func main() -> int
 
     for i in 0..250000
         t1: List<int> = [i, i + 1]
-        t2: Map<int, int> = {i: i}
+        t2: Map<int, int> = {(i): i}
         t3: Set<int> = {i, i + 1}
         t4: string = "a"
         count = count + 4
@@ -175,7 +175,7 @@ func main() -> int
     count: int = 0
 
     for i in 0..1000000
-        temp: Map<int, int> = {i: i * 2}
+        temp: Map<int, int> = {(i): i * 2}
         count = count + 1
         if i % 1000 == 0
             gc_async()
@@ -279,7 +279,7 @@ class TestGCAutoTriggerStress:
         """1M allocations relying entirely on automatic GC at function entry."""
         expect_output('''
 func allocate_temp(i: int) -> int
-    temp: Map<int, int> = {i: i * 2}
+    temp: Map<int, int> = {(i): i * 2}
     return temp.get(i)
 ~
 
@@ -303,7 +303,7 @@ func main() -> int
         """Deep function call chains with allocations - tests safepoint frequency."""
         expect_output('''
 func level3(i: int) -> int
-    m: Map<int, int> = {i: i}
+    m: Map<int, int> = {(i): i}
     return 0
 ~
 

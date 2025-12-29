@@ -331,6 +331,16 @@ class SetExpr(Expr):
 
 
 @dataclass
+class JsonObjectExpr(Expr):
+    """JSON object literal: {name: "Alice", age: 30}
+
+    Keys are bare identifiers or quoted strings, stored as string literals.
+    Distinguished from MapExpr by having string keys (not expression keys).
+    """
+    entries: List[tuple]  # List of (key_str: str, value_expr: Expr)
+
+
+@dataclass
 class TupleExpr(Expr):
     """Tuple literal: (a, b, c) or (name: a, other: b)"""
     elements: List[tuple]  # List of (name, expr) or (None, expr)

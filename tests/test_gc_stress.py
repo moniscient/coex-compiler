@@ -35,7 +35,7 @@ func main() -> int
     count: int = 0
 
     for i in 0..100000
-        temp: Map<int, int> = {i: i * 2}
+        temp: Map<int, int> = {(i): i * 2}
         count = count + 1
         if i % 1000 == 0
             gc()
@@ -121,7 +121,7 @@ func main() -> int
     keeper: Map<int, int> = {1: 1, 2: 2, 3: 3}
 
     for i in 0..50000
-        garbage: Map<int, int> = {i: i, i+1: i+1}
+        garbage: Map<int, int> = {(i): i, (i+1): i+1}
         gc()
     ~
 
@@ -174,7 +174,7 @@ func main() -> int
     survivor: Map<int, int> = {42: 42}
 
     for i in 0..100000
-        temp: Map<int, int> = {i: i * i}
+        temp: Map<int, int> = {(i): i * i}
         if i % 100 == 0
             gc()
         ~
@@ -198,7 +198,7 @@ func main() -> int
     live_list: List<int> = [1000]
 
     for i in 0..10000
-        temp_map: Map<int, int> = {i: i}
+        temp_map: Map<int, int> = {(i): i}
         temp_set: Set<int> = {i, i + 1}
         temp_list: List<int> = [i, i + 1, i + 2]
 
