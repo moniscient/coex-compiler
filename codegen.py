@@ -81,6 +81,9 @@ class CodeGenerator:
         # Current function for context
         self.current_function: Optional[FunctionDecl] = None
         self.current_type: Optional[str] = None  # For method generation
+
+        # Pre-allocated temp for comprehensions (avoids stack overflow in large comprehensions)
+        self._comp_temp_alloca: Optional[ir.AllocaInst] = None
         
         # Tuple field tracking (for named tuple access)
         self.tuple_field_info: Dict[str, PyList[tuple]] = {}  # var_name -> [(field_name, field_type)]
@@ -2394,7 +2397,12 @@ class CodeGenerator:
         # string_concat(a: String*, b: String*) -> String*
         string_concat_ty = ir.FunctionType(string_ptr, [string_ptr, string_ptr])
         self.string_concat = ir.Function(self.module, string_concat_ty, name="coex_string_concat")
-        
+
+        # string_join_list(strings: List*, separator: String*) -> String*
+        # Efficiently joins all strings in the list with separator between them
+        string_join_list_ty = ir.FunctionType(string_ptr, [self.list_struct.as_pointer(), string_ptr])
+        self.string_join_list = ir.Function(self.module, string_join_list_ty, name="coex_string_join_list")
+
         # string_eq(a: String*, b: String*) -> bool
         string_eq_ty = ir.FunctionType(i1, [string_ptr, string_ptr])
         self.string_eq = ir.Function(self.module, string_eq_ty, name="coex_string_eq")
@@ -2477,6 +2485,7 @@ class CodeGenerator:
         self._implement_string_get()
         self._implement_string_slice()
         self._implement_string_concat()
+        self._implement_string_join_list()
         self._implement_string_eq()
         self._implement_string_contains()
         self._implement_string_print()
@@ -2969,7 +2978,215 @@ class CodeGenerator:
         builder.store(total_size, size_ptr)
 
         builder.ret(string_ptr)
-    
+
+    def _implement_string_join_list(self):
+        """Efficiently join a list of strings with a separator.
+
+        This is O(n) instead of O(n²) - it first calculates total size,
+        allocates once, then copies all strings into the buffer.
+
+        Args:
+            strings: List* containing String* pointers
+            separator: String* to insert between elements
+
+        Returns:
+            String* with all strings joined
+        """
+        func = self.string_join_list
+        func.args[0].name = "strings"
+        func.args[1].name = "separator"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        string_ptr_ty = self.string_struct.as_pointer()
+
+        strings_list = func.args[0]
+        separator = func.args[1]
+
+        # Get list length
+        list_len = builder.call(self.list_len, [strings_list])
+
+        # Handle empty list - return empty string
+        empty_check = func.append_basic_block("empty_check")
+        calc_size = func.append_basic_block("calc_size")
+        builder.branch(empty_check)
+
+        builder.position_at_end(empty_check)
+        is_empty = builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        return_empty = func.append_basic_block("return_empty")
+        builder.cbranch(is_empty, return_empty, calc_size)
+
+        # Return empty string
+        builder.position_at_end(return_empty)
+        null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
+        empty_str = builder.call(self.string_new, [null_ptr, ir.Constant(i64, 0), ir.Constant(i64, 0)])
+        builder.ret(empty_str)
+
+        # Calculate total size needed
+        builder.position_at_end(calc_size)
+
+        # Get separator size (field 3) and len (field 2)
+        sep_size_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        sep_size = builder.load(sep_size_ptr)
+        sep_len_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        sep_len = builder.load(sep_len_ptr)
+
+        # Allocate counters for size calculation loop
+        total_size_ptr = builder.alloca(i64, name="total_size")
+        total_len_ptr = builder.alloca(i64, name="total_len")
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), total_size_ptr)
+        builder.store(ir.Constant(i64, 0), total_len_ptr)
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        # Size calculation loop
+        size_loop_cond = func.append_basic_block("size_loop_cond")
+        size_loop_body = func.append_basic_block("size_loop_body")
+        size_loop_done = func.append_basic_block("size_loop_done")
+        builder.branch(size_loop_cond)
+
+        builder.position_at_end(size_loop_cond)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, size_loop_body, size_loop_done)
+
+        builder.position_at_end(size_loop_body)
+        # Get string pointer from list
+        elem_data_ptr = builder.call(self.list_get, [strings_list, idx])
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+        elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
+
+        # Get element's size and len
+        elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+        elem_len_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        elem_len = builder.load(elem_len_ptr)
+
+        # Add to totals
+        curr_size = builder.load(total_size_ptr)
+        curr_len = builder.load(total_len_ptr)
+        new_size = builder.add(curr_size, elem_size)
+        new_len = builder.add(curr_len, elem_len)
+        builder.store(new_size, total_size_ptr)
+        builder.store(new_len, total_len_ptr)
+
+        # Increment index
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(size_loop_cond)
+
+        # Done calculating sizes
+        builder.position_at_end(size_loop_done)
+        total_size = builder.load(total_size_ptr)
+        total_len = builder.load(total_len_ptr)
+
+        # Add separator sizes: (n-1) * sep_size
+        n_minus_1 = builder.sub(list_len, ir.Constant(i64, 1))
+        sep_total_size = builder.mul(n_minus_1, sep_size)
+        sep_total_len = builder.mul(n_minus_1, sep_len)
+        total_size = builder.add(total_size, sep_total_size)
+        total_len = builder.add(total_len, sep_total_len)
+
+        # Allocate result string struct via GC
+        struct_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING)
+        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        result_str = builder.bitcast(raw_ptr, string_ptr_ty)
+
+        # Allocate data buffer
+        string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        dest_data = builder.call(self.gc.gc_alloc, [total_size, string_data_type_id])
+
+        # Store fields in result string
+        owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(dest_data, owner_ptr)
+        offset_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), offset_ptr)
+        len_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(total_len, len_ptr)
+        size_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        builder.store(total_size, size_ptr)
+
+        # Copy loop - copy each string and separator
+        write_pos_ptr = builder.alloca(i64, name="write_pos")
+        builder.store(ir.Constant(i64, 0), write_pos_ptr)
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        copy_loop_cond = func.append_basic_block("copy_loop_cond")
+        copy_loop_body = func.append_basic_block("copy_loop_body")
+        copy_loop_done = func.append_basic_block("copy_loop_done")
+        builder.branch(copy_loop_cond)
+
+        builder.position_at_end(copy_loop_cond)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, copy_loop_body, copy_loop_done)
+
+        builder.position_at_end(copy_loop_body)
+        write_pos = builder.load(write_pos_ptr)
+
+        # Add separator before all but first element
+        add_sep_block = func.append_basic_block("add_sep")
+        skip_sep_block = func.append_basic_block("skip_sep")
+        after_sep_block = func.append_basic_block("after_sep")
+
+        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
+        builder.cbranch(is_first, skip_sep_block, add_sep_block)
+
+        # Add separator
+        builder.position_at_end(add_sep_block)
+        sep_dest = builder.gep(dest_data, [write_pos])
+        sep_owner_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        sep_owner = builder.load(sep_owner_ptr)
+        sep_offset_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        sep_offset = builder.load(sep_offset_ptr)
+        sep_data = builder.gep(sep_owner, [sep_offset])
+        builder.call(self.memcpy, [sep_dest, sep_data, sep_size])
+        new_write_pos = builder.add(write_pos, sep_size)
+        builder.store(new_write_pos, write_pos_ptr)
+        builder.branch(after_sep_block)
+
+        builder.position_at_end(skip_sep_block)
+        builder.branch(after_sep_block)
+
+        builder.position_at_end(after_sep_block)
+        write_pos = builder.load(write_pos_ptr)
+
+        # Get and copy the string element
+        elem_data_ptr = builder.call(self.list_get, [strings_list, idx])
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+        elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
+
+        elem_owner_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        elem_owner = builder.load(elem_owner_ptr)
+        elem_offset_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        elem_offset = builder.load(elem_offset_ptr)
+        elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        elem_size = builder.load(elem_size_ptr)
+
+        elem_data = builder.gep(elem_owner, [elem_offset])
+        elem_dest = builder.gep(dest_data, [write_pos])
+        builder.call(self.memcpy, [elem_dest, elem_data, elem_size])
+
+        # Update write position
+        new_write_pos = builder.add(write_pos, elem_size)
+        builder.store(new_write_pos, write_pos_ptr)
+
+        # Increment index
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(copy_loop_cond)
+
+        # Return result
+        builder.position_at_end(copy_loop_done)
+        builder.ret(result_str)
+
     def _implement_string_eq(self):
         """Compare two strings for equality.
 
@@ -8286,20 +8503,31 @@ class CodeGenerator:
 
     def _stringify_array(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
                          result_ptr: ir.Value):
-        """Generate code to stringify a JSON array."""
+        """Generate code to stringify a JSON array.
+
+        Uses O(n) algorithm:
+        1. First loop: stringify each element into a List<String>
+        2. Use string_join_list to combine with "," separator
+        3. Wrap with "[" and "]"
+        """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get list pointer
         list_ptr = builder.inttoptr(value, self.list_struct.as_pointer())
 
-        # Start with "["
-        result = self._get_or_create_global_string(builder, "[", "lbracket")
-
         # Get list length
         list_len = builder.call(self.list_len, [list_ptr])
 
-        # Loop through elements
+        # Create a new list to hold stringified elements (8 bytes per String* pointer)
+        string_list = builder.call(self.list_new, [ir.Constant(i64, 8)])
+        string_list_ptr = builder.alloca(self.list_struct.as_pointer(), name="string_list")
+        builder.store(string_list, string_list_ptr)
+
+        # Allocate temp storage OUTSIDE loop to avoid stack overflow
+        temp_ptr = builder.alloca(i64, name="temp_str_ptr")
+
+        # Loop through elements and stringify each one
         loop_block = func.append_basic_block("array_loop")
         body_block = func.append_basic_block("array_body")
         array_done = func.append_basic_block("array_done")
@@ -8307,8 +8535,6 @@ class CodeGenerator:
         # Initialize index
         idx_ptr = builder.alloca(i64, name="idx")
         builder.store(ir.Constant(i64, 0), idx_ptr)
-        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="arr_str")
-        builder.store(result, result_str_ptr)
         builder.branch(loop_block)
 
         # Loop condition
@@ -8317,51 +8543,66 @@ class CodeGenerator:
         cmp = builder.icmp_signed("<", idx, list_len)
         builder.cbranch(cmp, body_block, array_done)
 
-        # Loop body
+        # Loop body - stringify element and append to string list
         builder.position_at_end(body_block)
-        # Add comma if not first
-        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
-        curr_str = builder.load(result_str_ptr)
-        comma_str = self._get_or_create_global_string(builder, ",", "comma")
-        with_comma = builder.call(self.string_concat, [curr_str, comma_str])
-        curr_str = builder.select(is_first, curr_str, with_comma)
-
-        # Get element and stringify it (list_get returns i8* to stored i64, need to load)
         elem_data_ptr = builder.call(self.list_get, [list_ptr, idx])
         elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
         elem_i64 = builder.load(elem_i64_ptr)
         elem_json = builder.inttoptr(elem_i64, self.json_struct.as_pointer())
         elem_str = builder.call(self.json_stringify, [elem_json])
-        curr_str = builder.call(self.string_concat, [curr_str, elem_str])
-        builder.store(curr_str, result_str_ptr)
+
+        # Append to string list (reuse pre-allocated temp_ptr)
+        curr_list = builder.load(string_list_ptr)
+        elem_str_i64 = builder.ptrtoint(elem_str, i64)
+        builder.store(elem_str_i64, temp_ptr)
+        temp_i8 = builder.bitcast(temp_ptr, ir.IntType(8).as_pointer())
+        new_list = builder.call(self.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        builder.store(new_list, string_list_ptr)
 
         # Increment and loop
         next_idx = builder.add(idx, ir.Constant(i64, 1))
         builder.store(next_idx, idx_ptr)
         builder.branch(loop_block)
 
-        # Done: add "]" and store result
+        # Done: join all strings with "," and wrap with "[" and "]"
         builder.position_at_end(array_done)
-        final_str = builder.load(result_str_ptr)
-        close_str = self._get_or_create_global_string(builder, "]", "rbracket")
-        final_str = builder.call(self.string_concat, [final_str, close_str])
+        final_list = builder.load(string_list_ptr)
+        comma_str = self._get_or_create_global_string(builder, ",", "comma")
+        joined_str = builder.call(self.string_join_list, [final_list, comma_str])
+
+        # Build "[" + joined + "]"
+        open_bracket = self._get_or_create_global_string(builder, "[", "lbracket")
+        close_bracket = self._get_or_create_global_string(builder, "]", "rbracket")
+        temp = builder.call(self.string_concat, [open_bracket, joined_str])
+        final_str = builder.call(self.string_concat, [temp, close_bracket])
         builder.store(final_str, result_ptr)
 
     def _stringify_object(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
                           result_ptr: ir.Value):
-        """Generate code to stringify a JSON object."""
+        """Generate code to stringify a JSON object.
+
+        Uses O(n) algorithm:
+        1. First loop: build "key":value strings into a List<String>
+        2. Use string_join_list to combine with "," separator
+        3. Wrap with "{" and "}"
+        """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get map pointer
         map_ptr = builder.inttoptr(value, self.map_struct.as_pointer())
 
-        # Start with "{"
-        result = self._get_or_create_global_string(builder, "{", "lbrace")
-
         # Get keys list
         keys_list = builder.call(self.map_keys, [map_ptr])
         list_len = builder.call(self.list_len, [keys_list])
+
+        # Create a new list to hold "key":value strings (8 bytes per String* pointer)
+        string_list = builder.call(self.list_new, [ir.Constant(i64, 8)])
+        string_list_ptr = builder.alloca(self.list_struct.as_pointer(), name="kv_string_list")
+        builder.store(string_list, string_list_ptr)
+
+        # Allocate temp storage OUTSIDE loop to avoid stack overflow
+        temp_ptr = builder.alloca(i64, name="temp_kv_ptr")
 
         # Loop through keys
         loop_block = func.append_basic_block("object_loop")
@@ -8371,8 +8612,6 @@ class CodeGenerator:
         # Initialize index
         idx_ptr = builder.alloca(i64, name="idx")
         builder.store(ir.Constant(i64, 0), idx_ptr)
-        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="obj_str")
-        builder.store(result, result_str_ptr)
         builder.branch(loop_block)
 
         # Loop condition
@@ -8381,14 +8620,8 @@ class CodeGenerator:
         cmp = builder.icmp_signed("<", idx, list_len)
         builder.cbranch(cmp, body_block, object_done)
 
-        # Loop body
+        # Loop body - build "key":value string and append to list
         builder.position_at_end(body_block)
-        # Add comma if not first
-        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
-        curr_str = builder.load(result_str_ptr)
-        comma_str = self._get_or_create_global_string(builder, ",", "comma2")
-        with_comma = builder.call(self.string_concat, [curr_str, comma_str])
-        curr_str = builder.select(is_first, curr_str, with_comma)
 
         # Get key string (list_get returns i8* to stored i64, need to load and inttoptr)
         key_data_ptr = builder.call(self.list_get, [keys_list, idx])
@@ -8396,30 +8629,42 @@ class CodeGenerator:
         key_i64 = builder.load(key_i64_ptr)
         key_str = builder.inttoptr(key_i64, self.string_struct.as_pointer())
 
-        # Add quoted key: "key":
+        # Build "key": string
         quote_str = self._get_or_create_global_string(builder, '"', "quote2")
         colon_str = self._get_or_create_global_string(builder, '":', "colon")
-        curr_str = builder.call(self.string_concat, [curr_str, quote_str])
-        curr_str = builder.call(self.string_concat, [curr_str, key_str])
-        curr_str = builder.call(self.string_concat, [curr_str, colon_str])
+        kv_str = builder.call(self.string_concat, [quote_str, key_str])
+        kv_str = builder.call(self.string_concat, [kv_str, colon_str])
 
         # Get value and stringify it
         val_i64 = builder.call(self.map_get_string, [map_ptr, key_str])
         val_json = builder.inttoptr(val_i64, self.json_struct.as_pointer())
         val_str = builder.call(self.json_stringify, [val_json])
-        curr_str = builder.call(self.string_concat, [curr_str, val_str])
-        builder.store(curr_str, result_str_ptr)
+        kv_str = builder.call(self.string_concat, [kv_str, val_str])
+
+        # Append to string list (reuse pre-allocated temp_ptr)
+        curr_list = builder.load(string_list_ptr)
+        kv_str_i64 = builder.ptrtoint(kv_str, i64)
+        builder.store(kv_str_i64, temp_ptr)
+        temp_i8 = builder.bitcast(temp_ptr, ir.IntType(8).as_pointer())
+        new_list = builder.call(self.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        builder.store(new_list, string_list_ptr)
 
         # Increment and loop
         next_idx = builder.add(idx, ir.Constant(i64, 1))
         builder.store(next_idx, idx_ptr)
         builder.branch(loop_block)
 
-        # Done: add "}" and store result
+        # Done: join all strings with "," and wrap with "{" and "}"
         builder.position_at_end(object_done)
-        final_str = builder.load(result_str_ptr)
-        close_str = self._get_or_create_global_string(builder, "}", "rbrace")
-        final_str = builder.call(self.string_concat, [final_str, close_str])
+        final_list = builder.load(string_list_ptr)
+        comma_str = self._get_or_create_global_string(builder, ",", "comma2")
+        joined_str = builder.call(self.string_join_list, [final_list, comma_str])
+
+        # Build "{" + joined + "}"
+        open_brace = self._get_or_create_global_string(builder, "{", "lbrace")
+        close_brace = self._get_or_create_global_string(builder, "}", "rbrace")
+        temp = builder.call(self.string_concat, [open_brace, joined_str])
+        final_str = builder.call(self.string_concat, [temp, close_brace])
         builder.store(final_str, result_ptr)
 
     def _implement_json_pretty(self):
@@ -15686,11 +15931,12 @@ class CodeGenerator:
         # Create new list with 8-byte elements (for Json* pointers)
         json_list = self.builder.call(self.list_new, [ir.Constant(i64, 8)])
 
-        # Store pointers for loop
+        # Store pointers for loop (allocate OUTSIDE loop to avoid stack overflow)
         json_list_ptr = self.builder.alloca(self.list_struct.as_pointer(), name="json_list_ptr")
         self.builder.store(json_list, json_list_ptr)
         idx_ptr = self.builder.alloca(i64, name="conv_idx")
         self.builder.store(ir.Constant(i64, 0), idx_ptr)
+        temp = self.builder.alloca(i64, name="json_temp")  # Reused each iteration
 
         # Create loop blocks
         func = self.builder.function
@@ -15718,9 +15964,8 @@ class CodeGenerator:
         # Convert to JSON (treat as int for now - could be enhanced)
         json_elem = self.builder.call(self.json_new_int, [elem_i64])
 
-        # Append to JSON list
+        # Append to JSON list (reuse pre-allocated temp)
         json_i64 = self.builder.ptrtoint(json_elem, i64)
-        temp = self.builder.alloca(i64, name="json_temp")
         self.builder.store(json_i64, temp)
         temp_i8 = self.builder.bitcast(temp, i8_ptr)
 
@@ -16270,9 +16515,9 @@ class CodeGenerator:
 
     def _generate_list_comprehension(self, expr: ListComprehension) -> ir.Value:
         """Generate code for list comprehension via desugaring.
-        
+
         [f(x) for x in data if p(x)]
-        
+
         Desugars to:
         __result = []
         for x in data
@@ -16285,16 +16530,22 @@ class CodeGenerator:
         # Create result list
         elem_size = ir.Constant(ir.IntType(64), 8)
         list_ptr = self.builder.call(self.list_new, [elem_size])
-        
+
         # Store result list in a temporary
         result_var = f"__comp_result_{self.lambda_counter}"
         self.lambda_counter += 1
         result_alloca = self.builder.alloca(self.list_struct.as_pointer(), name=result_var)
         self.builder.store(list_ptr, result_alloca)
-        
+
+        # Pre-allocate temp storage OUTSIDE loop to avoid stack overflow
+        self._comp_temp_alloca = self.builder.alloca(ir.IntType(64), name="comp_temp")
+
         # Generate the nested loop structure
         self._generate_comprehension_loop(expr.clauses, 0, expr.body, result_alloca, "list")
-        
+
+        # Clear the temp alloca reference
+        self._comp_temp_alloca = None
+
         # Return the result list
         return self.builder.load(result_alloca)
     
@@ -16593,13 +16844,13 @@ class CodeGenerator:
         if comp_type == "list":
             # Evaluate body expression
             val = self._generate_expression(body)
-            
-            # Store in temp and append to list
-            temp = self.builder.alloca(ir.IntType(64))
+
+            # Reuse pre-allocated temp from _generate_list_comprehension to avoid stack overflow
+            temp = self._comp_temp_alloca
             stored_val = self._cast_value(val, ir.IntType(64))
             self.builder.store(stored_val, temp)
             temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
-            
+
             result_list = self.builder.load(result_alloca)
             elem_size = ir.Constant(ir.IntType(64), 8)
             # list_append returns a NEW list (value semantics); store it back
