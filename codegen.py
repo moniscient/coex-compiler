@@ -4209,6 +4209,10 @@ class CodeGenerator:
         hamt_collect_ty = ir.FunctionType(list_ptr_type, [void_ptr, list_ptr_type])
         self.hamt_collect_keys = ir.Function(self.module, hamt_collect_ty, name="coex_hamt_collect_keys")
 
+        # Collect all values into a list (for iteration)
+        hamt_collect_values_ty = ir.FunctionType(list_ptr_type, [void_ptr, list_ptr_type])
+        self.hamt_collect_values = ir.Function(self.module, hamt_collect_values_ty, name="coex_hamt_collect_values")
+
         # HAMT string variants - use string_eq for key comparison
         string_ptr = self.string_struct.as_pointer()
 
@@ -4242,10 +4246,18 @@ class CodeGenerator:
         map_has_string_ty = ir.FunctionType(i1, [map_ptr, string_ptr])
         self.map_has_string = ir.Function(self.module, map_has_string_ty, name="coex_map_has_string")
 
+        # map_remove_string(map: Map*, key: String*) -> Map*
+        map_remove_string_ty = ir.FunctionType(map_ptr, [map_ptr, string_ptr])
+        self.map_remove_string = ir.Function(self.module, map_remove_string_ty, name="coex_map_remove_string")
+
         # map_keys(map: Map*) -> List*  (for iteration - returns list of keys as i64)
         list_ptr = self.list_struct.as_pointer()
         map_keys_ty = ir.FunctionType(list_ptr, [map_ptr])
         self.map_keys = ir.Function(self.module, map_keys_ty, name="coex_map_keys")
+
+        # map_values(map: Map*) -> List*  (for iteration - returns list of values as i64)
+        map_values_ty = ir.FunctionType(list_ptr, [map_ptr])
+        self.map_values = ir.Function(self.module, map_values_ty, name="coex_map_values")
 
         # Implement HAMT helper functions first
         self._implement_hamt_popcount()
@@ -4256,6 +4268,7 @@ class CodeGenerator:
         self._implement_hamt_insert()
         self._implement_hamt_remove()
         self._implement_hamt_collect_keys()
+        self._implement_hamt_collect_values()
 
         # Implement HAMT string variants
         self._implement_hamt_lookup_string()
@@ -4276,7 +4289,9 @@ class CodeGenerator:
         self._implement_map_set_string()
         self._implement_map_get_string()
         self._implement_map_has_string()
+        self._implement_map_remove_string()
         self._implement_map_keys()
+        self._implement_map_values()
 
         # Register Map methods
         self._register_map_methods()
@@ -5227,6 +5242,105 @@ class CodeGenerator:
 
         current_list = builder.load(result_ptr)
         updated_list = builder.call(self.hamt_collect_keys, [child_ptr, current_list])
+        builder.store(updated_list, result_ptr)
+
+        next_idx = builder.add(idx, ir.Constant(i32, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_done)
+        final_list = builder.load(result_ptr)
+        builder.ret(final_list)
+
+    def _implement_hamt_collect_values(self):
+        """Collect all values from the HAMT into a list (for iteration).
+
+        Pointer tagging: bit 0 = 1 for leaf, 0 for node.
+        """
+        func = self.hamt_collect_values
+        func.args[0].name = "node"
+        func.args[1].name = "list"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        node = func.args[0]
+        list_ptr = func.args[1]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Check null
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+
+        return_unchanged = func.append_basic_block("return_unchanged")
+        check_tag = func.append_basic_block("check_tag")
+        builder.cbranch(is_null, return_unchanged, check_tag)
+
+        builder.position_at_end(return_unchanged)
+        builder.ret(list_ptr)
+
+        # Check pointer tag
+        builder.position_at_end(check_tag)
+        ptr_as_int = builder.ptrtoint(node, i64)
+        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
+
+        handle_leaf = func.append_basic_block("handle_leaf")
+        handle_node = func.append_basic_block("handle_node")
+        builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
+
+        # Leaf - untag and add its value to list (index 2 instead of index 1 for key)
+        builder.position_at_end(handle_leaf)
+        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))  # Clear bit 0
+        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
+        leaf_ptr = builder.bitcast(untagged_ptr, self.hamt_leaf_struct.as_pointer())
+        value_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        value = builder.load(value_ptr)
+
+        # Create temp for value
+        temp = builder.alloca(i64, name="temp_value")
+        builder.store(value, temp)
+        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+        elem_size = ir.Constant(i64, 8)
+        new_list = builder.call(self.list_append, [list_ptr, temp_i8, elem_size])
+        builder.ret(new_list)
+
+        # Node - recurse through all children
+        builder.position_at_end(handle_node)
+        as_node = builder.bitcast(node, self.hamt_node_struct.as_pointer())
+        bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        bitmap = builder.load(bitmap_ptr)
+        popcount = builder.call(self.hamt_popcount, [bitmap])
+
+        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_ptr = builder.load(children_ptr_ptr)
+
+        result_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
+        builder.store(list_ptr, result_ptr)
+
+        idx_ptr = builder.alloca(i32, name="idx")
+        builder.store(ir.Constant(i32, 0), idx_ptr)
+
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        loop_done = func.append_basic_block("loop_done")
+
+        builder.branch(loop_cond)
+
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        done = builder.icmp_signed(">=", idx, popcount)
+        builder.cbranch(done, loop_done, loop_body)
+
+        builder.position_at_end(loop_body)
+        idx_64 = builder.zext(idx, i64)
+        child_ptr_ptr = builder.gep(children_ptr, [idx_64])
+        child_ptr = builder.load(child_ptr_ptr)
+
+        current_list = builder.load(result_ptr)
+        updated_list = builder.call(self.hamt_collect_values, [child_ptr, current_list])
         builder.store(updated_list, result_ptr)
 
         next_idx = builder.add(idx, ir.Constant(i32, 1))
@@ -6361,6 +6475,68 @@ class CodeGenerator:
         result = builder.call(self.hamt_contains_string, [root, hash_val, key, ir.Constant(i32, 0)])
         builder.ret(result)
 
+    def _implement_map_remove_string(self):
+        """Return a NEW map with string key removed using HAMT."""
+        func = self.map_remove_string
+        func.args[0].name = "old_map"
+        func.args[1].name = "key"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        old_map = func.args[0]
+        key = func.args[1]  # String pointer
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Compute string hash
+        hash_val = builder.call(self.string_hash, [key])
+
+        # Get old root (stored as i64, convert to pointer)
+        root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root_i64 = builder.load(root_field)
+        old_root = builder.inttoptr(old_root_i64, void_ptr)
+
+        # Get old len
+        len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        old_len = builder.load(len_field)
+
+        # Get old flags
+        flags_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        old_flags = builder.load(flags_field)
+
+        # Allocate removed flag
+        removed_ptr = builder.alloca(i32, name="removed")
+        builder.store(ir.Constant(i32, 0), removed_ptr)
+
+        # Remove from HAMT using string comparison
+        new_root = builder.call(self.hamt_remove_string, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
+
+        # Create new Map with new root
+        map_size = ir.Constant(i64, 24)
+        type_id = ir.Constant(i32, self.gc.TYPE_MAP)
+        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
+
+        # Store new root (convert pointer to i64)
+        new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        new_root_i64 = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_i64, new_root_field)
+
+        # Update len if key was removed
+        removed = builder.load(removed_ptr)
+        removed_64 = builder.zext(removed, i64)
+        new_len = builder.sub(old_len, removed_64)
+        new_len_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(new_len, new_len_field)
+
+        # Copy flags from old map
+        new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        builder.store(old_flags, new_flags_field)
+
+        builder.ret(new_map)
+
     def _implement_map_keys(self):
         """Return a List of all keys in the map (as i64 values) using HAMT."""
         func = self.map_keys
@@ -6385,6 +6561,32 @@ class CodeGenerator:
 
         # Collect all keys from HAMT into list
         result = builder.call(self.hamt_collect_keys, [root, empty_list])
+        builder.ret(result)
+
+    def _implement_map_values(self):
+        """Return a List of all values in the map (as i64 values) using HAMT."""
+        func = self.map_values
+        func.args[0].name = "map"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        map_ptr = func.args[0]
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        void_ptr = ir.IntType(8).as_pointer()
+
+        # Create empty result list with 8-byte elements
+        elem_size = ir.Constant(i64, 8)
+        empty_list = builder.call(self.list_new, [elem_size])
+
+        # Get HAMT root (stored as i64, convert to pointer)
+        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root_i64 = builder.load(root_ptr)
+        root = builder.inttoptr(root_i64, void_ptr)
+
+        # Collect all values from HAMT into list
+        result = builder.call(self.hamt_collect_values, [root, empty_list])
         builder.ret(result)
 
     def _register_map_methods(self):
@@ -7070,6 +7272,64 @@ class CodeGenerator:
             name="coex_json_get_index"
         )
 
+        # Type checking methods: is_null, is_bool, is_int, is_float, is_string, is_array, is_object
+        i1 = ir.IntType(1)
+        self.json_is_null = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_null")
+        self.json_is_bool = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_bool")
+        self.json_is_int = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_int")
+        self.json_is_float = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_float")
+        self.json_is_string = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_string")
+        self.json_is_array = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_array")
+        self.json_is_object = ir.Function(self.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_object")
+
+        # json_len(Json*) -> i64 (length for arrays/objects, 0 otherwise)
+        self.json_len = ir.Function(self.module, ir.FunctionType(i64, [json_ptr]), name="coex_json_len")
+
+        # json_has(Json*, String*) -> bool (check if object has key)
+        self.json_has = ir.Function(self.module, ir.FunctionType(i1, [json_ptr, self.string_struct.as_pointer()]), name="coex_json_has")
+
+        # json_set_field(Json*, String*, Json*) -> Json* (return new json with field set)
+        self.json_set_field = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, self.string_struct.as_pointer(), json_ptr]),
+            name="coex_json_set_field"
+        )
+
+        # json_set_index(Json*, i64, Json*) -> Json* (return new json with index set)
+        self.json_set_index = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, i64, json_ptr]),
+            name="coex_json_set_index"
+        )
+
+        # json_append(Json*, Json*) -> Json* (append to array)
+        self.json_append = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, json_ptr]),
+            name="coex_json_append"
+        )
+
+        # json_remove(Json*, String*) -> Json* (remove key from object)
+        self.json_remove = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [json_ptr, self.string_struct.as_pointer()]),
+            name="coex_json_remove"
+        )
+
+        # json_keys(Json*) -> List* (get keys as list of strings)
+        self.json_keys = ir.Function(
+            self.module,
+            ir.FunctionType(self.list_struct.as_pointer(), [json_ptr]),
+            name="coex_json_keys"
+        )
+
+        # json_values(Json*) -> List* (get values as list of json)
+        self.json_values = ir.Function(
+            self.module,
+            ir.FunctionType(self.list_struct.as_pointer(), [json_ptr]),
+            name="coex_json_values"
+        )
+
         # Implement the constructor functions
         self._implement_json_new_null()
         self._implement_json_new_bool()
@@ -7081,6 +7341,25 @@ class CodeGenerator:
         self._implement_json_get_tag()
         self._implement_json_get_field()
         self._implement_json_get_index()
+
+        # Implement type checking methods
+        self._implement_json_is_null()
+        self._implement_json_is_bool()
+        self._implement_json_is_int()
+        self._implement_json_is_float()
+        self._implement_json_is_string()
+        self._implement_json_is_array()
+        self._implement_json_is_object()
+
+        # Implement access and mutation methods
+        self._implement_json_len()
+        self._implement_json_has()
+        self._implement_json_set_field()
+        self._implement_json_set_index()
+        self._implement_json_append()
+        self._implement_json_remove()
+        self._implement_json_keys()
+        self._implement_json_values()
 
         # Register JSON type and methods
         self._register_json_methods()
@@ -7409,12 +7688,416 @@ class CodeGenerator:
         null_json_2 = builder.call(self.json_new_null, [])
         builder.ret(null_json_2)
 
+    def _implement_json_is_null(self):
+        """Implement is_null(): check if json value is null."""
+        func = self.json_is_null
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_NULL))
+        builder.ret(result)
+
+    def _implement_json_is_bool(self):
+        """Implement is_bool(): check if json value is a boolean."""
+        func = self.json_is_bool
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_BOOL))
+        builder.ret(result)
+
+    def _implement_json_is_int(self):
+        """Implement is_int(): check if json value is an integer."""
+        func = self.json_is_int
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_INT))
+        builder.ret(result)
+
+    def _implement_json_is_float(self):
+        """Implement is_float(): check if json value is a float."""
+        func = self.json_is_float
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_FLOAT))
+        builder.ret(result)
+
+    def _implement_json_is_string(self):
+        """Implement is_string(): check if json value is a string."""
+        func = self.json_is_string
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_STRING))
+        builder.ret(result)
+
+    def _implement_json_is_array(self):
+        """Implement is_array(): check if json value is an array."""
+        func = self.json_is_array
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        builder.ret(result)
+
+    def _implement_json_is_object(self):
+        """Implement is_object(): check if json value is an object."""
+        func = self.json_is_object
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.ret(result)
+
+    def _implement_json_len(self):
+        """Implement len(): return length of array/object, 0 otherwise."""
+        func = self.json_len
+        entry = func.append_basic_block("entry")
+        is_array = func.append_basic_block("is_array")
+        is_object = func.append_basic_block("is_object")
+        not_collection = func.append_basic_block("not_collection")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if array
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        builder.cbranch(is_arr, is_array, is_object)
+
+        # Array: get list length
+        builder.position_at_end(is_array)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        list_ptr = builder.inttoptr(value_i64, self.list_struct.as_pointer())
+        arr_len = builder.call(self.list_len, [list_ptr])
+        builder.ret(arr_len)
+
+        # Check if object
+        builder.position_at_end(is_object)
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, func.append_basic_block("get_obj_len"), not_collection)
+
+        # Object: get map length
+        get_obj_len = list(func.basic_blocks)[-1]
+        builder.position_at_end(get_obj_len)
+        value_ptr2 = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64_2 = builder.load(value_ptr2)
+        map_ptr = builder.inttoptr(value_i64_2, self.map_struct.as_pointer())
+        obj_len = builder.call(self.map_len, [map_ptr])
+        builder.ret(obj_len)
+
+        # Not a collection: return 0
+        builder.position_at_end(not_collection)
+        builder.ret(ir.Constant(i64, 0))
+
+    def _implement_json_has(self):
+        """Implement has(key): check if object has a key."""
+        func = self.json_has
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i1 = ir.IntType(1)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Object: check map.has_string(key)
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+        has_result = builder.call(self.map_has_string, [map_ptr, func.args[1]])
+        builder.ret(has_result)
+
+        # Not object: return false
+        builder.position_at_end(not_object)
+        builder.ret(ir.Constant(i1, 0))
+
+    def _implement_json_set_field(self):
+        """Implement set(key, value): return new json with field set."""
+        func = self.json_set_field
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Object: create new map with key set
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+
+        # Convert json value to i64 for map storage (pointer as i64)
+        json_val = func.args[2]
+        json_as_i64 = builder.ptrtoint(json_val, i64)
+
+        # Call map_set_string
+        new_map = builder.call(self.map_set_string, [map_ptr, func.args[1], json_as_i64])
+
+        # Create new json object with new map
+        result = builder.call(self.json_new_object, [new_map])
+        builder.ret(result)
+
+        # Not object: return the original json unchanged
+        builder.position_at_end(not_object)
+        builder.ret(func.args[0])
+
+    def _implement_json_set_index(self):
+        """Implement set(index, value): return new json with array element set."""
+        func = self.json_set_index
+        entry = func.append_basic_block("entry")
+        is_array = func.append_basic_block("is_array")
+        not_array = func.append_basic_block("not_array")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if array
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        builder.cbranch(is_arr, is_array, not_array)
+
+        # Array: create new list with element set
+        builder.position_at_end(is_array)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        list_ptr = builder.inttoptr(value_i64, self.list_struct.as_pointer())
+
+        # Convert json value to i8* for list storage
+        json_val = func.args[2]
+        json_as_i8ptr = builder.bitcast(json_val, ir.IntType(8).as_pointer())
+
+        # Call list_set (elem_size = 8 for pointer)
+        new_list = builder.call(self.list_set, [list_ptr, func.args[1], json_as_i8ptr, ir.Constant(i64, 8)])
+
+        # Create new json array with new list
+        result = builder.call(self.json_new_array, [new_list])
+        builder.ret(result)
+
+        # Not array: return the original json unchanged
+        builder.position_at_end(not_array)
+        builder.ret(func.args[0])
+
+    def _implement_json_append(self):
+        """Implement append(value): return new json with value appended to array."""
+        func = self.json_append
+        entry = func.append_basic_block("entry")
+        is_array = func.append_basic_block("is_array")
+        not_array = func.append_basic_block("not_array")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if array
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        builder.cbranch(is_arr, is_array, not_array)
+
+        # Array: append value
+        builder.position_at_end(is_array)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        list_ptr = builder.inttoptr(value_i64, self.list_struct.as_pointer())
+
+        # Convert json value to i8* for list storage
+        json_val = func.args[1]
+        json_as_i8ptr = builder.bitcast(json_val, ir.IntType(8).as_pointer())
+
+        # Call list_append (elem_size = 8 for pointer)
+        new_list = builder.call(self.list_append, [list_ptr, json_as_i8ptr, ir.Constant(i64, 8)])
+
+        # Create new json array with new list
+        result = builder.call(self.json_new_array, [new_list])
+        builder.ret(result)
+
+        # Not array: return the original json unchanged
+        builder.position_at_end(not_array)
+        builder.ret(func.args[0])
+
+    def _implement_json_remove(self):
+        """Implement remove(key): return new json with key removed from object."""
+        func = self.json_remove
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Object: remove key
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+
+        # Call map_remove_string (JSON objects use string keys)
+        new_map = builder.call(self.map_remove_string, [map_ptr, func.args[1]])
+
+        # Create new json object with new map
+        result = builder.call(self.json_new_object, [new_map])
+        builder.ret(result)
+
+        # Not object: return the original json unchanged
+        builder.position_at_end(not_object)
+        builder.ret(func.args[0])
+
+    def _implement_json_keys(self):
+        """Implement keys(): return list of keys from object."""
+        func = self.json_keys
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Object: get keys from map
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+
+        # Call map_keys
+        keys_list = builder.call(self.map_keys, [map_ptr])
+        builder.ret(keys_list)
+
+        # Not object: return empty list
+        builder.position_at_end(not_object)
+        # Create empty list with string element flag
+        flags = ir.Constant(i64, 0x02)  # FLAG_STRING_KEY for string elements
+        empty_list = builder.call(self.list_new, [flags])
+        builder.ret(empty_list)
+
+    def _implement_json_values(self):
+        """Implement values(): return list of values from object."""
+        func = self.json_values
+        entry = func.append_basic_block("entry")
+        is_object = func.append_basic_block("is_object")
+        not_object = func.append_basic_block("not_object")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Check if object
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        builder.cbranch(is_obj, is_object, not_object)
+
+        # Object: get values from map
+        builder.position_at_end(is_object)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        map_ptr = builder.inttoptr(value_i64, self.map_struct.as_pointer())
+
+        # Call map_values
+        values_list = builder.call(self.map_values, [map_ptr])
+        builder.ret(values_list)
+
+        # Not object: return empty list
+        builder.position_at_end(not_object)
+        # Create empty list
+        flags = ir.Constant(i64, 0)
+        empty_list = builder.call(self.list_new, [flags])
+        builder.ret(empty_list)
+
     def _register_json_methods(self):
         """Register JSON as a type with methods."""
         self.type_registry["Json"] = self.json_struct
         self.type_fields["Json"] = []  # Internal structure, not user-accessible
 
         self.type_methods["Json"] = {
+            # Type checking
             "is_null": "coex_json_is_null",
             "is_bool": "coex_json_is_bool",
             "is_int": "coex_json_is_int",
@@ -7422,10 +8105,20 @@ class CodeGenerator:
             "is_string": "coex_json_is_string",
             "is_array": "coex_json_is_array",
             "is_object": "coex_json_is_object",
+            # Access
             "get": "coex_json_get_field",
             "len": "coex_json_len",
+            "has": "coex_json_has",
+            # Mutation (returns new json)
+            "set": "coex_json_set_field",
+            "append": "coex_json_append",
+            "remove": "coex_json_remove",
+            # Iteration
+            "keys": "coex_json_keys",
+            "values": "coex_json_values",
         }
 
+        # Constructor functions
         self.functions["coex_json_new_null"] = self.json_new_null
         self.functions["coex_json_new_bool"] = self.json_new_bool
         self.functions["coex_json_new_int"] = self.json_new_int
@@ -7436,6 +8129,25 @@ class CodeGenerator:
         self.functions["coex_json_get_tag"] = self.json_get_tag
         self.functions["coex_json_get_field"] = self.json_get_field
         self.functions["coex_json_get_index"] = self.json_get_index
+
+        # Type checking functions
+        self.functions["coex_json_is_null"] = self.json_is_null
+        self.functions["coex_json_is_bool"] = self.json_is_bool
+        self.functions["coex_json_is_int"] = self.json_is_int
+        self.functions["coex_json_is_float"] = self.json_is_float
+        self.functions["coex_json_is_string"] = self.json_is_string
+        self.functions["coex_json_is_array"] = self.json_is_array
+        self.functions["coex_json_is_object"] = self.json_is_object
+
+        # Access and mutation functions
+        self.functions["coex_json_len"] = self.json_len
+        self.functions["coex_json_has"] = self.json_has
+        self.functions["coex_json_set_field"] = self.json_set_field
+        self.functions["coex_json_set_index"] = self.json_set_index
+        self.functions["coex_json_append"] = self.json_append
+        self.functions["coex_json_remove"] = self.json_remove
+        self.functions["coex_json_keys"] = self.json_keys
+        self.functions["coex_json_values"] = self.json_values
 
     # ========================================================================
     # Atomic Reference Type Implementation
@@ -10189,7 +10901,7 @@ class CodeGenerator:
         # Handle assignment to json type - convert primitives to JSON
         elif isinstance(stmt.type_annotation, PrimitiveType) and stmt.type_annotation.name == "json":
             init_value = self._generate_expression(stmt.initializer)
-            init_value = self._convert_to_json(init_value, self._infer_type_from_expr(stmt.initializer))
+            init_value = self._convert_to_json(init_value, stmt.initializer)
         else:
             init_value = self._generate_expression(stmt.initializer)
 
@@ -13248,7 +13960,7 @@ class CodeGenerator:
             if method in method_map:
                 mangled = method_map[method]
                 func = self.functions[mangled]
-                
+
                 # Build args: self first, then other args
                 args = [obj]
                 for i, arg in enumerate(expr.args):
@@ -13256,9 +13968,18 @@ class CodeGenerator:
                     # Cast to expected type (args[i+1] because args[0] is self)
                     if i + 1 < len(func.args):
                         expected = func.args[i + 1].type
-                        arg_val = self._cast_value(arg_val, expected)
+                        # Special handling for Json methods: convert value arg to Json*
+                        if type_name == "Json" and isinstance(expected, ir.PointerType):
+                            if hasattr(expected.pointee, 'name') and expected.pointee.name == "struct.Json":
+                                # Convert arg to JSON if it's not already
+                                if not (isinstance(arg_val.type, ir.PointerType) and
+                                        hasattr(arg_val.type.pointee, 'name') and
+                                        arg_val.type.pointee.name == "struct.Json"):
+                                    arg_val = self._convert_to_json(arg_val, arg)
+                        else:
+                            arg_val = self._cast_value(arg_val, expected)
                     args.append(arg_val)
-                
+
                 result = self.builder.call(func, args)
 
                 # Special handling for List.get and Array.get - returns pointer that needs dereferencing
@@ -14056,6 +14777,10 @@ class CodeGenerator:
 
     def _convert_to_json(self, value: ir.Value, expr: Expr) -> ir.Value:
         """Convert a value to a Json* pointer based on its type."""
+        # Handle NilLiteral first - before type checks since nil generates i64(0)
+        if isinstance(expr, NilLiteral):
+            return self.builder.call(self.json_new_null, [])
+
         # Check value type and call appropriate json_new_* constructor
         if isinstance(value.type, ir.IntType):
             if value.type.width == 1:
@@ -14085,10 +14810,6 @@ class CodeGenerator:
                 elif value.type.pointee.name == "struct.Map":
                     # Map -> JSON object
                     return self.builder.call(self.json_new_object, [value])
-
-        # Handle NilLiteral
-        if isinstance(expr, NilLiteral):
-            return self.builder.call(self.json_new_null, [])
 
         # Default: treat as int (may need extension for other types)
         if isinstance(value.type, ir.IntType):

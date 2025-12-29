@@ -217,3 +217,237 @@ func main() -> int
     return 0
 ~
 ''', "1\n")
+
+
+class TestJsonTypeMethods:
+    """Phase 2: Tests for JSON type checking methods."""
+
+    def test_is_null_on_nil(self, expect_output):
+        """is_null() returns true for nil."""
+        expect_output('''
+func main() -> int
+    j: json = nil
+    if j.is_null()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_null_on_object(self, expect_output):
+        """is_null() returns false for object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    if j.is_null()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "0\n")
+
+    def test_is_bool_on_true(self, expect_output):
+        """is_bool() returns true for boolean."""
+        expect_output('''
+func main() -> int
+    j: json = true
+    if j.is_bool()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_int_on_integer(self, expect_output):
+        """is_int() returns true for integer."""
+        expect_output('''
+func main() -> int
+    j: json = 42
+    if j.is_int()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_float_on_float(self, expect_output):
+        """is_float() returns true for float."""
+        expect_output('''
+func main() -> int
+    j: json = 3.14
+    if j.is_float()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_string_on_string(self, expect_output):
+        """is_string() returns true for string."""
+        expect_output('''
+func main() -> int
+    j: json = "hello"
+    if j.is_string()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_array_on_list(self, expect_output):
+        """is_array() returns true for array."""
+        expect_output('''
+func main() -> int
+    j: json = { items: [1, 2, 3] }
+    arr: json = j.items
+    if arr.is_array()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_is_object_on_object(self, expect_output):
+        """is_object() returns true for object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+
+class TestJsonAccessMethods:
+    """Phase 2: Tests for JSON access methods."""
+
+    def test_len_on_object(self, expect_output):
+        """len() returns number of fields in object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice", age: 30, active: true }
+    print(j.len())
+    return 0
+~
+''', "3\n")
+
+    def test_len_on_array(self, expect_output):
+        """len() returns number of elements in array."""
+        expect_output('''
+func main() -> int
+    j: json = { items: [1, 2, 3, 4, 5] }
+    print(j.items.len())
+    return 0
+~
+''', "5\n")
+
+    def test_has_existing_key(self, expect_output):
+        """has() returns true for existing key."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    if j.has("name")
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_has_missing_key(self, expect_output):
+        """has() returns false for missing key."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    if j.has("missing")
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "0\n")
+
+
+class TestJsonMutationMethods:
+    """Phase 2: Tests for JSON mutation methods (return new values)."""
+
+    def test_set_new_field(self, expect_output):
+        """set() adds a new field to object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    j2: json = j.set("age", 30)
+    print(j2.len())
+    return 0
+~
+''', "2\n")
+
+    def test_set_updates_field(self, expect_output):
+        """set() updates existing field."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    j2: json = j.set("name", "Bob")
+    print(j.len())
+    print(j2.len())
+    return 0
+~
+''', "1\n1\n")
+
+    def test_remove_field(self, expect_output):
+        """remove() removes a field from object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice", age: 30 }
+    j2: json = j.remove("age")
+    print(j.len())
+    print(j2.len())
+    return 0
+~
+''', "2\n1\n")
+
+
+class TestJsonIterationMethods:
+    """Phase 2: Tests for JSON iteration methods."""
+
+    def test_keys_on_object(self, expect_output):
+        """keys() returns list of keys from object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice", age: 30 }
+    k: List<string> = j.keys()
+    print(k.len())
+    return 0
+~
+''', "2\n")
+
+    def test_values_on_object(self, expect_output):
+        """values() returns list of values from object."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice", age: 30 }
+    v: List<json> = j.values()
+    print(v.len())
+    return 0
+~
+''', "2\n")
