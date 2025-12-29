@@ -451,3 +451,361 @@ func main() -> int
     return 0
 ~
 ''', "2\n")
+
+
+class TestCoexToJsonConversion:
+    """Phase 3: Tests for Coex → JSON implicit conversion."""
+
+    def test_user_type_to_json(self, expect_output):
+        """User-defined type converts to JSON object with _type field."""
+        expect_output('''
+type Person:
+    name: string
+    age: int
+~
+
+func main() -> int
+    p: Person = Person(name: "Alice", age: 30)
+    j: json = p
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_user_type_preserves_type_name(self, expect_output):
+        """Converted user type has _type field with type name."""
+        expect_output('''
+type Person:
+    name: string
+    age: int
+~
+
+func main() -> int
+    p: Person = Person(name: "Bob", age: 25)
+    j: json = p
+    if j.has("_type")
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_user_type_fields_accessible(self, expect_output):
+        """Fields from converted user type are accessible."""
+        expect_output('''
+type Point:
+    x: int
+    y: int
+~
+
+func main() -> int
+    pt: Point = Point(x: 10, y: 20)
+    j: json = pt
+    print(j.len())
+    return 0
+~
+''', "3\n")
+
+    def test_enum_to_json(self, expect_output):
+        """Enum converts to JSON with _type and _variant fields."""
+        expect_output('''
+type Color:
+    case Red
+    case Green
+    case Blue
+~
+
+func main() -> int
+    c: Color = Color.Red
+    j: json = c
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_enum_has_variant_field(self, expect_output):
+        """Converted enum has _variant field."""
+        expect_output('''
+type Status:
+    case Active
+    case Inactive
+~
+
+func main() -> int
+    s: Status = Status.Active
+    j: json = s
+    if j.has("_variant")
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_enum_with_data_to_json(self, expect_output):
+        """Enum variant with associated data converts properly."""
+        expect_output('''
+type Outcome:
+    case Success(value: int)
+    case Failure(code: int)
+~
+
+func main() -> int
+    r: Outcome = Outcome.Success(42)
+    j: json = r
+    if j.has("value")
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_nested_type_to_json(self, expect_output):
+        """Nested user type converts to nested JSON."""
+        expect_output('''
+type Inner:
+    value: int
+~
+
+type Outer:
+    inner: Inner
+    name: string
+~
+
+func main() -> int
+    i: Inner = Inner(value: 99)
+    o: Outer = Outer(inner: i, name: "test")
+    j: json = o
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_type_with_list_field_to_json(self, expect_output):
+        """User type with List field converts properly."""
+        expect_output('''
+type Container:
+    items: List<int>
+    count: int
+~
+
+func main() -> int
+    c: Container = Container(items: [1, 2, 3], count: 3)
+    j: json = c
+    print(j.len())
+    return 0
+~
+''', "3\n")
+
+
+class TestJsonToCoexConversion:
+    """Phase 3: Tests for JSON → Coex explicit conversion using 'as' operator."""
+
+    def test_json_int_as_int(self, expect_output):
+        """JSON integer can be cast to int."""
+        expect_output('''
+func main() -> int
+    j: json = 42
+    n: int = j as int
+    print(n)
+    return 0
+~
+''', "42\n")
+
+    def test_json_float_as_float(self, expect_output):
+        """JSON float can be cast to float."""
+        expect_output('''
+func main() -> int
+    j: json = 3.14
+    f: float = j as float
+    print(f)
+    return 0
+~
+''', "3.140000\n")
+
+    def test_json_bool_as_bool(self, expect_output):
+        """JSON boolean can be cast to bool."""
+        expect_output('''
+func main() -> int
+    j: json = true
+    b: bool = j as bool
+    if b
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_json_string_as_string(self, expect_output):
+        """JSON string can be cast to string."""
+        expect_output('''
+func main() -> int
+    j: json = "hello"
+    s: string = j as string
+    print(s.len())
+    return 0
+~
+''', "5\n")
+
+    def test_json_array_as_list(self, expect_output):
+        """JSON array can be cast to List."""
+        expect_output('''
+func main() -> int
+    j: json = { items: [1, 2, 3, 4, 5] }
+    arr: json = j.items
+    lst: List<json> = arr as List<json>
+    print(lst.len())
+    return 0
+~
+''', "5\n")
+
+    def test_json_object_as_struct(self, expect_output):
+        """JSON object can be cast to user type."""
+        expect_output('''
+type Point:
+    x: int
+    y: int
+~
+
+func main() -> int
+    pt: Point = Point(x: 10, y: 20)
+    j: json = pt
+    pt2: Point = j as Point
+    print(pt2.x)
+    print(pt2.y)
+    return 0
+~
+''', "10\n20\n")
+
+
+class TestJsonSerialization:
+    """Test JSON to string serialization (j as string)."""
+
+    def test_serialize_null(self, expect_output):
+        """Null JSON serializes to 'null'."""
+        expect_output('''
+func main() -> int
+    j: json = nil
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "null\n")
+
+    def test_serialize_bool_true(self, expect_output):
+        """True JSON serializes to 'true'."""
+        expect_output('''
+func main() -> int
+    j: json = true
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "true\n")
+
+    def test_serialize_bool_false(self, expect_output):
+        """False JSON serializes to 'false'."""
+        expect_output('''
+func main() -> int
+    j: json = false
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "false\n")
+
+    def test_serialize_int(self, expect_output):
+        """Int JSON serializes to number string."""
+        expect_output('''
+func main() -> int
+    j: json = 42
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "42\n")
+
+    def test_serialize_float(self, expect_output):
+        """Float JSON serializes to decimal string."""
+        expect_output('''
+func main() -> int
+    j: json = 3.14
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "3.14\n")
+
+    def test_serialize_string_extracts(self, expect_output):
+        """String JSON extraction returns unquoted string."""
+        expect_output('''
+func main() -> int
+    j: json = "hello"
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "hello\n")
+
+    def test_serialize_array(self, expect_output):
+        """Array JSON serializes to bracket notation."""
+        expect_output('''
+func main() -> int
+    j: json = [1, 2, 3]
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', "[1,2,3]\n")
+
+    def test_serialize_object(self, expect_output):
+        """Object JSON serializes to brace notation."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice" }
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', '{"name":"Alice"}\n')
+
+    def test_serialize_object_multiple_fields(self, expect_output):
+        """Object with multiple fields serializes correctly."""
+        expect_output('''
+func main() -> int
+    j: json = { name: "Alice", age: 30 }
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', '{"name":"Alice","age":30}\n')
+
+    def test_serialize_nested_object(self, expect_output):
+        """Nested objects serialize correctly."""
+        expect_output('''
+func main() -> int
+    j: json = { user: { name: "Bob" } }
+    s: string = j as string
+    print(s)
+    return 0
+~
+''', '{"user":{"name":"Bob"}}\n')

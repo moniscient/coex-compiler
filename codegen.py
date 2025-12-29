@@ -2463,6 +2463,10 @@ class CodeGenerator:
         string_from_hex_ty = ir.FunctionType(string_ptr, [i64])
         self.string_from_hex = ir.Function(self.module, string_from_hex_ty, name="coex_string_from_hex")
 
+        # string_validjson(s: String*) -> bool (check if string is valid JSON)
+        string_validjson_ty = ir.FunctionType(ir.IntType(1), [string_ptr])
+        self.string_validjson = ir.Function(self.module, string_validjson_ty, name="coex_string_validjson")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
@@ -2487,6 +2491,7 @@ class CodeGenerator:
         self._implement_string_from_float()
         self._implement_string_from_bool()
         self._implement_string_from_hex()
+        # Note: string_validjson is implemented after JSON type is created (needs json_parse)
 
         # Register String type methods
         self._register_string_methods()
@@ -3504,16 +3509,31 @@ class CodeGenerator:
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
 
+        # Create a null-terminated copy on stack for strtoll
+        # Allocate size+1 bytes using alloca
+        size_plus_one = builder.add(size, ir.Constant(i64, 1))
+        temp_buf = builder.call(self.malloc, [size_plus_one])
+        # Copy the data
+        builder.call(self.memcpy, [temp_buf, data, size])
+        # Null-terminate
+        null_pos = builder.gep(temp_buf, [size])
+        builder.store(ir.Constant(i8, 0), null_pos)
+
         # Allocate endptr on stack
         endptr_alloca = builder.alloca(i8_ptr, name="endptr")
 
-        # Call strtoll(data, &endptr, 10) for base-10 parsing
+        # Call strtoll(temp_buf, &endptr, 10) for base-10 parsing
         base_10 = ir.Constant(i32, 10)
-        result = builder.call(self.strtoll, [data, endptr_alloca, base_10])
+        result = builder.call(self.strtoll, [temp_buf, endptr_alloca, base_10])
 
-        # Check if conversion succeeded: endptr != data and *endptr is end of string or whitespace
+        # Check if conversion succeeded: endptr != temp_buf (meaning something was parsed)
+        # Must compare BEFORE freeing temp_buf
         endptr = builder.load(endptr_alloca)
-        no_conversion = builder.icmp_unsigned("==", endptr, data)
+        no_conversion = builder.icmp_unsigned("==", endptr, temp_buf)
+
+        # Free the temp buffer
+        builder.call(self.free, [temp_buf])
+
         failed = builder.or_(is_empty, no_conversion)
         builder.cbranch(failed, fail_block, success_block)
 
@@ -3798,6 +3818,34 @@ class CodeGenerator:
         result = builder.call(self.string_new, [buf, str_len, str_len])
         builder.ret(result)
 
+    def _implement_string_validjson(self):
+        """Check if string is valid JSON by attempting to parse it.
+
+        Returns true if parsing succeeds, false if it fails.
+        This leverages the existing json_parse function.
+        """
+        # Note: json_parse is created in _create_json_type, which is called after string type creation
+        # We need to defer the implementation or handle the ordering
+        # For now, we'll just create a stub that will be filled in after JSON type is created
+        func = self.string_validjson
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i1 = ir.IntType(1)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Call json_parse and check if result is non-null
+        # json_parse returns null on parse failure
+        json_result = builder.call(self.json_parse, [func.args[0]])
+
+        # Check if result is non-null
+        null_ptr = ir.Constant(self.json_struct.as_pointer(), None)
+        is_valid = builder.icmp_unsigned("!=", json_result, null_ptr)
+
+        builder.ret(is_valid)
+
     # ============================================================
     # Deep Copy Support for Value Semantics
     # ============================================================
@@ -4024,6 +4072,7 @@ class CodeGenerator:
             "int": "coex_string_to_int",
             "float": "coex_string_to_float",
             "int_hex": "coex_string_to_int_hex",
+            "validjson": "coex_string_validjson",
         }
 
         # Also store function references for direct access
@@ -4041,6 +4090,7 @@ class CodeGenerator:
         self.functions["coex_string_to_int"] = self.string_to_int
         self.functions["coex_string_to_float"] = self.string_to_float
         self.functions["coex_string_to_int_hex"] = self.string_to_int_hex
+        self.functions["coex_string_validjson"] = self.string_validjson
 
         # Static methods for String.from() and String.from_hex()
         self.functions["String_from"] = self.string_from_int  # Default; dispatch handles types
@@ -7330,6 +7380,27 @@ class CodeGenerator:
             name="coex_json_values"
         )
 
+        # json_stringify(Json*) -> String* (serialize JSON to string)
+        self.json_stringify = ir.Function(
+            self.module,
+            ir.FunctionType(self.string_struct.as_pointer(), [json_ptr]),
+            name="coex_json_stringify"
+        )
+
+        # json_parse(String*) -> Json* (parse string to JSON, returns null on error)
+        self.json_parse = ir.Function(
+            self.module,
+            ir.FunctionType(json_ptr, [self.string_struct.as_pointer()]),
+            name="coex_json_parse"
+        )
+
+        # json_pretty(Json*, i64 indent) -> String* (serialize JSON with pretty printing)
+        self.json_pretty = ir.Function(
+            self.module,
+            ir.FunctionType(self.string_struct.as_pointer(), [json_ptr, ir.IntType(64)]),
+            name="coex_json_pretty"
+        )
+
         # Implement the constructor functions
         self._implement_json_new_null()
         self._implement_json_new_bool()
@@ -7360,6 +7431,14 @@ class CodeGenerator:
         self._implement_json_remove()
         self._implement_json_keys()
         self._implement_json_values()
+
+        # Implement serialization functions
+        self._implement_json_stringify()
+        self._implement_json_pretty()
+        self._implement_json_parse()
+
+        # Implement string.validjson() now that json_parse exists
+        self._implement_string_validjson()
 
         # Register JSON type and methods
         self._register_json_methods()
@@ -8091,6 +8170,762 @@ class CodeGenerator:
         empty_list = builder.call(self.list_new, [flags])
         builder.ret(empty_list)
 
+    def _implement_json_stringify(self):
+        """Implement json_stringify(Json*) -> String*: serialize JSON to string."""
+        func = self.json_stringify
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Get value
+        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = builder.load(value_ptr)
+
+        # Create blocks for each JSON type
+        null_block = func.append_basic_block("null")
+        bool_block = func.append_basic_block("bool")
+        int_block = func.append_basic_block("int")
+        float_block = func.append_basic_block("float")
+        string_block = func.append_basic_block("string")
+        array_block = func.append_basic_block("array")
+        object_block = func.append_basic_block("object")
+        done_block = func.append_basic_block("done")
+
+        # Allocate result pointer
+        result_ptr = builder.alloca(self.string_struct.as_pointer(), name="result")
+
+        # Switch on tag
+        switch = builder.switch(tag, null_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_NULL), null_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_BOOL), bool_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_INT), int_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_FLOAT), float_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_STRING), string_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_ARRAY), array_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_OBJECT), object_block)
+
+        # NULL: return "null"
+        builder.position_at_end(null_block)
+        null_str = self._get_or_create_global_string(builder, "null", "null")
+        builder.store(null_str, result_ptr)
+        builder.branch(done_block)
+
+        # BOOL: return "true" or "false"
+        builder.position_at_end(bool_block)
+        bool_val = builder.trunc(value, ir.IntType(1))
+        true_str = self._get_or_create_global_string(builder, "true", "true")
+        false_str = self._get_or_create_global_string(builder, "false", "false")
+        bool_str = builder.select(bool_val, true_str, false_str)
+        builder.store(bool_str, result_ptr)
+        builder.branch(done_block)
+
+        # INT: convert to string using string_from_int
+        builder.position_at_end(int_block)
+        int_str = builder.call(self.string_from_int, [value])
+        builder.store(int_str, result_ptr)
+        builder.branch(done_block)
+
+        # FLOAT: convert to string using string_from_float
+        builder.position_at_end(float_block)
+        float_val = builder.bitcast(value, ir.DoubleType())
+        float_str = builder.call(self.string_from_float, [float_val])
+        builder.store(float_str, result_ptr)
+        builder.branch(done_block)
+
+        # STRING: wrap in quotes
+        builder.position_at_end(string_block)
+        str_ptr = builder.inttoptr(value, self.string_struct.as_pointer())
+        # Build "\"" + str + "\""
+        quote_str = self._get_or_create_global_string(builder, '"', "quote")
+        temp = builder.call(self.string_concat, [quote_str, str_ptr])
+        quoted_str = builder.call(self.string_concat, [temp, quote_str])
+        builder.store(quoted_str, result_ptr)
+        builder.branch(done_block)
+
+        # ARRAY: serialize as [elem1, elem2, ...]
+        builder.position_at_end(array_block)
+        self._stringify_array(builder, func, value, result_ptr)
+        builder.branch(done_block)
+
+        # OBJECT: serialize as {key1: val1, ...}
+        builder.position_at_end(object_block)
+        self._stringify_object(builder, func, value, result_ptr)
+        builder.branch(done_block)
+
+        # Done: return result
+        builder.position_at_end(done_block)
+        result = builder.load(result_ptr)
+        builder.ret(result)
+
+    def _get_or_create_global_string(self, builder: ir.IRBuilder, s: str, name: str) -> ir.Value:
+        """Get or create a global string constant and return String* pointer."""
+        # Create or get global string data
+        s_bytes = s.encode('utf-8')
+        global_name = f"str_{name}_{hash(s) & 0xFFFFFFFF}"
+
+        if global_name not in self.string_constants:
+            str_type = ir.ArrayType(ir.IntType(8), len(s_bytes) + 1)
+            global_str = ir.GlobalVariable(self.module, str_type, global_name)
+            global_str.global_constant = True
+            global_str.initializer = ir.Constant(str_type, bytearray(s_bytes + b'\0'))
+            global_str.linkage = 'private'
+            self.string_constants[global_name] = global_str
+
+        global_str = self.string_constants[global_name]
+
+        # Use string_from_literal like _get_string_ptr does
+        raw_ptr = builder.bitcast(global_str, ir.IntType(8).as_pointer())
+        return builder.call(self.string_from_literal, [raw_ptr])
+
+    def _stringify_array(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
+                         result_ptr: ir.Value):
+        """Generate code to stringify a JSON array."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get list pointer
+        list_ptr = builder.inttoptr(value, self.list_struct.as_pointer())
+
+        # Start with "["
+        result = self._get_or_create_global_string(builder, "[", "lbracket")
+
+        # Get list length
+        list_len = builder.call(self.list_len, [list_ptr])
+
+        # Loop through elements
+        loop_block = func.append_basic_block("array_loop")
+        body_block = func.append_basic_block("array_body")
+        array_done = func.append_basic_block("array_done")
+
+        # Initialize index
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="arr_str")
+        builder.store(result, result_str_ptr)
+        builder.branch(loop_block)
+
+        # Loop condition
+        builder.position_at_end(loop_block)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, body_block, array_done)
+
+        # Loop body
+        builder.position_at_end(body_block)
+        # Add comma if not first
+        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
+        curr_str = builder.load(result_str_ptr)
+        comma_str = self._get_or_create_global_string(builder, ",", "comma")
+        with_comma = builder.call(self.string_concat, [curr_str, comma_str])
+        curr_str = builder.select(is_first, curr_str, with_comma)
+
+        # Get element and stringify it (list_get returns i8* to stored i64, need to load)
+        elem_data_ptr = builder.call(self.list_get, [list_ptr, idx])
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+        elem_json = builder.inttoptr(elem_i64, self.json_struct.as_pointer())
+        elem_str = builder.call(self.json_stringify, [elem_json])
+        curr_str = builder.call(self.string_concat, [curr_str, elem_str])
+        builder.store(curr_str, result_str_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_block)
+
+        # Done: add "]" and store result
+        builder.position_at_end(array_done)
+        final_str = builder.load(result_str_ptr)
+        close_str = self._get_or_create_global_string(builder, "]", "rbracket")
+        final_str = builder.call(self.string_concat, [final_str, close_str])
+        builder.store(final_str, result_ptr)
+
+    def _stringify_object(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
+                          result_ptr: ir.Value):
+        """Generate code to stringify a JSON object."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get map pointer
+        map_ptr = builder.inttoptr(value, self.map_struct.as_pointer())
+
+        # Start with "{"
+        result = self._get_or_create_global_string(builder, "{", "lbrace")
+
+        # Get keys list
+        keys_list = builder.call(self.map_keys, [map_ptr])
+        list_len = builder.call(self.list_len, [keys_list])
+
+        # Loop through keys
+        loop_block = func.append_basic_block("object_loop")
+        body_block = func.append_basic_block("object_body")
+        object_done = func.append_basic_block("object_done")
+
+        # Initialize index
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="obj_str")
+        builder.store(result, result_str_ptr)
+        builder.branch(loop_block)
+
+        # Loop condition
+        builder.position_at_end(loop_block)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, body_block, object_done)
+
+        # Loop body
+        builder.position_at_end(body_block)
+        # Add comma if not first
+        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
+        curr_str = builder.load(result_str_ptr)
+        comma_str = self._get_or_create_global_string(builder, ",", "comma2")
+        with_comma = builder.call(self.string_concat, [curr_str, comma_str])
+        curr_str = builder.select(is_first, curr_str, with_comma)
+
+        # Get key string (list_get returns i8* to stored i64, need to load and inttoptr)
+        key_data_ptr = builder.call(self.list_get, [keys_list, idx])
+        key_i64_ptr = builder.bitcast(key_data_ptr, i64.as_pointer())
+        key_i64 = builder.load(key_i64_ptr)
+        key_str = builder.inttoptr(key_i64, self.string_struct.as_pointer())
+
+        # Add quoted key: "key":
+        quote_str = self._get_or_create_global_string(builder, '"', "quote2")
+        colon_str = self._get_or_create_global_string(builder, '":', "colon")
+        curr_str = builder.call(self.string_concat, [curr_str, quote_str])
+        curr_str = builder.call(self.string_concat, [curr_str, key_str])
+        curr_str = builder.call(self.string_concat, [curr_str, colon_str])
+
+        # Get value and stringify it
+        val_i64 = builder.call(self.map_get_string, [map_ptr, key_str])
+        val_json = builder.inttoptr(val_i64, self.json_struct.as_pointer())
+        val_str = builder.call(self.json_stringify, [val_json])
+        curr_str = builder.call(self.string_concat, [curr_str, val_str])
+        builder.store(curr_str, result_str_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_block)
+
+        # Done: add "}" and store result
+        builder.position_at_end(object_done)
+        final_str = builder.load(result_str_ptr)
+        close_str = self._get_or_create_global_string(builder, "}", "rbrace")
+        final_str = builder.call(self.string_concat, [final_str, close_str])
+        builder.store(final_str, result_ptr)
+
+    def _implement_json_pretty(self):
+        """Implement json_pretty(Json*, i64 indent) -> String*: serialize JSON with pretty printing.
+
+        This function calls a recursive helper that handles the actual pretty printing
+        with proper indentation at each level.
+        """
+        i64 = ir.IntType(64)
+        json_ptr = self.json_struct.as_pointer()
+
+        # First, create the internal recursive function declaration
+        func_ty = ir.FunctionType(self.string_struct.as_pointer(), [json_ptr, i64, i64])
+        self.json_pretty_internal = ir.Function(self.module, func_ty, name="coex_json_pretty_internal")
+
+        # Now implement the main pretty function
+        func = self.json_pretty
+        func.args[0].name = "json"
+        func.args[1].name = "indent"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Call the internal recursive pretty printer with depth=0
+        result = builder.call(self.json_pretty_internal, [func.args[0], func.args[1], ir.Constant(i64, 0)])
+        builder.ret(result)
+
+        # Now implement the internal recursive function
+        self._implement_json_pretty_internal()
+
+    def _implement_json_pretty_internal(self):
+        """Implement the internal recursive pretty printing function.
+
+        json_pretty_internal(Json*, i64 indent_size, i64 depth) -> String*
+        """
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Use the already-declared function
+        func = self.json_pretty_internal
+        func.args[0].name = "json"
+        func.args[1].name = "indent_size"
+        func.args[2].name = "depth"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        json_val = func.args[0]
+        indent_size = func.args[1]
+        depth = func.args[2]
+
+        # Get tag
+        tag_ptr = builder.gep(json_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Get value
+        value_ptr = builder.gep(json_val, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = builder.load(value_ptr)
+
+        # Create blocks for each JSON type
+        null_block = func.append_basic_block("null")
+        bool_block = func.append_basic_block("bool")
+        int_block = func.append_basic_block("int")
+        float_block = func.append_basic_block("float")
+        string_block = func.append_basic_block("string")
+        array_block = func.append_basic_block("array")
+        object_block = func.append_basic_block("object")
+        done_block = func.append_basic_block("done")
+
+        # Allocate result pointer
+        result_ptr = builder.alloca(self.string_struct.as_pointer(), name="result")
+
+        # Switch on tag
+        switch = builder.switch(tag, null_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_NULL), null_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_BOOL), bool_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_INT), int_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_FLOAT), float_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_STRING), string_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_ARRAY), array_block)
+        switch.add_case(ir.Constant(i8, self.JSON_TAG_OBJECT), object_block)
+
+        # NULL: return "null"
+        builder.position_at_end(null_block)
+        null_str = self._get_or_create_global_string(builder, "null", "pretty_null")
+        builder.store(null_str, result_ptr)
+        builder.branch(done_block)
+
+        # BOOL: return "true" or "false"
+        builder.position_at_end(bool_block)
+        bool_val = builder.trunc(value, ir.IntType(1))
+        true_str = self._get_or_create_global_string(builder, "true", "pretty_true")
+        false_str = self._get_or_create_global_string(builder, "false", "pretty_false")
+        bool_str = builder.select(bool_val, true_str, false_str)
+        builder.store(bool_str, result_ptr)
+        builder.branch(done_block)
+
+        # INT: convert to string
+        builder.position_at_end(int_block)
+        int_str = builder.call(self.string_from_int, [value])
+        builder.store(int_str, result_ptr)
+        builder.branch(done_block)
+
+        # FLOAT: convert to string
+        builder.position_at_end(float_block)
+        float_val = builder.bitcast(value, ir.DoubleType())
+        float_str = builder.call(self.string_from_float, [float_val])
+        builder.store(float_str, result_ptr)
+        builder.branch(done_block)
+
+        # STRING: wrap in quotes
+        builder.position_at_end(string_block)
+        str_ptr = builder.inttoptr(value, self.string_struct.as_pointer())
+        quote_str = self._get_or_create_global_string(builder, '"', "pretty_quote")
+        temp = builder.call(self.string_concat, [quote_str, str_ptr])
+        quoted_str = builder.call(self.string_concat, [temp, quote_str])
+        builder.store(quoted_str, result_ptr)
+        builder.branch(done_block)
+
+        # ARRAY: serialize with pretty printing
+        builder.position_at_end(array_block)
+        self._pretty_array(builder, func, value, indent_size, depth, result_ptr)
+        builder.branch(done_block)
+
+        # OBJECT: serialize with pretty printing
+        builder.position_at_end(object_block)
+        self._pretty_object(builder, func, value, indent_size, depth, result_ptr)
+        builder.branch(done_block)
+
+        # Done: return result
+        builder.position_at_end(done_block)
+        result = builder.load(result_ptr)
+        builder.ret(result)
+
+    def _make_indent_string(self, builder: ir.IRBuilder, indent_size: ir.Value, depth: ir.Value) -> ir.Value:
+        """Create an indentation string of (indent_size * depth) spaces."""
+        i64 = ir.IntType(64)
+
+        # Calculate total spaces needed
+        total_spaces = builder.mul(indent_size, depth)
+
+        # Create a single space string
+        space_str = self._get_or_create_global_string(builder, " ", "space")
+
+        # Build the indent string by concatenating spaces
+        # For simplicity, we'll use a loop
+        func = builder.function
+        loop_cond = func.append_basic_block("indent_loop_cond")
+        loop_body = func.append_basic_block("indent_loop_body")
+        loop_done = func.append_basic_block("indent_loop_done")
+
+        # Initialize
+        idx_ptr = builder.alloca(i64, name="indent_idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        result_ptr = builder.alloca(self.string_struct.as_pointer(), name="indent_str")
+        empty_str = self._get_or_create_global_string(builder, "", "empty")
+        builder.store(empty_str, result_ptr)
+        builder.branch(loop_cond)
+
+        # Loop condition
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, total_spaces)
+        builder.cbranch(cmp, loop_body, loop_done)
+
+        # Loop body: append a space
+        builder.position_at_end(loop_body)
+        curr_str = builder.load(result_ptr)
+        new_str = builder.call(self.string_concat, [curr_str, space_str])
+        builder.store(new_str, result_ptr)
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        # Done
+        builder.position_at_end(loop_done)
+        return builder.load(result_ptr)
+
+    def _pretty_array(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
+                      indent_size: ir.Value, depth: ir.Value, result_ptr: ir.Value):
+        """Generate code to pretty-print a JSON array."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get list pointer
+        list_ptr = builder.inttoptr(value, self.list_struct.as_pointer())
+
+        # Get list length
+        list_len = builder.call(self.list_len, [list_ptr])
+
+        # Check if empty
+        is_empty = builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        empty_block = func.append_basic_block("array_empty")
+        nonempty_block = func.append_basic_block("array_nonempty")
+        builder.cbranch(is_empty, empty_block, nonempty_block)
+
+        # Empty array: return "[]"
+        builder.position_at_end(empty_block)
+        empty_arr_str = self._get_or_create_global_string(builder, "[]", "empty_arr")
+        builder.store(empty_arr_str, result_ptr)
+        array_done = func.append_basic_block("array_pretty_done")
+        builder.branch(array_done)
+
+        # Non-empty array
+        builder.position_at_end(nonempty_block)
+        # Start with "[\n"
+        open_bracket = self._get_or_create_global_string(builder, "[\n", "arr_open")
+        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="arr_str")
+        builder.store(open_bracket, result_str_ptr)
+
+        # Calculate child depth
+        child_depth = builder.add(depth, ir.Constant(i64, 1))
+
+        # Create child indent string
+        child_indent = self._make_indent_string(builder, indent_size, child_depth)
+
+        # Loop through elements
+        loop_block = func.append_basic_block("arr_loop")
+        body_block = func.append_basic_block("arr_body")
+        after_loop = func.append_basic_block("arr_after_loop")
+
+        idx_ptr = builder.alloca(i64, name="arr_idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        builder.branch(loop_block)
+
+        # Loop condition
+        builder.position_at_end(loop_block)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, body_block, after_loop)
+
+        # Loop body
+        builder.position_at_end(body_block)
+        curr_str = builder.load(result_str_ptr)
+
+        # Add comma and newline if not first
+        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
+        comma_nl = self._get_or_create_global_string(builder, ",\n", "comma_nl")
+        with_comma = builder.call(self.string_concat, [curr_str, comma_nl])
+        curr_str = builder.select(is_first, curr_str, with_comma)
+
+        # Add child indent
+        curr_str = builder.call(self.string_concat, [curr_str, child_indent])
+
+        # Get element and pretty-print it
+        elem_data_ptr = builder.call(self.list_get, [list_ptr, idx])
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+        elem_json = builder.inttoptr(elem_i64, self.json_struct.as_pointer())
+        elem_str = builder.call(self.json_pretty_internal, [elem_json, indent_size, child_depth])
+        curr_str = builder.call(self.string_concat, [curr_str, elem_str])
+        builder.store(curr_str, result_str_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_block)
+
+        # After loop: add newline, parent indent, and closing bracket
+        builder.position_at_end(after_loop)
+        final_str = builder.load(result_str_ptr)
+        newline = self._get_or_create_global_string(builder, "\n", "newline")
+        final_str = builder.call(self.string_concat, [final_str, newline])
+        parent_indent = self._make_indent_string(builder, indent_size, depth)
+        final_str = builder.call(self.string_concat, [final_str, parent_indent])
+        close_bracket = self._get_or_create_global_string(builder, "]", "arr_close")
+        final_str = builder.call(self.string_concat, [final_str, close_bracket])
+        builder.store(final_str, result_ptr)
+        builder.branch(array_done)
+
+        builder.position_at_end(array_done)
+
+    def _pretty_object(self, builder: ir.IRBuilder, func: ir.Function, value: ir.Value,
+                       indent_size: ir.Value, depth: ir.Value, result_ptr: ir.Value):
+        """Generate code to pretty-print a JSON object."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get map pointer
+        map_ptr = builder.inttoptr(value, self.map_struct.as_pointer())
+
+        # Get keys list
+        keys_list = builder.call(self.map_keys, [map_ptr])
+        list_len = builder.call(self.list_len, [keys_list])
+
+        # Check if empty
+        is_empty = builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        empty_block = func.append_basic_block("obj_empty")
+        nonempty_block = func.append_basic_block("obj_nonempty")
+        builder.cbranch(is_empty, empty_block, nonempty_block)
+
+        # Empty object: return "{}"
+        builder.position_at_end(empty_block)
+        empty_obj_str = self._get_or_create_global_string(builder, "{}", "empty_obj")
+        builder.store(empty_obj_str, result_ptr)
+        object_done = func.append_basic_block("obj_pretty_done")
+        builder.branch(object_done)
+
+        # Non-empty object
+        builder.position_at_end(nonempty_block)
+        # Start with "{\n"
+        open_brace = self._get_or_create_global_string(builder, "{\n", "obj_open")
+        result_str_ptr = builder.alloca(self.string_struct.as_pointer(), name="obj_str")
+        builder.store(open_brace, result_str_ptr)
+
+        # Calculate child depth
+        child_depth = builder.add(depth, ir.Constant(i64, 1))
+
+        # Create child indent string
+        child_indent = self._make_indent_string(builder, indent_size, child_depth)
+
+        # Loop through keys
+        loop_block = func.append_basic_block("obj_loop")
+        body_block = func.append_basic_block("obj_body")
+        after_loop = func.append_basic_block("obj_after_loop")
+
+        idx_ptr = builder.alloca(i64, name="obj_idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        builder.branch(loop_block)
+
+        # Loop condition
+        builder.position_at_end(loop_block)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, list_len)
+        builder.cbranch(cmp, body_block, after_loop)
+
+        # Loop body
+        builder.position_at_end(body_block)
+        curr_str = builder.load(result_str_ptr)
+
+        # Add comma and newline if not first
+        is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
+        comma_nl = self._get_or_create_global_string(builder, ",\n", "comma_nl2")
+        with_comma = builder.call(self.string_concat, [curr_str, comma_nl])
+        curr_str = builder.select(is_first, curr_str, with_comma)
+
+        # Add child indent
+        curr_str = builder.call(self.string_concat, [curr_str, child_indent])
+
+        # Get key string
+        key_data_ptr = builder.call(self.list_get, [keys_list, idx])
+        key_i64_ptr = builder.bitcast(key_data_ptr, i64.as_pointer())
+        key_i64 = builder.load(key_i64_ptr)
+        key_str = builder.inttoptr(key_i64, self.string_struct.as_pointer())
+
+        # Add quoted key: "key":
+        quote_str = self._get_or_create_global_string(builder, '"', "pretty_quote2")
+        colon_space = self._get_or_create_global_string(builder, '": ', "colon_space")
+        curr_str = builder.call(self.string_concat, [curr_str, quote_str])
+        curr_str = builder.call(self.string_concat, [curr_str, key_str])
+        curr_str = builder.call(self.string_concat, [curr_str, colon_space])
+
+        # Get value and pretty-print it
+        val_i64 = builder.call(self.map_get_string, [map_ptr, key_str])
+        val_json = builder.inttoptr(val_i64, self.json_struct.as_pointer())
+        val_str = builder.call(self.json_pretty_internal, [val_json, indent_size, child_depth])
+        curr_str = builder.call(self.string_concat, [curr_str, val_str])
+        builder.store(curr_str, result_str_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_block)
+
+        # After loop: add newline, parent indent, and closing brace
+        builder.position_at_end(after_loop)
+        final_str = builder.load(result_str_ptr)
+        newline = self._get_or_create_global_string(builder, "\n", "newline2")
+        final_str = builder.call(self.string_concat, [final_str, newline])
+        parent_indent = self._make_indent_string(builder, indent_size, depth)
+        final_str = builder.call(self.string_concat, [final_str, parent_indent])
+        close_brace = self._get_or_create_global_string(builder, "}", "obj_close")
+        final_str = builder.call(self.string_concat, [final_str, close_brace])
+        builder.store(final_str, result_ptr)
+        builder.branch(object_done)
+
+        builder.position_at_end(object_done)
+
+    def _implement_json_parse(self):
+        """Implement json_parse(String*) -> Json*: parse string to JSON.
+        Returns null JSON on parse error."""
+        func = self.json_parse
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get string data pointer and length
+        str_ptr = func.args[0]
+        data_ptr_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        data_ptr = builder.load(data_ptr_ptr)
+        len_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        str_len = builder.load(len_ptr)
+
+        # Check for empty string
+        is_empty = builder.icmp_signed("==", str_len, ir.Constant(i64, 0))
+        not_empty = func.append_basic_block("not_empty")
+        return_null = func.append_basic_block("return_null")
+        builder.cbranch(is_empty, return_null, not_empty)
+
+        # Return null for empty/invalid
+        builder.position_at_end(return_null)
+        null_json = builder.call(self.json_new_null, [])
+        builder.ret(null_json)
+
+        # Parse the string
+        builder.position_at_end(not_empty)
+        # Get first character
+        first_char = builder.load(data_ptr)
+
+        # Dispatch based on first character
+        parse_null = func.append_basic_block("parse_null")
+        parse_true = func.append_basic_block("parse_true")
+        parse_false = func.append_basic_block("parse_false")
+        parse_number = func.append_basic_block("parse_number")
+        parse_string = func.append_basic_block("parse_string")
+        parse_array = func.append_basic_block("parse_array")
+        parse_object = func.append_basic_block("parse_object")
+
+        # Check for specific start characters
+        is_n = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('n')))
+        is_t = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('t')))
+        is_f = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('f')))
+        is_quote = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('"')))
+        is_bracket = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('[')))
+        is_brace = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('{')))
+        is_minus = builder.icmp_unsigned("==", first_char, ir.Constant(i8, ord('-')))
+        is_digit = builder.and_(
+            builder.icmp_unsigned(">=", first_char, ir.Constant(i8, ord('0'))),
+            builder.icmp_unsigned("<=", first_char, ir.Constant(i8, ord('9')))
+        )
+        is_number = builder.or_(is_minus, is_digit)
+
+        # Chain of checks
+        check_t = func.append_basic_block("check_t")
+        check_f = func.append_basic_block("check_f")
+        check_quote = func.append_basic_block("check_quote")
+        check_bracket = func.append_basic_block("check_bracket")
+        check_brace = func.append_basic_block("check_brace")
+        check_number = func.append_basic_block("check_number")
+
+        builder.cbranch(is_n, parse_null, check_t)
+
+        builder.position_at_end(check_t)
+        builder.cbranch(is_t, parse_true, check_f)
+
+        builder.position_at_end(check_f)
+        builder.cbranch(is_f, parse_false, check_quote)
+
+        builder.position_at_end(check_quote)
+        builder.cbranch(is_quote, parse_string, check_bracket)
+
+        builder.position_at_end(check_bracket)
+        builder.cbranch(is_bracket, parse_array, check_brace)
+
+        builder.position_at_end(check_brace)
+        builder.cbranch(is_brace, parse_object, check_number)
+
+        builder.position_at_end(check_number)
+        builder.cbranch(is_number, parse_number, return_null)
+
+        # Parse "null"
+        builder.position_at_end(parse_null)
+        null_result = builder.call(self.json_new_null, [])
+        builder.ret(null_result)
+
+        # Parse "true"
+        builder.position_at_end(parse_true)
+        true_result = builder.call(self.json_new_bool, [ir.Constant(ir.IntType(1), 1)])
+        builder.ret(true_result)
+
+        # Parse "false"
+        builder.position_at_end(parse_false)
+        false_result = builder.call(self.json_new_bool, [ir.Constant(ir.IntType(1), 0)])
+        builder.ret(false_result)
+
+        # Parse number (simple: use string_to_int or string_to_float)
+        builder.position_at_end(parse_number)
+        # Try to parse as int first - string_to_int returns {i1, i64}
+        parse_result = builder.call(self.string_to_int, [str_ptr])
+        int_val = builder.extract_value(parse_result, 1)  # Extract the i64 value
+        int_result = builder.call(self.json_new_int, [int_val])
+        builder.ret(int_result)
+
+        # Parse string (remove quotes)
+        builder.position_at_end(parse_string)
+        # For now, just wrap the string as-is (should remove quotes properly)
+        str_json = builder.call(self.json_new_string, [str_ptr])
+        builder.ret(str_json)
+
+        # Parse array - simplified: return empty array for now
+        builder.position_at_end(parse_array)
+        empty_list = builder.call(self.list_new, [ir.Constant(i64, 8)])
+        array_json = builder.call(self.json_new_array, [empty_list])
+        builder.ret(array_json)
+
+        # Parse object - simplified: return empty object for now
+        builder.position_at_end(parse_object)
+        flags = ir.Constant(i64, 0x01)  # String keys
+        empty_map = builder.call(self.map_new, [flags])
+        obj_json = builder.call(self.json_new_object, [empty_map])
+        builder.ret(obj_json)
+
     def _register_json_methods(self):
         """Register JSON as a type with methods."""
         self.type_registry["Json"] = self.json_struct
@@ -8116,6 +8951,8 @@ class CodeGenerator:
             # Iteration
             "keys": "coex_json_keys",
             "values": "coex_json_values",
+            # Serialization
+            "pretty": "coex_json_pretty",
         }
 
         # Constructor functions
@@ -8148,6 +8985,8 @@ class CodeGenerator:
         self.functions["coex_json_remove"] = self.json_remove
         self.functions["coex_json_keys"] = self.json_keys
         self.functions["coex_json_values"] = self.json_values
+        self.functions["coex_json_pretty"] = self.json_pretty
+        self.functions["coex_json_stringify"] = self.json_stringify
 
     # ========================================================================
     # Atomic Reference Type Implementation
@@ -13116,6 +13955,9 @@ class CodeGenerator:
         elif isinstance(expr, LlvmIrExpr):
             return self._generate_llvm_ir_block(expr)
 
+        elif isinstance(expr, AsExpr):
+            return self._generate_as_expr(expr)
+
         else:
             return ir.Constant(ir.IntType(64), 0)
     
@@ -14798,18 +15640,23 @@ class CodeGenerator:
             return self.builder.call(self.json_new_float, [value])
         elif isinstance(value.type, ir.PointerType):
             if hasattr(value.type.pointee, 'name'):
-                if value.type.pointee.name == "struct.String":
+                struct_name = value.type.pointee.name
+                if struct_name == "struct.String":
                     # String
                     return self.builder.call(self.json_new_string, [value])
-                elif value.type.pointee.name == "struct.Json":
+                elif struct_name == "struct.Json":
                     # Already JSON, return as-is
                     return value
-                elif value.type.pointee.name == "struct.List":
-                    # List -> JSON array
-                    return self.builder.call(self.json_new_array, [value])
-                elif value.type.pointee.name == "struct.Map":
+                elif struct_name == "struct.List":
+                    # List -> JSON array (need to convert elements to JSON)
+                    return self._convert_list_to_json_array(value)
+                elif struct_name == "struct.Map":
                     # Map -> JSON object
                     return self.builder.call(self.json_new_object, [value])
+                else:
+                    # Check for user-defined types and enums
+                    type_name = struct_name.replace("struct.", "") if struct_name.startswith("struct.") else struct_name
+                    return self._convert_udt_to_json(value, type_name)
 
         # Default: treat as int (may need extension for other types)
         if isinstance(value.type, ir.IntType):
@@ -14818,6 +15665,608 @@ class CodeGenerator:
 
         # Fallback: create null JSON
         return self.builder.call(self.json_new_null, [])
+
+    def _convert_list_to_json_array(self, list_ptr: ir.Value) -> ir.Value:
+        """Convert a Coex list to a JSON array by converting each element to JSON.
+
+        This creates a new list where each element is a Json* pointer, then wraps
+        it in a JSON array.
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get source list length and element size
+        src_len = self.builder.call(self.list_len, [list_ptr])
+
+        # Get the element size from the list struct (field 3)
+        elem_size_ptr = self.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_elem_size = self.builder.load(elem_size_ptr)
+
+        # Create new list with 8-byte elements (for Json* pointers)
+        json_list = self.builder.call(self.list_new, [ir.Constant(i64, 8)])
+
+        # Store pointers for loop
+        json_list_ptr = self.builder.alloca(self.list_struct.as_pointer(), name="json_list_ptr")
+        self.builder.store(json_list, json_list_ptr)
+        idx_ptr = self.builder.alloca(i64, name="conv_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        # Create loop blocks
+        func = self.builder.function
+        loop_cond = func.append_basic_block("list_conv_cond")
+        loop_body = func.append_basic_block("list_conv_body")
+        loop_done = func.append_basic_block("list_conv_done")
+
+        self.builder.branch(loop_cond)
+
+        # Loop condition
+        self.builder.position_at_end(loop_cond)
+        idx = self.builder.load(idx_ptr)
+        cmp = self.builder.icmp_signed("<", idx, src_len)
+        self.builder.cbranch(cmp, loop_body, loop_done)
+
+        # Loop body: get element, convert to JSON, append
+        self.builder.position_at_end(loop_body)
+        elem_data_ptr = self.builder.call(self.list_get, [list_ptr, idx])
+
+        # Determine conversion based on element size
+        # For now, assume all elements are 8 bytes and could be int or pointer
+        elem_i64_ptr = self.builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = self.builder.load(elem_i64_ptr)
+
+        # Convert to JSON (treat as int for now - could be enhanced)
+        json_elem = self.builder.call(self.json_new_int, [elem_i64])
+
+        # Append to JSON list
+        json_i64 = self.builder.ptrtoint(json_elem, i64)
+        temp = self.builder.alloca(i64, name="json_temp")
+        self.builder.store(json_i64, temp)
+        temp_i8 = self.builder.bitcast(temp, i8_ptr)
+
+        curr_list = self.builder.load(json_list_ptr)
+        new_list = self.builder.call(self.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        self.builder.store(new_list, json_list_ptr)
+
+        # Increment and loop
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_ptr)
+        self.builder.branch(loop_cond)
+
+        # Done: create JSON array from the converted list
+        self.builder.position_at_end(loop_done)
+        final_list = self.builder.load(json_list_ptr)
+        return self.builder.call(self.json_new_array, [final_list])
+
+    def _convert_udt_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
+        """Convert a user-defined type or enum to JSON with _type metadata."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Check if it's an enum
+        if type_name in self.enum_variants:
+            return self._convert_enum_to_json(value, type_name)
+
+        # Check if it's a user-defined struct
+        if type_name in self.type_fields:
+            return self._convert_struct_to_json(value, type_name)
+
+        # Unknown type - return null JSON
+        return self.builder.call(self.json_new_null, [])
+
+    def _convert_struct_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
+        """Convert a user-defined struct to JSON object with _type field."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Create empty JSON object (starts with empty map)
+        flags = ir.Constant(i64, 0x01)  # String keys
+        map_ptr = self.builder.call(self.map_new, [flags])
+
+        # Add _type field
+        type_str = self._get_string_ptr(type_name)
+        type_json = self.builder.call(self.json_new_string, [type_str])
+        type_json_i64 = self.builder.ptrtoint(type_json, i64)
+        type_key = self._get_string_ptr("_type")
+        map_ptr = self.builder.call(self.map_set_string, [map_ptr, type_key, type_json_i64])
+
+        # Add each field
+        field_info = self.type_fields[type_name]
+        for idx, (field_name, field_type) in enumerate(field_info):
+            # Extract field value
+            field_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            field_val = self.builder.load(field_ptr)
+
+            # Convert field value to JSON
+            field_json = self._convert_field_to_json(field_val, field_type)
+
+            # Add to map
+            field_json_i64 = self.builder.ptrtoint(field_json, i64)
+            field_key = self._get_string_ptr(field_name)
+            map_ptr = self.builder.call(self.map_set_string, [map_ptr, field_key, field_json_i64])
+
+        # Wrap map in JSON object
+        return self.builder.call(self.json_new_object, [map_ptr])
+
+    def _convert_enum_to_json(self, value: ir.Value, enum_name: str) -> ir.Value:
+        """Convert an enum to JSON object with _type and _variant fields."""
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = self.builder.function
+
+        # Get tag value (first field of enum struct)
+        tag_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = self.builder.load(tag_ptr)
+
+        # Create result alloca for PHI-like behavior
+        result_ptr = self.builder.alloca(self.json_struct.as_pointer(), name="enum_json")
+
+        # Build switch for each variant
+        variants = self.enum_variants[enum_name]
+        done_block = func.append_basic_block(f"enum_json_done")
+
+        # Default block (shouldn't happen but needed for switch)
+        default_block = func.append_basic_block(f"enum_json_default")
+
+        # Create switch instruction
+        switch = self.builder.switch(tag, default_block)
+
+        for variant_name, (variant_tag, variant_fields) in variants.items():
+            variant_block = func.append_basic_block(f"enum_json_{variant_name}")
+            switch.add_case(ir.Constant(i64, variant_tag), variant_block)
+
+            self.builder.position_at_end(variant_block)
+
+            # Create JSON object for this variant
+            flags = ir.Constant(i64, 0x01)  # String keys
+            map_ptr = self.builder.call(self.map_new, [flags])
+
+            # Add _type field
+            type_str = self._get_string_ptr(enum_name)
+            type_json = self.builder.call(self.json_new_string, [type_str])
+            type_json_i64 = self.builder.ptrtoint(type_json, i64)
+            type_key = self._get_string_ptr("_type")
+            map_ptr = self.builder.call(self.map_set_string, [map_ptr, type_key, type_json_i64])
+
+            # Add _variant field
+            variant_str = self._get_string_ptr(variant_name)
+            variant_json = self.builder.call(self.json_new_string, [variant_str])
+            variant_json_i64 = self.builder.ptrtoint(variant_json, i64)
+            variant_key = self._get_string_ptr("_variant")
+            map_ptr = self.builder.call(self.map_set_string, [map_ptr, variant_key, variant_json_i64])
+
+            # Add variant data fields (start at index 1, after tag)
+            for field_idx, (field_name, field_type) in enumerate(variant_fields):
+                field_ptr = self.builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, field_idx + 1)], inbounds=True)
+                field_val = self.builder.load(field_ptr)
+
+                # Convert field value to JSON
+                field_json = self._convert_field_to_json(field_val, field_type)
+
+                # Add to map
+                field_json_i64 = self.builder.ptrtoint(field_json, i64)
+                field_key = self._get_string_ptr(field_name)
+                map_ptr = self.builder.call(self.map_set_string, [map_ptr, field_key, field_json_i64])
+
+            # Wrap map in JSON object
+            json_obj = self.builder.call(self.json_new_object, [map_ptr])
+            self.builder.store(json_obj, result_ptr)
+            self.builder.branch(done_block)
+
+        # Default block - create null JSON
+        self.builder.position_at_end(default_block)
+        null_json = self.builder.call(self.json_new_null, [])
+        self.builder.store(null_json, result_ptr)
+        self.builder.branch(done_block)
+
+        # Done block - load and return result
+        self.builder.position_at_end(done_block)
+        return self.builder.load(result_ptr)
+
+    def _convert_field_to_json(self, field_val: ir.Value, field_type: Type) -> ir.Value:
+        """Convert a field value to JSON based on its Coex type."""
+        i64 = ir.IntType(64)
+
+        # Handle primitives
+        if isinstance(field_type, PrimitiveType):
+            if field_type.name == "int":
+                if isinstance(field_val.type, ir.IntType) and field_val.type.width < 64:
+                    field_val = self.builder.zext(field_val, i64)
+                return self.builder.call(self.json_new_int, [field_val])
+            elif field_type.name == "float":
+                return self.builder.call(self.json_new_float, [field_val])
+            elif field_type.name == "bool":
+                return self.builder.call(self.json_new_bool, [field_val])
+            elif field_type.name == "string":
+                # field_val is i64 (pointer as int), convert back to pointer
+                if isinstance(field_val.type, ir.IntType):
+                    str_ptr = self.builder.inttoptr(field_val, self.string_struct.as_pointer())
+                else:
+                    str_ptr = field_val
+                return self.builder.call(self.json_new_string, [str_ptr])
+
+        # Handle collections
+        if isinstance(field_type, ListType):
+            if isinstance(field_val.type, ir.IntType):
+                list_ptr = self.builder.inttoptr(field_val, self.list_struct.as_pointer())
+            else:
+                list_ptr = field_val
+            return self.builder.call(self.json_new_array, [list_ptr])
+
+        if isinstance(field_type, MapType):
+            if isinstance(field_val.type, ir.IntType):
+                map_ptr = self.builder.inttoptr(field_val, self.map_struct.as_pointer())
+            else:
+                map_ptr = field_val
+            return self.builder.call(self.json_new_object, [map_ptr])
+
+        # Handle user-defined types
+        if isinstance(field_type, NamedType):
+            if isinstance(field_val.type, ir.IntType):
+                udt_ptr = self.builder.inttoptr(field_val, self.type_registry[field_type.name].as_pointer())
+            else:
+                udt_ptr = field_val
+            return self._convert_udt_to_json(udt_ptr, field_type.name)
+
+        # Fallback - treat as int
+        if isinstance(field_val.type, ir.IntType):
+            if field_val.type.width < 64:
+                field_val = self.builder.zext(field_val, i64)
+            return self.builder.call(self.json_new_int, [field_val])
+
+        return self.builder.call(self.json_new_null, [])
+
+    def _generate_as_expr(self, expr: AsExpr) -> ir.Value:
+        """Generate code for type cast expression: expr as Type or expr as Type?"""
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = self.builder.function
+
+        # Generate the source expression
+        source = self._generate_expression(expr.expr)
+        target_type = expr.target_type
+
+        # Handle OptionalType wrapper - get the inner type
+        if isinstance(target_type, OptionalType):
+            inner_type = target_type.inner_type
+        else:
+            inner_type = target_type
+
+        # If source is not JSON, we need special handling
+        if not (isinstance(source.type, ir.PointerType) and
+                hasattr(source.type.pointee, 'name') and
+                source.type.pointee.name == "struct.Json"):
+            # Source is not JSON - handle other conversions
+            return self._generate_non_json_as_expr(source, expr)
+
+        # JSON → Coex conversion
+        # Get the JSON tag
+        tag_ptr = self.builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = self.builder.load(tag_ptr)
+        value_ptr = self.builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = self.builder.load(value_ptr)
+
+        # Handle JSON → string: extract string if JSON is string type, else serialize
+        if isinstance(inner_type, PrimitiveType) and inner_type.name == "string":
+            # Check if JSON is a string type - if so, extract; otherwise serialize
+            is_str_type = self.builder.icmp_unsigned("==", tag, ir.Constant(ir.IntType(8), self.JSON_TAG_STRING))
+
+            func = self.builder.function
+            extract_block = func.append_basic_block("json_extract_str")
+            serialize_block = func.append_basic_block("json_serialize_str")
+            done_block = func.append_basic_block("json_str_done")
+
+            self.builder.cbranch(is_str_type, extract_block, serialize_block)
+
+            # Extract the string directly
+            self.builder.position_at_end(extract_block)
+            extracted = self.builder.inttoptr(value, self.string_struct.as_pointer())
+            self.builder.branch(done_block)
+
+            # Serialize to JSON string
+            self.builder.position_at_end(serialize_block)
+            serialized = self.builder.call(self.json_stringify, [source])
+            self.builder.branch(done_block)
+
+            # Merge results
+            self.builder.position_at_end(done_block)
+            result = self.builder.phi(self.string_struct.as_pointer(), "str_result")
+            result.add_incoming(extracted, extract_block)
+            result.add_incoming(serialized, serialize_block)
+            return result
+
+        # Handle primitive target types (extraction)
+        if isinstance(inner_type, PrimitiveType):
+            return self._generate_json_to_primitive(source, tag, value, inner_type, expr.is_optional)
+
+        # Handle user-defined types
+        if isinstance(inner_type, NamedType):
+            if inner_type.name in self.type_fields:
+                return self._generate_json_to_struct(source, tag, value, inner_type, expr.is_optional)
+            if inner_type.name in self.enum_variants:
+                return self._generate_json_to_enum(source, tag, value, inner_type, expr.is_optional)
+
+        # Handle List type
+        if isinstance(inner_type, ListType):
+            return self._generate_json_to_list(source, tag, value, inner_type, expr.is_optional)
+
+        # Fallback - return 0/nil
+        if expr.is_optional:
+            return ir.Constant(i64, 0)
+        return ir.Constant(i64, 0)
+
+    def _generate_non_json_as_expr(self, source: ir.Value, expr: AsExpr) -> ir.Value:
+        """Handle non-JSON type conversions (e.g., int as string, string as json)."""
+        i64 = ir.IntType(64)
+        target_type = expr.target_type
+
+        if isinstance(target_type, OptionalType):
+            inner_type = target_type.inner_type
+        else:
+            inner_type = target_type
+
+        # string → json (parsing)
+        if isinstance(inner_type, PrimitiveType) and inner_type.name == "json":
+            # Check if source is a string
+            if (isinstance(source.type, ir.PointerType) and
+                hasattr(source.type.pointee, 'name') and
+                source.type.pointee.name == "struct.String"):
+                # Parse the string as JSON
+                return self.builder.call(self.json_parse, [source])
+            # Other types → json (implicit conversion)
+            return self._convert_to_json(source, expr.expr)
+
+        # For other conversions, just return the value (type checking should catch errors)
+        return source
+
+    def _generate_json_to_primitive(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                     target_type: PrimitiveType, is_optional: bool) -> ir.Value:
+        """Convert JSON to a primitive type."""
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = self.builder.function
+
+        # Determine expected tag
+        # JSON tags: 0=null, 1=bool, 2=int, 3=float, 4=string, 5=array, 6=object
+        if target_type.name == "bool":
+            expected_tag = 1
+            result_type = i1
+        elif target_type.name == "int":
+            expected_tag = 2
+            result_type = i64
+        elif target_type.name == "float":
+            expected_tag = 3
+            result_type = ir.DoubleType()
+        elif target_type.name == "string":
+            expected_tag = 4
+            result_type = self.string_struct.as_pointer()
+        else:
+            # Unknown primitive - return 0
+            return ir.Constant(i64, 0)
+
+        # Check tag matches
+        tag_matches = self.builder.icmp_unsigned("==", tag, ir.Constant(i8, expected_tag))
+
+        # Create blocks
+        match_block = func.append_basic_block("as_match")
+        fail_block = func.append_basic_block("as_fail")
+        done_block = func.append_basic_block("as_done")
+
+        # Allocate result
+        if is_optional:
+            # Optional returns i64 (0 for nil)
+            result_ptr = self.builder.alloca(i64, name="as_result")
+        else:
+            result_ptr = self.builder.alloca(result_type, name="as_result")
+
+        self.builder.cbranch(tag_matches, match_block, fail_block)
+
+        # Match block - extract value
+        self.builder.position_at_end(match_block)
+        if target_type.name == "bool":
+            extracted = self.builder.trunc(value, i1)
+            if is_optional:
+                # Store as i64 for optional (1 = Some(false), 2 = Some(true))
+                extended = self.builder.zext(extracted, i64)
+                # Add 1 so 0 can mean None
+                result = self.builder.add(extended, ir.Constant(i64, 1))
+                self.builder.store(result, result_ptr)
+            else:
+                self.builder.store(extracted, result_ptr)
+        elif target_type.name == "int":
+            if is_optional:
+                # For optional int, we need a sentinel. Use a tagged representation.
+                # Store value + 1, with 0 meaning None
+                # This limits range but works for most cases
+                result = self.builder.add(value, ir.Constant(i64, 1))
+                self.builder.store(result, result_ptr)
+            else:
+                self.builder.store(value, result_ptr)
+        elif target_type.name == "float":
+            # value is i64 - bitcast to double
+            extracted = self.builder.bitcast(value, ir.DoubleType())
+            if is_optional:
+                # Store as i64
+                self.builder.store(value, result_ptr)
+            else:
+                self.builder.store(extracted, result_ptr)
+        elif target_type.name == "string":
+            str_ptr = self.builder.inttoptr(value, self.string_struct.as_pointer())
+            if is_optional:
+                self.builder.store(value, result_ptr)
+            else:
+                # Store the actual String* pointer
+                self.builder.store(str_ptr, result_ptr)
+        self.builder.branch(done_block)
+
+        # Fail block
+        self.builder.position_at_end(fail_block)
+        if is_optional:
+            self.builder.store(ir.Constant(i64, 0), result_ptr)
+            self.builder.branch(done_block)
+        else:
+            # Panic - type mismatch
+            # For now, just store 0 and continue
+            if result_type == i1:
+                self.builder.store(ir.Constant(i1, 0), result_ptr)
+            elif result_type == i64:
+                self.builder.store(ir.Constant(i64, 0), result_ptr)
+            elif isinstance(result_type, ir.DoubleType):
+                self.builder.store(ir.Constant(ir.DoubleType(), 0.0), result_ptr)
+            else:
+                # Pointer type
+                null_ptr = self.builder.inttoptr(ir.Constant(i64, 0), result_type)
+                self.builder.store(null_ptr, result_ptr)
+            self.builder.branch(done_block)
+
+        # Done block
+        self.builder.position_at_end(done_block)
+        return self.builder.load(result_ptr)
+
+    def _generate_json_to_struct(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                  target_type: NamedType, is_optional: bool) -> ir.Value:
+        """Convert JSON object to user-defined struct."""
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = self.builder.function
+        type_name = target_type.name
+
+        # Check it's an object (tag == 6)
+        is_object = self.builder.icmp_unsigned("==", tag, ir.Constant(i8, 6))
+
+        match_block = func.append_basic_block("as_struct_match")
+        fail_block = func.append_basic_block("as_struct_fail")
+        done_block = func.append_basic_block("as_struct_done")
+
+        struct_type = self.type_registry[type_name]
+        result_ptr = self.builder.alloca(struct_type.as_pointer(), name="as_struct_result")
+
+        self.builder.cbranch(is_object, match_block, fail_block)
+
+        # Match block - extract fields
+        self.builder.position_at_end(match_block)
+
+        # Get the map from the JSON object
+        map_ptr = self.builder.inttoptr(value, self.map_struct.as_pointer())
+
+        # Allocate struct via GC
+        struct_size = ir.Constant(i64, len(self.type_fields[type_name]) * 8)
+        type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
+        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        struct_ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
+
+        # Extract each field
+        field_info = self.type_fields[type_name]
+        for idx, (field_name, field_type) in enumerate(field_info):
+            # Skip _type field
+            if field_name == "_type":
+                continue
+
+            # Get field from map
+            field_key = self._get_string_ptr(field_name)
+            field_json_i64 = self.builder.call(self.map_get_string, [map_ptr, field_key])
+
+            # Convert from JSON
+            field_json = self.builder.inttoptr(field_json_i64, self.json_struct.as_pointer())
+            field_val = self._extract_json_value(field_json, field_type)
+
+            # Store in struct
+            field_ptr = self.builder.gep(struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            self.builder.store(field_val, field_ptr)
+
+        if is_optional:
+            struct_i64 = self.builder.ptrtoint(struct_ptr, i64)
+            self.builder.store(self.builder.inttoptr(struct_i64, struct_type.as_pointer()), result_ptr)
+        else:
+            self.builder.store(struct_ptr, result_ptr)
+        self.builder.branch(done_block)
+
+        # Fail block
+        self.builder.position_at_end(fail_block)
+        null_ptr = self.builder.inttoptr(ir.Constant(i64, 0), struct_type.as_pointer())
+        self.builder.store(null_ptr, result_ptr)
+        self.builder.branch(done_block)
+
+        # Done block
+        self.builder.position_at_end(done_block)
+        return self.builder.load(result_ptr)
+
+    def _generate_json_to_enum(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                target_type: NamedType, is_optional: bool) -> ir.Value:
+        """Convert JSON object to enum."""
+        # Similar to struct but also checks _variant field
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+
+        # For now, return a simple placeholder
+        # Full enum conversion requires matching variant names
+        if is_optional:
+            return ir.Constant(i64, 0)
+        return ir.Constant(i64, 0)
+
+    def _generate_json_to_list(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                target_type: ListType, is_optional: bool) -> ir.Value:
+        """Convert JSON array to List."""
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        func = self.builder.function
+
+        # Check it's an array (tag == 5)
+        is_array = self.builder.icmp_unsigned("==", tag, ir.Constant(i8, 5))
+
+        match_block = func.append_basic_block("as_list_match")
+        fail_block = func.append_basic_block("as_list_fail")
+        done_block = func.append_basic_block("as_list_done")
+
+        result_ptr = self.builder.alloca(self.list_struct.as_pointer(), name="as_list_result")
+
+        self.builder.cbranch(is_array, match_block, fail_block)
+
+        # Match block - the value is already a List*
+        self.builder.position_at_end(match_block)
+        list_ptr = self.builder.inttoptr(value, self.list_struct.as_pointer())
+        self.builder.store(list_ptr, result_ptr)
+        self.builder.branch(done_block)
+
+        # Fail block
+        self.builder.position_at_end(fail_block)
+        null_ptr = self.builder.inttoptr(ir.Constant(i64, 0), self.list_struct.as_pointer())
+        self.builder.store(null_ptr, result_ptr)
+        self.builder.branch(done_block)
+
+        # Done block
+        self.builder.position_at_end(done_block)
+        return self.builder.load(result_ptr)
+
+    def _extract_json_value(self, json_ptr: ir.Value, target_type: Type) -> ir.Value:
+        """Extract a value from a JSON pointer, converting to the target type."""
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag and value
+        tag_ptr = self.builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = self.builder.load(tag_ptr)
+        value_ptr = self.builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = self.builder.load(value_ptr)
+
+        if isinstance(target_type, PrimitiveType):
+            if target_type.name == "int":
+                return value
+            elif target_type.name == "float":
+                return self.builder.bitcast(value, ir.DoubleType())
+            elif target_type.name == "bool":
+                return self.builder.trunc(value, ir.IntType(1))
+            elif target_type.name == "string":
+                return self.builder.inttoptr(value, self.string_struct.as_pointer())
+
+        # For complex types, return the raw value as i64
+        return value
 
     def _generate_list_comprehension(self, expr: ListComprehension) -> ir.Value:
         """Generate code for list comprehension via desugaring.
