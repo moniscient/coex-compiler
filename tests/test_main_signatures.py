@@ -2,10 +2,10 @@
 Tests for flexible main() function signatures.
 
 Supported signatures:
-1. func main() -> int                                           - basic
-2. func main(args: [string]) -> int                             - with args
-3. func main(stdin: File, stdout: File, stderr: File) -> int   - with stdio
-4. func main(args: [string], stdin: File, stdout: File, stderr: File) -> int - full
+1. func main() -> int                                              - basic
+2. func main(args: [string]) -> int                                - with args
+3. func main(stdin: posix, stdout: posix, stderr: posix) -> int   - with stdio
+4. func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int - full
 """
 
 import pytest
@@ -97,12 +97,12 @@ func main(args: [string]) -> int
 
 
 class TestMainWithStdio:
-    """Test main(stdin: File, stdout: File, stderr: File) -> int signature."""
+    """Test main(stdin: posix, stdout: posix, stderr: posix) -> int signature."""
 
     def test_main_stdout_writeln(self, compile_binary):
-        """Main can write to stdout File handle."""
+        """Main can write to stdout posix handle."""
         binary = compile_binary('''
-func main(stdin: File, stdout: File, stderr: File) -> int
+func main(stdin: posix, stdout: posix, stderr: posix) -> int
     stdout.writeln("hello via stdout")
     return 0
 ~
@@ -112,9 +112,9 @@ func main(stdin: File, stdout: File, stderr: File) -> int
         assert "hello via stdout" in proc.stdout, f"Expected 'hello via stdout' in stdout, got: {proc.stdout}"
 
     def test_main_stderr_writeln(self, compile_binary):
-        """Main can write to stderr File handle."""
+        """Main can write to stderr posix handle."""
         binary = compile_binary('''
-func main(stdin: File, stdout: File, stderr: File) -> int
+func main(stdin: posix, stdout: posix, stderr: posix) -> int
     stderr.writeln("error message")
     return 0
 ~
@@ -125,12 +125,12 @@ func main(stdin: File, stdout: File, stderr: File) -> int
 
 
 class TestMainFull:
-    """Test main(args: [string], stdin: File, stdout: File, stderr: File) -> int signature."""
+    """Test main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int signature."""
 
     def test_main_full_signature(self, compile_binary):
         """Main with both args and stdio."""
         binary = compile_binary('''
-func main(args: [string], stdin: File, stdout: File, stderr: File) -> int
+func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
     stdout.writeln("arg count:")
     print(args.len())
     return 0

@@ -190,7 +190,7 @@ func main() -> int
 
 ## Feature Status (as of Dec 2024)
 
-### Fully Working (185 tests passing)
+### Fully Working (821 tests passing)
 - Arithmetic, comparisons, boolean logic
 - Variables, assignment, compound operators (`+=`, `-=`, etc.)
 - Control flow: `if`/`else`/`elif`, `for..in`, `while`, `break`, `continue`
@@ -225,6 +225,47 @@ func main() -> int
 ```
 
 Standard library: `lib/math.coex` provides `abs`, `max`, `min`, `clamp`, `sign`
+
+### posix Platform Module
+
+The `posix` type provides low-level POSIX I/O and system utilities. It wraps a file descriptor.
+
+```coex
+# Opening files
+func main() -> int
+    f: Result<posix, string> = posix.open("file.txt", "r")
+    if f.is_ok()
+        handle: posix = f.unwrap()
+        content: Result<string, string> = handle.read_all()
+        handle.close()
+    ~
+    return 0
+~
+
+# Using stdio handles
+func main(stdin: posix, stdout: posix, stderr: posix) -> int
+    stdout.writeln("hello world")
+    return 0
+~
+```
+
+**Instance Methods:**
+- `open(path: string, mode: string) -> Result<posix, string>` - Static; opens file ("r", "w", "a")
+- `read(count: int) -> Result<[byte], string>` - Read count bytes
+- `read_all() -> Result<string, string>` - Read entire file as string
+- `write(data: [byte]) -> Result<int, string>` - Write byte array
+- `writeln(text: string) -> Result<(), string>` - Write string with newline
+- `seek(offset: int, whence: int) -> Result<int, string>` - Seek (0=SET, 1=CUR, 2=END)
+- `close() -> Result<(), string>` - Close file descriptor
+
+**Static Utility Methods:**
+- `posix.time() -> int` - Unix timestamp in seconds
+- `posix.time_ns() -> int` - Nanosecond precision monotonic time
+- `posix.getenv(name: string) -> string?` - Get environment variable (nil if not set)
+- `posix.random_seed() -> int` - Random 64-bit integer from /dev/urandom
+- `posix.urandom(count: int) -> [byte]` - Random bytes from /dev/urandom
+
+**Note:** This module only works on Unix-like systems (macOS, Linux).
 
 ### Known Issues
 | Issue | Description |

@@ -284,8 +284,8 @@ class CodeGenerator:
             "Err": (1, [("error", PrimitiveType("string"))]),  # tag 1
         }
 
-        # Create built-in File extern type
-        self._create_file_type()
+        # Create built-in posix platform type
+        self._create_posix_type()
 
         # Matrix registry for tracking declared matrices
         self.matrix_decls: Dict[str, 'MatrixDecl'] = {}  # name -> MatrixDecl
@@ -9711,81 +9711,115 @@ class CodeGenerator:
         result_val = builder.select(is_ok, ok_value, default)
         builder.ret(result_val)
 
-    def _create_file_type(self):
-        """Create built-in File extern type for file I/O.
+    def _create_posix_type(self):
+        """Create built-in posix platform type for POSIX I/O.
 
-        File is an extern type wrapping POSIX file descriptors:
-        - File.open(path, mode) -> Result<File, string>
-        - file.read_all() -> Result<string, string>
-        - file.writeln(text) -> Result<(), string>
-        - file.close() -> Result<(), string>
+        posix is a platform type wrapping POSIX file descriptors:
+        - posix.open(path, mode) -> Result<posix, string>
+        - p.read_all() -> Result<string, string>
+        - p.writeln(text) -> Result<(), string>
+        - p.close() -> Result<(), string>
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
-        i1 = ir.IntType(1)
 
         # Declare POSIX file functions
         # int open(const char *pathname, int flags, mode_t mode)
         open_ty = ir.FunctionType(i32, [i8_ptr, i32, i32])
-        self.posix_open = ir.Function(self.module, open_ty, name="open")
+        self.posix_open_syscall = ir.Function(self.module, open_ty, name="open")
 
         # ssize_t read(int fd, void *buf, size_t count)
         read_ty = ir.FunctionType(i64, [i32, i8_ptr, i64])
-        self.posix_read = ir.Function(self.module, read_ty, name="read")
+        self.posix_read_syscall = ir.Function(self.module, read_ty, name="read")
 
         # int close(int fd)
         close_ty = ir.FunctionType(i32, [i32])
-        self.posix_close = ir.Function(self.module, close_ty, name="close")
+        self.posix_close_syscall = ir.Function(self.module, close_ty, name="close")
 
         # off_t lseek(int fd, off_t offset, int whence)
         lseek_ty = ir.FunctionType(i64, [i32, i64, i32])
-        self.posix_lseek = ir.Function(self.module, lseek_ty, name="lseek")
+        self.posix_lseek_syscall = ir.Function(self.module, lseek_ty, name="lseek")
 
-        # Create File struct: { i32 fd, i1 is_open }
-        self.file_struct = ir.global_context.get_identified_type("struct.File")
-        self.file_struct.set_body(
-            i32,  # fd - file descriptor (field 0)
-            i1,   # is_open - whether file is open (field 1)
+        # time_t time(time_t *t) - returns seconds since Unix epoch
+        time_ty = ir.FunctionType(i64, [i8_ptr])
+        self.c_time = ir.Function(self.module, time_ty, name="time")
+
+        # int clock_gettime(clockid_t clk_id, struct timespec *tp)
+        clock_gettime_ty = ir.FunctionType(i32, [i32, i8_ptr])
+        self.c_clock_gettime = ir.Function(self.module, clock_gettime_ty, name="clock_gettime")
+
+        # char* getenv(const char *name)
+        getenv_ty = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.c_getenv = ir.Function(self.module, getenv_ty, name="getenv")
+
+        # Create posix struct: { i32 fd }
+        self.posix_struct = ir.global_context.get_identified_type("struct.posix")
+        self.posix_struct.set_body(
+            i32,  # fd - file descriptor (only field)
         )
-        file_ptr = self.file_struct.as_pointer()
+        posix_ptr = self.posix_struct.as_pointer()
 
-        # Register File in type registry
-        self.type_registry["File"] = self.file_struct
-        self.type_fields["File"] = [("fd", PrimitiveType("int")), ("is_open", PrimitiveType("bool"))]
-        self.type_methods["File"] = {}
+        # Register posix in type registry
+        self.type_registry["posix"] = self.posix_struct
+        self.type_fields["posix"] = [("fd", PrimitiveType("int"))]
+        self.type_methods["posix"] = {}
 
-        # Track File as extern type
+        # Track posix as extern type
         self.extern_types = getattr(self, 'extern_types', set())
-        self.extern_types.add("File")
+        self.extern_types.add("posix")
 
-        # Register File with GC (8 bytes, no reference fields)
-        self.gc.register_type("File", 8, [])
+        # Register posix with GC (4 bytes, no reference fields)
+        self.gc.register_type("posix", 4, [])
 
-        # Create File.open(path, mode) -> Result<File, string>
-        self._create_file_open(file_ptr, i8_ptr, i32, i64)
+        # Create posix.open(path, mode) -> Result<posix, string>
+        self._create_posix_open(posix_ptr, i8_ptr, i32, i64)
 
-        # Create file.read_all() -> Result<string, string>
-        self._create_file_read_all(file_ptr, i64, i8_ptr)
+        # Create p.read_all() -> Result<string, string>
+        self._create_posix_read_all(posix_ptr, i64, i8_ptr)
 
-        # Create file.writeln(text) -> Result<(), string>
-        self._create_file_writeln(file_ptr, i64)
+        # Create p.writeln(text) -> Result<(), string>
+        self._create_posix_writeln(posix_ptr, i64)
 
-        # Create file.close() -> Result<(), string>
-        self._create_file_close(file_ptr, i32)
+        # Create p.close() -> Result<(), string>
+        self._create_posix_close(posix_ptr, i32)
 
-    def _create_file_open(self, file_ptr: ir.Type, i8_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
-        """Create File.open(path, mode) static method."""
+        # Create p.read(count) -> Result<[byte], string>
+        self._create_posix_read(posix_ptr, i32, i64, i8_ptr)
+
+        # Create p.write(data) -> Result<int, string>
+        self._create_posix_write(posix_ptr, i32, i64, i8_ptr)
+
+        # Create p.seek(offset, whence) -> Result<int, string>
+        self._create_posix_seek(posix_ptr, i32, i64)
+
+        # Create posix.time() -> int (static method)
+        self._create_posix_time(i64, i8_ptr)
+
+        # Create posix.time_ns() -> int (static method)
+        self._create_posix_time_ns(i32, i64, i8_ptr)
+
+        # Create posix.getenv(name) -> string? (static method)
+        self._create_posix_getenv(i8_ptr, i64)
+
+        # Create posix.random_seed() -> int (static method)
+        self._create_posix_random_seed(i32, i64, i8_ptr)
+
+        # Create posix.urandom(count) -> [byte] (static method)
+        self._create_posix_urandom(i32, i64, i8_ptr)
+
+    def _create_posix_open(self, posix_ptr: ir.Type, i8_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
+        """Create posix.open(path, mode) static method."""
         result_ptr = self.result_struct.as_pointer()
         string_ptr = self.string_struct.as_pointer()
 
-        # File.open(path: String*, mode: String*) -> Result*
+        # posix.open(path: String*, mode: String*) -> Result*
         func_type = ir.FunctionType(result_ptr, [string_ptr, string_ptr])
-        func = ir.Function(self.module, func_type, name="coex_file_open")
-        self.file_open = func
-        self.functions["coex_file_open"] = func
-        self.functions["File_open"] = func  # For static method lookup
-        self.type_methods["File"]["open"] = "coex_file_open"
+        func = ir.Function(self.module, func_type, name="coex_posix_open")
+        self.posix_open_method = func
+        self.functions["coex_posix_open"] = func
+        self.functions["posix_open"] = func  # For static method lookup
+        self.type_methods["posix"]["open"] = "coex_posix_open"
 
         func.args[0].name = "path"
         func.args[1].name = "mode"
@@ -9815,33 +9849,29 @@ class CodeGenerator:
 
         # Call open(path, flags, 0644)
         mode_bits = ir.Constant(i32, 0o644)
-        fd = builder.call(self.posix_open, [path_cstr, flags, mode_bits])
+        fd = builder.call(self.posix_open_syscall, [path_cstr, flags, mode_bits])
 
         # Check if open succeeded (fd >= 0)
         zero = ir.Constant(i32, 0)
         success = builder.icmp_signed(">=", fd, zero)
         builder.cbranch(success, open_ok, open_err)
 
-        # Open succeeded - create File and return Ok(file)
+        # Open succeeded - create posix and return Ok(posix)
         builder.position_at_end(open_ok)
 
-        # Allocate File struct
-        file_size = ir.Constant(i64, 8)
-        file_type_id = ir.Constant(i32, self.gc.get_type_id("File"))
-        file_raw = builder.call(self.gc.gc_alloc, [file_size, file_type_id])
-        file_ptr_val = builder.bitcast(file_raw, file_ptr)
+        # Allocate posix struct (4 bytes for fd only)
+        posix_size = ir.Constant(i64, 4)
+        posix_type_id = ir.Constant(i32, self.gc.get_type_id("posix"))
+        posix_raw = builder.call(self.gc.gc_alloc, [posix_size, posix_type_id])
+        posix_ptr_val = builder.bitcast(posix_raw, posix_ptr)
 
         # Set fd field
-        fd_field = builder.gep(file_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd_field = builder.gep(posix_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(fd, fd_field)
 
-        # Set is_open = true
-        is_open_field = builder.gep(file_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(1), 1), is_open_field)
-
-        # Return Result.ok(file) - store file pointer as i64
-        file_as_i64 = builder.ptrtoint(file_ptr_val, i64)
-        ok_result = builder.call(self.result_ok, [file_as_i64])
+        # Return Result.ok(posix) - store posix pointer as i64
+        posix_as_i64 = builder.ptrtoint(posix_ptr_val, i64)
+        ok_result = builder.call(self.result_ok, [posix_as_i64])
         builder.ret(ok_result)
 
         # Open failed - return Err(message)
@@ -9859,20 +9889,20 @@ class CodeGenerator:
         global_str = self._create_global_string(value, name)
         return builder.bitcast(global_str, ir.IntType(8).as_pointer())
 
-    def _create_file_read_all(self, file_ptr: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
-        """Create file.read_all() method."""
+    def _create_posix_read_all(self, posix_ptr: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.read_all() method."""
         result_ptr = self.result_struct.as_pointer()
         string_ptr = self.string_struct.as_pointer()
         i32 = ir.IntType(32)
 
-        # file.read_all() -> Result*
-        func_type = ir.FunctionType(result_ptr, [file_ptr])
-        func = ir.Function(self.module, func_type, name="coex_file_read_all")
-        self.file_read_all = func
-        self.functions["coex_file_read_all"] = func
-        self.type_methods["File"]["read_all"] = "coex_file_read_all"
+        # posix.read_all() -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr])
+        func = ir.Function(self.module, func_type, name="coex_posix_read_all")
+        self.posix_read_all = func
+        self.functions["coex_posix_read_all"] = func
+        self.type_methods["posix"]["read_all"] = "coex_posix_read_all"
 
-        func.args[0].name = "file"
+        func.args[0].name = "p"
 
         entry = func.append_basic_block("entry")
         read_done = func.append_basic_block("read_done")
@@ -9880,20 +9910,20 @@ class CodeGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        file = func.args[0]
+        p = func.args[0]
 
-        # Get fd from file
-        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        # Get fd from posix
+        fd_field = builder.gep(p, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Get file size using lseek
         # lseek(fd, 0, SEEK_END) to get size
         SEEK_END = ir.Constant(i32, 2)
         SEEK_SET = ir.Constant(i32, 0)
-        file_size = builder.call(self.posix_lseek, [fd, ir.Constant(i64, 0), SEEK_END])
+        file_size = builder.call(self.posix_lseek_syscall, [fd, ir.Constant(i64, 0), SEEK_END])
 
         # Seek back to start
-        builder.call(self.posix_lseek, [fd, ir.Constant(i64, 0), SEEK_SET])
+        builder.call(self.posix_lseek_syscall, [fd, ir.Constant(i64, 0), SEEK_SET])
 
         # Allocate buffer for file content
         buf_size = builder.add(file_size, ir.Constant(i64, 1))  # +1 for null terminator
@@ -9901,7 +9931,7 @@ class CodeGenerator:
         buffer = builder.call(self.gc.gc_alloc, [buf_size, string_data_type_id])
 
         # Read entire file
-        bytes_read = builder.call(self.posix_read, [fd, buffer, file_size])
+        bytes_read = builder.call(self.posix_read_syscall, [fd, buffer, file_size])
 
         # Check if read succeeded
         zero = ir.Constant(i64, 0)
@@ -9929,20 +9959,20 @@ class CodeGenerator:
         err_result = builder.call(self.result_err, [err_as_i64])
         builder.ret(err_result)
 
-    def _create_file_writeln(self, file_ptr: ir.Type, i64: ir.Type):
-        """Create file.writeln(text) method."""
+    def _create_posix_writeln(self, posix_ptr: ir.Type, i64: ir.Type):
+        """Create posix.writeln(text) method."""
         result_ptr = self.result_struct.as_pointer()
         string_ptr = self.string_struct.as_pointer()
         i32 = ir.IntType(32)
 
-        # file.writeln(text: String*) -> Result*
-        func_type = ir.FunctionType(result_ptr, [file_ptr, string_ptr])
-        func = ir.Function(self.module, func_type, name="coex_file_writeln")
-        self.file_writeln = func
-        self.functions["coex_file_writeln"] = func
-        self.type_methods["File"]["writeln"] = "coex_file_writeln"
+        # posix.writeln(text: String*) -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr, string_ptr])
+        func = ir.Function(self.module, func_type, name="coex_posix_writeln")
+        self.posix_writeln = func
+        self.functions["coex_posix_writeln"] = func
+        self.type_methods["posix"]["writeln"] = "coex_posix_writeln"
 
-        func.args[0].name = "file"
+        func.args[0].name = "p"
         func.args[1].name = "text"
 
         entry = func.append_basic_block("entry")
@@ -9951,11 +9981,11 @@ class CodeGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        file = func.args[0]
+        p = func.args[0]
         text = func.args[1]
 
-        # Get fd from file
-        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        # Get fd from posix
+        fd_field = builder.gep(p, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Get text data and byte size (not total memory footprint)
@@ -9987,19 +10017,19 @@ class CodeGenerator:
         err_result = builder.call(self.result_err, [err_as_i64])
         builder.ret(err_result)
 
-    def _create_file_close(self, file_ptr: ir.Type, i32: ir.Type):
-        """Create file.close() method."""
+    def _create_posix_close(self, posix_ptr: ir.Type, i32: ir.Type):
+        """Create posix.close() method."""
         result_ptr = self.result_struct.as_pointer()
         i64 = ir.IntType(64)
 
-        # file.close() -> Result*
-        func_type = ir.FunctionType(result_ptr, [file_ptr])
-        func = ir.Function(self.module, func_type, name="coex_file_close")
-        self.file_close = func
-        self.functions["coex_file_close"] = func
-        self.type_methods["File"]["close"] = "coex_file_close"
+        # posix.close() -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr])
+        func = ir.Function(self.module, func_type, name="coex_posix_close")
+        self.posix_close_func = func
+        self.functions["coex_posix_close"] = func
+        self.type_methods["posix"]["close"] = "coex_posix_close"
 
-        func.args[0].name = "file"
+        func.args[0].name = "posix_handle"
 
         entry = func.append_basic_block("entry")
         close_ok = func.append_basic_block("close_ok")
@@ -10007,18 +10037,14 @@ class CodeGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        file = func.args[0]
+        posix_handle = func.args[0]
 
-        # Get fd from file
-        fd_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        # Get fd from posix struct
+        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
-        # Close the file
-        result = builder.call(self.posix_close, [fd])
-
-        # Set is_open = false
-        is_open_field = builder.gep(file, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(1), 0), is_open_field)
+        # Close the file descriptor
+        result = builder.call(self.posix_close_syscall, [fd])
 
         # Check if close succeeded (result == 0)
         zero = ir.Constant(i32, 0)
@@ -10037,6 +10063,419 @@ class CodeGenerator:
         err_as_i64 = builder.ptrtoint(err_string, i64)
         err_result = builder.call(self.result_err, [err_as_i64])
         builder.ret(err_result)
+
+    def _create_posix_read(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.read(count) method - reads bytes from file descriptor.
+
+        Returns Result<[byte], string> - Ok with byte list or Err with message.
+        """
+        result_ptr = self.result_struct.as_pointer()
+        list_ptr = self.list_struct.as_pointer()
+
+        # posix.read(count: int) -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr, i64])
+        func = ir.Function(self.module, func_type, name="coex_posix_read")
+        self.posix_read_func = func
+        self.functions["coex_posix_read"] = func
+        self.type_methods["posix"]["read"] = "coex_posix_read"
+
+        func.args[0].name = "posix_handle"
+        func.args[1].name = "count"
+
+        entry = func.append_basic_block("entry")
+        read_ok = func.append_basic_block("read_ok")
+        read_err = func.append_basic_block("read_err")
+
+        builder = ir.IRBuilder(entry)
+
+        posix_handle = func.args[0]
+        count = func.args[1]
+
+        # Get fd from posix struct
+        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Allocate buffer for reading
+        buf = builder.call(self.malloc, [count])
+
+        # Call read(fd, buf, count)
+        bytes_read = builder.call(self.posix_read_syscall, [fd, buf, count])
+
+        # Check if read failed (bytes_read < 0)
+        zero = ir.Constant(i64, 0)
+        success = builder.icmp_signed(">=", bytes_read, zero)
+        builder.cbranch(success, read_ok, read_err)
+
+        # Read succeeded - create [byte] list from buffer
+        builder.position_at_end(read_ok)
+
+        # Create new list with elem_size = 1 (byte)
+        elem_size = ir.Constant(i64, 1)
+        byte_list = builder.call(self.list_new, [elem_size])
+
+        # Get the tail pointer from the new list and copy data there
+        tail_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail = builder.load(tail_ptr)
+
+        # Copy bytes_read bytes from buf to tail
+        builder.call(self.memcpy, [tail, buf, bytes_read])
+
+        # Update list length and tail_len
+        len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(bytes_read, len_ptr)
+
+        tail_len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        bytes_read_32 = builder.trunc(bytes_read, i32)
+        builder.store(bytes_read_32, tail_len_ptr)
+
+        # Free the temporary buffer
+        builder.call(self.free, [buf])
+
+        # Return Ok(byte_list)
+        list_as_i64 = builder.ptrtoint(byte_list, i64)
+        ok_result = builder.call(self.result_ok, [list_as_i64])
+        builder.ret(ok_result)
+
+        # Read failed
+        builder.position_at_end(read_err)
+        builder.call(self.free, [buf])
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read from file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _create_posix_write(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.write(data) method - writes bytes to file descriptor.
+
+        Takes [byte] list and returns Result<int, string> with bytes written.
+        """
+        result_ptr = self.result_struct.as_pointer()
+        list_ptr = self.list_struct.as_pointer()
+
+        # posix.write(data: [byte]) -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr, list_ptr])
+        func = ir.Function(self.module, func_type, name="coex_posix_write")
+        self.posix_write_func = func
+        self.functions["coex_posix_write"] = func
+        self.type_methods["posix"]["write"] = "coex_posix_write"
+
+        func.args[0].name = "posix_handle"
+        func.args[1].name = "data"
+
+        entry = func.append_basic_block("entry")
+        write_ok = func.append_basic_block("write_ok")
+        write_err = func.append_basic_block("write_err")
+
+        builder = ir.IRBuilder(entry)
+
+        posix_handle = func.args[0]
+        data = func.args[1]
+
+        # Get fd from posix struct
+        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Get length from list
+        len_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        data_len = builder.load(len_ptr)
+
+        # Get tail pointer from list (where byte data is stored)
+        tail_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail = builder.load(tail_ptr)
+
+        # Call write(fd, tail, len)
+        bytes_written = builder.call(self.write_syscall, [fd, tail, data_len])
+
+        # Check if write failed (bytes_written < 0)
+        zero = ir.Constant(i64, 0)
+        success = builder.icmp_signed(">=", bytes_written, zero)
+        builder.cbranch(success, write_ok, write_err)
+
+        # Write succeeded - return Ok(bytes_written)
+        builder.position_at_end(write_ok)
+        ok_result = builder.call(self.result_ok, [bytes_written])
+        builder.ret(ok_result)
+
+        # Write failed
+        builder.position_at_end(write_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _create_posix_seek(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
+        """Create posix.seek(offset, whence) method - repositions file offset.
+
+        whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
+        Returns Result<int, string> with new position or error.
+        """
+        result_ptr = self.result_struct.as_pointer()
+
+        # posix.seek(offset: int, whence: int) -> Result*
+        func_type = ir.FunctionType(result_ptr, [posix_ptr, i64, i64])
+        func = ir.Function(self.module, func_type, name="coex_posix_seek")
+        self.posix_seek_func = func
+        self.functions["coex_posix_seek"] = func
+        self.type_methods["posix"]["seek"] = "coex_posix_seek"
+
+        func.args[0].name = "posix_handle"
+        func.args[1].name = "offset"
+        func.args[2].name = "whence"
+
+        entry = func.append_basic_block("entry")
+        seek_ok = func.append_basic_block("seek_ok")
+        seek_err = func.append_basic_block("seek_err")
+
+        builder = ir.IRBuilder(entry)
+
+        posix_handle = func.args[0]
+        offset = func.args[1]
+        whence = func.args[2]
+
+        # Get fd from posix struct
+        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd = builder.load(fd_field)
+
+        # Convert whence from i64 to i32 for lseek
+        whence_32 = builder.trunc(whence, i32)
+
+        # Call lseek(fd, offset, whence)
+        new_pos = builder.call(self.posix_lseek_syscall, [fd, offset, whence_32])
+
+        # Check if lseek failed (result == -1)
+        neg_one = ir.Constant(i64, -1)
+        failed = builder.icmp_signed("==", new_pos, neg_one)
+        builder.cbranch(failed, seek_err, seek_ok)
+
+        # Seek succeeded - return Ok(new_pos)
+        builder.position_at_end(seek_ok)
+        ok_result = builder.call(self.result_ok, [new_pos])
+        builder.ret(ok_result)
+
+        # Seek failed
+        builder.position_at_end(seek_err)
+        err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to seek in file")
+        err_string = builder.call(self.string_from_literal, [err_msg])
+        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_result = builder.call(self.result_err, [err_as_i64])
+        builder.ret(err_result)
+
+    def _create_posix_time(self, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.time() static method - returns Unix timestamp in seconds."""
+        # posix.time() -> int
+        func_type = ir.FunctionType(i64, [])
+        func = ir.Function(self.module, func_type, name="coex_posix_time")
+        self.posix_time_func = func
+        self.functions["coex_posix_time"] = func
+        self.functions["posix_time"] = func  # For static method lookup
+        self.type_methods["posix"]["time"] = "coex_posix_time"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Call time(NULL) to get seconds since Unix epoch
+        null_ptr = ir.Constant(i8_ptr, None)
+        timestamp = builder.call(self.c_time, [null_ptr])
+        builder.ret(timestamp)
+
+    def _create_posix_time_ns(self, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.time_ns() static method - returns nanosecond precision time.
+
+        Uses clock_gettime with runtime platform detection:
+        - macOS: CLOCK_MONOTONIC = 1
+        - Linux: CLOCK_MONOTONIC = 4
+        """
+        # posix.time_ns() -> int
+        func_type = ir.FunctionType(i64, [])
+        func = ir.Function(self.module, func_type, name="coex_posix_time_ns")
+        self.posix_time_ns_func = func
+        self.functions["coex_posix_time_ns"] = func
+        self.functions["posix_time_ns"] = func
+        self.type_methods["posix"]["time_ns"] = "coex_posix_time_ns"
+
+        entry = func.append_basic_block("entry")
+        is_linux = func.append_basic_block("is_linux")
+        is_macos = func.append_basic_block("is_macos")
+        call_clock = func.append_basic_block("call_clock")
+
+        builder = ir.IRBuilder(entry)
+
+        # Create timespec struct on stack: { i64 tv_sec, i64 tv_nsec }
+        timespec_ty = ir.LiteralStructType([i64, i64])
+        timespec = builder.alloca(timespec_ty, name="timespec")
+        timespec_ptr = builder.bitcast(timespec, i8_ptr)
+
+        # Runtime platform detection: try to open /proc/version (Linux-only)
+        proc_version = self._get_raw_string_ptr_with_builder(builder, "/proc/version")
+        O_RDONLY = ir.Constant(i32, 0)
+        fd = builder.call(self.posix_open_syscall, [proc_version, O_RDONLY, ir.Constant(i32, 0)])
+
+        # If fd >= 0, we're on Linux; otherwise macOS
+        zero = ir.Constant(i32, 0)
+        is_linux_cond = builder.icmp_signed(">=", fd, zero)
+        builder.cbranch(is_linux_cond, is_linux, is_macos)
+
+        # Linux path: close fd and use CLOCK_MONOTONIC = 4
+        builder.position_at_end(is_linux)
+        builder.call(self.posix_close_syscall, [fd])
+        clock_id_linux = ir.Constant(i32, 4)  # CLOCK_MONOTONIC on Linux
+        builder.branch(call_clock)
+
+        # macOS path: use CLOCK_MONOTONIC = 1
+        builder.position_at_end(is_macos)
+        clock_id_macos = ir.Constant(i32, 1)  # CLOCK_MONOTONIC on macOS
+        builder.branch(call_clock)
+
+        # Call clock_gettime
+        builder.position_at_end(call_clock)
+        clock_id = builder.phi(i32, name="clock_id")
+        clock_id.add_incoming(clock_id_linux, is_linux)
+        clock_id.add_incoming(clock_id_macos, is_macos)
+
+        builder.call(self.c_clock_gettime, [clock_id, timespec_ptr])
+
+        # Extract tv_sec and tv_nsec
+        sec_ptr = builder.gep(timespec, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        nsec_ptr = builder.gep(timespec, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        tv_sec = builder.load(sec_ptr)
+        tv_nsec = builder.load(nsec_ptr)
+
+        # Return tv_sec * 1_000_000_000 + tv_nsec
+        billion = ir.Constant(i64, 1000000000)
+        result = builder.add(builder.mul(tv_sec, billion), tv_nsec)
+        builder.ret(result)
+
+    def _create_posix_getenv(self, i8_ptr: ir.Type, i64: ir.Type):
+        """Create posix.getenv(name) static method - returns environment variable.
+
+        Returns string? (optional string) - nil if not found.
+        """
+        string_ptr = self.string_struct.as_pointer()
+        i32 = ir.IntType(32)
+
+        # posix.getenv(name: string) -> string?
+        # Returns nullable string pointer
+        func_type = ir.FunctionType(string_ptr, [string_ptr])
+        func = ir.Function(self.module, func_type, name="coex_posix_getenv")
+        self.posix_getenv_func = func
+        self.functions["coex_posix_getenv"] = func
+        self.functions["posix_getenv"] = func
+        self.type_methods["posix"]["getenv"] = "coex_posix_getenv"
+
+        func.args[0].name = "name"
+
+        entry = func.append_basic_block("entry")
+        found = func.append_basic_block("found")
+        not_found = func.append_basic_block("not_found")
+
+        builder = ir.IRBuilder(entry)
+
+        name = func.args[0]
+
+        # Get string data pointer (field 0 of string struct)
+        data_ptr = builder.gep(name, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        c_str = builder.load(data_ptr)
+
+        # Call getenv(name)
+        result = builder.call(self.c_getenv, [c_str])
+
+        # Check if result is NULL
+        null_ptr = ir.Constant(i8_ptr, None)
+        is_null = builder.icmp_unsigned("==", result, null_ptr)
+        builder.cbranch(is_null, not_found, found)
+
+        # Found - wrap in Coex string
+        builder.position_at_end(found)
+        coex_string = builder.call(self.string_from_literal, [result])
+        builder.ret(coex_string)
+
+        # Not found - return nil (null pointer)
+        builder.position_at_end(not_found)
+        null_string = ir.Constant(string_ptr, None)
+        builder.ret(null_string)
+
+    def _create_posix_random_seed(self, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.random_seed() static method - returns random seed from /dev/urandom."""
+        # posix.random_seed() -> int
+        func_type = ir.FunctionType(i64, [])
+        func = ir.Function(self.module, func_type, name="coex_posix_random_seed")
+        self.posix_random_seed_func = func
+        self.functions["coex_posix_random_seed"] = func
+        self.functions["posix_random_seed"] = func
+        self.type_methods["posix"]["random_seed"] = "coex_posix_random_seed"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Open /dev/urandom
+        urandom_path = self._get_raw_string_ptr_with_builder(builder, "/dev/urandom")
+        O_RDONLY = ir.Constant(i32, 0)
+        fd = builder.call(self.posix_open_syscall, [urandom_path, O_RDONLY, ir.Constant(i32, 0)])
+
+        # Allocate 8 bytes for i64
+        buf = builder.alloca(i64, name="seed_buf")
+        buf_ptr = builder.bitcast(buf, i8_ptr)
+
+        # Read 8 bytes
+        eight = ir.Constant(i64, 8)
+        builder.call(self.posix_read_syscall, [fd, buf_ptr, eight])
+
+        # Close fd
+        builder.call(self.posix_close_syscall, [fd])
+
+        # Return the random i64
+        seed = builder.load(buf)
+        builder.ret(seed)
+
+    def _create_posix_urandom(self, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
+        """Create posix.urandom(count) static method - returns random bytes."""
+        list_ptr = self.list_struct.as_pointer()
+
+        # posix.urandom(count: int) -> [byte]
+        func_type = ir.FunctionType(list_ptr, [i64])
+        func = ir.Function(self.module, func_type, name="coex_posix_urandom")
+        self.posix_urandom_func = func
+        self.functions["coex_posix_urandom"] = func
+        self.functions["posix_urandom"] = func
+        self.type_methods["posix"]["urandom"] = "coex_posix_urandom"
+
+        func.args[0].name = "count"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        count = func.args[0]
+
+        # Open /dev/urandom
+        urandom_path = self._get_raw_string_ptr_with_builder(builder, "/dev/urandom")
+        O_RDONLY = ir.Constant(i32, 0)
+        fd = builder.call(self.posix_open_syscall, [urandom_path, O_RDONLY, ir.Constant(i32, 0)])
+
+        # Create new list with elem_size = 1 (byte)
+        elem_size = ir.Constant(i64, 1)
+        byte_list = builder.call(self.list_new, [elem_size])
+
+        # Get the tail pointer and read directly into it
+        tail_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail = builder.load(tail_ptr)
+
+        # Read count bytes into tail
+        builder.call(self.posix_read_syscall, [fd, tail, count])
+
+        # Close fd
+        builder.call(self.posix_close_syscall, [fd])
+
+        # Update list length and tail_len
+        len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(count, len_ptr)
+
+        tail_len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        count_32 = builder.trunc(count, i32)
+        builder.store(count_32, tail_len_ptr)
+
+        builder.ret(byte_list)
 
     # ========================================================================
     # Type Mapping
@@ -11411,8 +11850,8 @@ class CodeGenerator:
 
         Supported signatures:
         1. func main(args: [string]) -> int
-        2. func main(stdin: File, stdout: File, stderr: File) -> int
-        3. func main(args: [string], stdin: File, stdout: File, stderr: File) -> int
+        2. func main(stdin: posix, stdout: posix, stderr: posix) -> int
+        3. func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
         """
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
@@ -11433,9 +11872,9 @@ class CodeGenerator:
         if has_args:
             impl_param_types.append(self.list_struct.as_pointer())  # [string] is a List*
         if has_stdio:
-            impl_param_types.append(self.file_struct.as_pointer())  # stdin: File*
-            impl_param_types.append(self.file_struct.as_pointer())  # stdout: File*
-            impl_param_types.append(self.file_struct.as_pointer())  # stderr: File*
+            impl_param_types.append(self.posix_struct.as_pointer())  # stdin: posix*
+            impl_param_types.append(self.posix_struct.as_pointer())  # stdout: posix*
+            impl_param_types.append(self.posix_struct.as_pointer())  # stderr: posix*
 
         # Create user's main as coex_main_impl
         impl_func_type = ir.FunctionType(i64, impl_param_types)
@@ -11520,22 +11959,16 @@ class CodeGenerator:
             call_args.append(final_args_list)
 
         if has_stdio:
-            # Create File handles for stdin (fd=0), stdout (fd=1), stderr (fd=2)
-            file_ptr = self.file_struct.as_pointer()
-
-            for fd_num, name in [(0, "stdin_file"), (1, "stdout_file"), (2, "stderr_file")]:
-                # Allocate File struct
-                file_alloca = builder.alloca(self.file_struct, name=name)
+            # Create posix handles for stdin (fd=0), stdout (fd=1), stderr (fd=2)
+            for fd_num, name in [(0, "stdin_posix"), (1, "stdout_posix"), (2, "stderr_posix")]:
+                # Allocate posix struct
+                posix_alloca = builder.alloca(self.posix_struct, name=name)
 
                 # Set fd field
-                fd_ptr = builder.gep(file_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+                fd_ptr = builder.gep(posix_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
                 builder.store(ir.Constant(i32, fd_num), fd_ptr)
 
-                # Set is_open to true
-                is_open_ptr = builder.gep(file_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-                builder.store(ir.Constant(ir.IntType(1), 1), is_open_ptr)
-
-                call_args.append(file_alloca)
+                call_args.append(posix_alloca)
 
         # Call user's main implementation
         result = builder.call(impl_func, call_args)
