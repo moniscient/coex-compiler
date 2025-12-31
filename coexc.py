@@ -116,7 +116,8 @@ def print_ast(program, indent=0):
 def compile_coex(source_path: str, output_path: str = None,
                  emit_ir: bool = False, emit_ast: bool = False,
                  link: bool = False, no_commentary: bool = False,
-                 strip_commentary: bool = False, commentary_only: bool = False):
+                 strip_commentary: bool = False, commentary_only: bool = False,
+                 cli_printing: bool = None, cli_debugging: bool = None):
     """
     Compile a Coex source file.
 
@@ -199,6 +200,9 @@ def compile_coex(source_path: str, output_path: str = None,
     # Generate code
     print("Generating LLVM IR...")
     codegen = CodeGenerator()
+    # Pass CLI overrides for print/debug directives
+    codegen.cli_printing = cli_printing
+    codegen.cli_debugging = cli_debugging
     ir = codegen.generate(program, source_path=source_path)
 
     if emit_ir:
@@ -285,6 +289,14 @@ Examples:
                         help="Remove all #@ comments from source")
     parser.add_argument("--commentary-only", action="store_true",
                         help="Only update commentary, don't compile")
+    parser.add_argument("--printing", action="store_true",
+                        help="Force enable print() output")
+    parser.add_argument("--no-printing", action="store_true",
+                        help="Force disable print() output")
+    parser.add_argument("--debugging", action="store_true",
+                        help="Force enable debug() output")
+    parser.add_argument("--no-debugging", action="store_true",
+                        help="Force disable debug() output")
 
     args = parser.parse_args()
 
@@ -299,6 +311,20 @@ Examples:
 
     try:
         link = not output.endswith(".o")
+
+        # Compute CLI overrides for print/debug directives
+        cli_printing = None
+        if args.printing:
+            cli_printing = True
+        elif args.no_printing:
+            cli_printing = False
+
+        cli_debugging = None
+        if args.debugging:
+            cli_debugging = True
+        elif args.no_debugging:
+            cli_debugging = False
+
         compile_coex(
             args.source,
             output,
@@ -307,7 +333,9 @@ Examples:
             link=link,
             no_commentary=args.no_commentary,
             strip_commentary=args.strip_commentary,
-            commentary_only=args.commentary_only
+            commentary_only=args.commentary_only,
+            cli_printing=cli_printing,
+            cli_debugging=cli_debugging
         )
     except CompileError as e:
         print(f"Compilation failed: {e}", file=sys.stderr)

@@ -17,15 +17,17 @@ from pathlib import Path
 
 class CompilerResult:
     """Result of compiling and optionally running a Coex program."""
-    
-    def __init__(self, compile_success: bool, compile_output: str, 
+
+    def __init__(self, compile_success: bool, compile_output: str,
                  run_success: bool = None, run_output: str = None,
-                 ir: str = None):
+                 ir: str = None, stdout: str = None, stderr: str = None):
         self.compile_success = compile_success
         self.compile_output = compile_output
         self.run_success = run_success
         self.run_output = run_output
         self.ir = ir
+        self.stdout = stdout if stdout is not None else (run_output or "")
+        self.stderr = stderr if stderr is not None else ""
 
 
 @pytest.fixture
@@ -81,12 +83,14 @@ def compile_coex(compiler_root):
                 capture_output=True,
                 text=True
             )
-            
+
             return CompilerResult(
                 compile_success=True,
                 compile_output=compile_output,
                 run_success=run_result.returncode == 0,
-                run_output=run_result.stdout
+                run_output=run_result.stdout,
+                stdout=run_result.stdout,
+                stderr=run_result.stderr
             )
     
     return _compile

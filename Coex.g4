@@ -26,7 +26,7 @@ grammar Coex;
 // ----------------------------------------------------------------------------
 
 program
-    : NEWLINE* ((importDecl | replaceDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
+    : NEWLINE* ((importDecl | replaceDecl | directiveDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
     ;
 
 // Module imports: import module_name or import "path/to/library.cxz"
@@ -38,6 +38,11 @@ importDecl
 // Local alias: replace shortname with module.function
 replaceDecl
     : REPLACE IDENTIFIER WITH qualifiedName
+    ;
+
+// Compiler directives: printing/debugging [on/off]
+directiveDecl
+    : (PRINTING | DEBUGGING) (ON | OFF)?
     ;
 
 // Qualified name for module.function references
@@ -715,6 +720,12 @@ NIL         : 'nil' ;
 IMPORT      : 'import' ;
 REPLACE     : 'replace' ;
 WITH        : 'with' ;
+
+// Compiler directives
+PRINTING    : 'printing' ;
+DEBUGGING   : 'debugging' ;
+ON          : 'on' ;
+OFF         : 'off' ;
 
 // Inline LLVM IR
 LLVM_IR     : 'llvm_ir' ;

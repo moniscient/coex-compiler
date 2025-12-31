@@ -24,6 +24,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#directiveDecl.
+    def visitDirectiveDecl(self, ctx:CoexParser.DirectiveDeclContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#qualifiedName.
     def visitQualifiedName(self, ctx:CoexParser.QualifiedNameContext):
         return self.visitChildren(ctx)

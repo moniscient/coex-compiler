@@ -138,6 +138,12 @@ class CodeGenerator:
         self.module_search_paths: PyList[str] = []
         self.current_module: Optional[str] = None  # Track which module we're compiling
 
+        # Print/Debug directive support
+        self.printing_enabled: bool = True   # Default: print() enabled
+        self.debugging_enabled: bool = False  # Default: debug() disabled
+        self.cli_printing: Optional[bool] = None  # CLI override for printing
+        self.cli_debugging: Optional[bool] = None  # CLI override for debugging
+
         # FFI library support (.cxz libraries)
         self.loaded_libraries: Dict[str, LibraryInfo] = {}  # library_name -> LibraryInfo
         self.cxz_loader: Optional[CXZLoader] = None  # Initialized lazily when needed
@@ -170,6 +176,10 @@ class CodeGenerator:
         # printf
         printf_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # dprintf (write to file descriptor, POSIX) - used for debug output to stderr
+        dprintf_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(32), ir.IntType(8).as_pointer()], var_arg=True)
+        self.dprintf = ir.Function(self.module, dprintf_ty, name="dprintf")
 
         # fflush for output synchronization (NULL argument flushes all output streams)
         fflush_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()])
@@ -2444,7 +2454,11 @@ class CodeGenerator:
         # string_print(s: String*) -> void
         string_print_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
         self.string_print = ir.Function(self.module, string_print_ty, name="coex_string_print")
-        
+
+        # string_debug(s: String*) -> void (prints to stderr)
+        string_debug_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
+        self.string_debug = ir.Function(self.module, string_debug_ty, name="coex_string_debug")
+
         # string_data(s: String*) -> i8* (get pointer to data portion)
         string_data_ty = ir.FunctionType(i8_ptr, [string_ptr])
         self.string_data = ir.Function(self.module, string_data_ty, name="coex_string_data")
@@ -2519,6 +2533,7 @@ class CodeGenerator:
         self._implement_string_eq()
         self._implement_string_contains()
         self._implement_string_print()
+        self._implement_string_debug()
         self._implement_string_copy()
         self._implement_string_deep_copy()
         self._implement_string_hash()
@@ -3428,6 +3443,40 @@ class CodeGenerator:
         # Print newline
         newline_ptr = builder.bitcast(self._create_global_string("\n", "newline"), ir.IntType(8).as_pointer())
         builder.call(self.write_syscall, [stdout_fd, newline_ptr, ir.Constant(ir.IntType(64), 1)])
+
+        builder.ret_void()
+
+    def _implement_string_debug(self):
+        """Print string to stderr using POSIX write (no null terminator needed).
+
+        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        """
+        func = self.string_debug
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        s = func.args[0]
+
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size = builder.load(size_ptr)
+
+        # Compute data pointer: owner + offset
+        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_ptr = builder.load(owner_ptr_ptr)
+        offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        offset = builder.load(offset_ptr)
+        data_ptr = builder.gep(owner_ptr, [offset])
+
+        # write(2, data, size) - fd 2 is stderr
+        stderr_fd = ir.Constant(ir.IntType(32), 2)
+        builder.call(self.write_syscall, [stderr_fd, data_ptr, size])
+
+        # Print newline
+        newline_ptr = builder.bitcast(self._create_global_string("\n", "newline_debug"), ir.IntType(8).as_pointer())
+        builder.call(self.write_syscall, [stderr_fd, newline_ptr, ir.Constant(ir.IntType(64), 1)])
 
         builder.ret_void()
 
@@ -10674,6 +10723,19 @@ class CodeGenerator:
                 raise RuntimeError(f"Module '{rep.module}' not imported for replace '{rep.shortname}'")
             self.replace_aliases[rep.shortname] = (rep.module, rep.qualified_name)
 
+        # Process compiler directives (printing/debugging)
+        for directive in program.directives:
+            if directive.name == "printing":
+                self.printing_enabled = directive.enabled
+            elif directive.name == "debugging":
+                self.debugging_enabled = directive.enabled
+
+        # CLI overrides file directives
+        if self.cli_printing is not None:
+            self.printing_enabled = self.cli_printing
+        if self.cli_debugging is not None:
+            self.debugging_enabled = self.cli_debugging
+
         # Register all traits first (they define interfaces)
         for trait_decl in program.traits:
             self._register_trait(trait_decl)
@@ -12544,6 +12606,8 @@ class CodeGenerator:
             self._generate_return(stmt)
         elif isinstance(stmt, PrintStmt):
             self._generate_print(stmt)
+        elif isinstance(stmt, DebugStmt):
+            self._generate_debug(stmt)
         elif isinstance(stmt, IfStmt):
             self._generate_if(stmt)
         elif isinstance(stmt, WhileStmt):
@@ -13556,10 +13620,9 @@ class CodeGenerator:
     
     def _generate_print(self, stmt: PrintStmt):
         """Generate a print statement"""
-        # Emit deprecation warning
-        import sys
-        print("Warning: print() is deprecated. Use stdout.writeln() instead.",
-              file=sys.stderr)
+        # Skip if printing is disabled
+        if not self.printing_enabled:
+            return
 
         value = self._generate_expression(stmt.value)
         
@@ -13607,6 +13670,62 @@ class CodeGenerator:
                 self.builder.call(self.printf, [fmt_ptr, value])
 
         # Flush stdout to ensure output appears in correct order
+        null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
+        self.builder.call(self.fflush, [null_ptr])
+
+    def _generate_debug(self, stmt: DebugStmt):
+        """Generate a debug statement (output to stderr)"""
+        # Skip if debugging is disabled (compile-time elimination)
+        if not self.debugging_enabled:
+            return
+
+        value = self._generate_expression(stmt.value)
+        stderr_fd = ir.Constant(ir.IntType(32), 2)
+
+        # Select format based on type
+        if isinstance(value.type, ir.IntType):
+            if value.type.width == 1:
+                # Boolean
+                true_block = self.builder.append_basic_block("debug_true")
+                false_block = self.builder.append_basic_block("debug_false")
+                merge_block = self.builder.append_basic_block("debug_merge")
+
+                self.builder.cbranch(value, true_block, false_block)
+
+                self.builder.position_at_end(true_block)
+                fmt_ptr = self.builder.bitcast(self._true_str, ir.IntType(8).as_pointer())
+                self.builder.call(self.dprintf, [stderr_fd, fmt_ptr])
+                self.builder.branch(merge_block)
+
+                self.builder.position_at_end(false_block)
+                fmt_ptr = self.builder.bitcast(self._false_str, ir.IntType(8).as_pointer())
+                self.builder.call(self.dprintf, [stderr_fd, fmt_ptr])
+                self.builder.branch(merge_block)
+
+                self.builder.position_at_end(merge_block)
+            else:
+                # Integer
+                fmt_ptr = self.builder.bitcast(self._int_fmt, ir.IntType(8).as_pointer())
+                # Extend to i64 if needed
+                if value.type.width < 64:
+                    value = self.builder.sext(value, ir.IntType(64))
+                self.builder.call(self.dprintf, [stderr_fd, fmt_ptr, value])
+
+        elif isinstance(value.type, ir.DoubleType):
+            fmt_ptr = self.builder.bitcast(self._float_fmt, ir.IntType(8).as_pointer())
+            self.builder.call(self.dprintf, [stderr_fd, fmt_ptr, value])
+
+        elif isinstance(value.type, ir.PointerType):
+            pointee = value.type.pointee
+            # Check if this is a String*
+            if hasattr(pointee, 'name') and pointee.name == "struct.String":
+                self.builder.call(self.string_debug, [value])
+            else:
+                # Raw string pointer
+                fmt_ptr = self.builder.bitcast(self._str_fmt, ir.IntType(8).as_pointer())
+                self.builder.call(self.dprintf, [stderr_fd, fmt_ptr, value])
+
+        # Flush stderr to ensure output appears in correct order
         null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
         self.builder.call(self.fflush, [null_ptr])
 

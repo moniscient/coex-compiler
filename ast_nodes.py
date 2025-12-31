@@ -659,7 +659,13 @@ class ChannelSendStmt(Stmt):
 
 @dataclass
 class PrintStmt(Stmt):
-    """Built-in print for testing"""
+    """Built-in print to stdout"""
+    value: Expr
+
+
+@dataclass
+class DebugStmt(Stmt):
+    """Built-in debug output to stderr"""
     value: Expr
 
 
@@ -774,6 +780,13 @@ class ReplaceDecl:
     qualified_name: str  # e.g., "abs" (the function name in the module)
 
 
+@dataclass
+class DirectiveDecl:
+    """Compiler directive: printing/debugging [on/off]"""
+    name: str      # "printing" or "debugging"
+    enabled: bool  # True for on/present, False for off
+
+
 # ============================================================================
 # Program Node
 # ============================================================================
@@ -782,6 +795,7 @@ class ReplaceDecl:
 class Program:
     imports: List[ImportDecl] = field(default_factory=list)
     replaces: List['ReplaceDecl'] = field(default_factory=list)
+    directives: List['DirectiveDecl'] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)
     matrices: List[MatrixDecl] = field(default_factory=list)

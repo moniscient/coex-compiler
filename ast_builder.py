@@ -27,6 +27,10 @@ class ASTBuilder:
                 rep = self.visit_replace_decl(child)
                 if rep:
                     program.replaces.append(rep)
+            elif isinstance(child, CoexParser.DirectiveDeclContext):
+                directive = self.visit_directive_decl(child)
+                if directive:
+                    program.directives.append(directive)
             elif isinstance(child, CoexParser.DeclarationContext):
                 decl = self.visit_declaration(child)
                 if isinstance(decl, FunctionDecl):
@@ -77,6 +81,24 @@ class ASTBuilder:
         module = identifiers[0].getText()
         qualified_name = identifiers[1].getText()
         return ReplaceDecl(shortname=shortname, module=module, qualified_name=qualified_name)
+
+    def visit_directive_decl(self, ctx: CoexParser.DirectiveDeclContext) -> Optional[DirectiveDecl]:
+        """Visit a directive declaration: printing/debugging [on/off]"""
+        # Determine which directive
+        if ctx.PRINTING():
+            name = "printing"
+        elif ctx.DEBUGGING():
+            name = "debugging"
+        else:
+            return None
+
+        # Determine enabled state (default True if just "printing" or "debugging")
+        enabled = True
+        if ctx.OFF():
+            enabled = False
+        # ON() is explicit but same as default
+
+        return DirectiveDecl(name=name, enabled=enabled)
 
     def _get_string_value(self, ctx) -> str:
         """Extract string value from string literal"""
@@ -620,11 +642,13 @@ class ASTBuilder:
             # Expression statement
             expr = self.visit_expression(exprs[0])
             
-            # Detect built-in print() calls
+            # Detect built-in print() and debug() calls
             if isinstance(expr, CallExpr) and isinstance(expr.callee, Identifier):
                 if expr.callee.name == "print" and len(expr.args) >= 1:
                     return PrintStmt(expr.args[0])
-            
+                if expr.callee.name == "debug" and len(expr.args) >= 1:
+                    return DebugStmt(expr.args[0])
+
             return ExprStmt(expr)
     
     def visit_assign_op(self, ctx: CoexParser.AssignOpContext) -> AssignOp:
