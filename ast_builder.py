@@ -45,9 +45,29 @@ class ASTBuilder:
     # ========================================================================
 
     def visit_import_decl(self, ctx: CoexParser.ImportDeclContext) -> Optional[ImportDecl]:
-        """Visit an import declaration: import module_name"""
-        module = ctx.IDENTIFIER().getText()
-        return ImportDecl(module=module)
+        """Visit an import declaration: import module_name or import "library.cxz" """
+        # Check for module import (bare identifier)
+        if ctx.IDENTIFIER():
+            module = ctx.IDENTIFIER().getText()
+            return ImportDecl(module=module)
+
+        # Check for library import (string literal)
+        if ctx.stringLiteral():
+            path = self._get_string_value(ctx.stringLiteral())
+            # Extract library name from path (e.g., "regex.cxz" -> "regex")
+            import os
+            basename = os.path.basename(path)
+            if basename.endswith('.cxz'):
+                module_name = basename[:-4]
+            else:
+                module_name = basename
+            return ImportDecl(
+                module=module_name,
+                library_path=path,
+                is_library=True
+            )
+
+        return None
 
     def visit_replace_decl(self, ctx: CoexParser.ReplaceDeclContext) -> Optional[ReplaceDecl]:
         """Visit a replace declaration: replace shortname with module.function"""

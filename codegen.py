@@ -15,6 +15,9 @@ import os
 # Import garbage collector (will be initialized after module creation)
 from coex_gc import GarbageCollector
 
+# Import CXZ library loader (for FFI support)
+from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
+
 binding.initialize_native_target()
 binding.initialize_native_asmprinter()
 
@@ -26,6 +29,15 @@ class ModuleInfo:
     program: 'Program'
     functions: Dict[str, str] = field(default_factory=dict)  # func_name -> mangled_name
     types: Dict[str, str] = field(default_factory=dict)      # type_name -> mangled_name
+
+
+@dataclass
+class LibraryInfo:
+    """Information about a loaded .cxz library"""
+    name: str
+    path: str
+    loaded_lib: LoadedLibrary
+    symbols: Dict[str, FFISymbol] = field(default_factory=dict)  # symbol_name -> FFISymbol
 
 
 class CodeGenerator:
@@ -56,6 +68,7 @@ class CodeGenerator:
         self.type_registry: Dict[str, ir.Type] = {}  # type_name -> LLVM struct type (not pointer)
         self.type_fields: Dict[str, PyList[Tuple[str, Type]]] = {}  # type_name -> [(field_name, coex_type)]
         self.type_methods: Dict[str, Dict[str, str]] = {}  # type_name -> {method_name -> mangled_func_name}
+        self.static_methods: Dict[str, bool] = {}  # mangled_method_name -> True if static (no self param)
         self.type_decls: Dict[str, TypeDecl] = {}  # type_name -> TypeDecl AST node
         self.enum_variants: Dict[str, Dict[str, tuple]] = {}  # enum_name -> {variant_name -> (tag, fields)}
         
@@ -124,6 +137,23 @@ class CodeGenerator:
         self.replace_aliases: Dict[str, Tuple[str, str]] = {}  # shortname -> (module, func_name)
         self.module_search_paths: PyList[str] = []
         self.current_module: Optional[str] = None  # Track which module we're compiling
+
+        # FFI library support (.cxz libraries)
+        self.loaded_libraries: Dict[str, LibraryInfo] = {}  # library_name -> LibraryInfo
+        self.cxz_loader: Optional[CXZLoader] = None  # Initialized lazily when needed
+        self.ffi_symbols: Dict[str, FFISymbol] = {}  # symbol_name -> FFISymbol (aggregated from all libraries)
+        self.ffi_link_args: PyList[str] = []  # Link arguments for FFI objects
+
+        # FFI runtime function declarations
+        self._ffi_runtime_declared = False
+        self._ffi_instance_create: Optional[ir.Function] = None
+        self._ffi_instance_destroy: Optional[ir.Function] = None
+        self._ffi_enter: Optional[ir.Function] = None
+        self._ffi_exit: Optional[ir.Function] = None
+
+        # FFI instance tracking per function (for nested calls)
+        self._current_ffi_instance: Optional[ir.Value] = None
+        self._ffi_instance_stack: PyList[ir.Value] = []
 
         # Inline LLVM IR support
         self._pending_inline_ir: PyList[Dict] = []  # Pending IR to inject during serialization
@@ -10544,21 +10574,27 @@ class CodeGenerator:
             # Check if it's a type parameter that needs substitution
             if coex_type.name in self.type_substitutions:
                 return self._get_llvm_type(self.type_substitutions[coex_type.name])
-            
+
             # Check if this is a generic type instantiation
             if coex_type.type_args and coex_type.name in self.generic_types:
                 mangled_name = self._monomorphize_type(coex_type.name, coex_type.type_args)
                 return self.type_registry[mangled_name].as_pointer()
-            
+
             # User-defined type - return pointer to struct
             if coex_type.name in self.type_registry:
                 return self.type_registry[coex_type.name].as_pointer()
-            
+
+            # If in a module context, try the mangled name
+            if self.current_module:
+                mangled_name = f"__{self.current_module}__{coex_type.name}"
+                if mangled_name in self.type_registry:
+                    return self.type_registry[mangled_name].as_pointer()
+
             # Check if it's a generic type without args - error or default
             if coex_type.name in self.generic_types:
                 # Generic used without type arguments - return placeholder
                 return ir.IntType(64)
-            
+
             # Unknown type - default to i64
             return ir.IntType(64)
         
@@ -10623,9 +10659,14 @@ class CodeGenerator:
         compiler_dir = os.path.dirname(os.path.abspath(__file__))
         self.module_search_paths.append(os.path.join(compiler_dir, "lib"))
 
-        # Load imported modules first (they must be compiled before main program)
+        # Load imported modules and libraries
         for imp in program.imports:
-            self._load_module(imp.module)
+            if imp.is_library:
+                # Library import: import "path/to/lib.cxz"
+                self._load_library(imp.library_path, imp.module)
+            else:
+                # Module import: import math
+                self._load_module(imp.module)
 
         # Register replace aliases
         for rep in program.replaces:
@@ -10754,6 +10795,7 @@ class CodeGenerator:
             self._register_trait(trait_decl)
 
         # Register types with mangled names
+        mangled_type_decls = []
         for type_decl in program.types:
             mangled = f"{prefix}{type_decl.name}"
             # Store original name mapping
@@ -10767,11 +10809,43 @@ class CodeGenerator:
                 variants=type_decl.variants
             )
             self._register_type(mangled_type_decl)
+            mangled_type_decls.append(mangled_type_decl)
+
+            # Also register under unqualified name for use within this library's methods
+            # This allows Regex(handle, pattern) to work inside compile_flags()
+            if type_decl.name not in self.type_registry:
+                self.type_registry[type_decl.name] = self.type_registry[mangled]
+            if type_decl.name not in self.type_fields:
+                self.type_fields[type_decl.name] = self.type_fields[mangled]
+            if mangled in self.type_methods and type_decl.name not in self.type_methods:
+                self.type_methods[type_decl.name] = self.type_methods[mangled]
+
+        # Declare type methods (must happen before generating functions that may call them)
+        for mangled_type_decl in mangled_type_decls:
+            self._declare_type_methods(mangled_type_decl)
+
+        # Register method functions under unqualified names for static method calls
+        # e.g., __regex__Regex_compile_flags -> Regex_compile_flags
+        for type_decl in program.types:
+            mangled_type_name = f"{prefix}{type_decl.name}"
+            if mangled_type_name in self.type_methods:
+                for method_name, mangled_method in self.type_methods[mangled_type_name].items():
+                    unqualified_method = f"{type_decl.name}_{method_name}"
+                    if mangled_method in self.functions and unqualified_method not in self.functions:
+                        self.functions[unqualified_method] = self.functions[mangled_method]
 
         # Declare and generate functions with mangled names
         for func in program.functions:
             if func.name == "main":
                 continue  # Skip main in modules
+
+            # Extern functions should NOT be mangled - they link to C code
+            if func.kind == FunctionKind.EXTERN:
+                # Use original name for extern functions
+                module_info.functions[func.name] = func.name
+                self.func_decls[func.name] = func
+                self._declare_function(func)
+                continue
 
             mangled = f"{prefix}{func.name}"
             module_info.functions[func.name] = mangled
@@ -10792,6 +10866,176 @@ class CodeGenerator:
             # Declare and generate
             self._declare_function(mangled_func)
             self._generate_function(mangled_func)
+
+        # Generate type method bodies
+        for mangled_type_decl in mangled_type_decls:
+            self._generate_type_methods(mangled_type_decl)
+
+    # ========================================================================
+    # FFI Library Loading
+    # ========================================================================
+
+    def _load_library(self, library_path: str, library_name: str):
+        """Load a .cxz library and register its FFI symbols.
+
+        Args:
+            library_path: Path to the .cxz file (relative or absolute)
+            library_name: Extracted library name (e.g., "regex" from "regex.cxz")
+        """
+        # Check if already loaded
+        if library_name in self.loaded_libraries:
+            return self.loaded_libraries[library_name]
+
+        # Initialize CXZ loader lazily
+        if self.cxz_loader is None:
+            self.cxz_loader = CXZLoader(search_paths=self.module_search_paths)
+
+        # Load the library
+        try:
+            loaded_lib = self.cxz_loader.load(library_path)
+        except CXZError as e:
+            raise RuntimeError(f"Failed to load library '{library_name}': {e}")
+
+        # Create library info
+        lib_info = LibraryInfo(
+            name=library_name,
+            path=library_path,
+            loaded_lib=loaded_lib,
+            symbols=loaded_lib.get_ffi_symbols()
+        )
+        self.loaded_libraries[library_name] = lib_info
+
+        # Aggregate FFI symbols for quick lookup
+        for sym_name, sym in lib_info.symbols.items():
+            self.ffi_symbols[sym_name] = sym
+
+        # Collect link arguments
+        self.ffi_link_args.extend(loaded_lib.get_link_args())
+
+        # Declare FFI runtime functions if not already done
+        self._declare_ffi_runtime()
+
+        # Parse and process the library's Coex source files
+        self._process_library_sources(lib_info)
+
+        return lib_info
+
+    def _process_library_sources(self, lib_info: LibraryInfo):
+        """Process Coex source files from a library.
+
+        Parses extern declarations and registers them, along with
+        types and wrapper functions defined in the library.
+        """
+        from antlr4 import CommonTokenStream, InputStream
+        from CoexLexer import CoexLexer
+        from CoexParser import CoexParser
+        from ast_builder import ASTBuilder
+
+        for filename, source in lib_info.loaded_lib.coex_sources.items():
+            # Parse the source
+            input_stream = InputStream(source)
+            lexer = CoexLexer(input_stream)
+            token_stream = CommonTokenStream(lexer)
+            parser = CoexParser(token_stream)
+            tree = parser.program()
+
+            builder = ASTBuilder()
+            program = builder.build(tree)
+
+            # Create a pseudo-module for this library source
+            module_info = ModuleInfo(
+                name=lib_info.name,
+                path=f"{lib_info.path}:{filename}",
+                program=program
+            )
+
+            # Process the contents with library name prefix
+            saved_module = self.current_module
+            self.current_module = lib_info.name
+
+            # Register types and generate functions from library
+            self._generate_module_contents(program, module_info)
+
+            self.current_module = saved_module
+
+            # Also register the module info for qualified access
+            if lib_info.name not in self.loaded_modules:
+                self.loaded_modules[lib_info.name] = module_info
+
+            # Register library functions under their unqualified names for direct access
+            # This allows users to call regex_match() instead of regex.regex_match()
+            for original_name, mangled_name in module_info.functions.items():
+                if mangled_name in self.functions and original_name not in self.functions:
+                    self.functions[original_name] = self.functions[mangled_name]
+
+            # Also register extern function declarations for the library
+            if hasattr(self, 'extern_function_decls'):
+                for original_name, mangled_name in module_info.functions.items():
+                    if mangled_name in self.extern_function_decls and original_name not in self.extern_function_decls:
+                        self.extern_function_decls[original_name] = self.extern_function_decls[mangled_name]
+
+            # Register library types under their unqualified names for direct access
+            # This allows users to use Regex instead of regex.Regex
+            for original_name, mangled_name in module_info.types.items():
+                if mangled_name in self.type_registry and original_name not in self.type_registry:
+                    self.type_registry[original_name] = self.type_registry[mangled_name]
+                if mangled_name in self.type_fields and original_name not in self.type_fields:
+                    self.type_fields[original_name] = self.type_fields[mangled_name]
+                if mangled_name in self.type_methods and original_name not in self.type_methods:
+                    self.type_methods[original_name] = self.type_methods[mangled_name]
+                    # Also register method functions under unqualified names
+                    # e.g., __regex__Regex_compile_flags -> Regex_compile_flags
+                    for method_name, mangled_method in self.type_methods[mangled_name].items():
+                        unqualified_method = f"{original_name}_{method_name}"
+                        if mangled_method in self.functions and unqualified_method not in self.functions:
+                            self.functions[unqualified_method] = self.functions[mangled_method]
+
+    def _declare_ffi_runtime(self):
+        """Declare the FFI runtime support functions."""
+        if self._ffi_runtime_declared:
+            return
+
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        void = ir.VoidType()
+
+        # int64_t coex_ffi_instance_create(const char* library_name)
+        create_type = ir.FunctionType(i64, [i8_ptr])
+        self._ffi_instance_create = ir.Function(
+            self.module, create_type, name="coex_ffi_instance_create"
+        )
+        self._ffi_instance_create.linkage = 'external'
+
+        # void coex_ffi_instance_destroy(int64_t instance_id)
+        destroy_type = ir.FunctionType(void, [i64])
+        self._ffi_instance_destroy = ir.Function(
+            self.module, destroy_type, name="coex_ffi_instance_destroy"
+        )
+        self._ffi_instance_destroy.linkage = 'external'
+
+        # void coex_ffi_enter(int64_t instance_id)
+        enter_type = ir.FunctionType(void, [i64])
+        self._ffi_enter = ir.Function(
+            self.module, enter_type, name="coex_ffi_enter"
+        )
+        self._ffi_enter.linkage = 'external'
+
+        # void coex_ffi_exit(int64_t instance_id)
+        exit_type = ir.FunctionType(void, [i64])
+        self._ffi_exit = ir.Function(
+            self.module, exit_type, name="coex_ffi_exit"
+        )
+        self._ffi_exit.linkage = 'external'
+
+        self._ffi_runtime_declared = True
+
+    def get_ffi_link_args(self) -> PyList[str]:
+        """Get the link arguments for FFI libraries.
+
+        Call this after generate() to get the list of object files
+        and system libraries needed for linking.
+        """
+        return self.ffi_link_args
 
     def _register_trait(self, trait_decl: 'TraitDecl'):
         """Register a trait definition"""
@@ -11590,38 +11834,148 @@ class CodeGenerator:
                         # Offset is (1 + field_index) * 8 (tag is at offset 0)
                         ref_offsets.add((1 + i) * 8)
             self.gc.register_type(type_decl.name, size, list(ref_offsets))
-    
+
+    def _method_uses_self(self, method) -> bool:
+        """Check if a method body references 'self' or implicit field access.
+
+        Methods that don't use self are static methods and don't get a self parameter.
+        """
+        from ast_nodes import (Identifier, MemberExpr, MethodCallExpr, Assignment,
+                               IfStmt, WhileStmt, ForStmt, ForAssignStmt,
+                               ReturnStmt, VarDecl, CallExpr, BinaryExpr, UnaryExpr,
+                               TernaryExpr, IndexExpr, TupleExpr, ListExpr, MapExpr,
+                               SetExpr, LambdaExpr, MatchStmt, SelectStmt, WithinStmt,
+                               SelfExpr)
+
+        def check_expr(expr) -> bool:
+            """Recursively check if expression uses self"""
+            if expr is None:
+                return False
+            if isinstance(expr, Identifier):
+                return expr.name == "self"
+            if isinstance(expr, SelfExpr):
+                return True
+            if isinstance(expr, MemberExpr):
+                # Check if accessing self.field
+                if isinstance(expr.object, SelfExpr):
+                    return True
+                if isinstance(expr.object, Identifier) and expr.object.name == "self":
+                    return True
+                return check_expr(expr.object)
+            if isinstance(expr, MethodCallExpr):
+                if check_expr(expr.object):
+                    return True
+                return any(check_expr(a) for a in expr.args)
+            if isinstance(expr, CallExpr):
+                return any(check_expr(a) for a in expr.args)
+            if isinstance(expr, BinaryExpr):
+                return check_expr(expr.left) or check_expr(expr.right)
+            if isinstance(expr, UnaryExpr):
+                return check_expr(expr.operand)
+            if isinstance(expr, TernaryExpr):
+                return check_expr(expr.condition) or check_expr(expr.then_expr) or check_expr(expr.else_expr)
+            if isinstance(expr, IndexExpr):
+                if check_expr(expr.object):
+                    return True
+                return check_expr(expr.index)
+            if isinstance(expr, TupleExpr):
+                return any(check_expr(e) for e in expr.elements)
+            if isinstance(expr, ListExpr):
+                return any(check_expr(e) for e in expr.elements)
+            if isinstance(expr, MapExpr):
+                return any(check_expr(k) or check_expr(v) for k, v in expr.pairs)
+            if isinstance(expr, SetExpr):
+                return any(check_expr(e) for e in expr.elements)
+            if isinstance(expr, LambdaExpr):
+                return any(check_stmt(s) for s in (expr.body if isinstance(expr.body, list) else []))
+            return False
+
+        def check_stmt(stmt) -> bool:
+            """Recursively check if statement uses self"""
+            if stmt is None:
+                return False
+            if isinstance(stmt, ReturnStmt):
+                return check_expr(stmt.value)
+            if isinstance(stmt, VarDecl):
+                return check_expr(stmt.initializer)
+            if isinstance(stmt, Assignment):
+                # Check if assigning to self.field
+                target = stmt.target
+                if isinstance(target, Identifier) and target.name == "self":
+                    return True
+                if isinstance(target, SelfExpr):
+                    return True
+                if isinstance(target, MemberExpr):
+                    if isinstance(target.object, SelfExpr):
+                        return True
+                    if isinstance(target.object, Identifier) and target.object.name == "self":
+                        return True
+                return check_expr(stmt.target) or check_expr(stmt.value)
+            if isinstance(stmt, IfStmt):
+                if check_expr(stmt.condition):
+                    return True
+                if any(check_stmt(s) for s in stmt.then_body):
+                    return True
+                if any(check_stmt(s) for s in (stmt.else_body or [])):
+                    return True
+                return any(check_expr(c) or any(check_stmt(s) for s in b)
+                          for c, b in (stmt.else_if_clauses or []))
+            if isinstance(stmt, WhileStmt):
+                return check_expr(stmt.condition) or any(check_stmt(s) for s in stmt.body)
+            if isinstance(stmt, (ForStmt, ForAssignStmt)):
+                return check_expr(stmt.iterable) or any(check_stmt(s) for s in stmt.body)
+            if isinstance(stmt, MatchStmt):
+                if check_expr(stmt.subject):
+                    return True
+                return any(any(check_stmt(s) for s in arm.body) for arm in stmt.arms)
+            if hasattr(stmt, 'value') and stmt.value is not None:
+                return check_expr(stmt.value)
+            return False
+
+        # Check all statements in method body
+        for stmt in method.body:
+            if check_stmt(stmt):
+                return True
+        return False
+
     def _declare_type_methods(self, type_decl: TypeDecl):
         """Declare all methods for a type"""
         # Skip generic types - methods are declared during monomorphization
         if type_decl.type_params:
             return
-        
+
         struct_type = self.type_registry[type_decl.name]
         self_ptr_type = struct_type.as_pointer()
-        
+
         for method in type_decl.methods:
             # Mangle name: TypeName_methodName
             mangled_name = f"{type_decl.name}_{method.name}"
-            
-            # Build parameter types (self is implicit first parameter)
-            param_types = [self_ptr_type]  # self pointer
+
+            # Check if this is a static method (doesn't use self)
+            is_static = not self._method_uses_self(method)
+            self.static_methods[mangled_name] = is_static
+
+            # Build parameter types
+            param_types = []
+            if not is_static:
+                param_types.append(self_ptr_type)  # self pointer for instance methods
             for param in method.params:
                 param_types.append(self._get_llvm_type(param.type_annotation))
-            
+
             # Build return type
             if method.return_type:
                 return_type = self._get_llvm_type(method.return_type)
             else:
                 return_type = ir.VoidType()
-            
+
             # Create function
             func_type = ir.FunctionType(return_type, param_types)
             llvm_func = ir.Function(self.module, func_type, name=mangled_name)
-            
-            # Name the self parameter
-            llvm_func.args[0].name = "self"
-            
+
+            # Name the self parameter for instance methods
+            if not is_static and len(llvm_func.args) > 0:
+                llvm_func.args[0].name = "self"
+
             self.functions[mangled_name] = llvm_func
             self.type_methods[type_decl.name][method.name] = mangled_name
     
@@ -11630,45 +11984,60 @@ class CodeGenerator:
         # Skip generic types - methods are generated during monomorphization
         if type_decl.type_params:
             return
-        
+
         struct_type = self.type_registry[type_decl.name]
-        
+
         for method in type_decl.methods:
             mangled_name = self.type_methods[type_decl.name][method.name]
             llvm_func = self.functions[mangled_name]
-            
+
+            # Check if this is a static method
+            is_static = self.static_methods.get(mangled_name, False)
+
             # Create entry block
             entry = llvm_func.append_basic_block(name="entry")
             self.builder = ir.IRBuilder(entry)
-            
+
             # Clear locals and set context
             self.locals = {}
             self.current_function = method
-            self.current_type = type_decl.name
-            
-            # Store self pointer
-            self_alloca = self.builder.alloca(llvm_func.args[0].type, name="self")
-            self.builder.store(llvm_func.args[0], self_alloca)
-            self.locals["self"] = self_alloca
-            
-            # Also make fields accessible directly by name
-            self._setup_field_aliases(type_decl.name, self_alloca)
-            
-            # Allocate other parameters
-            for i, param in enumerate(method.params):
-                llvm_param = llvm_func.args[i + 1]  # +1 for self
-                llvm_param.name = param.name
-                
-                alloca = self.builder.alloca(llvm_param.type, name=param.name)
-                self.builder.store(llvm_param, alloca)
-                self.locals[param.name] = alloca
-            
+            self.current_type = type_decl.name if not is_static else None
+
+            if is_static:
+                # Static method - no self parameter
+                # Allocate parameters directly (no offset for self)
+                for i, param in enumerate(method.params):
+                    llvm_param = llvm_func.args[i]
+                    llvm_param.name = param.name
+
+                    alloca = self.builder.alloca(llvm_param.type, name=param.name)
+                    self.builder.store(llvm_param, alloca)
+                    self.locals[param.name] = alloca
+            else:
+                # Instance method - has self as first parameter
+                # Store self pointer
+                self_alloca = self.builder.alloca(llvm_func.args[0].type, name="self")
+                self.builder.store(llvm_func.args[0], self_alloca)
+                self.locals["self"] = self_alloca
+
+                # Also make fields accessible directly by name
+                self._setup_field_aliases(type_decl.name, self_alloca)
+
+                # Allocate other parameters
+                for i, param in enumerate(method.params):
+                    llvm_param = llvm_func.args[i + 1]  # +1 for self
+                    llvm_param.name = param.name
+
+                    alloca = self.builder.alloca(llvm_param.type, name=param.name)
+                    self.builder.store(llvm_param, alloca)
+                    self.locals[param.name] = alloca
+
             # Generate body
             for stmt in method.body:
                 self._generate_statement(stmt)
                 if self.builder.block.is_terminated:
                     break
-            
+
             # Add implicit return if needed
             if not self.builder.block.is_terminated:
                 if isinstance(llvm_func.return_value.type, ir.VoidType):
@@ -11700,10 +12069,14 @@ class CodeGenerator:
         return None
 
     def _get_c_type(self, coex_type: Type) -> ir.Type:
-        """Get LLVM type for C ABI (e.g., int -> i32, float -> double)."""
+        """Get LLVM type for C ABI.
+
+        Coex int is 64-bit, so we map to int64_t for C compatibility.
+        C code should use int64_t or ssize_t for Coex int parameters.
+        """
         if isinstance(coex_type, PrimitiveType):
             if coex_type.name == "int":
-                return ir.IntType(32)  # C int is 32-bit
+                return ir.IntType(64)  # Coex int is 64-bit, use int64_t in C
             elif coex_type.name == "float":
                 return ir.DoubleType()  # C double
             elif coex_type.name == "bool":
@@ -11714,23 +12087,26 @@ class CodeGenerator:
         return self._get_llvm_type(coex_type)
 
     def _convert_to_c_type(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Convert a Coex value to C ABI type for @clink call."""
+        """Convert a Coex value to C ABI type for extern call.
+
+        Since Coex int is 64-bit and maps to C int64_t, no conversion needed.
+        Only string requires special handling (struct to char*).
+        """
         if isinstance(coex_type, PrimitiveType):
-            if coex_type.name == "int":
-                # Coex int is i64, C int is i32
-                return self.builder.trunc(value, ir.IntType(32))
-            elif coex_type.name == "string":
+            if coex_type.name == "string":
                 # Coex string is struct, C needs char*
                 # Get the data pointer from the string struct using string_data
                 return self.builder.call(self.string_data, [value])
+            # int, float, bool: no conversion needed (same ABI)
         return value
 
     def _convert_from_c_type(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Convert a C return value back to Coex type."""
-        if isinstance(coex_type, PrimitiveType):
-            if coex_type.name == "int":
-                # C int (i32) to Coex int (i64)
-                return self.builder.sext(value, ir.IntType(64))
+        """Convert a C return value back to Coex type.
+
+        Since Coex int is 64-bit and maps to C int64_t, no conversion needed.
+        For most types, the value passes through unchanged.
+        """
+        # No conversion needed - types match between Coex and C ABI
         return value
 
     def _declare_function(self, func: FunctionDecl):

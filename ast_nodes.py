@@ -760,8 +760,10 @@ class MatrixDecl:
 
 @dataclass
 class ImportDecl:
-    """Import declaration: import module_name"""
-    module: str  # e.g., "math"
+    """Import declaration: import module_name or import "library.cxz" """
+    module: str  # Module name, e.g., "math" or library name extracted from path
+    library_path: Optional[str] = None  # Path for .cxz library imports, e.g., "regex.cxz"
+    is_library: bool = False  # True for .cxz library imports
 
 
 @dataclass

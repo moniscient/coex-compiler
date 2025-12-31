@@ -1,0 +1,143 @@
+# Coex Regex Library
+# POSIX Regular Expression support using Henry Spencer's BSD regex library
+#
+# Provides both Basic Regular Expressions (BRE) and Extended Regular Expressions (ERE)
+# following the POSIX.2 specification.
+#
+# Example usage:
+#     import "regex.cxz"
+#
+#     func main() -> int
+#         if regex_match("[0-9]+", "abc123def")
+#             print("Found digits!")
+#         ~
+#         return 0
+#     ~
+
+# ============================================================================
+# FFI Extern Declarations
+# ============================================================================
+
+extern coex_regex_compile(pattern: string, flags: int) -> int
+~
+
+extern coex_regex_match(handle: int, text: string, eflags: int) -> int
+~
+
+extern coex_regex_free(handle: int) -> int
+~
+
+# ============================================================================
+# Result Types
+# ============================================================================
+
+type RegexError:
+    code: int
+    message: string
+~
+
+# ============================================================================
+# Regex Type - Compiled Regular Expression
+# ============================================================================
+
+type Regex:
+    handle: int
+    pattern: string
+
+    # Compile a pattern with Extended Regular Expression syntax (recommended)
+    # REG_EXTENDED = 1
+    func compile(pattern: string) -> Regex
+        return Regex.compile_flags(pattern, 1)
+    ~
+
+    # Compile with Basic Regular Expression syntax
+    # REG_BASIC = 0
+    func compile_basic(pattern: string) -> Regex
+        return Regex.compile_flags(pattern, 0)
+    ~
+
+    # Compile with case-insensitive matching
+    # REG_EXTENDED | REG_ICASE = 1 + 2 = 3
+    func compile_icase(pattern: string) -> Regex
+        return Regex.compile_flags(pattern, 3)
+    ~
+
+    # Compile with explicit flags
+    func compile_flags(pattern: string, flags: int) -> Regex
+        handle = coex_regex_compile(pattern, flags)
+        return Regex(handle, pattern)
+    ~
+
+    # Check if compilation succeeded
+    func is_valid() -> bool
+        return self.handle > 0
+    ~
+
+    # Get the error code (negative if compilation failed)
+    func error_code() -> int
+        return self.handle
+    ~
+
+    # Test if pattern matches the text
+    func matches(text: string) -> bool
+        if self.handle <= 0
+            return false
+        ~
+        result = coex_regex_match(self.handle, text, 0)
+        return result == 0
+    ~
+
+    # Test with execution flags
+    func matches_flags(text: string, eflags: int) -> bool
+        if self.handle <= 0
+            return false
+        ~
+        result = coex_regex_match(self.handle, text, eflags)
+        return result == 0
+    ~
+
+    # Free the compiled regex (release resources)
+    func free() -> int
+        if self.handle <= 0
+            return -1
+        ~
+        return coex_regex_free(self.handle)
+    ~
+~
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+# Quick match test using Extended Regular Expression syntax
+func regex_match(pattern: string, text: string) -> bool
+    r = Regex.compile(pattern)
+    if not r.is_valid()
+        return false
+    ~
+    result = r.matches(text)
+    r.free()
+    return result
+~
+
+# Quick match test using Basic Regular Expression syntax
+func regex_match_basic(pattern: string, text: string) -> bool
+    r = Regex.compile_basic(pattern)
+    if not r.is_valid()
+        return false
+    ~
+    result = r.matches(text)
+    r.free()
+    return result
+~
+
+# Quick case-insensitive match test
+func regex_match_icase(pattern: string, text: string) -> bool
+    r = Regex.compile_icase(pattern)
+    if not r.is_valid()
+        return false
+    ~
+    result = r.matches(text)
+    r.free()
+    return result
+~

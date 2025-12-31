@@ -215,8 +215,24 @@ def compile_coex(source_path: str, output_path: str = None,
         exe_path = output_path if not output_path.endswith(".o") else output_path[:-2]
         print(f"Linking to {exe_path}...")
 
+        # Build link command
+        link_cmd = ["clang", obj_path, "-o", exe_path, "-lpthread", "-lm"]
+
+        # Add FFI library link arguments (compiled .o files and system libs)
+        ffi_link_args = codegen.get_ffi_link_args()
+        if ffi_link_args:
+            link_cmd.extend(ffi_link_args)
+            # Add FFI runtime support library
+            runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
+            ffi_runtime = os.path.join(runtime_dir, "libcoex_ffi.a")
+            if os.path.exists(ffi_runtime):
+                link_cmd.append(ffi_runtime)
+            else:
+                print(f"Warning: FFI runtime library not found at {ffi_runtime}")
+                print("Build it with: cd runtime && make")
+
         result = subprocess.run(
-            ["clang", obj_path, "-o", exe_path, "-lpthread", "-lm"],
+            link_cmd,
             capture_output=True,
             text=True
         )
@@ -231,7 +247,13 @@ def compile_coex(source_path: str, output_path: str = None,
         print(f"Successfully compiled to {exe_path}")
     else:
         print(f"Successfully compiled to {obj_path}")
-        print(f"To link: clang {obj_path} -o <executable>")
+        # Show FFI link args if any
+        ffi_link_args = codegen.get_ffi_link_args()
+        if ffi_link_args:
+            ffi_args = " ".join(ffi_link_args)
+            print(f"To link: clang {obj_path} {ffi_args} -o <executable>")
+        else:
+            print(f"To link: clang {obj_path} -o <executable>")
 
 
 def main():

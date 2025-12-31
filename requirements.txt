@@ -3,6 +3,9 @@
 # Parser generator runtime
 antlr4-python3-runtime>=4.13.0
 
+# TOML parsing for .cxz manifests (stdlib in 3.11+)
+tomli>=2.0.0;python_version<"3.11"
+
 # LLVM bindings for code generation
 llvmlite>=0.41.0
 

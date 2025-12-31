@@ -29,9 +29,10 @@ program
     : NEWLINE* ((importDecl | replaceDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
     ;
 
-// Module imports: import module_name
+// Module imports: import module_name or import "path/to/library.cxz"
 importDecl
-    : IMPORT IDENTIFIER
+    : IMPORT IDENTIFIER                    // Module import: import math
+    | IMPORT stringLiteral                 // Library import: import "regex.cxz"
     ;
 
 // Local alias: replace shortname with module.function

@@ -1,0 +1,43 @@
+# Coex Regex Library
+# POSIX Regular Expression support using Henry Spencer's BSD regex library (rxspencer)
+
+[library]
+name = "regex"
+version = "1.0.0"
+description = "POSIX Regular Expression support for Coex"
+authors = ["Coex Project"]
+license = "BSD-2-Clause"
+source = ["regex.coex"]
+
+[ffi.rxspencer]
+# Note: engine.c is #included by regexec.c, not compiled separately
+source = [
+    "coex_wrapper.c",
+    "rxspencer/regcomp.c",
+    "rxspencer/regexec.c",
+    "rxspencer/regerror.c",
+    "rxspencer/regfree.c"
+]
+headers = [".", "rxspencer"]
+system_headers = []
+system_libs = []
+
+[[ffi.rxspencer.symbols]]
+name = "coex_regex_compile"
+params = ["string", "int"]
+returns = "int"
+
+[[ffi.rxspencer.symbols]]
+name = "coex_regex_match"
+params = ["int", "string", "int"]
+returns = "int"
+
+[[ffi.rxspencer.symbols]]
+name = "coex_regex_free"
+params = ["int"]
+returns = "int"
+
+[[ffi.rxspencer.symbols]]
+name = "coex_regex_error"
+params = ["int", "string", "int"]
+returns = "int"
