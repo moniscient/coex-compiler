@@ -1,10 +1,11 @@
 """
-Tests for undeclared identifier error detection.
+Tests for undeclared identifier and undefined method error detection.
 
 These tests verify the compiler properly reports errors for:
 - Using undeclared variables
 - Compound assignment on undeclared variables
 - Method calls on undeclared objects
+- Calling undefined methods on types
 """
 
 import pytest
@@ -94,6 +95,41 @@ func main() -> int
     return 0
 ~
 ''', "Undeclared identifier 'some_struct'")
+
+
+class TestUndefinedMethodErrors:
+    """Tests for calling undefined methods on types."""
+
+    def test_undefined_method_on_posix(self, expect_compile_error):
+        """Test error when calling non-existent method on posix"""
+        expect_compile_error('''
+func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
+    src: Result<posix, string> = posix.open("test.txt", "r")
+    handle: posix = src.unwrap()
+    chunk: Result<string, string> = handle.readall()
+    return 0
+~
+''', "Undefined method 'readall' on type 'posix'")
+
+    def test_undefined_method_on_list(self, expect_compile_error):
+        """Test error when calling non-existent method on list"""
+        expect_compile_error('''
+func main() -> int
+    nums = [1, 2, 3]
+    nums.push(4)
+    return 0
+~
+''', "Undefined method 'push' on type 'List'")
+
+    def test_undefined_method_on_string(self, expect_compile_error):
+        """Test error when calling non-existent method on string"""
+        expect_compile_error('''
+func main() -> int
+    s = "hello"
+    x = s.length()
+    return 0
+~
+''', "Undefined method 'length' on type 'String'")
 
 
 class TestDeclaredVariablesWork:

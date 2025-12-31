@@ -16139,8 +16139,11 @@ class CodeGenerator:
                     return self._array_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
-        # Generic method lookup failed
-        return ir.Constant(ir.IntType(64), 0)
+        # Generic method lookup failed - raise error
+        if type_name:
+            raise RuntimeError(f"Undefined method '{method}' on type '{type_name}'")
+        else:
+            raise RuntimeError(f"Undefined method '{method}' on unknown type")
     
     def _get_type_name_from_ptr(self, llvm_type: ir.Type) -> Optional[str]:
         """Get the Coex type name from an LLVM pointer type"""
