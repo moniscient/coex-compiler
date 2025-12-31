@@ -10730,14 +10730,21 @@ class CodeGenerator:
     # Module Loading
     # ========================================================================
 
-    def _find_module_file(self, module_name: str) -> Optional[str]:
-        """Find module file in search paths"""
-        filename = f"{module_name}.coex"
+    def _find_module_file(self, module_name: str) -> Optional[tuple]:
+        """Find module file in search paths.
 
-        for path in self.module_search_paths:
-            full_path = os.path.join(path, filename)
-            if os.path.exists(full_path):
-                return full_path
+        Returns:
+            Tuple of (path, is_library) where is_library is True for .cxz files,
+            or None if not found.
+        """
+        # Check for both .coex (source) and .cxz (library) files
+        # Prefer .coex if both exist
+        for ext, is_library in [('.coex', False), ('.cxz', True)]:
+            filename = f"{module_name}{ext}"
+            for path in self.module_search_paths:
+                full_path = os.path.join(path, filename)
+                if os.path.exists(full_path):
+                    return (full_path, is_library)
 
         return None
 
@@ -10747,11 +10754,20 @@ class CodeGenerator:
         if module_name in self.loaded_modules:
             return self.loaded_modules[module_name]
 
-        # Find module file
-        module_path = self._find_module_file(module_name)
-        if not module_path:
+        # Find module file (checks both .coex and .cxz)
+        result = self._find_module_file(module_name)
+        if not result:
             searched = ", ".join(self.module_search_paths)
             raise RuntimeError(f"Module not found: {module_name} (searched: {searched})")
+
+        module_path, is_library = result
+
+        # If it's a .cxz library, delegate to library loader
+        if is_library:
+            self._load_library(module_path, module_name)
+            # Create a placeholder ModuleInfo for consistency
+            # The actual symbols are in loaded_libraries
+            return ModuleInfo(name=module_name, path=module_path, program=None)
 
         # Parse module
         from antlr4 import FileStream, CommonTokenStream
@@ -15049,8 +15065,8 @@ class CodeGenerator:
                     ], inbounds=True)
                     return self.builder.load(field_ptr, name=name)
             
-            # Unknown variable
-            return ir.Constant(ir.IntType(64), 0)
+            # Unknown variable - raise error
+            raise RuntimeError(f"Undeclared identifier '{name}': variable has not been declared in this scope")
     
     def _generate_binary(self, expr: BinaryExpr) -> ir.Value:
         """Generate code for binary expression"""
