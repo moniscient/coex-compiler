@@ -63,6 +63,11 @@ class CodeGenerator:
         # Symbol tables
         self.locals: Dict[str, ir.AllocaInst] = {}
         self.functions: Dict[str, ir.Function] = {}
+
+        # Scope tracking for better error messages
+        self.scope_depth: int = 0  # Current nesting level
+        self.var_scopes: Dict[str, int] = {}  # variable_name -> scope_depth where declared
+        self.scope_stack: PyList[PyList[str]] = [[]]  # Stack of variable names per scope level
         
         # Type registry for user-defined types
         self.type_registry: Dict[str, ir.Type] = {}  # type_name -> LLVM struct type (not pointer)
@@ -2519,6 +2524,15 @@ class CodeGenerator:
         string_validjson_ty = ir.FunctionType(ir.IntType(1), [string_ptr])
         self.string_validjson = ir.Function(self.module, string_validjson_ty, name="coex_string_validjson")
 
+        # string_from_bytes(bytes: List*) -> String* (convert byte array to string)
+        list_ptr = self.list_struct.as_pointer()
+        string_from_bytes_ty = ir.FunctionType(string_ptr, [list_ptr])
+        self.string_from_bytes = ir.Function(self.module, string_from_bytes_ty, name="coex_string_from_bytes")
+
+        # string_to_bytes(s: String*) -> List* (convert string to byte array)
+        string_to_bytes_ty = ir.FunctionType(list_ptr, [string_ptr])
+        self.string_to_bytes = ir.Function(self.module, string_to_bytes_ty, name="coex_string_to_bytes")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
@@ -2545,6 +2559,8 @@ class CodeGenerator:
         self._implement_string_from_float()
         self._implement_string_from_bool()
         self._implement_string_from_hex()
+        self._implement_string_from_bytes()
+        self._implement_string_to_bytes()
         # Note: string_validjson is implemented after JSON type is created (needs json_parse)
 
         # Register String type methods
@@ -4114,6 +4130,200 @@ class CodeGenerator:
         result = builder.call(self.string_new, [buf, str_len, str_len])
         builder.ret(result)
 
+    def _implement_string_from_bytes(self):
+        """Convert byte array (List*) to String.
+
+        Copies the bytes from the list into a new string buffer.
+        Treats bytes as UTF-8 data and counts codepoints.
+
+        List struct layout:
+        - field 0: root (PVNode*) - tree root
+        - field 1: len (i64) - total element count
+        - field 2: depth (i32) - tree depth
+        - field 3: tail (i8*) - tail array
+        - field 4: tail_len (i32) - elements in tail
+        - field 5: elem_size (i64)
+        """
+        func = self.string_from_bytes
+        func.args[0].name = "bytes"
+
+        entry = func.append_basic_block("entry")
+        check_empty = func.append_basic_block("check_empty")
+        copy_loop = func.append_basic_block("copy_loop")
+        count_codepoint = func.append_basic_block("count_codepoint")
+        after_count = func.append_basic_block("after_count")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        bytes_list = func.args[0]
+
+        # Get list length from field 1
+        len_ptr = builder.gep(bytes_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        byte_len = builder.load(len_ptr)
+
+        builder.branch(check_empty)
+
+        # Check for empty list
+        builder.position_at_end(check_empty)
+        is_empty = builder.icmp_unsigned("==", byte_len, ir.Constant(i64, 0))
+        builder.cbranch(is_empty, done, copy_loop)
+
+        # Allocate buffer and copy bytes, counting codepoints
+        builder.position_at_end(copy_loop)
+
+        # Allocate destination buffer
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        data_buf = builder.call(self.gc.gc_alloc, [byte_len, type_id])
+
+        # Initialize counters
+        idx_ptr = builder.alloca(i64, name="idx")
+        codepoint_count_ptr = builder.alloca(i64, name="codepoint_count")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        builder.store(ir.Constant(i64, 0), codepoint_count_ptr)
+
+        # Loop to copy bytes and count codepoints
+        loop_header = func.append_basic_block("loop_header")
+        loop_body = func.append_basic_block("loop_body")
+        loop_end = func.append_basic_block("loop_end")
+
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_header)
+        idx = builder.load(idx_ptr)
+        in_bounds = builder.icmp_unsigned("<", idx, byte_len)
+        builder.cbranch(in_bounds, loop_body, loop_end)
+
+        builder.position_at_end(loop_body)
+        # Get byte from list using list_get
+        elem_ptr = builder.call(self.list_get, [bytes_list, idx])
+        byte_val = builder.load(builder.bitcast(elem_ptr, i8.as_pointer()))
+
+        # Store byte in destination buffer
+        dest_ptr = builder.gep(data_buf, [idx])
+        builder.store(byte_val, dest_ptr)
+
+        # Count codepoint: if (byte & 0xC0) != 0x80, it's a new codepoint
+        masked = builder.and_(byte_val, ir.Constant(i8, 0xC0))
+        is_continuation = builder.icmp_unsigned("==", masked, ir.Constant(i8, 0x80))
+        builder.cbranch(is_continuation, after_count, count_codepoint)
+
+        builder.position_at_end(count_codepoint)
+        current_count = builder.load(codepoint_count_ptr)
+        new_count = builder.add(current_count, ir.Constant(i64, 1))
+        builder.store(new_count, codepoint_count_ptr)
+        builder.branch(after_count)
+
+        builder.position_at_end(after_count)
+        # Increment index
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_end)
+        final_codepoint_count = builder.load(codepoint_count_ptr)
+
+        # Create String struct
+        result = builder.call(self.string_new, [data_buf, final_codepoint_count, byte_len])
+        builder.ret(result)
+
+        # Handle empty list - return empty string
+        builder.position_at_end(done)
+        # Allocate empty string
+        empty_buf = builder.call(self.gc.gc_alloc, [ir.Constant(i64, 1), type_id])
+        builder.store(ir.Constant(i8, 0), empty_buf)
+        empty_str = builder.call(self.string_new, [empty_buf, ir.Constant(i64, 0), ir.Constant(i64, 0)])
+        builder.ret(empty_str)
+
+    def _implement_string_to_bytes(self):
+        """Convert String to byte array (List*).
+
+        Creates a new list containing the raw bytes of the string.
+
+        String struct layout:
+        - field 0: owner (i8*) - data buffer
+        - field 1: offset (i64) - byte offset
+        - field 2: len (i64) - codepoint count
+        - field 3: size (i64) - byte count
+        """
+        func = self.string_to_bytes
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        check_empty = func.append_basic_block("check_empty")
+        copy_bytes = func.append_basic_block("copy_bytes")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        s = func.args[0]
+
+        # Get string data pointer
+        data_ptr = builder.call(self.string_data, [s])
+
+        # Get byte size from field 3
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
+
+        builder.branch(check_empty)
+
+        # Check for empty string
+        builder.position_at_end(check_empty)
+        is_empty = builder.icmp_unsigned("==", byte_size, ir.Constant(i64, 0))
+        builder.cbranch(is_empty, done, copy_bytes)
+
+        # Create list and copy bytes
+        builder.position_at_end(copy_bytes)
+
+        # Create new byte list (elem_size = 1)
+        byte_list = builder.call(self.list_new, [ir.Constant(i64, 1)])
+
+        # Loop to append each byte
+        idx_ptr = builder.alloca(i64, name="idx")
+        list_ptr = builder.alloca(self.list_struct.as_pointer(), name="list")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        builder.store(byte_list, list_ptr)
+
+        loop_header = func.append_basic_block("loop_header")
+        loop_body = func.append_basic_block("loop_body")
+        loop_end = func.append_basic_block("loop_end")
+
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_header)
+        idx = builder.load(idx_ptr)
+        in_bounds = builder.icmp_unsigned("<", idx, byte_size)
+        builder.cbranch(in_bounds, loop_body, loop_end)
+
+        builder.position_at_end(loop_body)
+        # Get byte from string - the source pointer is already an i8*
+        src_byte_ptr = builder.gep(data_ptr, [idx])
+
+        # Append to list (takes elem pointer, not value)
+        current_list = builder.load(list_ptr)
+        new_list = builder.call(self.list_append, [current_list, src_byte_ptr, ir.Constant(i64, 1)])
+        builder.store(new_list, list_ptr)
+
+        # Increment index
+        new_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_end)
+        final_list = builder.load(list_ptr)
+        builder.ret(final_list)
+
+        # Handle empty string - return empty list
+        builder.position_at_end(done)
+        empty_list = builder.call(self.list_new, [ir.Constant(i64, 1)])
+        builder.ret(empty_list)
+
     def _implement_string_validjson(self):
         """Check if string is valid JSON by attempting to parse it.
 
@@ -4369,6 +4579,7 @@ class CodeGenerator:
             "float": "coex_string_to_float",
             "int_hex": "coex_string_to_int_hex",
             "validjson": "coex_string_validjson",
+            "bytes": "coex_string_to_bytes",
         }
 
         # Also store function references for direct access
@@ -4391,10 +4602,13 @@ class CodeGenerator:
         # Static methods for String.from() and String.from_hex()
         self.functions["String_from"] = self.string_from_int  # Default; dispatch handles types
         self.functions["String_from_hex"] = self.string_from_hex
+        self.functions["String_from_bytes"] = self.string_from_bytes
         self.functions["coex_string_from_int"] = self.string_from_int
         self.functions["coex_string_from_float"] = self.string_from_float
         self.functions["coex_string_from_bool"] = self.string_from_bool
         self.functions["coex_string_from_hex"] = self.string_from_hex
+        self.functions["coex_string_from_bytes"] = self.string_from_bytes
+        self.functions["coex_string_to_bytes"] = self.string_to_bytes
 
     def _create_map_type(self):
         """Create the Map type and helper functions using HAMT (Hash Array Mapped Trie).
@@ -11425,6 +11639,7 @@ class CodeGenerator:
         self.builder = ir.IRBuilder(entry)
 
         self.locals = {}
+        self._reset_function_scope()
         self.current_function = method
         self.current_type = type_name
 
@@ -11554,6 +11769,7 @@ class CodeGenerator:
 
         old_locals = self.locals
         self.locals = {}
+        self._reset_function_scope()
         old_current_function = self.current_function
         self.current_function = func_decl
 
@@ -12078,6 +12294,7 @@ class CodeGenerator:
 
             # Clear locals and set context
             self.locals = {}
+            self._reset_function_scope()
             self.current_function = method
             self.current_type = type_decl.name if not is_static else None
 
@@ -12503,6 +12720,7 @@ class CodeGenerator:
 
         # Clear locals and moved variables for this function scope
         self.locals = {}
+        self._reset_function_scope()
         self.moved_vars = set()
         self.current_function = func
 
@@ -12589,9 +12807,43 @@ class CodeGenerator:
         self.current_function = None
     
     # ========================================================================
+    # Scope Management
+    # ========================================================================
+
+    def _enter_scope(self):
+        """Enter a new block scope (if, for, while, etc.)."""
+        self.scope_depth += 1
+        self.scope_stack.append([])
+
+    def _exit_scope(self):
+        """Exit the current block scope, removing variables declared in it."""
+        if self.scope_depth > 0:
+            # Get variables declared in this scope
+            vars_in_scope = self.scope_stack.pop()
+            # Remove them from locals and var_scopes
+            for var_name in vars_in_scope:
+                if var_name in self.locals:
+                    del self.locals[var_name]
+                if var_name in self.var_scopes:
+                    del self.var_scopes[var_name]
+            self.scope_depth -= 1
+
+    def _register_var_in_scope(self, var_name: str):
+        """Register a variable as being declared in the current scope."""
+        self.var_scopes[var_name] = self.scope_depth
+        if self.scope_stack:
+            self.scope_stack[-1].append(var_name)
+
+    def _reset_function_scope(self):
+        """Reset scope tracking for a new function."""
+        self.scope_depth = 0
+        self.var_scopes = {}
+        self.scope_stack = [[]]
+
+    # ========================================================================
     # Statement Generation
     # ========================================================================
-    
+
     def _generate_statement(self, stmt: Stmt):
         """Generate code for a statement"""
         if isinstance(stmt, VarDecl):
@@ -12631,6 +12883,9 @@ class CodeGenerator:
     
     def _generate_var_decl(self, stmt: VarDecl):
         """Generate a local variable declaration or reassignment"""
+        # Track whether this is a new variable for scope registration
+        is_new_var = stmt.name not in self.locals
+
         # Formulas require const bindings for purity
         if not stmt.is_const and self.current_function is not None:
             if self.current_function.kind == FunctionKind.FORMULA:
@@ -12800,6 +13055,10 @@ class CodeGenerator:
             self.builder.store(init_value, alloca)
             self.locals[stmt.name] = alloca
 
+            # Register new variable in current scope for proper scoping
+            if is_new_var:
+                self._register_var_in_scope(stmt.name)
+
             # Register as GC root if this is a heap type
             if stmt.name in self.gc_root_indices and self.gc is not None:
                 root_idx = self.gc_root_indices[stmt.name]
@@ -12899,6 +13158,10 @@ class CodeGenerator:
 
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
+
+        # Register new variable in current scope for proper scoping
+        if is_new_var:
+            self._register_var_in_scope(stmt.name)
 
         # Variable is now properly typed, remove from placeholders
         self.placeholder_vars.discard(stmt.name)
@@ -13756,39 +14019,45 @@ class CodeGenerator:
         
         # Generate then block
         self.builder.position_at_end(then_block)
+        self._enter_scope()  # Variables declared in then-block are scoped here
         for s in stmt.then_body:
             self._generate_statement(s)
             if self.builder.block.is_terminated:
                 break
+        self._exit_scope()  # Clean up variables from then-block
         if not self.builder.block.is_terminated:
             self.builder.branch(merge_block)
-        
+
         # Generate else-if blocks
         for i, (elif_cond, elif_body) in enumerate(stmt.else_if_clauses):
             self.builder.position_at_end(else_blocks[i])
             cond = self._generate_expression(elif_cond)
             cond = self._to_bool(cond)
-            
+
             elif_then = func.append_basic_block("elif_then")
             next_else = else_blocks[i + 1] if i + 1 < len(else_blocks) else else_block
-            
+
             self.builder.cbranch(cond, elif_then, next_else)
-            
+
             self.builder.position_at_end(elif_then)
+            self._enter_scope()  # Variables declared in elif-block are scoped here
             for s in elif_body:
                 self._generate_statement(s)
                 if self.builder.block.is_terminated:
                     break
+            self._exit_scope()  # Clean up variables from elif-block
             if not self.builder.block.is_terminated:
                 self.builder.branch(merge_block)
-        
+
         # Generate else block
         if stmt.else_body:
             self.builder.position_at_end(else_block)
+            self._enter_scope()  # Variables declared in else-block are scoped here
             for s in stmt.else_body:
                 self._generate_statement(s)
                 if self.builder.block.is_terminated:
                     break
+            self._exit_scope()  # Clean up variables from else-block
             if not self.builder.block.is_terminated:
                 self.builder.branch(merge_block)
         
@@ -15924,6 +16193,15 @@ class CodeGenerator:
                         arg_val = self._cast_value(arg_val, ir.IntType(64))
                         return self.builder.call(self.string_from_int, [arg_val])
 
+                # Special handling for String.from_bytes() - convert byte array to string
+                if type_name == "String" and expr.method == "from_bytes" and expr.args:
+                    arg_val = self._generate_expression(expr.args[0])
+                    # Ensure it's a list pointer
+                    if isinstance(arg_val.type, ir.PointerType):
+                        return self.builder.call(self.string_from_bytes, [arg_val])
+                    # If not a pointer, return empty string as fallback
+                    return self.builder.call(self.string_from_literal, [self._get_string_literal("")])
+
                 # Look for static methods (factory methods)
                 mangled = f"{type_name}_{expr.method}"
                 if mangled in self.functions:
@@ -17986,14 +18264,15 @@ class CodeGenerator:
         entry = func.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
         self.locals = {}
-        
+        self._reset_function_scope()
+
         # Bind parameters
         for i, (param, llvm_param) in enumerate(zip(expr.params, func.args)):
             llvm_param.name = param.name
             alloca = self.builder.alloca(param_types[i], name=param.name)
             self.builder.store(llvm_param, alloca)
             self.locals[param.name] = alloca
-        
+
         # Generate body expression
         result = self._generate_expression(expr.body)
         
@@ -18006,17 +18285,18 @@ class CodeGenerator:
             
             func_type = ir.FunctionType(actual_ret_type, param_types)
             func = ir.Function(self.module, func_type, name=lambda_name)
-            
+
             entry = func.append_basic_block("entry")
             self.builder = ir.IRBuilder(entry)
             self.locals = {}
-            
+            self._reset_function_scope()
+
             for i, (param, llvm_param) in enumerate(zip(expr.params, func.args)):
                 llvm_param.name = param.name
                 alloca = self.builder.alloca(param_types[i], name=param.name)
                 self.builder.store(llvm_param, alloca)
                 self.locals[param.name] = alloca
-            
+
             result = self._generate_expression(expr.body)
         
         # Return the result
@@ -18475,8 +18755,9 @@ class CodeGenerator:
         saved_matrix = self.current_matrix
         saved_cell_x = self.current_cell_x
         saved_cell_y = self.current_cell_y
-        
+
         self.locals = {}
+        self._reset_function_scope()
         self.current_matrix = matrix_name
         
         # Get self pointer

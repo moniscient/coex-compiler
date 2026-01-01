@@ -202,7 +202,7 @@ func main() -> int
 - Traits (structural implementation checking)
 - Matrix/CA (sequential execution, `cell` keyword)
 - List: `[1, 2, 3]`, methods: `.len()`, `.get(i)`, `.append(x)`, iteration, comprehensions
-- String: `"hello"`, methods: `.len()` (returns UTF-8 codepoint count)
+- String: `"hello"`, methods: `.len()`, `.bytes()`, `String.from()`, `String.from_bytes()`, `String.from_hex()`
 - Map: `{1: 10, 2: 20}`, methods: `.get`, `.set`, `.has`, `.remove`, `.len()`
 - Set: `{1, 2, 3}`, methods: `.add`, `.has`, `.remove`, `.len()`
 - Lambdas: `formula(_ x: int) => x * 2`

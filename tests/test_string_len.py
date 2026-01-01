@@ -352,3 +352,63 @@ func main() -> int
     return 0
 ~
 ''', "Value: 42, Count: 100\n")
+
+    def test_string_from_bytes_ascii(self, expect_output):
+        """String.from_bytes converts byte array to string"""
+        expect_output('''
+func main() -> int
+    bytes: [byte] = [72, 101, 108, 108, 111]
+    s = String.from_bytes(bytes)
+    print(s)
+    return 0
+~
+''', "Hello\n")
+
+    def test_string_from_bytes_empty(self, expect_output):
+        """String.from_bytes handles empty byte array"""
+        expect_output('''
+func main() -> int
+    bytes: [byte] = []
+    s = String.from_bytes(bytes)
+    print("len=" + String.from(s.len()))
+    return 0
+~
+''', "len=0\n")
+
+    def test_string_bytes_ascii(self, expect_output):
+        """string.bytes() converts string to byte array"""
+        expect_output('''
+func main() -> int
+    s = "Hi"
+    bytes = s.bytes()
+    print(String.from(bytes.len()))
+    b0: byte = bytes.get(0)
+    b1: byte = bytes.get(1)
+    print(String.from(b0 as int))
+    print(String.from(b1 as int))
+    return 0
+~
+''', "2\n72\n105\n")
+
+    def test_string_bytes_empty(self, expect_output):
+        """string.bytes() handles empty string"""
+        expect_output('''
+func main() -> int
+    s = ""
+    bytes = s.bytes()
+    print(String.from(bytes.len()))
+    return 0
+~
+''', "0\n")
+
+    def test_string_bytes_roundtrip(self, expect_output):
+        """String.from_bytes and .bytes() are inverses"""
+        expect_output('''
+func main() -> int
+    original = "Hello, World!"
+    bytes = original.bytes()
+    reconstructed = String.from_bytes(bytes)
+    print(reconstructed)
+    return 0
+~
+''', "Hello, World!\n")

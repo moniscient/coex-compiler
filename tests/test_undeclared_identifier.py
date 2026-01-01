@@ -166,3 +166,78 @@ func main() -> int
     return 0
 ~
 ''', "100\n")
+
+
+class TestScopeErrors:
+    """Tests for variable scoping errors - using variables outside their declaring scope."""
+
+    def test_variable_from_if_block_not_visible(self, expect_compile_error):
+        """Variable declared in if block should not be visible outside"""
+        expect_compile_error('''
+func main() -> int
+    x = 5
+    if x > 0
+        data: int = 42
+    ~
+    print(data)
+    return 0
+~
+''', "Undeclared identifier 'data'")
+
+    def test_variable_from_else_block_not_visible(self, expect_compile_error):
+        """Variable declared in else block should not be visible outside"""
+        expect_compile_error('''
+func main() -> int
+    x = 5
+    if x < 0
+        a = 1
+    else
+        result: int = 100
+    ~
+    print(result)
+    return 0
+~
+''', "Undeclared identifier 'result'")
+
+    def test_variable_from_elif_block_not_visible(self, expect_compile_error):
+        """Variable declared in else-if block should not be visible outside"""
+        expect_compile_error('''
+func main() -> int
+    x = 2
+    if x == 1
+        a = 1
+    else if x == 2
+        value: int = 50
+    else
+        a = 3
+    ~
+    print(value)
+    return 0
+~
+''', "Undeclared identifier 'value'")
+
+    def test_variable_visible_in_same_scope(self, expect_output):
+        """Variable declared at function level should be visible throughout function"""
+        expect_output('''
+func main() -> int
+    data: int = 42
+    if data > 0
+        print(data)
+    ~
+    print(data)
+    return 0
+~
+''', "42\n42\n")
+
+    def test_variable_can_be_modified_in_if_block(self, expect_output):
+        """Variable declared outside if block can be modified inside"""
+        expect_output('''
+func main() -> int
+    data: int = 10
+    if true
+        data = 20
+    ~
+    print(data)
+    return 0
+~
+''', "20\n")

@@ -1,0 +1,31 @@
+import regex
+
+func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
+    if args.len() != 3
+        stderr.writeln("Usage: rex file pattern")
+        return 1
+    ~
+    source_path: string = args.get(1)
+    rex: string = args.get(2)
+
+    # Open source file
+    src: Result<posix, string> = posix.open(source_path, "r")
+    if src.is_err()
+        stderr.writeln("Cannot open source file")
+        return 1
+    ~
+    src_handle: posix = src.unwrap()
+
+    chunk: Result<string, string> = src_handle.read_all()
+    src_handle.close()
+
+    if chunk.is_err()
+        stderr.writeln("Cannot read file")
+        return 1
+    ~
+
+    s: string = chunk.unwrap()
+    matched = regex_match(rex, s)
+    print(matched)
+    return 0
+~
