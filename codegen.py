@@ -269,15 +269,16 @@ class CodeGenerator:
         )
 
         # Create list struct type using Persistent Vector structure
-        # struct List { PVNode* root, i64 len, i32 depth, i8* tail, i32 tail_len, i64 elem_size }
+        # Phase 4: All fields are i64 for handle-based GC
+        # struct List { i64 root_handle, i64 len, i64 depth, i64 tail_handle, i64 tail_len, i64 elem_size }
         # Tail optimization: rightmost 1-32 elements stored separately for fast append
         self.list_struct = ir.global_context.get_identified_type("struct.List")
         self.list_struct.set_body(
-            self.pv_node_struct.as_pointer(),  # root - tree root (null for small lists) (field 0)
+            ir.IntType(64),   # root_handle - tree root handle (0 for small lists) (field 0) - Phase 4
             ir.IntType(64),   # len - total element count (field 1)
-            ir.IntType(32),   # depth - tree depth (0 = tail only) (field 2)
-            ir.IntType(8).as_pointer(),  # tail - rightmost leaf array (field 3)
-            ir.IntType(32),   # tail_len - elements in tail (1-32) (field 4)
+            ir.IntType(64),   # depth - tree depth (0 = tail only) (field 2) - Phase 4: widened to i64
+            ir.IntType(64),   # tail_handle - rightmost leaf array handle (field 3) - Phase 4
+            ir.IntType(64),   # tail_len - elements in tail (1-32) (field 4) - Phase 4: widened to i64
             ir.IntType(64),   # elem_size (field 5)
         )
         
@@ -297,12 +298,13 @@ class CodeGenerator:
         self._create_json_type()
 
         # Create Array type and helpers (dense, contiguous collection)
-        # struct Array { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
-        # Owner pointer first, offset enables slice views without data copying.
+        # struct Array { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }
+        # Phase 4: Owner is now an i64 handle (pointer stored as integer for GC handles)
+        # Offset enables slice views without data copying.
         # NOTE: No refcount - GC handles memory, COW done via always-copy semantics
         self.array_struct = ir.global_context.get_identified_type("struct.Array")
         self.array_struct.set_body(
-            ir.IntType(8).as_pointer(),  # owner (field 0) - pointer to data buffer
+            ir.IntType(64),  # owner_handle (field 0) - handle to data buffer (Phase 4)
             ir.IntType(64),  # offset (field 1) - byte offset into owner's data
             ir.IntType(64),  # len (field 2) - element count
             ir.IntType(64),  # cap (field 3) - capacity
@@ -409,12 +411,12 @@ class CodeGenerator:
     def _implement_list_new(self):
         """Implement list_new: allocate a new empty list with given element size.
 
-        Persistent Vector List struct:
-        - field 0: root (PVNode*) - null for empty/small lists
+        Persistent Vector List struct (Phase 4 - all i64):
+        - field 0: root_handle (i64) - 0 for empty/small lists
         - field 1: len (i64) - total element count
-        - field 2: depth (i32) - tree depth (0 = tail only)
-        - field 3: tail (i8*) - rightmost leaf array
-        - field 4: tail_len (i32) - elements in tail (0-32)
+        - field 2: depth (i64) - tree depth (0 = tail only)
+        - field 3: tail_handle (i64) - rightmost leaf array handle
+        - field 4: tail_len (i64) - elements in tail (0-32)
         - field 5: elem_size (i64)
         """
         func = self.list_new
@@ -426,38 +428,39 @@ class CodeGenerator:
         i64 = ir.IntType(64)
 
         # Allocate List struct via GC
-        # Size: 8 (root ptr) + 8 (len) + 4 (depth) + 8 (tail ptr) + 4 (tail_len) + 8 (elem_size) = 40 bytes
-        # With padding/alignment, use 48 for safety
+        # Size: 6 * 8 = 48 bytes (all i64 fields)
         list_size = ir.Constant(i64, 48)
         type_id = ir.Constant(i32, self.gc.TYPE_LIST)
-        raw_ptr = builder.call(self.gc.gc_alloc, [list_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, list_size, type_id)
         list_ptr = builder.bitcast(raw_ptr, self.list_struct.as_pointer())
 
         # Initialize fields for empty list
-        # root = null (field 0)
+        # root_handle = 0 (null) (field 0) - Phase 4: i64 handle
         root_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(self.pv_node_struct.as_pointer(), None), root_ptr)
+        builder.store(ir.Constant(i64, 0), root_ptr)
 
         # len = 0 (field 1)
         len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), len_ptr)
 
-        # depth = 0 (field 2)
+        # depth = 0 (field 2) - Phase 4: i64
         depth_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        builder.store(ir.Constant(i32, 0), depth_ptr)
+        builder.store(ir.Constant(i64, 0), depth_ptr)
 
         # tail = allocate space for 32 elements (field 3)
         # Initial allocation: 32 * elem_size bytes
         tail_capacity = ir.Constant(i64, 32)
         tail_size = builder.mul(tail_capacity, func.args[0])
         tail_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
-        tail_ptr = builder.call(self.gc.gc_alloc, [tail_size, tail_type_id])
+        tail_ptr = self.gc.alloc_with_deref(builder, tail_size, tail_type_id)
+        # Phase 4: Store as i64 handle
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        builder.store(tail_ptr, tail_field_ptr)
+        tail_handle = builder.ptrtoint(tail_ptr, i64)
+        builder.store(tail_handle, tail_field_ptr)
 
-        # tail_len = 0 (field 4)
+        # tail_len = 0 (field 4) - Phase 4: i64
         tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        builder.store(ir.Constant(i32, 0), tail_len_ptr)
+        builder.store(ir.Constant(i64, 0), tail_len_ptr)
 
         # elem_size (field 5)
         elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
@@ -490,20 +493,21 @@ class CodeGenerator:
         elem_ptr = func.args[1]
         elem_size = func.args[2]
 
-        # Load old list fields
+        # Load old list fields (Phase 4: all fields are i64)
         # len (field 1)
         old_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
-        # depth (field 2)
+        # depth (field 2) - Phase 4: i64
         old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_depth = builder.load(old_depth_ptr)
 
-        # tail (field 3)
-        old_tail_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        old_tail = builder.load(old_tail_ptr)
+        # tail_handle (field 3) - Phase 4: i64 handle
+        old_tail_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        old_tail_handle = builder.load(old_tail_handle_ptr)
+        old_tail = builder.inttoptr(old_tail_handle, ir.IntType(8).as_pointer())
 
-        # tail_len (field 4)
+        # tail_len (field 4) - Phase 4: i64
         old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         old_tail_len = builder.load(old_tail_len_ptr)
 
@@ -511,9 +515,10 @@ class CodeGenerator:
         old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         old_elem_size = builder.load(old_elem_size_ptr)
 
-        # root (field 0)
-        old_root_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(old_root_ptr)
+        # root_handle (field 0) - Phase 4: i64 handle
+        old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root_handle = builder.load(old_root_handle_ptr)
+        old_root = builder.inttoptr(old_root_handle, self.pv_node_struct.as_pointer())
 
         # Create new list
         new_list = builder.call(self.list_new, [old_elem_size])
@@ -523,8 +528,8 @@ class CodeGenerator:
         new_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(new_len, new_len_ptr)
 
-        # Check if tail has room (tail_len < 32)
-        tail_has_room = builder.icmp_signed("<", old_tail_len, ir.Constant(i32, 32))
+        # Check if tail has room (tail_len < 32) - Phase 4: i64 comparison
+        tail_has_room = builder.icmp_signed("<", old_tail_len, ir.Constant(i64, 32))
         tail_room_block = func.append_basic_block("tail_has_room")
         tail_full_block = func.append_basic_block("tail_full")
         builder.cbranch(tail_has_room, tail_room_block, tail_full_block)
@@ -532,30 +537,30 @@ class CodeGenerator:
         # --- CASE 1: Tail has room ---
         builder.position_at_end(tail_room_block)
 
-        # Share the root (structural sharing)
+        # Share the root (structural sharing) - Phase 4: store i64 handle
         new_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(old_root, new_root_ptr)
+        builder.store(old_root_handle, new_root_ptr)
 
-        # Copy depth
+        # Copy depth - Phase 4: i64
         new_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_depth, new_depth_ptr)
 
-        # Get new tail pointer (already allocated by list_new)
-        new_tail_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        new_tail = builder.load(new_tail_ptr_field)
+        # Get new tail pointer (already allocated by list_new) - Phase 4: handle
+        new_tail_handle_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail_handle = builder.load(new_tail_handle_ptr_field)
+        new_tail = builder.inttoptr(new_tail_handle, ir.IntType(8).as_pointer())
 
-        # Copy old tail contents to new tail
-        old_tail_len_64 = builder.zext(old_tail_len, i64)
-        old_tail_size = builder.mul(old_tail_len_64, old_elem_size)
+        # Copy old tail contents to new tail - Phase 4: old_tail_len is already i64
+        old_tail_size = builder.mul(old_tail_len, old_elem_size)
         builder.call(self.memcpy, [new_tail, old_tail, old_tail_size])
 
         # Append new element at position old_tail_len
-        new_elem_offset = builder.mul(old_tail_len_64, old_elem_size)
+        new_elem_offset = builder.mul(old_tail_len, old_elem_size)
         new_elem_dest = builder.gep(new_tail, [new_elem_offset])
         builder.call(self.memcpy, [new_elem_dest, elem_ptr, elem_size])
 
-        # Set new tail_len = old_tail_len + 1
-        new_tail_len = builder.add(old_tail_len, ir.Constant(i32, 1))
+        # Set new tail_len = old_tail_len + 1 - Phase 4: i64
+        new_tail_len = builder.add(old_tail_len, ir.Constant(i64, 1))
         new_tail_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(new_tail_len, new_tail_len_ptr)
 
@@ -581,17 +586,16 @@ class CodeGenerator:
 
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
-        leaf_data = builder.call(self.gc.gc_alloc, [leaf_size, leaf_type_id])
+        leaf_data = self.gc.alloc_with_deref(builder, leaf_size, leaf_type_id)
         builder.call(self.memcpy, [leaf_data, old_tail, leaf_size])
 
         # Calculate how many leaves are currently in the tree
         # tree_elements = old_len - old_tail_len (where old_tail_len = 32 since tail is full)
         tree_elements = builder.sub(old_len, ir.Constant(i64, 32))
-        leaves_in_tree_64 = builder.udiv(tree_elements, ir.Constant(i64, 32))
-        leaves_in_tree = builder.trunc(leaves_in_tree_64, i32)
+        leaves_in_tree = builder.udiv(tree_elements, ir.Constant(i64, 32))
 
-        # Determine new root based on old root
-        old_root_is_null = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        # Determine new root based on old root - Phase 4: compare handle to 0
+        old_root_is_null = builder.icmp_unsigned("==", old_root_handle, ir.Constant(i64, 0))
         create_root_block = func.append_basic_block("create_root")
         add_to_tree_block = func.append_basic_block("add_to_tree")
         merge_block = func.append_basic_block("merge")
@@ -601,14 +605,14 @@ class CodeGenerator:
         builder.position_at_end(create_root_block)
 
         # Create new root node (no refcount - GC handles memory)
-        new_root_raw_create = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_root_raw_create = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_root_create = builder.bitcast(new_root_raw_create, self.pv_node_struct.as_pointer())
 
         # Store leaf_data pointer in children[0] (field 0 is now children)
         create_child0_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(leaf_data, create_child0_ptr)
 
-        new_depth_create = ir.Constant(i32, 1)
+        new_depth_create = ir.Constant(i64, 1)  # Phase 4: i64
         builder.branch(merge_block)
 
         # Add to tree block: existing tree, need to add leaf at correct position
@@ -623,11 +627,11 @@ class CodeGenerator:
         # Max leaves at depth d = 32^d = 1 << (5*d)
         # leaves_in_tree is the index where we want to insert the new leaf
 
-        # Calculate max_leaves at current depth = 1 << (5 * old_depth)
-        depth_times_5 = builder.mul(old_depth, ir.Constant(i32, 5))
-        max_leaves = builder.shl(ir.Constant(i32, 1), depth_times_5)
+        # Calculate max_leaves at current depth = 1 << (5 * old_depth) - Phase 4: i64
+        depth_times_5 = builder.mul(old_depth, ir.Constant(i64, 5))
+        max_leaves = builder.shl(ir.Constant(i64, 1), depth_times_5)
 
-        # Check if we need to increase depth
+        # Check if we need to increase depth - Phase 4: i64 comparison
         need_depth_increase = builder.icmp_unsigned(">=", leaves_in_tree, max_leaves)
         depth_increase_block = func.append_basic_block("depth_increase")
         path_copy_block = func.append_basic_block("path_copy")
@@ -637,7 +641,7 @@ class CodeGenerator:
         builder.position_at_end(depth_increase_block)
 
         # Create new root node (no refcount - GC handles memory)
-        new_uber_root_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_uber_root_raw = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_uber_root = builder.bitcast(new_uber_root_raw, self.pv_node_struct.as_pointer())
 
         # Zero out children array (field 0)
@@ -653,19 +657,19 @@ class CodeGenerator:
 
         # No refcount increment - GC handles shared references
 
-        # New depth = old_depth + 1
-        increased_depth = builder.add(old_depth, ir.Constant(i32, 1))
+        # New depth = old_depth + 1 - Phase 4: i64
+        increased_depth = builder.add(old_depth, ir.Constant(i64, 1))
         builder.branch(path_copy_block)
 
         # --- Path copy: insert leaf at correct position ---
         builder.position_at_end(path_copy_block)
 
-        # PHI nodes for working root and depth
+        # PHI nodes for working root and depth - Phase 4: depth is i64
         working_root = builder.phi(self.pv_node_struct.as_pointer(), name="working_root")
         working_root.add_incoming(new_uber_root, depth_increase_block)
         working_root.add_incoming(old_root, add_to_tree_block)
 
-        working_depth = builder.phi(i32, name="working_depth")
+        working_depth = builder.phi(i64, name="working_depth")
         working_depth.add_incoming(increased_depth, depth_increase_block)
         working_depth.add_incoming(old_depth, add_to_tree_block)
 
@@ -679,9 +683,9 @@ class CodeGenerator:
         # Allocate space for path (array of node pointers, max 8 levels should be enough)
         path_alloca = builder.alloca(ir.ArrayType(self.pv_node_struct.as_pointer(), 8), name="path")
 
-        # Allocate level counter
-        level_alloca = builder.alloca(i32, name="level")
-        start_level = builder.sub(working_depth, ir.Constant(i32, 1))
+        # Allocate level counter - Phase 4: i64
+        level_alloca = builder.alloca(i64, name="level")
+        start_level = builder.sub(working_depth, ir.Constant(i64, 1))
         builder.store(start_level, level_alloca)
 
         # Allocate current node pointer
@@ -689,7 +693,7 @@ class CodeGenerator:
         builder.store(working_root, current_alloca)
 
         # Copy the root node first (we always need a new root, no refcount - GC handles it)
-        new_root_raw_add = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_root_raw_add = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_root_add = builder.bitcast(new_root_raw_add, self.pv_node_struct.as_pointer())
 
         # Copy root's children (field 0 is children)
@@ -699,19 +703,19 @@ class CodeGenerator:
         new_children_i8 = builder.bitcast(new_children_ptr, ir.IntType(8).as_pointer())
         builder.call(self.memcpy, [new_children_i8, old_children_i8, children_array_size])
 
-        # Store new root in path[depth-1]
-        path_slot = builder.gep(path_alloca, [ir.Constant(i32, 0), start_level], inbounds=True)
+        # Store new root in path[depth-1] - Phase 4: index is i64
+        path_slot = builder.gep(path_alloca, [ir.Constant(i64, 0), start_level], inbounds=True)
         builder.store(new_root_add, path_slot)
 
-        # Check if depth is 1 (simple case: just insert leaf directly)
-        is_depth_1 = builder.icmp_signed("==", working_depth, ir.Constant(i32, 1))
+        # Check if depth is 1 (simple case: just insert leaf directly) - Phase 4: i64
+        is_depth_1 = builder.icmp_signed("==", working_depth, ir.Constant(i64, 1))
         depth_1_insert_block = func.append_basic_block("depth_1_insert")
         multi_level_block = func.append_basic_block("multi_level")
         builder.cbranch(is_depth_1, depth_1_insert_block, multi_level_block)
 
         # --- Depth 1: simple direct insertion ---
         builder.position_at_end(depth_1_insert_block)
-        leaf_slot_d1 = builder.and_(leaves_in_tree, ir.Constant(i32, 0x1F))
+        leaf_slot_d1 = builder.and_(leaves_in_tree, ir.Constant(i64, 0x1F))
         leaf_ptr_d1 = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 0), leaf_slot_d1], inbounds=True)
         builder.store(leaf_data, leaf_ptr_d1)
         builder.branch(merge_block)
@@ -724,8 +728,8 @@ class CodeGenerator:
         descend_body = func.append_basic_block("descend_body")
         descend_done = func.append_basic_block("descend_done")
 
-        # Initialize: start at level depth-2 (we already copied root at depth-1)
-        level_minus_2 = builder.sub(working_depth, ir.Constant(i32, 2))
+        # Initialize: start at level depth-2 (we already copied root at depth-1) - Phase 4: i64
+        level_minus_2 = builder.sub(working_depth, ir.Constant(i64, 2))
         builder.store(level_minus_2, level_alloca)
 
         # Parent node is new_root_add
@@ -734,10 +738,10 @@ class CodeGenerator:
 
         builder.branch(descend_cond)
 
-        # Loop condition: level >= 0
+        # Loop condition: level >= 0 - Phase 4: i64
         builder.position_at_end(descend_cond)
         current_level = builder.load(level_alloca)
-        continue_descend = builder.icmp_signed(">=", current_level, ir.Constant(i32, 0))
+        continue_descend = builder.icmp_signed(">=", current_level, ir.Constant(i64, 0))
         builder.cbranch(continue_descend, descend_body, descend_done)
 
         # Loop body: copy or create node at this level
@@ -746,15 +750,15 @@ class CodeGenerator:
         parent_node = builder.load(parent_alloca)
         level_for_calc = builder.load(level_alloca)
 
-        # Calculate child index: (leaf_idx >> ((level+1) * 5)) & 0x1F
-        level_plus_1 = builder.add(level_for_calc, ir.Constant(i32, 1))
-        shift_amt = builder.mul(level_plus_1, ir.Constant(i32, 5))
+        # Calculate child index: (leaf_idx >> ((level+1) * 5)) & 0x1F - Phase 4: i64
+        level_plus_1 = builder.add(level_for_calc, ir.Constant(i64, 1))
+        shift_amt = builder.mul(level_plus_1, ir.Constant(i64, 5))
         shifted_idx = builder.lshr(leaves_in_tree, shift_amt)
-        child_idx = builder.and_(shifted_idx, ir.Constant(i32, 0x1F))
+        child_idx = builder.and_(shifted_idx, ir.Constant(i64, 0x1F))
 
         # Get child pointer from parent (field 0 is children)
         parent_children = builder.gep(parent_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        child_ptr_ptr = builder.gep(parent_children, [ir.Constant(i32, 0), child_idx], inbounds=True)
+        child_ptr_ptr = builder.gep(parent_children, [ir.Constant(i64, 0), child_idx], inbounds=True)
         old_child_i8 = builder.load(child_ptr_ptr)
 
         # Check if child exists
@@ -766,7 +770,7 @@ class CodeGenerator:
 
         # Create new child node (no refcount - GC handles it)
         builder.position_at_end(create_child_block)
-        new_child_raw_create = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_child_raw_create = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_child_create = builder.bitcast(new_child_raw_create, self.pv_node_struct.as_pointer())
         # Zero out children (field 0 is children)
         create_child_children = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -777,7 +781,7 @@ class CodeGenerator:
         # Copy existing child node (no refcount - GC handles it)
         builder.position_at_end(copy_child_block)
         old_child_node = builder.bitcast(old_child_i8, self.pv_node_struct.as_pointer())
-        new_child_raw_copy = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_child_raw_copy = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_child_copy = builder.bitcast(new_child_raw_copy, self.pv_node_struct.as_pointer())
         # Copy children from old node (field 0 is children)
         old_child_children = builder.gep(old_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -797,16 +801,16 @@ class CodeGenerator:
         new_child_as_i8 = builder.bitcast(new_child_phi, ir.IntType(8).as_pointer())
         builder.store(new_child_as_i8, child_ptr_ptr)
 
-        # Store in path array
+        # Store in path array - Phase 4: i64 index
         current_level_reload = builder.load(level_alloca)
-        path_slot_loop = builder.gep(path_alloca, [ir.Constant(i32, 0), current_level_reload], inbounds=True)
+        path_slot_loop = builder.gep(path_alloca, [ir.Constant(i64, 0), current_level_reload], inbounds=True)
         builder.store(new_child_phi, path_slot_loop)
 
         # Update parent for next iteration
         builder.store(new_child_phi, parent_alloca)
 
-        # Decrement level
-        new_level = builder.sub(current_level_reload, ir.Constant(i32, 1))
+        # Decrement level - Phase 4: i64
+        new_level = builder.sub(current_level_reload, ir.Constant(i64, 1))
         builder.store(new_level, level_alloca)
 
         builder.branch(descend_cond)
@@ -817,8 +821,8 @@ class CodeGenerator:
         # The bottom node is in parent_alloca (it's the level-0 node)
         bottom_node = builder.load(parent_alloca)
 
-        # Calculate leaf slot: leaves_in_tree & 0x1F
-        leaf_slot_multi = builder.and_(leaves_in_tree, ir.Constant(i32, 0x1F))
+        # Calculate leaf slot: leaves_in_tree & 0x1F - Phase 4: i64
+        leaf_slot_multi = builder.and_(leaves_in_tree, ir.Constant(i64, 0x1F))
 
         # Insert leaf (field 0 is children)
         leaf_ptr_multi = builder.gep(bottom_node, [ir.Constant(i32, 0), ir.Constant(i32, 0), leaf_slot_multi], inbounds=True)
@@ -833,36 +837,38 @@ class CodeGenerator:
         # Merge block: finalize new list
         builder.position_at_end(merge_block)
 
-        # PHI nodes for new_root and new_depth
+        # PHI nodes for new_root and new_depth - Phase 4: depth is i64
         # Incoming from: create_root_block, depth_1_insert_block, descend_done
         new_root_phi = builder.phi(self.pv_node_struct.as_pointer(), name="new_root")
         new_root_phi.add_incoming(new_root_create, create_root_block)
         new_root_phi.add_incoming(new_root_add, depth_1_insert_block)
         new_root_phi.add_incoming(new_root_add, descend_done)
 
-        new_depth_phi = builder.phi(i32, name="new_depth")
+        new_depth_phi = builder.phi(i64, name="new_depth")
         new_depth_phi.add_incoming(new_depth_create, create_root_block)
         new_depth_phi.add_incoming(working_depth, depth_1_insert_block)
         new_depth_phi.add_incoming(working_depth, descend_done)
 
-        # Set new list's root
+        # Set new list's root - Phase 4: store as i64 handle
         new_list_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root_phi, new_list_root_ptr)
+        new_root_handle = builder.ptrtoint(new_root_phi, i64)
+        builder.store(new_root_handle, new_list_root_ptr)
 
-        # Set new list's depth
+        # Set new list's depth - Phase 4: i64
         new_list_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(new_depth_phi, new_list_depth_ptr)
 
-        # Create new tail with just the appended element
-        new_list_tail_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        new_list_tail = builder.load(new_list_tail_ptr_field)
+        # Create new tail with just the appended element - Phase 4: load handle
+        new_list_tail_handle_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_list_tail_handle = builder.load(new_list_tail_handle_ptr_field)
+        new_list_tail = builder.inttoptr(new_list_tail_handle, ir.IntType(8).as_pointer())
 
         # Copy element to new tail at position 0
         builder.call(self.memcpy, [new_list_tail, elem_ptr, elem_size])
 
-        # Set tail_len = 1
+        # Set tail_len = 1 - Phase 4: i64
         new_list_tail_len_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        builder.store(ir.Constant(i32, 1), new_list_tail_len_ptr)
+        builder.store(ir.Constant(i64, 1), new_list_tail_len_ptr)
 
         builder.ret(new_list)
     
@@ -891,20 +897,21 @@ class CodeGenerator:
         list_ptr = func.args[0]
         index = func.args[1]
 
-        # Load list fields
+        # Load list fields (Phase 4: all fields are i64)
         # len (field 1)
         len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         list_len = builder.load(len_ptr)
 
-        # depth (field 2)
+        # depth (field 2) - Phase 4: i64
         depth_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         depth = builder.load(depth_ptr)
 
-        # tail (field 3)
-        tail_ptr_field = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        tail = builder.load(tail_ptr_field)
+        # tail_handle (field 3) - Phase 4: i64 handle
+        tail_handle_ptr_field = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail_handle = builder.load(tail_handle_ptr_field)
+        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
 
-        # tail_len (field 4)
+        # tail_len (field 4) - Phase 4: i64
         tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         tail_len = builder.load(tail_len_ptr)
 
@@ -912,13 +919,13 @@ class CodeGenerator:
         elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # root (field 0)
-        root_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root = builder.load(root_ptr)
+        # root_handle (field 0) - Phase 4: i64 handle
+        root_handle_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root_handle = builder.load(root_handle_ptr)
+        root = builder.inttoptr(root_handle, self.pv_node_struct.as_pointer())
 
-        # Calculate tail_start = len - tail_len
-        tail_len_64 = builder.zext(tail_len, i64)
-        tail_start = builder.sub(list_len, tail_len_64)
+        # Calculate tail_start = len - tail_len - Phase 4: both are i64
+        tail_start = builder.sub(list_len, tail_len)
 
         # Check if index is in tail
         in_tail = builder.icmp_unsigned(">=", index, tail_start)
@@ -949,15 +956,12 @@ class CodeGenerator:
         current_node_alloca = builder.alloca(self.pv_node_struct.as_pointer(), name="current_node")
         builder.store(root, current_node_alloca)
 
-        # Allocate level counter (starts at depth-1, goes down to 0)
-        level_alloca = builder.alloca(i32, name="level")
-        start_level = builder.sub(depth, ir.Constant(i32, 1))
+        # Allocate level counter (starts at depth-1, goes down to 0) - Phase 4: i64
+        level_alloca = builder.alloca(i64, name="level")
+        start_level = builder.sub(depth, ir.Constant(i64, 1))
         builder.store(start_level, level_alloca)
 
-        # Convert index to i32 for bit manipulation
-        index_32 = builder.trunc(index, i32)
-
-        # Loop: while level >= 0
+        # Loop: while level >= 0 - Phase 4: use i64 for all calculations
         loop_cond = func.append_basic_block("tree_loop_cond")
         loop_body = func.append_basic_block("tree_loop_body")
         loop_done = func.append_basic_block("tree_loop_done")
@@ -966,20 +970,20 @@ class CodeGenerator:
 
         builder.position_at_end(loop_cond)
         current_level = builder.load(level_alloca)
-        continue_loop = builder.icmp_signed(">=", current_level, ir.Constant(i32, 0))
+        continue_loop = builder.icmp_signed(">=", current_level, ir.Constant(i64, 0))
         builder.cbranch(continue_loop, loop_body, loop_done)
 
         builder.position_at_end(loop_body)
 
-        # Calculate child index: (index >> (5 * (level + 1))) & 0x1F
+        # Calculate child index: (index >> (5 * (level + 1))) & 0x1F - Phase 4: i64
         # Level 0 means we're at the lowest node level (parents of leaves)
         # For depth=1, level=0, we need shift of 5 to get leaf index
         # For depth=2, level=1 at root needs shift of 10, level=0 needs shift of 5
         level_loaded = builder.load(level_alloca)
-        level_plus_one = builder.add(level_loaded, ir.Constant(i32, 1))
-        shift_amount = builder.mul(level_plus_one, ir.Constant(i32, 5))
-        shifted = builder.lshr(index_32, shift_amount)
-        child_idx = builder.and_(shifted, ir.Constant(i32, 0x1F))
+        level_plus_one = builder.add(level_loaded, ir.Constant(i64, 1))
+        shift_amount = builder.mul(level_plus_one, ir.Constant(i64, 5))
+        shifted = builder.lshr(index, shift_amount)
+        child_idx = builder.and_(shifted, ir.Constant(i64, 0x1F))
 
         # Get current node
         current_node = builder.load(current_node_alloca)
@@ -987,12 +991,12 @@ class CodeGenerator:
         # Get children array pointer (field 0 is children)
         children_array_ptr = builder.gep(current_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
 
-        # Get child at child_idx
-        child_ptr_ptr = builder.gep(children_array_ptr, [ir.Constant(i32, 0), child_idx], inbounds=True)
+        # Get child at child_idx - Phase 4: use i64 index
+        child_ptr_ptr = builder.gep(children_array_ptr, [ir.Constant(i64, 0), child_idx], inbounds=True)
         child_ptr = builder.load(child_ptr_ptr)
 
-        # Check if we're at the last level (level == 0)
-        at_leaf_level = builder.icmp_signed("==", level_loaded, ir.Constant(i32, 0))
+        # Check if we're at the last level (level == 0) - Phase 4: i64
+        at_leaf_level = builder.icmp_signed("==", level_loaded, ir.Constant(i64, 0))
         leaf_access = func.append_basic_block("leaf_access")
         continue_descent = func.append_basic_block("continue_descent")
         builder.cbranch(at_leaf_level, leaf_access, continue_descent)
@@ -1000,10 +1004,9 @@ class CodeGenerator:
         # At leaf level: child_ptr points to element data (leaf array)
         builder.position_at_end(leaf_access)
 
-        # The leaf is an array of 32 elements, access index & 0x1F
-        leaf_idx = builder.and_(index_32, ir.Constant(i32, 0x1F))
-        leaf_idx_64 = builder.zext(leaf_idx, i64)
-        leaf_offset = builder.mul(leaf_idx_64, elem_size)
+        # The leaf is an array of 32 elements, access index & 0x1F - Phase 4: i64
+        leaf_idx = builder.and_(index, ir.Constant(i64, 0x1F))
+        leaf_offset = builder.mul(leaf_idx, elem_size)
         leaf_result = builder.gep(child_ptr, [leaf_offset])
         builder.ret(leaf_result)
 
@@ -1012,8 +1015,8 @@ class CodeGenerator:
         next_node = builder.bitcast(child_ptr, self.pv_node_struct.as_pointer())
         builder.store(next_node, current_node_alloca)
 
-        # Decrement level
-        new_level = builder.sub(level_loaded, ir.Constant(i32, 1))
+        # Decrement level - Phase 4: i64
+        new_level = builder.sub(level_loaded, ir.Constant(i64, 1))
         builder.store(new_level, level_alloca)
         builder.branch(loop_cond)
 
@@ -1048,20 +1051,21 @@ class CodeGenerator:
         value_ptr = func.args[2]
         elem_size = func.args[3]
 
-        # Load old list fields
+        # Load old list fields (Phase 4: all fields are i64)
         # len (field 1)
         old_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(old_len_ptr)
 
-        # depth (field 2)
+        # depth (field 2) - Phase 4: i64
         old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_depth = builder.load(old_depth_ptr)
 
-        # tail (field 3)
-        old_tail_ptr_field = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        old_tail = builder.load(old_tail_ptr_field)
+        # tail_handle (field 3) - Phase 4: i64 handle
+        old_tail_handle_ptr_field = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        old_tail_handle = builder.load(old_tail_handle_ptr_field)
+        old_tail = builder.inttoptr(old_tail_handle, ir.IntType(8).as_pointer())
 
-        # tail_len (field 4)
+        # tail_len (field 4) - Phase 4: i64
         old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         old_tail_len = builder.load(old_tail_len_ptr)
 
@@ -1069,13 +1073,13 @@ class CodeGenerator:
         old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         stored_elem_size = builder.load(old_elem_size_ptr)
 
-        # root (field 0)
-        old_root_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root = builder.load(old_root_ptr)
+        # root_handle (field 0) - Phase 4: i64 handle
+        old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_root_handle = builder.load(old_root_handle_ptr)
+        old_root = builder.inttoptr(old_root_handle, self.pv_node_struct.as_pointer())
 
-        # Calculate tail_start = len - tail_len
-        tail_len_64 = builder.zext(old_tail_len, i64)
-        tail_start = builder.sub(old_len, tail_len_64)
+        # Calculate tail_start = len - tail_len - Phase 4: both are i64
+        tail_start = builder.sub(old_len, old_tail_len)
 
         # Check if index is in tail
         in_tail = builder.icmp_unsigned(">=", index, tail_start)
@@ -1089,26 +1093,26 @@ class CodeGenerator:
         # Create new list
         new_list_tail = builder.call(self.list_new, [stored_elem_size])
 
-        # Share the root (no refcount - GC handles shared references)
+        # Share the root (Phase 4: store i64 handle)
         new_root_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(old_root, new_root_ptr_t)
+        builder.store(old_root_handle, new_root_ptr_t)
 
-        # Copy depth and len
+        # Copy depth and len - Phase 4: depth is i64
         new_depth_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_depth, new_depth_ptr_t)
         new_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(old_len, new_len_ptr_t)
 
-        # Get new tail pointer (allocated by list_new)
-        new_tail_ptr_field_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        new_tail_t = builder.load(new_tail_ptr_field_t)
+        # Get new tail pointer (allocated by list_new) - Phase 4: handle
+        new_tail_handle_ptr_field_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail_handle_t = builder.load(new_tail_handle_ptr_field_t)
+        new_tail_t = builder.inttoptr(new_tail_handle_t, ir.IntType(8).as_pointer())
 
-        # Copy old tail contents to new tail
-        old_tail_len_64_t = builder.zext(old_tail_len, i64)
-        old_tail_size_t = builder.mul(old_tail_len_64_t, stored_elem_size)
+        # Copy old tail contents to new tail - Phase 4: old_tail_len is already i64
+        old_tail_size_t = builder.mul(old_tail_len, stored_elem_size)
         builder.call(self.memcpy, [new_tail_t, old_tail, old_tail_size_t])
 
-        # Set new tail_len
+        # Set new tail_len - Phase 4: i64
         new_tail_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(old_tail_len, new_tail_len_ptr_t)
 
@@ -1126,16 +1130,17 @@ class CodeGenerator:
         # Create new list
         new_list_tree = builder.call(self.list_new, [stored_elem_size])
 
-        # Copy len and depth
+        # Copy len and depth - Phase 4: depth is i64
         new_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(old_len, new_len_ptr_tr)
         new_depth_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_depth, new_depth_ptr_tr)
 
-        # Copy tail (tail is unchanged, just copy the whole thing)
-        new_tail_ptr_field_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        new_tail_tr = builder.load(new_tail_ptr_field_tr)
-        old_tail_size_tr = builder.mul(tail_len_64, stored_elem_size)
+        # Copy tail (tail is unchanged, just copy the whole thing) - Phase 4: handle
+        new_tail_handle_ptr_field_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        new_tail_handle_tr = builder.load(new_tail_handle_ptr_field_tr)
+        new_tail_tr = builder.inttoptr(new_tail_handle_tr, ir.IntType(8).as_pointer())
+        old_tail_size_tr = builder.mul(old_tail_len, stored_elem_size)  # Phase 4: old_tail_len is i64
         builder.call(self.memcpy, [new_tail_tr, old_tail, old_tail_size_tr])
         new_tail_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(old_tail_len, new_tail_len_ptr_tr)
@@ -1148,8 +1153,8 @@ class CodeGenerator:
         pv_node_type_id = ir.Constant(i32, self.gc.TYPE_PV_NODE)
         leaf_type_id = ir.Constant(i32, self.gc.TYPE_LIST_TAIL)
 
-        # Check if root is null (shouldn't happen if index is in tree, but handle it)
-        root_null_check = builder.icmp_unsigned("==", old_root, ir.Constant(self.pv_node_struct.as_pointer(), None))
+        # Check if root is null - Phase 4: compare handle to 0
+        root_null_check = builder.icmp_unsigned("==", old_root_handle, ir.Constant(i64, 0))
         root_exists = func.append_basic_block("root_exists")
         ret_empty = func.append_basic_block("ret_empty")
         builder.cbranch(root_null_check, ret_empty, root_exists)
@@ -1160,7 +1165,7 @@ class CodeGenerator:
         builder.position_at_end(root_exists)
 
         # Copy the root node (no refcount - GC handles memory)
-        new_root_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_root_raw = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_root = builder.bitcast(new_root_raw, self.pv_node_struct.as_pointer())
 
         # Copy children pointers from old root (field 0 is children)
@@ -1171,12 +1176,10 @@ class CodeGenerator:
         new_root_children_i8 = builder.bitcast(new_root_children, ir.IntType(8).as_pointer())
         builder.call(self.memcpy, [new_root_children_i8, old_root_children_i8, children_size])
 
-        # Store new root in new list
+        # Store new root in new list - Phase 4: store as i64 handle
         new_root_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_root, new_root_ptr_tr)
-
-        # Convert index to i32 for bit manipulation
-        index_32 = builder.trunc(index, i32)
+        new_root_handle_tr = builder.ptrtoint(new_root, i64)
+        builder.store(new_root_handle_tr, new_root_ptr_tr)
 
         # For depth=1 (most common case), we just need to:
         # 1. Calculate which leaf (child_idx = (index >> 5) & 0x1F)
@@ -1186,8 +1189,8 @@ class CodeGenerator:
 
         # For depth>1, we need to path copy all nodes from root to leaf
 
-        # Check if depth == 1 (simple case)
-        depth_is_one = builder.icmp_signed("==", old_depth, ir.Constant(i32, 1))
+        # Check if depth == 1 (simple case) - Phase 4: i64
+        depth_is_one = builder.icmp_signed("==", old_depth, ir.Constant(i64, 1))
         depth_one_block = func.append_basic_block("depth_one")
         depth_multi_block = func.append_basic_block("depth_multi")
         builder.cbranch(depth_is_one, depth_one_block, depth_multi_block)
@@ -1195,23 +1198,22 @@ class CodeGenerator:
         # --- Depth == 1 case ---
         builder.position_at_end(depth_one_block)
 
-        # Calculate child index: (index >> 5) & 0x1F
-        child_idx_d1 = builder.lshr(index_32, ir.Constant(i32, 5))
-        child_idx_d1 = builder.and_(child_idx_d1, ir.Constant(i32, 0x1F))
+        # Calculate child index: (index >> 5) & 0x1F - Phase 4: i64
+        child_idx_d1 = builder.lshr(index, ir.Constant(i64, 5))
+        child_idx_d1 = builder.and_(child_idx_d1, ir.Constant(i64, 0x1F))
 
-        # Get old leaf pointer from old root (field 0 is children)
+        # Get old leaf pointer from old root (field 0 is children) - Phase 4: i64 GEP index
         old_leaf_ptr_d1 = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 0), child_idx_d1], inbounds=True)
         old_leaf_d1 = builder.load(old_leaf_ptr_d1)
 
         # Create new leaf (copy of old leaf)
         leaf_size_d1 = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_d1 = builder.call(self.gc.gc_alloc, [leaf_size_d1, leaf_type_id])
+        new_leaf_d1 = self.gc.alloc_with_deref(builder, leaf_size_d1, leaf_type_id)
         builder.call(self.memcpy, [new_leaf_d1, old_leaf_d1, leaf_size_d1])
 
-        # Modify element in new leaf at position index & 0x1F
-        leaf_elem_idx_d1 = builder.and_(index_32, ir.Constant(i32, 0x1F))
-        leaf_elem_idx_d1_64 = builder.zext(leaf_elem_idx_d1, i64)
-        leaf_elem_offset_d1 = builder.mul(leaf_elem_idx_d1_64, stored_elem_size)
+        # Modify element in new leaf at position index & 0x1F - Phase 4: i64
+        leaf_elem_idx_d1 = builder.and_(index, ir.Constant(i64, 0x1F))
+        leaf_elem_offset_d1 = builder.mul(leaf_elem_idx_d1, stored_elem_size)
         leaf_elem_dest_d1 = builder.gep(new_leaf_d1, [leaf_elem_offset_d1])
         builder.call(self.memcpy, [leaf_elem_dest_d1, value_ptr, elem_size])
 
@@ -1236,12 +1238,12 @@ class CodeGenerator:
         builder.store(old_root, current_old_node)
         builder.store(new_root, current_new_node)
 
-        # Level counter: start at depth-1, go down to 0
-        level_alloca = builder.alloca(i32, name="level")
-        start_level = builder.sub(old_depth, ir.Constant(i32, 1))
+        # Level counter: start at depth-1, go down to 0 - Phase 4: i64
+        level_alloca = builder.alloca(i64, name="level")
+        start_level = builder.sub(old_depth, ir.Constant(i64, 1))
         builder.store(start_level, level_alloca)
 
-        # Loop through levels
+        # Loop through levels - Phase 4: i64
         path_loop_cond = func.append_basic_block("path_loop_cond")
         path_loop_body = func.append_basic_block("path_loop_body")
         path_loop_done = func.append_basic_block("path_loop_done")
@@ -1249,26 +1251,26 @@ class CodeGenerator:
 
         builder.position_at_end(path_loop_cond)
         curr_level = builder.load(level_alloca)
-        continue_path = builder.icmp_signed(">", curr_level, ir.Constant(i32, 0))
+        continue_path = builder.icmp_signed(">", curr_level, ir.Constant(i64, 0))
         builder.cbranch(continue_path, path_loop_body, path_loop_done)
 
         builder.position_at_end(path_loop_body)
         level_val = builder.load(level_alloca)
 
-        # Calculate child index at this level: (index >> (5 * (level + 1))) & 0x1F
-        level_plus_one = builder.add(level_val, ir.Constant(i32, 1))
-        shift_amt = builder.mul(level_plus_one, ir.Constant(i32, 5))
-        child_idx_path = builder.lshr(index_32, shift_amt)
-        child_idx_path = builder.and_(child_idx_path, ir.Constant(i32, 0x1F))
+        # Calculate child index at this level: (index >> (5 * (level + 1))) & 0x1F - Phase 4: i64
+        level_plus_one = builder.add(level_val, ir.Constant(i64, 1))
+        shift_amt = builder.mul(level_plus_one, ir.Constant(i64, 5))
+        child_idx_path = builder.lshr(index, shift_amt)
+        child_idx_path = builder.and_(child_idx_path, ir.Constant(i64, 0x1F))
 
-        # Get old child node (field 0 is children)
+        # Get old child node (field 0 is children) - Phase 4: i64 GEP index
         old_node_curr = builder.load(current_old_node)
         old_child_ptr = builder.gep(old_node_curr, [ir.Constant(i32, 0), ir.Constant(i32, 0), child_idx_path], inbounds=True)
         old_child_raw = builder.load(old_child_ptr)
         old_child = builder.bitcast(old_child_raw, self.pv_node_struct.as_pointer())
 
         # Create new child node (no refcount - GC handles memory)
-        new_child_raw = builder.call(self.gc.gc_alloc, [pv_node_size, pv_node_type_id])
+        new_child_raw = self.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
         new_child = builder.bitcast(new_child_raw, self.pv_node_struct.as_pointer())
 
         # Copy children array from old child (field 0 is children)
@@ -1288,17 +1290,17 @@ class CodeGenerator:
         builder.store(old_child, current_old_node)
         builder.store(new_child, current_new_node)
 
-        # Decrement level
-        new_level = builder.sub(level_val, ir.Constant(i32, 1))
+        # Decrement level - Phase 4: i64
+        new_level = builder.sub(level_val, ir.Constant(i64, 1))
         builder.store(new_level, level_alloca)
         builder.branch(path_loop_cond)
 
         # Path loop done - now at level 0, need to handle leaf
         builder.position_at_end(path_loop_done)
 
-        # Calculate leaf index: (index >> 5) & 0x1F
-        leaf_idx_multi = builder.lshr(index_32, ir.Constant(i32, 5))
-        leaf_idx_multi = builder.and_(leaf_idx_multi, ir.Constant(i32, 0x1F))
+        # Calculate leaf index: (index >> 5) & 0x1F - Phase 4: i64
+        leaf_idx_multi = builder.lshr(index, ir.Constant(i64, 5))
+        leaf_idx_multi = builder.and_(leaf_idx_multi, ir.Constant(i64, 0x1F))
 
         # Get old leaf from current old node (field 0 is children)
         final_old_node = builder.load(current_old_node)
@@ -1307,13 +1309,12 @@ class CodeGenerator:
 
         # Create new leaf
         leaf_size_m = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_m = builder.call(self.gc.gc_alloc, [leaf_size_m, leaf_type_id])
+        new_leaf_m = self.gc.alloc_with_deref(builder, leaf_size_m, leaf_type_id)
         builder.call(self.memcpy, [new_leaf_m, old_leaf_m, leaf_size_m])
 
-        # Modify element in new leaf
-        elem_idx_m = builder.and_(index_32, ir.Constant(i32, 0x1F))
-        elem_idx_m_64 = builder.zext(elem_idx_m, i64)
-        elem_offset_m = builder.mul(elem_idx_m_64, stored_elem_size)
+        # Modify element in new leaf - Phase 4: i64
+        elem_idx_m = builder.and_(index, ir.Constant(i64, 0x1F))
+        elem_offset_m = builder.mul(elem_idx_m, stored_elem_size)
         elem_dest_m = builder.gep(new_leaf_m, [elem_offset_m])
         builder.call(self.memcpy, [elem_dest_m, value_ptr, elem_size])
 
@@ -1688,18 +1689,19 @@ class CodeGenerator:
         # Allocate Array struct (40 bytes: 5 x 8-byte fields)
         array_size_const = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY)
-        raw_ptr = builder.call(self.gc.gc_alloc, [array_size_const, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, array_size_const, type_id)
         array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
 
         # Allocate data buffer first: cap * elem_size
         data_size = builder.mul(cap, elem_size)
         array_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY_DATA)
-        data_ptr = builder.call(self.gc.gc_alloc, [data_size, array_data_type_id])
+        data_ptr = self.gc.alloc_with_deref(builder, data_size, array_data_type_id)
 
         # Initialize fields
-        # owner (field 0)
+        # owner_handle (field 0) - Phase 4: store as i64 handle
         owner_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_ptr, owner_field_ptr)
+        owner_handle = builder.ptrtoint(data_ptr, ir.IntType(64))
+        builder.store(owner_handle, owner_field_ptr)
 
         # offset = 0 (field 1) - new arrays own their data from the start
         offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
@@ -1738,9 +1740,10 @@ class CodeGenerator:
         elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Compute data pointer: owner + offset
-        owner_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        owner = builder.load(owner_field_ptr)
+        # Compute data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         base_offset = builder.load(offset_ptr)
         data = builder.gep(owner, [base_offset])
@@ -1788,16 +1791,18 @@ class CodeGenerator:
         new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(old_len, new_len_ptr)
 
-        # Compute old data pointer: owner + offset
-        old_owner_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_owner = builder.load(old_owner_ptr)
+        # Compute old data pointer: owner + offset (Phase 4: owner is i64 handle)
+        old_owner_handle_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_owner_handle = builder.load(old_owner_handle_ptr)
+        old_owner = builder.inttoptr(old_owner_handle, ir.IntType(8).as_pointer())
         old_offset_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         old_offset = builder.load(old_offset_ptr)
         old_data = builder.gep(old_owner, [old_offset])
 
-        # New array has offset=0, so just load owner directly
-        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        new_data = builder.load(new_data_ptr)
+        # New array has offset=0, so just load owner (Phase 4: owner is i64 handle)
+        new_data_handle_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        new_data_handle = builder.load(new_data_handle_ptr)
+        new_data = builder.inttoptr(new_data_handle, ir.IntType(8).as_pointer())
 
         copy_size = builder.mul(old_len, elem_size)
         builder.call(self.memcpy, [new_data, old_data, copy_size])
@@ -1844,16 +1849,18 @@ class CodeGenerator:
         new_len_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         builder.store(new_cap, new_len_ptr)
 
-        # Compute old data pointer: owner + offset
-        old_owner_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        old_owner = builder.load(old_owner_ptr)
+        # Compute old data pointer: owner + offset (Phase 4: owner is i64 handle)
+        old_owner_handle_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        old_owner_handle = builder.load(old_owner_handle_ptr)
+        old_owner = builder.inttoptr(old_owner_handle, ir.IntType(8).as_pointer())
         old_offset_ptr = builder.gep(old_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         old_offset = builder.load(old_offset_ptr)
         old_data = builder.gep(old_owner, [old_offset])
 
-        # New array has offset=0, so just load owner directly
-        new_data_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        new_data = builder.load(new_data_ptr)
+        # New array has offset=0, so just load owner (Phase 4: owner is i64 handle)
+        new_data_handle_ptr = builder.gep(new_arr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        new_data_handle = builder.load(new_data_handle_ptr)
+        new_data = builder.inttoptr(new_data_handle, ir.IntType(8).as_pointer())
 
         copy_size = builder.mul(old_len, elem_size)
         builder.call(self.memcpy, [new_data, old_data, copy_size])
@@ -1955,9 +1962,10 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Load source fields
-        src_owner_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_owner = builder.load(src_owner_ptr)
+        # Load source fields (Phase 4: owner is i64 handle)
+        src_owner_handle_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner_handle = builder.load(src_owner_handle_ptr)
+        src_owner = builder.inttoptr(src_owner_handle, ir.IntType(8).as_pointer())
 
         src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
@@ -1976,7 +1984,7 @@ class CodeGenerator:
 
         # Allocate new data buffer
         type_id = ir.Constant(i32, self.gc.TYPE_ARRAY_DATA)
-        new_data = builder.call(self.gc.gc_alloc, [data_size, type_id])
+        new_data = self.gc.alloc_with_deref(builder, data_size, type_id)
 
         # Copy data from source to new buffer
         builder.call(self.memcpy, [new_data, src_data, data_size])
@@ -1984,12 +1992,13 @@ class CodeGenerator:
         # Allocate new Array descriptor (40 bytes)
         struct_size = ir.Constant(i64, 40)
         array_type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, array_type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, array_type_id)
         array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
 
-        # Store owner = new_data (independent buffer)
+        # Store owner = new_data (Phase 4: owner is i64 handle)
         new_owner_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_data, new_owner_ptr)
+        new_owner_handle = builder.ptrtoint(new_data, i64)
+        builder.store(new_owner_handle, new_owner_ptr)
 
         # Store offset = 0 (fresh allocation, not a view)
         new_offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2013,11 +2022,12 @@ class CodeGenerator:
         """Create a slice VIEW of an array (zero-copy).
 
         Returns a new Array descriptor that shares the parent's data buffer.
-        Layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+        Layout: { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }
+        Phase 4: owner is now i64 handle (copied directly for shared ownership).
 
         The slice's offset = parent.offset + (start * elem_size)
         The slice's len = end - start
-        The slice shares the same owner pointer (zero-copy).
+        The slice shares the same owner handle (zero-copy).
         """
         func = self.array_getrange
         func.args[0].name = "arr"
@@ -2034,9 +2044,9 @@ class CodeGenerator:
         i64 = ir.IntType(64)
         zero = ir.Constant(i64, 0)
 
-        # Load source fields
-        src_owner_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_owner = builder.load(src_owner_ptr)
+        # Load source fields (Phase 4: owner is i64 handle - copy directly for slice view)
+        src_owner_handle_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner_handle = builder.load(src_owner_handle_ptr)
 
         src_offset_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
@@ -2067,12 +2077,12 @@ class CodeGenerator:
         # Allocate new Array descriptor (40 bytes) - NO data copy!
         struct_size = ir.Constant(i64, 40)
         type_id = ir.Constant(i32, self.gc.TYPE_ARRAY)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         array_ptr = builder.bitcast(raw_ptr, self.array_struct.as_pointer())
 
-        # Store owner (shared with source - this is the slice view!)
+        # Store owner handle (shared with source - this is the slice view!)
         new_owner_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(src_owner, new_owner_ptr)
+        builder.store(src_owner_handle, new_owner_ptr)
 
         # Store new offset
         new_offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2140,9 +2150,10 @@ class CodeGenerator:
         array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         self.builder.store(list_len, array_len_ptr)
 
-        # Array data: compute owner + offset (fields 0 and 1)
-        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner = self.builder.load(array_owner_ptr)
+        # Array data: compute owner + offset (Phase 4: owner is i64 handle)
+        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner_handle = self.builder.load(array_owner_handle_ptr)
+        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
         array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         array_offset = self.builder.load(array_offset_ptr)
         array_data = self.builder.gep(array_owner, [array_offset])
@@ -2211,13 +2222,15 @@ class CodeGenerator:
         # Get list of keys from set using set_to_list (HAMT-based)
         key_list = self.builder.call(self.set_to_list, [set_ptr])
 
-        # Get list data pointer (field 3 in List struct)
-        list_data_ptr = self.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        list_data = self.builder.load(list_data_ptr)
+        # Get list data pointer (field 3 in List struct) - Phase 4: handle
+        list_data_handle_ptr = self.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        list_data_handle = self.builder.load(list_data_handle_ptr)
+        list_data = self.builder.inttoptr(list_data_handle, i8_ptr)
 
-        # Get array data pointer: compute owner + offset (fields 0 and 1)
-        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner = self.builder.load(array_owner_ptr)
+        # Get array data pointer: compute owner + offset (Phase 4: owner is i64 handle)
+        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner_handle = self.builder.load(array_owner_handle_ptr)
+        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
         array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         array_offset = self.builder.load(array_offset_ptr)
         array_data = self.builder.gep(array_owner, [array_offset])
@@ -2252,9 +2265,10 @@ class CodeGenerator:
         elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
-        # Get Array data: compute owner + offset (fields 0 and 1)
-        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner = self.builder.load(array_owner_ptr)
+        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
+        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner_handle = self.builder.load(array_owner_handle_ptr)
+        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
         array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         array_offset = self.builder.load(array_offset_ptr)
         array_data = self.builder.gep(array_owner, [array_offset])
@@ -2323,9 +2337,10 @@ class CodeGenerator:
         elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         elem_size = self.builder.load(elem_size_ptr)
 
-        # Get Array data: compute owner + offset (fields 0 and 1)
-        array_owner_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner = self.builder.load(array_owner_ptr)
+        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
+        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_owner_handle = self.builder.load(array_owner_handle_ptr)
+        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
         array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         array_offset = self.builder.load(array_offset_ptr)
         array_data = self.builder.gep(array_owner, [array_offset])
@@ -2535,9 +2550,10 @@ class CodeGenerator:
         Strings are immutable and GC-managed. No refcounting needed.
         """
         # String struct - immutable, GC-managed, supports slice views
+        # Phase 4: owner is now i64 handle instead of i8* pointer
         self.string_struct = ir.global_context.get_identified_type("struct.String")
         self.string_struct.set_body(
-            ir.IntType(8).as_pointer(),  # owner (field 0) - pointer to data buffer
+            ir.IntType(64),  # owner_handle (field 0) - handle to data buffer
             ir.IntType(64),  # offset (field 1) - byte offset into owner's data
             ir.IntType(64),  # len - codepoint count (field 2)
             ir.IntType(64),  # size - byte count (field 3)
@@ -2719,8 +2735,9 @@ class CodeGenerator:
     def _implement_string_data(self):
         """Get pointer to actual data (owner + offset).
 
-        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Phase 4: Layout: { i64 owner_handle, i64 offset, i64 len, i64 size }
         Returns owner + offset to get the actual data pointer.
+        owner_handle is converted from i64 to pointer using inttoptr.
         """
         func = self.string_data
         func.args[0].name = "s"
@@ -2729,13 +2746,18 @@ class CodeGenerator:
         builder = ir.IRBuilder(entry)
 
         s = func.args[0]
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
 
-        # Load owner pointer from field 0
-        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        # Load owner_handle from field 0 (Phase 4: i64)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+
+        # Convert handle to pointer (Phase 4: inttoptr for backward compatibility)
+        owner_ptr = builder.inttoptr(owner_handle, i8_ptr)
 
         # Load offset from field 1
-        offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
 
         # Compute data pointer: owner + offset
@@ -2746,11 +2768,12 @@ class CodeGenerator:
     def _implement_string_new(self):
         """Create String from data pointer, byte length, and char count.
 
-        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Phase 4: Layout: { i64 owner_handle, i64 offset, i64 len, i64 size }
         - Allocates 32 bytes for struct via GC
         - Allocates byte_len bytes for data via GC
         - Sets offset to 0 (new strings own their data from the start)
         - Strings are immutable, GC-managed
+        - owner_handle is stored as i64 (ptrtoint for backward compatibility)
         """
         func = self.string_new
         func.args[0].name = "data"
@@ -2764,33 +2787,37 @@ class CodeGenerator:
         byte_len = func.args[1]
         char_count = func.args[2]
 
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+
         # Allocate 32 bytes for String struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 32)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        struct_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING)
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
         # Allocate data buffer: byte_len bytes via GC
-        string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
-        data_buf = builder.call(self.gc.gc_alloc, [byte_len, string_data_type_id])
+        string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        data_buf = self.gc.alloc_with_deref(builder, byte_len, string_data_type_id)
 
         # Copy source data to buffer
         builder.call(self.memcpy, [data_buf, data, byte_len])
 
-        # Store owner pointer at field 0
-        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_buf, owner_ptr_ptr)
+        # Store owner_handle at field 0 (Phase 4: convert pointer to i64)
+        owner_handle = builder.ptrtoint(data_buf, i64)
+        owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(owner_handle, owner_ptr)
 
         # Store offset = 0 at field 1 (new strings start at beginning of buffer)
-        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), offset_ptr)
 
         # Store len (codepoint count) at field 2
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(char_count, len_ptr)
 
         # Store size (byte count) at field 3
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(byte_len, size_ptr)
 
         builder.ret(string_ptr)
@@ -2863,30 +2890,34 @@ class CodeGenerator:
         # Allocate 32 bytes for String struct via GC
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
         # Allocate data buffer and copy literal data (for GC consistency)
         # This ensures all string data pointers are GC-allocated, allowing
         # the GC to mark them correctly during recursive marking
         string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
-        data_buf = builder.call(self.gc.gc_alloc, [final_byte_len, string_data_type_id])
+        data_buf = self.gc.alloc_with_deref(builder, final_byte_len, string_data_type_id)
         builder.call(self.memcpy, [data_buf, cstr, final_byte_len])
 
-        # Store owner pointer at field 0
-        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(data_buf, owner_ptr_ptr)
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+
+        # Store owner_handle at field 0 (Phase 4: convert pointer to i64)
+        owner_handle = builder.ptrtoint(data_buf, i64)
+        owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(owner_handle, owner_ptr)
 
         # Store offset = 0 at field 1 (new strings start at beginning of buffer)
-        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), offset_ptr)
 
         # Store len (codepoint count) at field 2
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(final_char_count, len_ptr)
 
         # Store size (byte count) at field 3
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(final_byte_len, size_ptr)
 
         builder.ret(string_ptr)
@@ -2976,9 +3007,10 @@ class CodeGenerator:
         builder.cbranch(is_invalid, out_of_bounds, in_bounds)
 
         builder.position_at_end(in_bounds)
-        # Compute data pointer: owner + offset
-        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        # Compute data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -3040,14 +3072,20 @@ class CodeGenerator:
         # Calculate new byte length (size of slice)
         new_byte_len = builder.sub(end_clamped, start_clamped)
 
-        # Load source owner and offset
-        source_owner_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        source_owner = builder.load(source_owner_ptr)
-        source_offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Load source owner_handle and offset (Phase 4: owner is i64)
+        source_owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        source_owner_handle = builder.load(source_owner_handle_ptr)
+        source_offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         source_offset = builder.load(source_offset_ptr)
 
         # Calculate new offset: source.offset + start_clamped
         new_offset = builder.add(source_offset, start_clamped)
+
+        # Convert owner_handle to pointer for data access (Phase 4)
+        source_owner = builder.inttoptr(source_owner_handle, i8_ptr)
 
         # Compute data pointer for codepoint counting
         slice_start = builder.gep(source_owner, [new_offset])
@@ -3089,23 +3127,24 @@ class CodeGenerator:
         # Allocate new String descriptor (32 bytes) - NO data copy!
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Store owner (shared with source - this is the slice view!)
-        new_owner_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(source_owner, new_owner_ptr)
+        # Store owner_handle (shared with source - this is the slice view!)
+        # Phase 4: store i64 handle, not pointer
+        new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(source_owner_handle, new_owner_ptr)
 
         # Store new offset
-        new_offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        new_offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(new_offset, new_offset_ptr)
 
         # Store len (codepoint count) at field 2
-        new_len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        new_len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(final_char_count, new_len_ptr)
 
         # Store size (byte count) at field 3
-        new_size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        new_size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(new_byte_len, new_size_ptr)
 
         builder.ret(string_ptr)
@@ -3113,7 +3152,7 @@ class CodeGenerator:
     def _implement_string_concat(self):
         """Concatenate two strings.
 
-        Layout: { i8* owner, i64 offset, i64 len, i64 size }
+        Phase 4: Layout: { i64 owner_handle, i64 offset, i64 len, i64 size }
         Creates a new immutable string, GC-managed.
         Result has offset=0 (owns its data from the start).
         """
@@ -3127,18 +3166,22 @@ class CodeGenerator:
         a = func.args[0]
         b = func.args[1]
 
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
+
         # Get size (byte count) from both strings (field 3)
-        a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        a_size_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         a_size = builder.load(a_size_ptr)
 
-        b_size_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        b_size_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         b_size = builder.load(b_size_ptr)
 
         # Get len (codepoint count) from both strings (field 2)
-        a_len_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        a_len_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         a_len = builder.load(a_len_ptr)
 
-        b_len_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        b_len_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         b_len = builder.load(b_len_ptr)
 
         # Total byte size and codepoint count
@@ -3146,46 +3189,49 @@ class CodeGenerator:
         total_len = builder.add(a_len, b_len)
 
         # Allocate 32 bytes for String struct via GC
-        struct_size = ir.Constant(ir.IntType(64), 32)
-        type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        struct_size = ir.Constant(i64, 32)
+        type_id = ir.Constant(i32, self.gc.TYPE_STRING)
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
         # Allocate data buffer: total_size bytes via GC
-        string_data_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_STRING_DATA)
-        dest_data = builder.call(self.gc.gc_alloc, [total_size, string_data_type_id])
+        string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
+        dest_data = self.gc.alloc_with_deref(builder, total_size, string_data_type_id)
 
-        # Compute a's data pointer: owner + offset
-        a_owner_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_owner = builder.load(a_owner_ptr)
-        a_offset_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        # Compute a's data pointer: owner + offset (Phase 4: load handle, convert to ptr)
+        a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        a_owner_handle = builder.load(a_owner_handle_ptr)
+        a_owner = builder.inttoptr(a_owner_handle, i8_ptr)
+        a_offset_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         a_offset = builder.load(a_offset_ptr)
         a_data = builder.gep(a_owner, [a_offset])
         builder.call(self.memcpy, [dest_data, a_data, a_size])
 
-        # Compute b's data pointer: owner + offset
+        # Compute b's data pointer: owner + offset (Phase 4: load handle, convert to ptr)
         b_dest = builder.gep(dest_data, [a_size])
-        b_owner_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_owner = builder.load(b_owner_ptr)
-        b_offset_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        b_owner_handle_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        b_owner_handle = builder.load(b_owner_handle_ptr)
+        b_owner = builder.inttoptr(b_owner_handle, i8_ptr)
+        b_offset_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
         builder.call(self.memcpy, [b_dest, b_data, b_size])
 
-        # Store owner pointer at field 0
-        owner_ptr_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        builder.store(dest_data, owner_ptr_ptr)
+        # Store owner_handle at field 0 (Phase 4: convert pointer to i64)
+        owner_handle = builder.ptrtoint(dest_data, i64)
+        owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        builder.store(owner_handle, owner_ptr)
 
         # Store offset = 0 at field 1 (new strings own their data from the start)
-        offset_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+        offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        builder.store(ir.Constant(i64, 0), offset_ptr)
 
         # Store len at field 2
-        len_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(total_len, len_ptr)
 
         # Store size at field 3
-        size_ptr = builder.gep(string_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(total_size, size_ptr)
 
         builder.ret(string_ptr)
@@ -3306,16 +3352,17 @@ class CodeGenerator:
         # Allocate result string struct via GC
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         result_str = builder.bitcast(raw_ptr, string_ptr_ty)
 
         # Allocate data buffer
         string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        dest_data = builder.call(self.gc.gc_alloc, [total_size, string_data_type_id])
+        dest_data = self.gc.alloc_with_deref(builder, total_size, string_data_type_id)
 
-        # Store fields in result string
+        # Store fields in result string (Phase 4: owner is i64 handle)
         owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(dest_data, owner_ptr)
+        owner_handle = builder.ptrtoint(dest_data, i64)
+        builder.store(owner_handle, owner_ptr)
         offset_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), offset_ptr)
         len_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
@@ -3349,11 +3396,12 @@ class CodeGenerator:
         is_first = builder.icmp_signed("==", idx, ir.Constant(i64, 0))
         builder.cbranch(is_first, skip_sep_block, add_sep_block)
 
-        # Add separator
+        # Add separator (Phase 4: owner is i64 handle)
         builder.position_at_end(add_sep_block)
         sep_dest = builder.gep(dest_data, [write_pos])
-        sep_owner_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        sep_owner = builder.load(sep_owner_ptr)
+        sep_owner_handle_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        sep_owner_handle = builder.load(sep_owner_handle_ptr)
+        sep_owner = builder.inttoptr(sep_owner_handle, ir.IntType(8).as_pointer())
         sep_offset_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         sep_offset = builder.load(sep_offset_ptr)
         sep_data = builder.gep(sep_owner, [sep_offset])
@@ -3374,8 +3422,10 @@ class CodeGenerator:
         elem_i64 = builder.load(elem_i64_ptr)
         elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
 
-        elem_owner_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        elem_owner = builder.load(elem_owner_ptr)
+        # Phase 4: owner is i64 handle
+        elem_owner_handle_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        elem_owner_handle = builder.load(elem_owner_handle_ptr)
+        elem_owner = builder.inttoptr(elem_owner_handle, ir.IntType(8).as_pointer())
         elem_offset_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         elem_offset = builder.load(elem_offset_ptr)
         elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -3432,16 +3482,18 @@ class CodeGenerator:
         builder.cbranch(size_eq, check_data, not_equal)
 
         builder.position_at_end(check_data)
-        # Compute a's data pointer: owner + offset
-        a_owner_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        a_owner = builder.load(a_owner_ptr)
+        # Compute a's data pointer: owner + offset (Phase 4: owner is i64 handle)
+        a_owner_handle_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        a_owner_handle = builder.load(a_owner_handle_ptr)
+        a_owner = builder.inttoptr(a_owner_handle, ir.IntType(8).as_pointer())
         a_offset_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         a_offset = builder.load(a_offset_ptr)
         a_data = builder.gep(a_owner, [a_offset])
 
-        # Compute b's data pointer: owner + offset
-        b_owner_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        b_owner = builder.load(b_owner_ptr)
+        # Compute b's data pointer: owner + offset (Phase 4: owner is i64 handle)
+        b_owner_handle_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        b_owner_handle = builder.load(b_owner_handle_ptr)
+        b_owner = builder.inttoptr(b_owner_handle, ir.IntType(8).as_pointer())
         b_offset_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
@@ -3504,16 +3556,18 @@ class CodeGenerator:
         needle_size_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         needle_size = builder.load(needle_size_ptr)
 
-        # Compute s's data pointer: owner + offset
-        s_owner_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        s_owner = builder.load(s_owner_ptr)
+        # Compute s's data pointer: owner + offset (Phase 4: owner is i64 handle)
+        s_owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        s_owner_handle = builder.load(s_owner_handle_ptr)
+        s_owner = builder.inttoptr(s_owner_handle, ir.IntType(8).as_pointer())
         s_offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         s_offset = builder.load(s_offset_ptr)
         s_data = builder.gep(s_owner, [s_offset])
 
-        # Compute needle's data pointer: owner + offset
-        needle_owner_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        needle_owner = builder.load(needle_owner_ptr)
+        # Compute needle's data pointer: owner + offset (Phase 4: owner is i64 handle)
+        needle_owner_handle_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        needle_owner_handle = builder.load(needle_owner_handle_ptr)
+        needle_owner = builder.inttoptr(needle_owner_handle, ir.IntType(8).as_pointer())
         needle_offset_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         needle_offset = builder.load(needle_offset_ptr)
         needle_data = builder.gep(needle_owner, [needle_offset])
@@ -3595,9 +3649,10 @@ class CodeGenerator:
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
 
-        # Compute data pointer: owner + offset
-        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        # Compute data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -3629,9 +3684,10 @@ class CodeGenerator:
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
 
-        # Compute data pointer: owner + offset
-        owner_ptr_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        # Compute data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -3684,9 +3740,10 @@ class CodeGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Load source fields
-        src_owner_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        src_owner = builder.load(src_owner_ptr)
+        # Load source fields (Phase 4: owner is i64 handle)
+        src_owner_handle_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        src_owner_handle = builder.load(src_owner_handle_ptr)
+        src_owner = builder.inttoptr(src_owner_handle, i8_ptr)
 
         src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
@@ -3702,7 +3759,7 @@ class CodeGenerator:
 
         # Allocate new data buffer (src_size bytes)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        new_data = builder.call(self.gc.gc_alloc, [src_size, type_id])
+        new_data = self.gc.alloc_with_deref(builder, src_size, type_id)
 
         # Copy data from source to new buffer
         builder.call(self.memcpy, [new_data, src_data, src_size])
@@ -3710,12 +3767,13 @@ class CodeGenerator:
         # Allocate new String descriptor (32 bytes)
         struct_size = ir.Constant(i64, 32)
         string_type_id = ir.Constant(i32, self.gc.TYPE_STRING)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, string_type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, string_type_id)
         string_ptr = builder.bitcast(raw_ptr, self.string_struct.as_pointer())
 
-        # Store owner = new_data (independent buffer)
+        # Store owner = new_data (Phase 4: owner is i64 handle)
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(new_data, new_owner_ptr)
+        new_owner_handle = builder.ptrtoint(new_data, i64)
+        builder.store(new_owner_handle, new_owner_ptr)
 
         # Store offset = 0 (fresh allocation, not a view)
         new_offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -3762,9 +3820,10 @@ class CodeGenerator:
         builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(init_loop)
-        # Compute data pointer: owner + offset
-        owner_ptr_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        # Compute data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -3843,20 +3902,22 @@ class CodeGenerator:
         end = func.args[2]
         source = func.args[3]
 
-        # Get source string byte size (field 3) and compute data pointer (owner + offset)
+        # Get source string byte size (field 3) and compute data pointer (Phase 4: owner is i64 handle)
         source_size_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         source_size = builder.load(source_size_ptr)
-        source_owner_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        source_owner = builder.load(source_owner_ptr)
+        source_owner_handle_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        source_owner_handle = builder.load(source_owner_handle_ptr)
+        source_owner = builder.inttoptr(source_owner_handle, i8_ptr)
         source_offset_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         source_offset = builder.load(source_offset_ptr)
         source_data = builder.gep(source_owner, [source_offset])
 
-        # Get original string byte size (field 3) and compute data pointer (owner + offset)
+        # Get original string byte size (field 3) and compute data pointer (Phase 4: owner is i64 handle)
         orig_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         orig_size = builder.load(orig_size_ptr)
-        orig_owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        orig_owner = builder.load(orig_owner_ptr)
+        orig_owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        orig_owner_handle = builder.load(orig_owner_handle_ptr)
+        orig_owner = builder.inttoptr(orig_owner_handle, i8_ptr)
         orig_offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         orig_offset = builder.load(orig_offset_ptr)
         orig_data = builder.gep(orig_owner, [orig_offset])
@@ -3877,7 +3938,7 @@ class CodeGenerator:
 
         # Allocate new data buffer
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        new_data = builder.call(self.gc.gc_alloc, [new_size, type_id])
+        new_data = self.gc.alloc_with_deref(builder, new_size, type_id)
 
         # Copy prefix: [0, start)
         builder.call(self.memcpy, [new_data, orig_data, start_clamped])
@@ -3964,9 +4025,10 @@ class CodeGenerator:
         size = builder.load(size_ptr)
         is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
 
-        # Get data pointer: owner + offset
-        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner = builder.load(owner_ptr)
+        # Get data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner = builder.inttoptr(owner_handle, i8_ptr)
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
@@ -4043,9 +4105,10 @@ class CodeGenerator:
         size = builder.load(size_ptr)
         is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
 
-        # Get data pointer: owner + offset
-        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner = builder.load(owner_ptr)
+        # Get data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner = builder.inttoptr(owner_handle, i8_ptr)
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
@@ -4106,9 +4169,10 @@ class CodeGenerator:
         size = builder.load(size_ptr)
         is_empty = builder.icmp_signed("==", size, ir.Constant(i64, 0))
 
-        # Get data pointer: owner + offset
-        owner_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner = builder.load(owner_ptr)
+        # Get data pointer: owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner = builder.inttoptr(owner_handle, i8_ptr)
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
@@ -4160,7 +4224,7 @@ class CodeGenerator:
         # Allocate a small buffer on the stack (32 bytes is plenty for any i64)
         buf_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+        buf = self.gc.alloc_with_deref(builder, buf_size, type_id)
 
         # Call snprintf(buf, 32, "%lld", n)
         fmt_ptr = builder.bitcast(self._int_conv_fmt, i8_ptr)
@@ -4194,7 +4258,7 @@ class CodeGenerator:
         # Allocate a buffer (64 bytes for float representation)
         buf_size = ir.Constant(i64, 64)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+        buf = self.gc.alloc_with_deref(builder, buf_size, type_id)
 
         # Call snprintf(buf, 64, "%g", f)
         fmt_ptr = builder.bitcast(self._float_conv_fmt, i8_ptr)
@@ -4267,7 +4331,7 @@ class CodeGenerator:
         # Allocate a buffer (32 bytes for hex representation)
         buf_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        buf = builder.call(self.gc.gc_alloc, [buf_size, type_id])
+        buf = self.gc.alloc_with_deref(builder, buf_size, type_id)
 
         # Call snprintf(buf, 32, "%llx", n)
         fmt_ptr = builder.bitcast(self._hex_conv_fmt, i8_ptr)
@@ -4327,7 +4391,7 @@ class CodeGenerator:
 
         # Allocate destination buffer
         type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        data_buf = builder.call(self.gc.gc_alloc, [byte_len, type_id])
+        data_buf = self.gc.alloc_with_deref(builder, byte_len, type_id)
 
         # Initialize counters
         idx_ptr = builder.alloca(i64, name="idx")
@@ -4383,7 +4447,7 @@ class CodeGenerator:
         # Handle empty list - return empty string
         builder.position_at_end(done)
         # Allocate empty string
-        empty_buf = builder.call(self.gc.gc_alloc, [ir.Constant(i64, 1), type_id])
+        empty_buf = self.gc.alloc_with_deref(builder, ir.Constant(i64, 1), type_id)
         builder.store(ir.Constant(i8, 0), empty_buf)
         empty_str = builder.call(self.string_new, [empty_buf, ir.Constant(i64, 0), ir.Constant(i64, 0)])
         builder.ret(empty_str)
@@ -4958,20 +5022,21 @@ class CodeGenerator:
             ir.IntType(64)   # value (field 2)
         )
 
-        # HAMTNode struct: { i32 bitmap, i8** children }
+        # HAMTNode struct: { i32 bitmap, i64* children } - Phase 5: children are i64 handles
         # Children array is allocated separately with popcount(bitmap) elements
+        # Each child is stored as i64 (pointer converted via ptrtoint)
         self.hamt_node_struct = ir.global_context.get_identified_type("struct.HAMTNode")
         self.hamt_node_struct.set_body(
             ir.IntType(32),  # bitmap (field 0)
-            ir.IntType(8).as_pointer().as_pointer()  # children (field 1)
+            ir.IntType(64).as_pointer()  # children (field 1) - Phase 5: i64 array
         )
 
-        # HAMTCollision struct: { i64 hash, i32 count, HAMTLeaf* entries }
+        # HAMTCollision struct: { i64 hash, i32 count, i64 entries } - Phase 5: entries is i64 handle
         self.hamt_collision_struct = ir.global_context.get_identified_type("struct.HAMTCollision")
         self.hamt_collision_struct.set_body(
             ir.IntType(64),  # hash (field 0)
             ir.IntType(32),  # count (field 1)
-            self.hamt_leaf_struct.as_pointer()  # entries (field 2)
+            ir.IntType(64)   # entries (field 2) - Phase 5: pointer stored as i64
         )
 
         # Map struct: { i64 root, i64 len, i64 flags }
@@ -5232,16 +5297,17 @@ class CodeGenerator:
         # Allocate HAMTNode struct (4 + 8 = 16 bytes with padding)
         node_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_HAMT_NODE if hasattr(self.gc, 'TYPE_HAMT_NODE') else 0)
-        raw_ptr = builder.call(self.gc.gc_alloc, [node_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, node_size, type_id)
         node_ptr = builder.bitcast(raw_ptr, self.hamt_node_struct.as_pointer())
 
         # Store bitmap (field 0)
         bitmap_field = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(bitmap, bitmap_field)
 
-        # Allocate children array: child_count * 8 bytes (pointers)
+        # Allocate children array: child_count * 8 bytes (i64 handles) - Phase 5
         child_count_64 = builder.zext(child_count, i64)
         children_size = builder.mul(child_count_64, ir.Constant(i64, 8))
+        i64_ptr = ir.IntType(64).as_pointer()
 
         # Handle zero children case
         zero_children = builder.icmp_unsigned("==", child_count, ir.Constant(i32, 0))
@@ -5249,12 +5315,12 @@ class CodeGenerator:
             with then:
                 # No children - store null pointer
                 children_field = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-                null_ptr = ir.Constant(void_ptr.as_pointer(), None)
+                null_ptr = ir.Constant(i64_ptr, None)
                 builder.store(null_ptr, children_field)
             with otherwise:
-                # Allocate children array
-                children_raw = builder.call(self.gc.gc_alloc, [children_size, ir.Constant(i32, 0)])
-                children_ptr = builder.bitcast(children_raw, void_ptr.as_pointer())
+                # Allocate children array - Phase 5: array of i64
+                children_raw = self.gc.alloc_with_deref(builder, children_size, ir.Constant(i32, 0))
+                children_ptr = builder.bitcast(children_raw, i64_ptr)
                 children_field2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
                 builder.store(children_ptr, children_field2)
 
@@ -5279,7 +5345,7 @@ class CodeGenerator:
         # Allocate HAMTLeaf struct (8 + 8 + 8 = 24 bytes)
         leaf_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_HAMT_LEAF if hasattr(self.gc, 'TYPE_HAMT_LEAF') else 0)
-        raw_ptr = builder.call(self.gc.gc_alloc, [leaf_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, leaf_size, type_id)
         leaf_ptr = builder.bitcast(raw_ptr, self.hamt_leaf_struct.as_pointer())
 
         # Store hash (field 0)
@@ -5385,12 +5451,13 @@ class CodeGenerator:
         lower_bits = builder.and_(bitmap, lower_mask)
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
 
-        # Get child pointer
+        # Get child pointer - Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         # Recurse with shift + 5
         new_shift = builder.add(shift, ir.Constant(i32, 5))
@@ -5472,11 +5539,13 @@ class CodeGenerator:
         lower_bits = builder.and_(bitmap, lower_mask)
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         new_shift = builder.add(shift, ir.Constant(i32, 5))
         result = builder.call(self.hamt_contains, [child_ptr, hash_val, key, new_shift])
@@ -5595,7 +5664,9 @@ class CodeGenerator:
         single_child_node = builder.call(self.hamt_node_new, [single_bit_mask, ir.Constant(i32, 1)])
         single_children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         single_children_ptr = builder.load(single_children_ptr_ptr)
-        builder.store(sub_result, builder.gep(single_children_ptr, [ir.Constant(i64, 0)]))
+        # Phase 5: convert pointer to i64 before storing
+        sub_result_i64 = builder.ptrtoint(sub_result, i64)
+        builder.store(sub_result_i64, builder.gep(single_children_ptr, [ir.Constant(i64, 0)]))
         single_child_node_void = builder.bitcast(single_child_node, void_ptr)
         builder.ret(single_child_node_void)
 
@@ -5626,9 +5697,12 @@ class CodeGenerator:
         new_child_ptr = builder.gep(split_children_ptr, [new_idx_64])
 
         # Store existing leaf (keep its tag) and new leaf (already tagged)
+        # Phase 5: convert pointers to i64 before storing
         new_leaf4_void = builder.bitcast(new_leaf4, void_ptr)
-        builder.store(node, old_child_ptr)  # node still has its tag
-        builder.store(new_leaf4_void, new_child_ptr)
+        node_i64 = builder.ptrtoint(node, i64)
+        new_leaf4_i64 = builder.ptrtoint(new_leaf4_void, i64)
+        builder.store(node_i64, old_child_ptr)  # node still has its tag
+        builder.store(new_leaf4_i64, new_child_ptr)
 
         split_node_void = builder.bitcast(split_node, void_ptr)
         builder.ret(split_node_void)
@@ -5657,11 +5731,13 @@ class CodeGenerator:
         child_idx_2 = builder.call(self.hamt_popcount, [lower_bits_2])
         old_count_2 = builder.call(self.hamt_popcount, [bitmap])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr_2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr_2 = builder.load(children_ptr_ptr_2)
         child_idx_64_2 = builder.zext(child_idx_2, i64)
         child_ptr_ptr_2 = builder.gep(children_ptr_2, [child_idx_64_2])
-        old_child = builder.load(child_ptr_ptr_2)
+        old_child_handle = builder.load(child_ptr_ptr_2)
+        old_child = builder.inttoptr(old_child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         # Recurse
         next_shift_2 = builder.add(shift, ir.Constant(i32, 5))
@@ -5693,8 +5769,10 @@ class CodeGenerator:
         dst_ptr = builder.gep(new_children_ptr, [copy_idx_64])
 
         # Check if this is the child being updated
+        # Phase 5: work with i64 values for children array
         is_updated_child = builder.icmp_signed("==", copy_idx, child_idx_2)
-        child_to_store = builder.select(is_updated_child, new_child, builder.load(src_ptr))
+        new_child_i64 = builder.ptrtoint(new_child, i64)
+        child_to_store = builder.select(is_updated_child, new_child_i64, builder.load(src_ptr))
         builder.store(child_to_store, dst_ptr)
 
         next_copy_idx = builder.add(copy_idx, ir.Constant(i32, 1))
@@ -5751,12 +5829,14 @@ class CodeGenerator:
         builder.branch(copy_before)
 
         # Insert new leaf (hamt_leaf_new returns tagged pointer)
+        # Phase 5: convert pointer to i64 before storing
         builder.position_at_end(insert_new)
         new_leaf_5 = builder.call(self.hamt_leaf_new, [hash_val, key, value])
         new_leaf_5_void = builder.bitcast(new_leaf_5, void_ptr)
+        new_leaf_5_i64 = builder.ptrtoint(new_leaf_5_void, i64)
         insert_idx_64 = builder.zext(insert_idx, i64)
         insert_ptr = builder.gep(new_children_ptr_3, [insert_idx_64])
-        builder.store(new_leaf_5_void, insert_ptr)
+        builder.store(new_leaf_5_i64, insert_ptr)
 
         # Copy children after insertion point
         copy_after = func.append_basic_block("copy_after")
@@ -5882,11 +5962,13 @@ class CodeGenerator:
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
         old_count = builder.call(self.hamt_popcount, [bitmap])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        old_child = builder.load(child_ptr_ptr)
+        old_child_handle = builder.load(child_ptr_ptr)
+        old_child = builder.inttoptr(old_child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         next_shift = builder.add(shift, ir.Constant(i32, 5))
         new_child = builder.call(self.hamt_remove, [old_child, hash_val, key, next_shift, removed_ptr])
@@ -6009,12 +6091,14 @@ class CodeGenerator:
         loop_done_2 = builder.icmp_signed(">=", copy_idx_4, old_count)
         builder.cbranch(loop_done_2, copy_done_keep, copy_body_keep)
 
+        # Phase 5: work with i64 values for children array
         builder.position_at_end(copy_body_keep)
         copy_idx_4_64 = builder.zext(copy_idx_4, i64)
         src_ptr_4 = builder.gep(children_ptr, [copy_idx_4_64])
         dst_ptr_4 = builder.gep(updated_children_ptr, [copy_idx_4_64])
         is_updated = builder.icmp_signed("==", copy_idx_4, child_idx)
-        to_store = builder.select(is_updated, new_child, builder.load(src_ptr_4))
+        new_child_i64 = builder.ptrtoint(new_child, i64)
+        to_store = builder.select(is_updated, new_child_i64, builder.load(src_ptr_4))
         builder.store(to_store, dst_ptr_4)
 
         next_copy_4 = builder.add(copy_idx_4, ir.Constant(i32, 1))
@@ -6107,10 +6191,12 @@ class CodeGenerator:
         done = builder.icmp_signed(">=", idx, popcount)
         builder.cbranch(done, loop_done, loop_body)
 
+        # Phase 5: children array is i64*
         builder.position_at_end(loop_body)
         idx_64 = builder.zext(idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         current_list = builder.load(result_ptr)
         updated_list = builder.call(self.hamt_collect_keys, [child_ptr, current_list])
@@ -6206,10 +6292,12 @@ class CodeGenerator:
         done = builder.icmp_signed(">=", idx, popcount)
         builder.cbranch(done, loop_done, loop_body)
 
+        # Phase 5: children array is i64*
         builder.position_at_end(loop_body)
         idx_64 = builder.zext(idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         current_list = builder.load(result_ptr)
         updated_list = builder.call(self.hamt_collect_values, [child_ptr, current_list])
@@ -6316,11 +6404,13 @@ class CodeGenerator:
         lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         new_shift = builder.add(shift, five)
         result = builder.call(self.hamt_lookup_string, [child_ptr, hash_val, key, new_shift])
@@ -6407,11 +6497,13 @@ class CodeGenerator:
         lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
         child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_ptr = builder.load(child_ptr_ptr)
+        child_handle = builder.load(child_ptr_ptr)
+        child_ptr = builder.inttoptr(child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         new_shift = builder.add(shift, five)
         result = builder.call(self.hamt_contains_string, [child_ptr, hash_val, key, new_shift])
@@ -6531,7 +6623,9 @@ class CodeGenerator:
         single_child_node = builder.call(self.hamt_node_new, [single_bit, ir.Constant(i32, 1)])
         children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
-        builder.store(sub_result, builder.gep(children_ptr, [ir.Constant(i64, 0)]))
+        # Phase 5: convert pointer to i64 before storing
+        sub_result_i64 = builder.ptrtoint(sub_result, i64)
+        builder.store(sub_result_i64, builder.gep(children_ptr, [ir.Constant(i64, 0)]))
         single_node_void = builder.bitcast(single_child_node, void_ptr)
         builder.ret(single_node_void)
 
@@ -6562,8 +6656,11 @@ class CodeGenerator:
         new_pos_64 = builder.zext(new_pos, i64)
 
         # node is already tagged (original leaf), new leaf is tagged above
-        builder.store(node, builder.gep(split_children, [old_pos_64]))
-        builder.store(new_key_leaf_tagged, builder.gep(split_children, [new_pos_64]))
+        # Phase 5: convert pointers to i64 before storing
+        node_i64 = builder.ptrtoint(node, i64)
+        new_key_leaf_i64 = builder.ptrtoint(new_key_leaf_tagged, i64)
+        builder.store(node_i64, builder.gep(split_children, [old_pos_64]))
+        builder.store(new_key_leaf_i64, builder.gep(split_children, [new_pos_64]))
 
         split_node_void = builder.bitcast(split_node, void_ptr)
         builder.ret(split_node_void)
@@ -6592,10 +6689,12 @@ class CodeGenerator:
         e_child_idx = builder.call(self.hamt_popcount, [e_lower_bits])
         e_old_count = builder.call(self.hamt_popcount, [n_bitmap])
 
+        # Phase 5: children array is i64*
         e_children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         e_children = builder.load(e_children_ptr_ptr)
         e_child_idx_64 = builder.zext(e_child_idx, i64)
-        e_old_child = builder.load(builder.gep(e_children, [e_child_idx_64]))
+        e_old_child_handle = builder.load(builder.gep(e_children, [e_child_idx_64]))
+        e_old_child = builder.inttoptr(e_old_child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         e_next_shift = builder.add(shift, five)
         e_new_child = builder.call(self.hamt_insert_string, [e_old_child, hash_val, key, value, e_next_shift, added_ptr])
@@ -6619,11 +6718,13 @@ class CodeGenerator:
         e_done = builder.icmp_signed(">=", e_i, e_old_count)
         builder.cbranch(e_done, e_loop_done, e_loop_body)
 
+        # Phase 5: work with i64 values for children array
         builder.position_at_end(e_loop_body)
         e_is_updated = builder.icmp_unsigned("==", e_i, e_child_idx)
         e_i_64 = builder.zext(e_i, i64)
         e_old_val = builder.load(builder.gep(e_children, [e_i_64]))
-        e_copy_val = builder.select(e_is_updated, e_new_child, e_old_val)
+        e_new_child_i64 = builder.ptrtoint(e_new_child, i64)
+        e_copy_val = builder.select(e_is_updated, e_new_child_i64, e_old_val)
         builder.store(e_copy_val, builder.gep(e_new_children, [e_i_64]))
 
         e_next_i = builder.add(e_i, ir.Constant(i32, 1))
@@ -6687,8 +6788,10 @@ class CodeGenerator:
 
         builder.cbranch(a_is_insert, insert_new, copy_old)
 
+        # Phase 5: convert pointer to i64 before storing
         builder.position_at_end(insert_new)
-        builder.store(a_new_leaf_tagged, builder.gep(a_new_children, [a_dst_i_64]))
+        a_new_leaf_i64 = builder.ptrtoint(a_new_leaf_tagged, i64)
+        builder.store(a_new_leaf_i64, builder.gep(a_new_children, [a_dst_i_64]))
         builder.branch(after_insert)
 
         builder.position_at_end(copy_old)
@@ -6805,10 +6908,12 @@ class CodeGenerator:
         child_idx = builder.call(self.hamt_popcount, [lower_bits])
         old_count = builder.call(self.hamt_popcount, [bitmap])
 
+        # Phase 5: children array is i64*
         children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children = builder.load(children_ptr_ptr)
         child_idx_64 = builder.zext(child_idx, i64)
-        old_child = builder.load(builder.gep(children, [child_idx_64]))
+        old_child_handle = builder.load(builder.gep(children, [child_idx_64]))
+        old_child = builder.inttoptr(old_child_handle, void_ptr)  # Phase 5: convert i64 to pointer
 
         next_shift = builder.add(shift, five)
         new_child = builder.call(self.hamt_remove_string, [old_child, hash_val, key, next_shift, removed_ptr])
@@ -6912,11 +7017,13 @@ class CodeGenerator:
         u_done = builder.icmp_signed(">=", u_i, old_count)
         builder.cbranch(u_done, u_loop_done, u_loop_body)
 
+        # Phase 5: work with i64 values for children array
         builder.position_at_end(u_loop_body)
         u_is_updated = builder.icmp_unsigned("==", u_i, child_idx)
         u_i_64 = builder.zext(u_i, i64)
         u_old_val = builder.load(builder.gep(children, [u_i_64]))
-        u_copy_val = builder.select(u_is_updated, new_child, u_old_val)
+        new_child_i64 = builder.ptrtoint(new_child, i64)
+        u_copy_val = builder.select(u_is_updated, new_child_i64, u_old_val)
         builder.store(u_copy_val, builder.gep(updated_children, [u_i_64]))
 
         u_next_i = builder.add(u_i, ir.Constant(i32, 1))
@@ -6967,7 +7074,7 @@ class CodeGenerator:
         # Fields: root (i64), len (i64), flags (i64)
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
-        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, map_size, type_id)
         map_ptr = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
         # Store root = 0 (null as i64) (field 0)
@@ -7030,7 +7137,7 @@ class CodeGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
-        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -7151,7 +7258,7 @@ class CodeGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
-        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -7272,7 +7379,7 @@ class CodeGenerator:
         # Create new Map struct
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
-        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, map_ptr_type)
 
         # Store new root (convert pointer to i64)
@@ -7388,7 +7495,7 @@ class CodeGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_MAP)
-        raw_ptr = builder.call(self.gc.gc_alloc, [map_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, self.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -7623,7 +7730,7 @@ class CodeGenerator:
         # All fields are i64 for consistent cross-platform layout
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
-        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, set_size, type_id)
         set_ptr = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
         # Store root = 0 (null pointer as i64)
@@ -7711,7 +7818,7 @@ class CodeGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
-        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -7802,7 +7909,7 @@ class CodeGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
-        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -8000,7 +8107,7 @@ class CodeGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, self.gc.TYPE_SET)
-        raw_ptr = builder.call(self.gc.gc_alloc, [set_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, self.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -8284,7 +8391,7 @@ class CodeGenerator:
         # Allocate Json struct (9 bytes, but align to 16)
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_NULL (0)
@@ -8311,7 +8418,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_BOOL (1)
@@ -8339,7 +8446,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_INT (2)
@@ -8366,7 +8473,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_FLOAT (3)
@@ -8394,7 +8501,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_STRING (4)
@@ -8422,7 +8529,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_ARRAY (5)
@@ -8450,7 +8557,7 @@ class CodeGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, self.gc.TYPE_JSON)
-        raw_ptr = builder.call(self.gc.gc_alloc, [json_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, self.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_OBJECT (6)
@@ -9667,10 +9774,15 @@ class CodeGenerator:
         i64 = ir.IntType(64)
 
         # Get string data pointer and length
+        # Phase 4: String layout is { i64 owner_handle, i64 offset, i64 len, i64 size }
         str_ptr = func.args[0]
-        data_ptr_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
-        len_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        owner_handle_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        offset_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset_val = builder.load(offset_ptr)
+        data_ptr = builder.gep(owner_ptr, [offset_val])
+        len_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         str_len = builder.load(len_ptr)
 
         # Check for empty string
@@ -9915,7 +10027,7 @@ class CodeGenerator:
         # Allocate AtomicRef struct (8 bytes) via GC
         ref_size = ir.Constant(ir.IntType(64), 8)
         type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_UNKNOWN)
-        raw_ptr = builder.call(self.gc.gc_alloc, [ref_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, ref_size, type_id)
         ref_ptr = builder.bitcast(raw_ptr, self.atomic_ref_struct.as_pointer())
         
         # Get pointer to the value field
@@ -10137,7 +10249,7 @@ class CodeGenerator:
         # Allocate Result struct (24 bytes = 3 * 8) via GC
         struct_size = ir.Constant(i64, 24)
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id("Result"))
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         result = builder.bitcast(raw_ptr, result_ptr)
 
         # Set tag = 0 (Ok)
@@ -10182,7 +10294,7 @@ class CodeGenerator:
         # Allocate Result struct (24 bytes = 3 * 8) via GC
         struct_size = ir.Constant(i64, 24)
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id("Result"))
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, type_id)
         result = builder.bitcast(raw_ptr, result_ptr)
 
         # Set tag = 1 (Err)
@@ -10473,7 +10585,7 @@ class CodeGenerator:
         # Allocate posix struct (4 bytes for fd only)
         posix_size = ir.Constant(i64, 4)
         posix_type_id = ir.Constant(i32, self.gc.get_type_id("posix"))
-        posix_raw = builder.call(self.gc.gc_alloc, [posix_size, posix_type_id])
+        posix_raw = self.gc.alloc_with_deref(builder, posix_size, posix_type_id)
         posix_ptr_val = builder.bitcast(posix_raw, posix_ptr)
 
         # Set fd field
@@ -10539,7 +10651,7 @@ class CodeGenerator:
         # Allocate buffer for file content
         buf_size = builder.add(file_size, ir.Constant(i64, 1))  # +1 for null terminator
         string_data_type_id = ir.Constant(i32, self.gc.TYPE_STRING_DATA)
-        buffer = builder.call(self.gc.gc_alloc, [buf_size, string_data_type_id])
+        buffer = self.gc.alloc_with_deref(builder, buf_size, string_data_type_id)
 
         # Read entire file
         bytes_read = builder.call(self.posix_read_syscall, [fd, buffer, file_size])
@@ -10724,9 +10836,10 @@ class CodeGenerator:
         elem_size = ir.Constant(i64, 1)
         byte_list = builder.call(self.list_new, [elem_size])
 
-        # Get the tail pointer from the new list and copy data there
-        tail_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        tail = builder.load(tail_ptr)
+        # Get the tail pointer from the new list and copy data there (Phase 4: handle)
+        tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail_handle = builder.load(tail_handle_ptr)
+        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
 
         # Copy bytes_read bytes from buf to tail
         builder.call(self.memcpy, [tail, buf, bytes_read])
@@ -10735,9 +10848,9 @@ class CodeGenerator:
         len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(bytes_read, len_ptr)
 
+        # Phase 4: tail_len is i64
         tail_len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        bytes_read_32 = builder.trunc(bytes_read, i32)
-        builder.store(bytes_read_32, tail_len_ptr)
+        builder.store(bytes_read, tail_len_ptr)
 
         # Free the temporary buffer
         builder.call(self.free, [buf])
@@ -10791,9 +10904,10 @@ class CodeGenerator:
         len_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         data_len = builder.load(len_ptr)
 
-        # Get tail pointer from list (where byte data is stored)
-        tail_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        tail = builder.load(tail_ptr)
+        # Get tail pointer from list (where byte data is stored) - Phase 4: handle
+        tail_handle_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail_handle = builder.load(tail_handle_ptr)
+        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
 
         # Call write(fd, tail, len)
         bytes_written = builder.call(self.write_syscall, [fd, tail, data_len])
@@ -10985,9 +11099,10 @@ class CodeGenerator:
 
         name = func.args[0]
 
-        # Get string data pointer (field 0 of string struct)
-        data_ptr = builder.gep(name, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        c_str = builder.load(data_ptr)
+        # Get string data pointer (Phase 4: owner is i64 handle)
+        # Note: getenv expects null-terminated string, so we just use string_data
+        # which returns owner + offset (must ensure null-terminated at call site)
+        c_str = builder.call(self.string_data, [name])
 
         # Call getenv(name)
         result = builder.call(self.c_getenv, [c_str])
@@ -11068,9 +11183,10 @@ class CodeGenerator:
         elem_size = ir.Constant(i64, 1)
         byte_list = builder.call(self.list_new, [elem_size])
 
-        # Get the tail pointer and read directly into it
-        tail_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        tail = builder.load(tail_ptr)
+        # Get the tail pointer and read directly into it - Phase 4: handle
+        tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        tail_handle = builder.load(tail_handle_ptr)
+        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
 
         # Read count bytes into tail
         builder.call(self.posix_read_syscall, [fd, tail, count])
@@ -11082,9 +11198,9 @@ class CodeGenerator:
         len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(count, len_ptr)
 
+        # Phase 4: tail_len is now i64
         tail_len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        count_32 = builder.trunc(count, i32)
-        builder.store(count_32, tail_len_ptr)
+        builder.store(count, tail_len_ptr)
 
         builder.ret(byte_list)
 
@@ -11755,13 +11871,18 @@ class CodeGenerator:
         # Create struct type
         name = f"struct.{mangled_name}"
         struct_type = ir.global_context.get_identified_type(name)
-        
+
         # Collect field types and names
+        # Phase 6: Reference type fields use i64 handles instead of pointers
         field_types = []
         field_info = []
         for field in type_decl.fields:
             field_type = self._substitute_type(field.type_annotation)
-            llvm_type = self._get_llvm_type(field_type)
+            if self._is_reference_type(field_type):
+                # Phase 6: Store as i64 handle instead of pointer
+                llvm_type = ir.IntType(64)
+            else:
+                llvm_type = self._get_llvm_type(field_type)
             field_types.append(llvm_type)
             field_info.append((field.name, field_type))
         
@@ -14056,7 +14177,7 @@ class CodeGenerator:
         # Allocate new struct via GC
         struct_size = ir.Constant(i64, struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
         type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(self.builder, struct_size, type_id)
         new_struct = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Copy all fields from old struct to new struct
@@ -14064,12 +14185,24 @@ class CodeGenerator:
             if i == field_idx:
                 # This is the changed field - store new value
                 dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
-                # Cast value if needed
-                expected_type = struct_type.elements[i]
-                cast_value = self._cast_value(new_value, expected_type)
-                self.builder.store(cast_value, dst_field_ptr)
+                # Phase 6: Reference type fields store as i64 handles
+                if self._is_reference_type(field_type):
+                    if isinstance(new_value.type, ir.PointerType):
+                        # Get handle for the object (not raw ptrtoint!)
+                        value_i8 = self.builder.bitcast(new_value, ir.IntType(8).as_pointer())
+                        store_value = self.builder.call(self.gc.gc_ptr_to_handle, [value_i8])
+                    elif new_value.type != i64:
+                        store_value = self._cast_value(new_value, i64)
+                    else:
+                        store_value = new_value
+                else:
+                    # Cast value if needed
+                    expected_type = struct_type.elements[i]
+                    store_value = self._cast_value(new_value, expected_type)
+                self.builder.store(store_value, dst_field_ptr)
             else:
                 # Copy field from old struct (reference sharing for heap types)
+                # Both old and new struct use i64 for reference type fields
                 src_field_ptr = self.builder.gep(old_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
                 field_val = self.builder.load(src_field_ptr)
                 dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
@@ -15670,10 +15803,14 @@ class CodeGenerator:
                         ir.Constant(ir.IntType(32), i + 1)
                     ], inbounds=True)
                     field_val = self.builder.load(field_ptr)
-                    
+
                     # Convert back to proper type if needed
                     if isinstance(field_type, PrimitiveType) and field_type.name == "float":
                         field_val = self.builder.bitcast(field_val, ir.DoubleType())
+                    # Phase 6: Reference type fields store i64 handles - convert to pointer
+                    elif self._is_reference_type(field_type):
+                        ptr_type = self._get_llvm_type(field_type)
+                        field_val = self.builder.inttoptr(field_val, ptr_type)
                     
                     # If sub-pattern is an identifier, bind it
                     if isinstance(sub_pattern, IdentifierPattern):
@@ -16303,9 +16440,10 @@ class CodeGenerator:
         self.builder.store(capacity, len_ptr)
 
         # Fill the array with the initial value
-        # Get data pointer: compute owner + offset (fields 0 and 1)
-        owner_ptr_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner_ptr = self.builder.load(owner_ptr_ptr)
+        # Get data pointer: compute owner + offset (Phase 4: owner is i64 handle)
+        owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle = self.builder.load(owner_handle_ptr)
+        owner_ptr = self.builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
         offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset_val = self.builder.load(offset_ptr)
         data_ptr = self.builder.gep(owner_ptr, [offset_val])
@@ -16373,7 +16511,7 @@ class CodeGenerator:
 
         # Allocate via GC with registered type ID
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
+        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Initialize fields
@@ -16390,24 +16528,35 @@ class CodeGenerator:
                     field_values[field_name] = self._generate_expression(arg)
         
         # Store each field
+        i64 = ir.IntType(64)
         for i, (field_name, field_type) in enumerate(field_info):
             field_ptr = self.builder.gep(ptr, [
                 ir.Constant(ir.IntType(32), 0),
                 ir.Constant(ir.IntType(32), i)
             ], inbounds=True)
-            
+
             if field_name in field_values:
                 value = field_values[field_name]
-                # Cast if needed
-                expected_type = self._get_llvm_type(field_type)
-                value = self._cast_value(value, expected_type)
+                # Phase 6: Reference type fields store as i64 handles
+                if self._is_reference_type(field_type):
+                    # Get handle for the object (not raw ptrtoint!)
+                    if isinstance(value.type, ir.PointerType):
+                        # Cast to i8* for gc_ptr_to_handle
+                        value_i8 = self.builder.bitcast(value, ir.IntType(8).as_pointer())
+                        value = self.builder.call(self.gc.gc_ptr_to_handle, [value_i8])
+                    elif value.type != i64:
+                        value = self._cast_value(value, i64)
+                else:
+                    # Cast if needed
+                    expected_type = self._get_llvm_type(field_type)
+                    value = self._cast_value(value, expected_type)
                 self.builder.store(value, field_ptr)
             else:
-                # Default initialize to zero
-                expected_type = self._get_llvm_type(field_type)
+                # Default initialize to zero (0 = null handle for reference types)
+                expected_type = i64 if self._is_reference_type(field_type) else self._get_llvm_type(field_type)
                 default = self._get_default_value_for_llvm(expected_type)
                 self.builder.store(default, field_ptr)
-        
+
         return ptr
     
     def _generate_type_new(self, type_name: str, args: PyList[Expr]) -> ir.Value:
@@ -16448,20 +16597,24 @@ class CodeGenerator:
         size_val = ir.Constant(ir.IntType(64), size)
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
 
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
+        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
-        
+
         # Zero-initialize all fields
         for i, (field_name, field_type) in enumerate(field_info):
             field_ptr = self.builder.gep(ptr, [
                 ir.Constant(ir.IntType(32), 0),
                 ir.Constant(ir.IntType(32), i)
             ], inbounds=True)
-            
-            expected_type = self._get_llvm_type(field_type)
-            default = self._get_default_value_for_llvm(expected_type)
+
+            # Phase 6: Reference type fields use i64 handles (0 = null)
+            if self._is_reference_type(field_type):
+                default = ir.Constant(i64, 0)
+            else:
+                expected_type = self._get_llvm_type(field_type)
+                default = self._get_default_value_for_llvm(expected_type)
             self.builder.store(default, field_ptr)
-        
+
         return ptr
     
     def _find_enum_variant(self, variant_name: str) -> Optional[Tuple[str, str]]:
@@ -16488,7 +16641,7 @@ class CodeGenerator:
         size_val = ir.Constant(ir.IntType(64), size)
 
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(enum_name))
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [size_val, type_id])
+        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Store tag
@@ -16982,7 +17135,7 @@ class CodeGenerator:
         
         # Try to determine the type from the pointer
         type_name = self._get_type_name_from_ptr(obj.type)
-        
+
         if type_name and type_name in self.type_fields:
             field_idx = self._get_field_index(type_name, expr.member)
             if field_idx is not None:
@@ -16991,7 +17144,19 @@ class CodeGenerator:
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), field_idx)
                 ], inbounds=True)
-                return self.builder.load(field_ptr)
+                field_val = self.builder.load(field_ptr)
+
+                # Phase 6: Reference type fields store i64 handles - convert to pointer
+                field_info = self.type_fields[type_name]
+                if field_idx < len(field_info):
+                    _, field_type = field_info[field_idx]
+                    if self._is_reference_type(field_type):
+                        # Field contains a handle - dereference to get pointer
+                        ptr_i8 = self.builder.call(self.gc.gc_handle_deref, [field_val])
+                        ptr_type = self._get_llvm_type(field_type)
+                        return self.builder.bitcast(ptr_i8, ptr_type)
+
+                return field_val
         
         # Handle JSON field access: j.field -> json_get_field(j, "field")
         if type_name == "Json":
@@ -17999,7 +18164,7 @@ class CodeGenerator:
         # Allocate struct via GC
         struct_size = ir.Constant(i64, len(self.type_fields[type_name]) * 8)
         type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
-        raw_ptr = self.builder.call(self.gc.gc_alloc, [struct_size, type_id])
+        raw_ptr = self.gc.alloc_with_deref(self.builder, struct_size, type_id)
         struct_ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Extract each field
@@ -18917,7 +19082,7 @@ class CodeGenerator:
         # Allocate matrix struct via GC
         struct_size = ir.Constant(ir.IntType(64), 32)  # 4 * 8 bytes
         matrix_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_UNKNOWN)
-        raw_ptr = builder.call(self.gc.gc_alloc, [struct_size, matrix_type_id])
+        raw_ptr = self.gc.alloc_with_deref(builder, struct_size, matrix_type_id)
         matrix_ptr = builder.bitcast(raw_ptr, matrix_ptr_type)
         
         # Store width and height
@@ -18940,7 +19105,7 @@ class CodeGenerator:
         
         # Allocate read buffer via GC
         buffer_type_id = ir.Constant(ir.IntType(32), self.gc.TYPE_ARRAY_DATA)
-        read_raw = builder.call(self.gc.gc_alloc, [buffer_size, buffer_type_id])
+        read_raw = self.gc.alloc_with_deref(builder, buffer_size, buffer_type_id)
         read_buffer = builder.bitcast(read_raw, elem_type.as_pointer())
         read_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),
@@ -18949,7 +19114,7 @@ class CodeGenerator:
         builder.store(read_buffer, read_field)
 
         # Allocate write buffer via GC
-        write_raw = builder.call(self.gc.gc_alloc, [buffer_size, buffer_type_id])
+        write_raw = self.gc.alloc_with_deref(builder, buffer_size, buffer_type_id)
         write_buffer = builder.bitcast(write_raw, elem_type.as_pointer())
         write_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),

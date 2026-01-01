@@ -30,6 +30,9 @@ class GarbageCollector:
     GC_THRESHOLD = 10000     # Trigger GC after this many allocations
     INITIAL_HEAP_SIZE = 1024 * 1024 * 1024  # 1GB initial heap
 
+    # Handle table constants (Handle-Based GC)
+    INITIAL_HANDLE_TABLE_SIZE = 1048576  # 1M handles (8MB for pointers)
+
     # Flag bits in header (stored in i64 flags field)
     FLAG_MARK_BIT = 0x01     # Bit 0: mark bit for GC
     FLAG_FORWARDED = 0x02    # Bit 1: object has been forwarded (compaction)
@@ -90,6 +93,12 @@ class GarbageCollector:
         self.gc_alloc_count = None    # Count allocations to trigger GC
         self.gc_enabled = None        # Whether GC is enabled
 
+        # Handle table globals (Handle-Based GC - Phase 1)
+        self.gc_handle_table = None       # i8** - array of object pointers
+        self.gc_handle_table_size = None  # i64 - current table capacity
+        self.gc_handle_free_list = None   # i64 - head of free slot chain (0 = empty)
+        self.gc_next_handle = None        # i64 - next fresh handle to allocate
+
         # GC functions
         self.gc_init = None
         self.gc_alloc = None
@@ -100,6 +109,13 @@ class GarbageCollector:
         self.gc_mark_object = None
         self.gc_scan_roots = None
         self.gc_sweep = None
+
+        # Handle management functions (Handle-Based GC - Phase 1)
+        self.gc_handle_alloc = None       # Allocate handle slot, returns i64 handle
+        self.gc_handle_free = None        # Return handle to free list
+        self.gc_handle_deref = None       # Dereference handle to get i8* pointer
+        self.gc_handle_store = None       # Store pointer in handle slot
+        self.gc_handle_table_grow = None  # Double table size
 
         # Dual-heap async GC functions
         self.gc_async = None
@@ -195,6 +211,13 @@ class GarbageCollector:
         self._implement_gc_dump_object()
         self._implement_gc_validate_heap()
         self._implement_gc_set_trace_level()
+        # Handle-Based GC - Phase 1: Handle management functions
+        self._implement_gc_handle_table_grow()
+        self._implement_gc_handle_alloc()
+        self._implement_gc_handle_free()
+        self._implement_gc_handle_deref()
+        self._implement_gc_handle_store()
+        self._implement_gc_ptr_to_handle()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -208,20 +231,21 @@ class GarbageCollector:
             self.i64,  # 24: forward pointer (for compaction, 0 if not forwarded)
         ])
 
-        # Allocation node: { i8* next, i8* data, i64 size }
+        # Allocation node: { i8* next, i64 handle, i64 size }
         # Linked list of all allocations for sweep
+        # Phase 7: Changed from i8* data to i64 handle for handle-based GC
         self.alloc_node_type = ir.LiteralStructType([
             self.i8_ptr,  # next allocation node
-            self.i8_ptr,  # pointer to user data
+            self.i64,     # handle to the object (instead of data pointer)
             self.i64,     # size of allocation
         ])
 
-        # GC Frame: { i8* parent, i64 num_roots, i8** roots }
-        # Shadow stack frame for root tracking
+        # GC Frame: { i8* parent, i64 num_roots, i64* handle_slots }
+        # Shadow stack frame for root tracking (Phase 3: handles instead of pointers)
         self.gc_frame_type = ir.LiteralStructType([
             self.i8_ptr,      # parent frame pointer
             self.i64,         # number of roots
-            self.i8_ptr_ptr,  # pointer to roots array
+            self.i64_ptr,     # pointer to handle slots array (array of i64 handles)
         ])
 
         # ============================================================
@@ -237,12 +261,13 @@ class GarbageCollector:
             self.i64,     # region_id - 0 for heap A, 1 for heap B
         ])
 
-        # RootSnapshot: { i8** roots, i64 count, i64 heap_to_collect }
+        # RootSnapshot: { i64* handle_slots, i64 count, i64 heap_to_collect }
         # Captures shadow stack state at swap time
+        # Phase 3: Uses i64* for handle slots instead of i8** for pointer slots
         self.root_snapshot_type = ir.LiteralStructType([
-            self.i8_ptr_ptr,  # roots - array of root pointer values
-            self.i64,         # count - number of roots captured
-            self.i64,         # heap_to_collect - 0 for A, 1 for B
+            self.i64_ptr,  # handle_slots - array of handle values
+            self.i64,      # count - number of handles captured
+            self.i64,      # heap_to_collect - 0 for A, 1 for B
         ])
 
         # GCState: { i64 active_heap, i64 gc_in_progress, i64 gc_complete,
@@ -333,6 +358,35 @@ class GarbageCollector:
         self.gc_enabled = ir.GlobalVariable(self.module, self.i1, name="gc_enabled")
         self.gc_enabled.initializer = ir.Constant(self.i1, 1)
         self.gc_enabled.linkage = 'internal'
+
+        # ============================================================
+        # Handle Table Globals (Handle-Based GC - Phase 1)
+        # ============================================================
+        # Every heap object is referenced through a handle (i64 index).
+        # gc_handle_table[handle] contains the actual i8* pointer.
+        # Handle 0 is reserved for null.
+
+        # Pointer to handle table (array of i8* pointers)
+        # SHARED - atomic reads, mutex for writes/growth
+        self.gc_handle_table = ir.GlobalVariable(self.module, self.i8_ptr_ptr, name="gc_handle_table")
+        self.gc_handle_table.initializer = ir.Constant(self.i8_ptr_ptr, None)
+        self.gc_handle_table.linkage = 'internal'
+
+        # Current table capacity
+        self.gc_handle_table_size = ir.GlobalVariable(self.module, self.i64, name="gc_handle_table_size")
+        self.gc_handle_table_size.initializer = ir.Constant(self.i64, 0)
+        self.gc_handle_table_size.linkage = 'internal'
+
+        # Head of free list (0 = empty, non-zero = first free slot)
+        # Free slots store next free index in the slot itself
+        self.gc_handle_free_list = ir.GlobalVariable(self.module, self.i64, name="gc_handle_free_list")
+        self.gc_handle_free_list.initializer = ir.Constant(self.i64, 0)
+        self.gc_handle_free_list.linkage = 'internal'
+
+        # Next fresh handle to allocate (starts at 1, handle 0 = null)
+        self.gc_next_handle = ir.GlobalVariable(self.module, self.i64, name="gc_next_handle")
+        self.gc_next_handle.initializer = ir.Constant(self.i64, 1)
+        self.gc_next_handle.linkage = 'internal'
 
         # ============================================================
         # Dual-heap async GC globals
@@ -468,26 +522,30 @@ class GarbageCollector:
         gc_init_ty = ir.FunctionType(self.void, [])
         self.gc_init = ir.Function(self.module, gc_init_ty, name="coex_gc_init")
 
-        # gc_alloc(size: i64, type_id: i32) -> i8*
-        gc_alloc_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i32])
+        # gc_alloc(size: i64, type_id: i32) -> i64 (handle)
+        # Phase 2: Returns handle (i64) instead of raw pointer
+        # Use gc_handle_deref to get the actual pointer
+        gc_alloc_ty = ir.FunctionType(self.i64, [self.i64, self.i32])
         self.gc_alloc = ir.Function(self.module, gc_alloc_ty, name="coex_gc_alloc")
 
         # gc_collect() -> void
         gc_collect_ty = ir.FunctionType(self.void, [])
         self.gc_collect = ir.Function(self.module, gc_collect_ty, name="coex_gc_collect")
 
-        # gc_push_frame(num_roots: i64, roots: i8**) -> i8*
+        # gc_push_frame(num_roots: i64, handle_slots: i64*) -> i8*
         # Returns pointer to frame (for passing to pop_frame)
-        gc_push_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i8_ptr_ptr])
+        # Phase 3: takes array of i64 handle slots instead of i8* pointer slots
+        gc_push_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i64_ptr])
         self.gc_push_frame = ir.Function(self.module, gc_push_ty, name="coex_gc_push_frame")
 
         # gc_pop_frame(frame: i8*) -> void
         gc_pop_ty = ir.FunctionType(self.void, [self.i8_ptr])
         self.gc_pop_frame = ir.Function(self.module, gc_pop_ty, name="coex_gc_pop_frame")
 
-        # gc_set_root(roots: i8**, index: i64, value: i8*) -> void
-        # Update a root slot
-        gc_set_root_ty = ir.FunctionType(self.void, [self.i8_ptr_ptr, self.i64, self.i8_ptr])
+        # gc_set_root(slots: i64*, index: i64, handle: i64) -> void
+        # Update a root slot with a handle value
+        # Phase 3: stores i64 handles instead of i8* pointers
+        gc_set_root_ty = ir.FunctionType(self.void, [self.i64_ptr, self.i64, self.i64])
         self.gc_set_root = ir.Function(self.module, gc_set_root_ty, name="coex_gc_set_root")
 
         # gc_mark_object(ptr: i8*) -> void
@@ -646,6 +704,43 @@ class GarbageCollector:
         # Set trace verbosity level
         gc_set_trace_level_ty = ir.FunctionType(self.void, [self.i64])
         self.gc_set_trace_level = ir.Function(self.module, gc_set_trace_level_ty, name="coex_gc_set_trace_level")
+
+        # ============================================================
+        # Handle Management Function Declarations (Handle-Based GC - Phase 1)
+        # ============================================================
+
+        # gc_handle_alloc() -> i64
+        # Allocate a handle slot (from free list or bump allocator)
+        # Returns handle index (never 0, which represents null)
+        gc_handle_alloc_ty = ir.FunctionType(self.i64, [])
+        self.gc_handle_alloc = ir.Function(self.module, gc_handle_alloc_ty, name="coex_gc_handle_alloc")
+
+        # gc_handle_free(handle: i64) -> void
+        # Return a handle to the free list (called during sweep)
+        gc_handle_free_ty = ir.FunctionType(self.void, [self.i64])
+        self.gc_handle_free = ir.Function(self.module, gc_handle_free_ty, name="coex_gc_handle_free")
+
+        # gc_handle_deref(handle: i64) -> i8*
+        # Dereference a handle to get the object pointer
+        # Returns null if handle is 0
+        gc_handle_deref_ty = ir.FunctionType(self.i8_ptr, [self.i64])
+        self.gc_handle_deref = ir.Function(self.module, gc_handle_deref_ty, name="coex_gc_handle_deref")
+
+        # gc_handle_store(handle: i64, ptr: i8*) -> void
+        # Store a pointer in a handle slot
+        gc_handle_store_ty = ir.FunctionType(self.void, [self.i64, self.i8_ptr])
+        self.gc_handle_store = ir.Function(self.module, gc_handle_store_ty, name="coex_gc_handle_store")
+
+        # gc_handle_table_grow() -> void
+        # Double the handle table size (called when table exhausted)
+        gc_handle_table_grow_ty = ir.FunctionType(self.void, [])
+        self.gc_handle_table_grow = ir.Function(self.module, gc_handle_table_grow_ty, name="coex_gc_handle_table_grow")
+
+        # gc_ptr_to_handle(ptr: i8*) -> i64
+        # Get the handle for an object from its pointer (reads header's forward field)
+        # Returns 0 if ptr is null
+        gc_ptr_to_handle_ty = ir.FunctionType(self.i64, [self.i8_ptr])
+        self.gc_ptr_to_handle = ir.Function(self.module, gc_ptr_to_handle_ty, name="coex_gc_ptr_to_handle")
 
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
@@ -847,21 +942,49 @@ class GarbageCollector:
         ], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), heap_b_count_ptr)
 
+        # ============================================================
+        # Initialize Handle Table (Handle-Based GC - Phase 1)
+        # ============================================================
+        # Allocate initial handle table: 1M slots * 8 bytes = 8MB
+        # Handle 0 is reserved for null, so we start allocating at handle 1
+
+        table_size = ir.Constant(self.i64, self.INITIAL_HANDLE_TABLE_SIZE)
+        table_bytes = builder.mul(table_size, ir.Constant(self.i64, 8))  # 8 bytes per pointer
+        table_ptr = builder.call(self.codegen.malloc, [table_bytes])
+        table_ptr_typed = builder.bitcast(table_ptr, self.i8_ptr_ptr)
+        builder.store(table_ptr_typed, self.gc_handle_table)
+        builder.store(table_size, self.gc_handle_table_size)
+
+        # Initialize all slots to NULL (memset to 0)
+        # This ensures dereferencing an uninitialized slot returns NULL
+        builder.call(self.codegen.memset, [
+            table_ptr,
+            ir.Constant(self.i8, 0),
+            table_bytes
+        ])
+
+        # Reset handle allocation state
+        builder.store(ir.Constant(self.i64, 0), self.gc_handle_free_list)  # Empty free list
+        builder.store(ir.Constant(self.i64, 1), self.gc_next_handle)  # Start at handle 1
+
         builder.ret_void()
 
     def _implement_gc_push_frame(self):
-        """Push a new frame onto the shadow stack"""
+        """Push a new frame onto the shadow stack.
+
+        Phase 3: Takes i64* handle_slots instead of i8** roots.
+        """
         func = self.gc_push_frame
         func.args[0].name = "num_roots"
-        func.args[1].name = "roots"
+        func.args[1].name = "handle_slots"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
         num_roots = func.args[0]
-        roots = func.args[1]
+        handle_slots = func.args[1]
 
-        # Allocate frame struct (24 bytes: parent + num_roots + roots_ptr)
+        # Allocate frame struct (24 bytes: parent + num_roots + handle_slots_ptr)
         frame_size = ir.Constant(self.i64, 24)
         raw_frame = builder.call(self.codegen.malloc, [frame_size])
         frame = builder.bitcast(raw_frame, self.gc_frame_type.as_pointer())
@@ -875,9 +998,9 @@ class GarbageCollector:
         num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(num_roots, num_roots_ptr)
 
-        # Set roots pointer
-        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(roots, roots_ptr_ptr)
+        # Set handle_slots pointer (Phase 3: i64* instead of i8**)
+        slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(handle_slots, slots_ptr_ptr)
 
         # Update frame top
         builder.store(raw_frame, self.gc_frame_top)
@@ -916,22 +1039,25 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_set_root(self):
-        """Set a root slot value"""
+        """Set a root slot to a handle value.
+
+        Phase 3: Takes i64* slots and stores i64 handle values.
+        """
         func = self.gc_set_root
-        func.args[0].name = "roots"
+        func.args[0].name = "slots"
         func.args[1].name = "index"
-        func.args[2].name = "value"
+        func.args[2].name = "handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        roots = func.args[0]
+        slots = func.args[0]
         index = func.args[1]
-        value = func.args[2]
+        handle = func.args[2]
 
-        # roots[index] = value
-        slot_ptr = builder.gep(roots, [index], inbounds=True)
-        builder.store(value, slot_ptr)
+        # slots[index] = handle
+        slot_ptr = builder.gep(slots, [index], inbounds=True)
+        builder.store(handle, slot_ptr)
 
         builder.ret_void()
 
@@ -1015,12 +1141,23 @@ class GarbageCollector:
         next_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         builder.store(old_head, next_ptr)
 
-        # node->data = user_ptr (after header)
+        # Compute user_ptr (after header)
         block_int = builder.ptrtoint(block, self.i64)
         user_ptr_int = builder.add(block_int, header_size)
         user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
-        data_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(user_ptr, data_ptr)
+
+        # Phase 7: Allocate handle and store pointer in handle table
+        # Then store handle in alloc_node (instead of user_ptr)
+        handle = builder.call(self.gc_handle_alloc, [])
+        builder.call(self.gc_handle_store, [handle, user_ptr])
+
+        # Phase 8 fix: Store handle in header's forward field for ptr->handle lookup
+        # This allows gc_ptr_to_handle to recover the handle from a pointer
+        builder.store(handle, forward_ptr)
+
+        # node->handle = handle (Phase 7: store handle instead of data pointer)
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(handle, handle_ptr)
 
         # node->size = aligned_size
         node_size_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
@@ -1054,7 +1191,9 @@ class GarbageCollector:
         new_bytes_since = builder.add(bytes_since, aligned_size)
         builder.store(new_bytes_since, bytes_since_ptr)
 
-        builder.ret(user_ptr)
+        # Phase 7: Handle already created and stored in alloc_node above
+        # Return handle (i64) instead of raw pointer
+        builder.ret(handle)
 
     def _implement_gc_mark_hamt(self):
         """Recursively mark HAMT nodes and leaves.
@@ -1352,9 +1491,11 @@ class GarbageCollector:
         field_offset = builder.load(offset_ptr2)
 
         field_addr_int = builder.add(obj_int, field_offset)
-        field_addr = builder.inttoptr(field_addr_int, self.i8_ptr_ptr)
-        field_ptr = builder.load(field_addr)
-        # Recursively mark the field
+        # Phase 6: User type fields now store i64 handles, not pointers
+        field_addr = builder.inttoptr(field_addr_int, self.i64_ptr)
+        field_handle = builder.load(field_addr)
+        # Deref handle to get pointer, then recursively mark
+        field_ptr = builder.call(self.gc_handle_deref, [field_handle])
         builder.call(func, [field_ptr])
         builder.branch(user_next_offset)
 
@@ -1412,28 +1553,32 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark List: root (field 0) and tail (field 3) pointers
-        # List struct: { i8* root (0), i64 len (1), i32 depth (2), i8* tail (3), i32 tail_len (4), i64 elem_size (5) }
+        # List struct: { i64 root (0), i64 len (1), i64 depth (2), i64 tail (3), i64 tail_len (4), i64 elem_size (5) }
+        # Root and tail store raw pointers as i64 (via ptrtoint), need inttoptr to get pointers
         builder.position_at_end(mark_list)
-        list_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i32, self.i8_ptr, self.i32, self.i64]).as_pointer()
+        list_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
         list_typed = builder.bitcast(ptr, list_ptr_type)
         # Mark root
-        root_ptr_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        root_ptr = builder.load(root_ptr_ptr)
+        root_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        root_i64 = builder.load(root_i64_ptr)
+        root_ptr = builder.inttoptr(root_i64, self.i8_ptr)  # Convert i64 to pointer
         builder.call(func, [root_ptr])  # Recursive call
         # Mark tail
-        tail_ptr_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
-        tail_ptr = builder.load(tail_ptr_ptr)
+        tail_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        tail_i64 = builder.load(tail_i64_ptr)
+        tail_ptr = builder.inttoptr(tail_i64, self.i8_ptr)  # Convert i64 to pointer
         builder.call(func, [tail_ptr])  # Recursive call
         builder.branch(done)
 
         # Mark Array: owner pointer at field 0
-        # Array struct: { i8* owner (0), i64 offset (1), i64 len (2), i64 cap (3), i64 elem_size (4) }
-        # For slice views, owner points to the shared data buffer
+        # Array struct: { i64 owner (0), i64 offset (1), i64 len (2), i64 cap (3), i64 elem_size (4) }
+        # Owner stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
         builder.position_at_end(mark_array)
-        array_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64, self.i64]).as_pointer()
+        array_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
         array_typed = builder.bitcast(ptr, array_ptr_type)
-        owner_ptr_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        owner_i64_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        owner_i64 = builder.load(owner_i64_ptr)
+        owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
         builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
         builder.branch(done)
 
@@ -1455,13 +1600,14 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark String: owner pointer at field 0
-        # String struct: { i8* owner (0), i64 offset (1), i64 len (2), i64 size (3) }
-        # For slice views, owner points to the shared data buffer
+        # String struct: { i64 owner (0), i64 offset (1), i64 len (2), i64 size (3) }
+        # Owner stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
         builder.position_at_end(mark_string)
-        string_ptr_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i64, self.i64]).as_pointer()
+        string_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64]).as_pointer()
         string_typed = builder.bitcast(ptr, string_ptr_type)
-        owner_ptr_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        owner_ptr = builder.load(owner_ptr_ptr)
+        owner_i64_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        owner_i64 = builder.load(owner_i64_ptr)
+        owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
         builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
         builder.branch(done)
 
@@ -1550,14 +1696,19 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_scan_roots(self):
-        """Scan shadow stack and mark all roots"""
+        """Scan shadow stack and mark all roots.
+
+        Phase 3: Slots now contain i64 handles instead of i8* pointers.
+        We load the handle, deref to get pointer, then mark.
+        """
         func = self.gc_scan_roots
 
         entry = func.append_basic_block("entry")
         frame_loop = func.append_basic_block("frame_loop")
         process_frame = func.append_basic_block("process_frame")
         root_loop = func.append_basic_block("root_loop")
-        mark_root = func.append_basic_block("mark_root")
+        check_handle = func.append_basic_block("check_handle")
+        do_mark = func.append_basic_block("do_mark")
         next_root = func.append_basic_block("next_root")
         next_frame = func.append_basic_block("next_frame")
         done = func.append_basic_block("done")
@@ -1585,9 +1736,9 @@ class GarbageCollector:
         num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         num_roots = builder.load(num_roots_ptr)
 
-        # Get roots array
-        roots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        roots = builder.load(roots_ptr_ptr)
+        # Get handle_slots array (Phase 3: now i64* instead of i8**)
+        slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        slots = builder.load(slots_ptr_ptr)
 
         # Root index
         root_idx = builder.alloca(self.i64, name="root_idx")
@@ -1599,25 +1750,28 @@ class GarbageCollector:
         builder.position_at_end(root_loop)
         i = builder.load(root_idx)
         done_roots = builder.icmp_unsigned(">=", i, num_roots)
-        builder.cbranch(done_roots, next_frame, mark_root)
+        builder.cbranch(done_roots, next_frame, check_handle)
 
-        # Mark root
-        builder.position_at_end(mark_root)
+        # Check handle (Phase 3: load i64 handle from slot)
+        builder.position_at_end(check_handle)
         i_val = builder.load(root_idx)
-        root_slot = builder.gep(roots, [i_val], inbounds=True)
-        root_ptr = builder.load(root_slot)
+        slot_ptr = builder.gep(slots, [i_val], inbounds=True)
+        handle = builder.load(slot_ptr)
 
-        # Mark if not null
-        is_root_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_root_null, next_root, next_root)  # Skip null roots
+        # Skip if handle is 0 (null handle)
+        is_null_handle = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_handle, next_root, do_mark)
 
-        # TODO: Actually call gc_mark_object for non-null roots
-        # For simplicity, we'll just increment and continue
+        # Get pointer and mark
+        # Note: set_root stores raw pointers as i64 (not handles), so use inttoptr
+        # A future improvement would be to store actual handles, but this requires
+        # changing how allocations track handles through the codebase
+        builder.position_at_end(do_mark)
+        root_ptr = builder.inttoptr(handle, self.i8_ptr)
+        builder.call(self.gc_mark_object, [root_ptr])
+        builder.branch(next_root)
 
         builder.position_at_end(next_root)
-        # Actually mark the root
-        builder.call(self.gc_mark_object, [root_ptr])
-
         next_i = builder.add(i_val, ir.Constant(self.i64, 1))
         builder.store(next_i, root_idx)
         builder.branch(root_loop)
@@ -1660,6 +1814,10 @@ class GarbageCollector:
         swept_bytes = builder.alloca(self.i64, name="swept_bytes")
         builder.store(ir.Constant(self.i64, 0), swept_bytes)
 
+        # Phase 7: Store current object's handle for use across blocks
+        current_handle = builder.alloca(self.i64, name="current_handle")
+        builder.store(ir.Constant(self.i64, 0), current_handle)
+
         # prev = null (pointer to previous node's next field, or gc_alloc_list)
         prev = builder.alloca(self.i8_ptr.as_pointer(), name="prev")
         builder.store(self.gc_alloc_list, prev)
@@ -1681,9 +1839,14 @@ class GarbageCollector:
         builder.position_at_end(check_marked)
         node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
 
-        # Get data pointer
-        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Phase 7: Get handle from node (field 1 is now i64 handle, not i8* data)
+        handle_field_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_field_ptr)
+        # Store handle for use in unmarked block
+        builder.store(obj_handle, current_handle)
+
+        # Phase 7: Dereference handle to get data pointer
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
         # Get header
         data_int = builder.ptrtoint(data_ptr, self.i64)
@@ -1735,6 +1898,9 @@ class GarbageCollector:
         builder.store(next_node, prev_ptr)
         # Free the allocation (header + data)
         builder.call(self.codegen.free, [header_ptr])
+        # Phase 7: Free the handle (return to free list)
+        freed_handle = builder.load(current_handle)
+        builder.call(self.gc_handle_free, [freed_handle])
         # Free the allocation node
         builder.call(self.codegen.free, [curr_val])
         # Move to next (prev stays the same since we removed current)
@@ -1919,35 +2085,37 @@ class GarbageCollector:
     # Helper methods for codegen to manage shadow stack frames
 
     def create_frame_roots(self, builder: ir.IRBuilder, num_roots: int) -> ir.Value:
-        """Create an array of root slots on the stack.
+        """Create an array of handle slots on the stack.
 
-        Returns pointer to the roots array (i8**).
+        Phase 3: Returns pointer to i64[] array (handle slots) instead of i8*[].
+        Returns i64* pointer to the first handle slot.
         """
         if num_roots == 0:
-            return ir.Constant(self.i8_ptr_ptr, None)
+            return ir.Constant(self.i64_ptr, None)
 
-        # Allocate array of i8* on stack
-        roots_type = ir.ArrayType(self.i8_ptr, num_roots)
-        roots_alloca = builder.alloca(roots_type, name="gc_roots")
+        # Allocate array of i64 handles on stack (Phase 3)
+        slots_type = ir.ArrayType(self.i64, num_roots)
+        slots_alloca = builder.alloca(slots_type, name="gc_handle_slots")
 
-        # Zero-initialize
+        # Zero-initialize (handle 0 = null)
         for i in range(num_roots):
-            slot_ptr = builder.gep(roots_alloca, [
+            slot_ptr = builder.gep(slots_alloca, [
                 ir.Constant(self.i32, 0),
                 ir.Constant(self.i32, i)
             ], inbounds=True)
-            builder.store(ir.Constant(self.i8_ptr, None), slot_ptr)
+            builder.store(ir.Constant(self.i64, 0), slot_ptr)
 
-        # Cast to i8**
-        return builder.bitcast(roots_alloca, self.i8_ptr_ptr)
+        # Cast to i64*
+        return builder.bitcast(slots_alloca, self.i64_ptr)
 
-    def push_frame_inline(self, builder: ir.IRBuilder, num_roots: int, roots: ir.Value) -> ir.Value:
+    def push_frame_inline(self, builder: ir.IRBuilder, num_roots: int, handle_slots: ir.Value) -> ir.Value:
         """Push a GC frame using stack allocation (avoids malloc fragmentation).
 
+        Phase 3: Takes i64* handle_slots instead of i8** roots.
         Allocates the frame structure on the stack instead of heap.
         Returns pointer to the stack-allocated frame for later pop.
         """
-        # Allocate frame struct on stack (parent: i8*, num_roots: i64, roots: i8**)
+        # Allocate frame struct on stack (parent: i8*, num_roots: i64, handle_slots: i64*)
         frame_alloca = builder.alloca(self.gc_frame_type, name="gc_frame")
 
         # Get old top
@@ -1961,9 +2129,9 @@ class GarbageCollector:
         num_roots_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(ir.Constant(self.i64, num_roots), num_roots_ptr)
 
-        # Set roots pointer
-        roots_ptr_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(roots, roots_ptr_ptr)
+        # Set handle_slots pointer (Phase 3: i64* instead of i8**)
+        slots_ptr_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        builder.store(handle_slots, slots_ptr_ptr)
 
         # Update gc_frame_top to point to this frame
         raw_frame = builder.bitcast(frame_alloca, self.i8_ptr)
@@ -1990,13 +2158,14 @@ class GarbageCollector:
         new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
         builder.store(new_depth, self.gc_frame_depth)
 
-    def push_frame(self, builder: ir.IRBuilder, num_roots: int, roots: ir.Value) -> ir.Value:
+    def push_frame(self, builder: ir.IRBuilder, num_roots: int, handle_slots: ir.Value) -> ir.Value:
         """Push a GC frame. Returns frame pointer for later pop.
 
+        Phase 3: Takes i64* handle_slots instead of i8** roots.
         Uses stack-allocated frames to avoid malloc fragmentation from
         millions of small allocations.
         """
-        return self.push_frame_inline(builder, num_roots, roots)
+        return self.push_frame_inline(builder, num_roots, handle_slots)
 
     def pop_frame(self, builder: ir.IRBuilder, frame: ir.Value):
         """Pop a GC frame.
@@ -2005,16 +2174,52 @@ class GarbageCollector:
         """
         self.pop_frame_inline(builder, frame)
 
-    def set_root(self, builder: ir.IRBuilder, roots: ir.Value, index: int, value: ir.Value):
-        """Set a root slot to a value."""
+    def set_root(self, builder: ir.IRBuilder, handle_slots: ir.Value, index: int, value: ir.Value):
+        """Set a root slot to a handle value.
+
+        Phase 3: Takes i64* handle_slots and stores i64 handles.
+        For backward compatibility with Phase 2, if value is a pointer,
+        we convert it to i64 using ptrtoint. In a fully handle-based system,
+        callers should pass actual handles.
+        """
         index_val = ir.Constant(self.i64, index)
-        # Cast value to i8* if needed
-        if value.type != self.i8_ptr:
-            if isinstance(value.type, ir.PointerType):
-                value = builder.bitcast(value, self.i8_ptr)
+        # Convert value to i64 handle
+        if value.type == self.i64:
+            # Already a handle
+            handle = value
+        elif isinstance(value.type, ir.PointerType):
+            # Convert pointer to i64 (backward compatibility)
+            handle = builder.ptrtoint(value, self.i64)
+        elif isinstance(value.type, ir.IntType) and value.type.width == 64:
+            handle = value
+        else:
+            # Try bitcast/conversion for other types
+            if isinstance(value.type, ir.IntType):
+                handle = builder.zext(value, self.i64)
             else:
-                value = builder.inttoptr(value, self.i8_ptr)
-        builder.call(self.gc_set_root, [roots, index_val, value])
+                # Fallback: bitcast to i64
+                handle = builder.ptrtoint(builder.bitcast(value, self.i8_ptr), self.i64)
+        builder.call(self.gc_set_root, [handle_slots, index_val, handle])
+
+    def alloc_with_deref(self, builder: ir.IRBuilder, size: ir.Value, type_id: ir.Value) -> ir.Value:
+        """Allocate memory and return the pointer (backward compatibility helper).
+
+        Phase 2: gc_alloc now returns a handle (i64). This helper calls gc_alloc
+        to get the handle, then immediately dereferences it to get the pointer.
+        This maintains backward compatibility with existing code that expects
+        gc_alloc to return a pointer.
+
+        Args:
+            builder: LLVM IR builder
+            size: Size of allocation in bytes (i64)
+            type_id: Type ID for GC tracing (i32)
+
+        Returns:
+            i8* pointer to the allocated memory
+        """
+        handle = builder.call(self.gc_alloc, [size, type_id])
+        ptr = builder.call(self.gc_handle_deref, [handle])
+        return ptr
 
     # ========================================================================
     # Dual-Heap Async GC Implementations
@@ -2081,18 +2286,18 @@ class GarbageCollector:
         snap_raw = builder.call(self.codegen.malloc, [snap_size])
         snapshot = builder.bitcast(snap_raw, self.root_snapshot_type.as_pointer())
 
-        # Allocate roots array
-        ptr_size = ir.Constant(self.i64, 8)
-        array_size = builder.mul(final_count, ptr_size)
+        # Allocate handle slots array (Phase 3: i64* instead of i8**)
+        slot_size = ir.Constant(self.i64, 8)  # sizeof(i64)
+        array_size = builder.mul(final_count, slot_size)
         # Ensure at least 8 bytes even if count is 0
         min_size = builder.icmp_unsigned(">", array_size, ir.Constant(self.i64, 0))
         actual_size = builder.select(min_size, array_size, ir.Constant(self.i64, 8))
-        roots_array = builder.call(self.codegen.malloc, [actual_size])
-        roots_typed = builder.bitcast(roots_array, self.i8_ptr_ptr)
+        slots_array = builder.call(self.codegen.malloc, [actual_size])
+        slots_typed = builder.bitcast(slots_array, self.i64_ptr)
 
         # Store in snapshot
-        roots_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(roots_typed, roots_field)
+        slots_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(slots_typed, slots_field)
         count_field = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(final_count, count_field)
         # heap_to_collect will be set by caller
@@ -2115,26 +2320,27 @@ class GarbageCollector:
         frame2 = builder.bitcast(curr_frame2, self.gc_frame_type.as_pointer())
         num_roots_ptr2 = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         frame_num_roots = builder.load(num_roots_ptr2)
-        roots_ptr_ptr = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        frame_roots = builder.load(roots_ptr_ptr)
+        # Phase 3: Get handle slots (i64*) instead of roots (i8**)
+        slots_ptr_ptr = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        frame_slots = builder.load(slots_ptr_ptr)
 
-        root_idx = builder.alloca(self.i64, name="root_idx")
-        builder.store(ir.Constant(self.i64, 0), root_idx)
+        slot_idx = builder.alloca(self.i64, name="slot_idx")
+        builder.store(ir.Constant(self.i64, 0), slot_idx)
         builder.branch(copy_roots)
 
         builder.position_at_end(copy_roots)
-        ri = builder.load(root_idx)
+        ri = builder.load(slot_idx)
         done_roots = builder.icmp_unsigned(">=", ri, frame_num_roots)
         builder.cbranch(done_roots, copy_next_frame, copy_root)
 
         builder.position_at_end(copy_root)
-        ri2 = builder.load(root_idx)
-        src_slot = builder.gep(frame_roots, [ri2], inbounds=True)
-        root_val = builder.load(src_slot)
+        ri2 = builder.load(slot_idx)
+        src_slot = builder.gep(frame_slots, [ri2], inbounds=True)
+        handle_val = builder.load(src_slot)  # Phase 3: i64 handle
 
         ci = builder.load(copy_idx)
-        dst_slot = builder.gep(roots_typed, [ci], inbounds=True)
-        builder.store(root_val, dst_slot)
+        dst_slot = builder.gep(slots_typed, [ci], inbounds=True)
+        builder.store(handle_val, dst_slot)
 
         new_ci = builder.add(ci, ir.Constant(self.i64, 1))
         builder.store(new_ci, copy_idx)
@@ -2142,7 +2348,7 @@ class GarbageCollector:
 
         builder.position_at_end(copy_next_root)
         next_ri = builder.add(ri2, ir.Constant(self.i64, 1))
-        builder.store(next_ri, root_idx)
+        builder.store(next_ri, slot_idx)
         builder.branch(copy_roots)
 
         builder.position_at_end(copy_next_frame)
@@ -2155,22 +2361,26 @@ class GarbageCollector:
         builder.ret(snapshot)
 
     def _implement_gc_mark_from_snapshot(self):
-        """Mark objects reachable from snapshot roots."""
+        """Mark objects reachable from snapshot handle slots.
+
+        Phase 3: Snapshot now contains i64 handles instead of i8* pointers.
+        """
         func = self.gc_mark_from_snapshot
         func.args[0].name = "snapshot"
 
         entry = func.append_basic_block("entry")
         mark_loop = func.append_basic_block("mark_loop")
-        mark_root = func.append_basic_block("mark_root")
-        next_root = func.append_basic_block("next_root")
+        check_handle = func.append_basic_block("check_handle")
+        do_mark = func.append_basic_block("do_mark")
+        next_slot = func.append_basic_block("next_slot")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
         snapshot = func.args[0]
 
-        # Get roots array and count
-        roots_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        roots = builder.load(roots_ptr)
+        # Get handle slots array and count (Phase 3)
+        slots_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        slots = builder.load(slots_ptr)
         count_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         count = builder.load(count_ptr)
 
@@ -2181,21 +2391,24 @@ class GarbageCollector:
         builder.position_at_end(mark_loop)
         i = builder.load(idx)
         done_marking = builder.icmp_unsigned(">=", i, count)
-        builder.cbranch(done_marking, done, mark_root)
+        builder.cbranch(done_marking, done, check_handle)
 
-        builder.position_at_end(mark_root)
+        builder.position_at_end(check_handle)
         i2 = builder.load(idx)
-        root_slot = builder.gep(roots, [i2], inbounds=True)
-        root_ptr = builder.load(root_slot)
+        slot = builder.gep(slots, [i2], inbounds=True)
+        handle = builder.load(slot)  # Phase 3: i64 handle
 
-        # Mark if not null
-        is_null = builder.icmp_unsigned("==", root_ptr, ir.Constant(self.i8_ptr, None))
-        with builder.if_then(builder.not_(is_null)):
-            builder.call(self.gc_mark_object, [root_ptr])
+        # Skip if handle is 0 (null handle)
+        is_null = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null, next_slot, do_mark)
 
-        builder.branch(next_root)
+        builder.position_at_end(do_mark)
+        # Note: set_root stores raw pointers as i64 (not handles), so use inttoptr
+        root_ptr = builder.inttoptr(handle, self.i8_ptr)
+        builder.call(self.gc_mark_object, [root_ptr])
+        builder.branch(next_slot)
 
-        builder.position_at_end(next_root)
+        builder.position_at_end(next_slot)
         next_i = builder.add(i2, ir.Constant(self.i64, 1))
         builder.store(next_i, idx)
         builder.branch(mark_loop)
@@ -2302,9 +2515,10 @@ class GarbageCollector:
         builder.position_at_end(process_alloc)
         node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
 
-        # Get data pointer and mark the object
-        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Phase 7: Get handle and dereference to get data pointer
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_ptr)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
         # Mark the object (gc_mark_object handles null and already-marked)
         builder.call(self.gc_mark_object, [data_ptr])
@@ -2737,9 +2951,10 @@ class GarbageCollector:
         builder.position_at_end(print_obj)
         node = builder.bitcast(curr, self.alloc_node_type.as_pointer())
 
-        # Get data pointer
-        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Phase 7: Get handle and dereference to get data pointer
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_ptr)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
         # Get header
         data_int = builder.ptrtoint(data_ptr, self.i64)
@@ -2981,9 +3196,10 @@ class GarbageCollector:
         builder.position_at_end(check_obj)
         node = builder.bitcast(curr, self.alloc_node_type.as_pointer())
 
-        # Get data pointer
-        data_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        data_ptr = builder.load(data_ptr_ptr)
+        # Phase 7: Get handle and dereference to get data pointer
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_ptr)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
         # Get header
         data_int = builder.ptrtoint(data_ptr, self.i64)
@@ -3040,3 +3256,230 @@ class GarbageCollector:
         level = func.args[0]
         builder.store(level, self.gc_trace_level)
         builder.ret_void()
+
+    # ============================================================
+    # Handle-Based GC - Phase 1: Handle Management Functions
+    # ============================================================
+
+    def _implement_gc_handle_table_grow(self):
+        """Double the handle table size when exhausted.
+
+        This is called when gc_next_handle exceeds gc_handle_table_size
+        and the free list is empty. Doubles the table capacity and copies
+        existing entries to the new table.
+        """
+        func = self.gc_handle_table_grow
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Load current table state
+        old_table = builder.load(self.gc_handle_table)
+        old_size = builder.load(self.gc_handle_table_size)
+
+        # Calculate new size (double)
+        new_size = builder.mul(old_size, ir.Constant(self.i64, 2))
+        new_bytes = builder.mul(new_size, ir.Constant(self.i64, 8))
+
+        # Allocate new table
+        new_table_raw = builder.call(self.codegen.malloc, [new_bytes])
+        new_table = builder.bitcast(new_table_raw, self.i8_ptr_ptr)
+
+        # Initialize new table to NULL
+        builder.call(self.codegen.memset, [
+            new_table_raw,
+            ir.Constant(self.i8, 0),
+            new_bytes
+        ])
+
+        # Copy old entries to new table
+        old_bytes = builder.mul(old_size, ir.Constant(self.i64, 8))
+        old_table_raw = builder.bitcast(old_table, self.i8_ptr)
+        builder.call(self.codegen.memcpy, [
+            new_table_raw,
+            old_table_raw,
+            old_bytes
+        ])
+
+        # Update globals
+        builder.store(new_table, self.gc_handle_table)
+        builder.store(new_size, self.gc_handle_table_size)
+
+        # Free old table
+        builder.call(self.codegen.free, [old_table_raw])
+
+        builder.ret_void()
+
+    def _implement_gc_handle_alloc(self):
+        """Allocate a handle slot, returning the handle index.
+
+        Strategy:
+        1. Try free list first (LIFO reuse)
+        2. If free list empty, bump gc_next_handle
+        3. If bump exceeds table size, grow table and retry
+
+        Returns: i64 handle (never 0, which represents null)
+        """
+        func = self.gc_handle_alloc
+        entry = func.append_basic_block("entry")
+        try_free_list = func.append_basic_block("try_free_list")
+        use_free_list = func.append_basic_block("use_free_list")
+        try_bump = func.append_basic_block("try_bump")
+        need_grow = func.append_basic_block("need_grow")
+        use_bump = func.append_basic_block("use_bump")
+
+        builder = ir.IRBuilder(entry)
+        builder.branch(try_free_list)
+
+        # Try free list first
+        builder.position_at_end(try_free_list)
+        free_head = builder.load(self.gc_handle_free_list)
+        has_free = builder.icmp_unsigned('!=', free_head, ir.Constant(self.i64, 0))
+        builder.cbranch(has_free, use_free_list, try_bump)
+
+        # Use free list entry
+        builder.position_at_end(use_free_list)
+        # Load next free from the slot (stored as i64 in the pointer slot)
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [free_head])
+        # The slot stores the next free handle as a pointer-sized value
+        next_free_ptr = builder.load(slot_ptr)
+        next_free = builder.ptrtoint(next_free_ptr, self.i64)
+        builder.store(next_free, self.gc_handle_free_list)
+        # Clear the slot (it will be set by gc_handle_store)
+        builder.store(ir.Constant(self.i8_ptr, None), slot_ptr)
+        builder.ret(free_head)
+
+        # Try bump allocation
+        builder.position_at_end(try_bump)
+        next_handle = builder.load(self.gc_next_handle)
+        table_size = builder.load(self.gc_handle_table_size)
+        need_grow_cond = builder.icmp_unsigned('>=', next_handle, table_size)
+        builder.cbranch(need_grow_cond, need_grow, use_bump)
+
+        # Need to grow table
+        builder.position_at_end(need_grow)
+        builder.call(self.gc_handle_table_grow, [])
+        builder.branch(try_bump)  # Retry after growth
+
+        # Use bump allocation
+        builder.position_at_end(use_bump)
+        handle = builder.load(self.gc_next_handle)
+        new_next = builder.add(handle, ir.Constant(self.i64, 1))
+        builder.store(new_next, self.gc_next_handle)
+        builder.ret(handle)
+
+    def _implement_gc_handle_free(self):
+        """Return a handle to the free list (called during sweep).
+
+        The freed slot stores the previous free list head, forming a LIFO list.
+        """
+        func = self.gc_handle_free
+        func.args[0].name = "handle"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        handle = func.args[0]
+
+        # Get current free list head
+        old_head = builder.load(self.gc_handle_free_list)
+
+        # Store old head in the slot being freed (as a pointer-sized value)
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [handle])
+        old_head_as_ptr = builder.inttoptr(old_head, self.i8_ptr)
+        builder.store(old_head_as_ptr, slot_ptr)
+
+        # Update free list head
+        builder.store(handle, self.gc_handle_free_list)
+
+        builder.ret_void()
+
+    def _implement_gc_handle_deref(self):
+        """Dereference a handle to get the object pointer.
+
+        Returns NULL if handle is 0 (null handle).
+        Otherwise returns gc_handle_table[handle].
+        """
+        func = self.gc_handle_deref
+        func.args[0].name = "handle"
+
+        entry = func.append_basic_block("entry")
+        is_null = func.append_basic_block("is_null")
+        not_null = func.append_basic_block("not_null")
+
+        builder = ir.IRBuilder(entry)
+
+        handle = func.args[0]
+
+        # Check for null handle
+        is_zero = builder.icmp_unsigned('==', handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_zero, is_null, not_null)
+
+        # Return NULL for handle 0
+        builder.position_at_end(is_null)
+        builder.ret(ir.Constant(self.i8_ptr, None))
+
+        # Dereference non-null handle
+        builder.position_at_end(not_null)
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [handle])
+        ptr = builder.load(slot_ptr)
+        builder.ret(ptr)
+
+    def _implement_gc_handle_store(self):
+        """Store a pointer in a handle slot.
+
+        gc_handle_table[handle] = ptr
+        """
+        func = self.gc_handle_store
+        func.args[0].name = "handle"
+        func.args[1].name = "ptr"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        handle = func.args[0]
+        ptr = func.args[1]
+
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [handle])
+        builder.store(ptr, slot_ptr)
+
+        builder.ret_void()
+
+    def _implement_gc_ptr_to_handle(self):
+        """Get the handle for an object from its pointer.
+
+        Reads the handle from the object's header (forward field at offset 24).
+        Returns 0 if ptr is null.
+        """
+        func = self.gc_ptr_to_handle
+        func.args[0].name = "ptr"
+
+        entry = func.append_basic_block("entry")
+        is_null = func.append_basic_block("is_null")
+        not_null = func.append_basic_block("not_null")
+
+        builder = ir.IRBuilder(entry)
+
+        ptr = func.args[0]
+
+        # Check for null pointer
+        ptr_int = builder.ptrtoint(ptr, self.i64)
+        is_zero = builder.icmp_unsigned('==', ptr_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_zero, is_null, not_null)
+
+        # Return 0 for null pointer
+        builder.position_at_end(is_null)
+        builder.ret(ir.Constant(self.i64, 0))
+
+        # Get header and read handle from forward field
+        builder.position_at_end(not_null)
+        # Header is HEADER_SIZE bytes before the object pointer
+        header_int = builder.sub(ptr_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr = builder.inttoptr(header_int, self.header_type.as_pointer())
+        # Forward field is at index 3
+        forward_ptr = builder.gep(header_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        handle = builder.load(forward_ptr)
+        builder.ret(handle)
