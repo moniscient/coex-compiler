@@ -170,6 +170,11 @@ class CodeGenerator:
         self._pending_inline_ir: PyList[Dict] = []  # Pending IR to inject during serialization
         self._inline_ir_counter = 0  # Counter for unique stub function names
 
+        # Compiler warnings for implicit conversions
+        # These are collected during code generation and can be output as #@ comments
+        self.warnings: PyList[Dict] = []  # [{line, column, category, message}, ...]
+        self.current_line: int = 0  # Current source line being processed
+
         # Garbage collector (initialized after module creation, before builtins)
         self.gc: Optional[GarbageCollector] = None
 
@@ -2374,6 +2379,144 @@ class CodeGenerator:
         self.builder.position_at_end(end_block)
         return self.builder.load(set_alloca)
 
+    def _list_to_set(self, list_ptr: ir.Value, elem_is_ptr: bool = False) -> ir.Value:
+        """Convert a List to a Set (List.to_set() -> Set).
+
+        Creates a new Set with the same elements as the List.
+        Duplicate elements in the List are deduplicated.
+        """
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        func = self.builder.function
+
+        # Get List length
+        list_len = self.builder.call(self.list_len, [list_ptr])
+
+        # Create new empty Set with flags indicating element type
+        flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
+        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
+
+        # Store set_ptr in alloca since set_add returns new set
+        set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="list_to_set")
+        self.builder.store(set_ptr, set_alloca)
+
+        # Loop through list elements and add to set
+        idx_alloca = self.builder.alloca(i64, name="list_to_set_idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = func.append_basic_block("list_to_set_cond")
+        body_block = func.append_basic_block("list_to_set_body")
+        end_block = func.append_basic_block("list_to_set_end")
+
+        self.builder.branch(cond_block)
+
+        # Condition: idx < list_len
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, list_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        # Body: get element from list and add to set
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+
+        # Get element from list using list_get
+        elem_ptr = self.builder.call(self.list_get, [list_ptr, idx])
+        # Load element as i64 (assuming elements are stored as i64)
+        typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
+        elem_val = self.builder.load(typed_ptr)
+
+        # Add element to set (set_add returns new set)
+        current_set = self.builder.load(set_alloca)
+        new_set = self.builder.call(self.set_add, [current_set, elem_val])
+        self.builder.store(new_set, set_alloca)
+
+        # Increment index
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        # End
+        self.builder.position_at_end(end_block)
+        return self.builder.load(set_alloca)
+
+    def _try_implicit_collection_conversion(self, value: ir.Value, target_type: Type, value_type: Type = None) -> Tuple[ir.Value, bool]:
+        """Try to implicitly convert between collection types.
+
+        Returns (converted_value, was_converted) where was_converted is True if
+        an implicit conversion was performed (and a warning should be emitted).
+
+        Supported conversions:
+        - List<T> -> Array<T> (via .packed())
+        - Array<T> -> List<T> (via .unpacked())
+        - List<T> -> Set<T> (via .to_set(), deduplicates)
+        - Set<T> -> List<T> (via .unpacked())
+        - Set<T> -> Array<T> (via .packed())
+        - Array<T> -> Set<T> (via .toSet(), deduplicates)
+        """
+        if not isinstance(value.type, ir.PointerType):
+            return value, False
+
+        pointee = value.type.pointee
+        if not hasattr(pointee, 'name'):
+            return value, False
+
+        source_struct = pointee.name  # e.g., "struct.List"
+
+        # Determine target collection type
+        if isinstance(target_type, ListType):
+            target_struct = "struct.List"
+        elif isinstance(target_type, ArrayType):
+            target_struct = "struct.Array"
+        elif isinstance(target_type, SetType):
+            target_struct = "struct.Set"
+        else:
+            return value, False
+
+        # No conversion needed if types match
+        if source_struct == target_struct:
+            return value, False
+
+        # Perform conversion based on source -> target
+        if source_struct == "struct.List" and target_struct == "struct.Array":
+            return self._list_to_array(value), True
+        elif source_struct == "struct.Array" and target_struct == "struct.List":
+            return self._array_to_list(value), True
+        elif source_struct == "struct.List" and target_struct == "struct.Set":
+            return self._list_to_set(value), True
+        elif source_struct == "struct.Set" and target_struct == "struct.List":
+            # set_to_list is available via coex_set_to_list
+            return self.builder.call(self.set_to_list, [value]), True
+        elif source_struct == "struct.Set" and target_struct == "struct.Array":
+            return self._set_to_array(value), True
+        elif source_struct == "struct.Array" and target_struct == "struct.Set":
+            return self._array_to_set(value), True
+
+        return value, False
+
+    def _get_conversion_warning_message(self, source_struct: str, target_struct: str) -> str:
+        """Get the warning message for an implicit collection conversion."""
+        source_name = source_struct.replace("struct.", "")
+        target_name = target_struct.replace("struct.", "")
+
+        # Map struct names to user-friendly names
+        names = {"List": "List", "Array": "Array", "Set": "Set"}
+        source = names.get(source_name, source_name)
+        target = names.get(target_name, target_name)
+
+        if source == "List" and target == "Array":
+            return f"Implicit conversion from {source} to {target} (O(n) copy to contiguous memory)"
+        elif source == "Array" and target == "List":
+            return f"Implicit conversion from {source} to {target} (O(n) copy to persistent vector)"
+        elif source in ("List", "Array") and target == "Set":
+            return f"Implicit conversion from {source} to {target} (O(n) with deduplication)"
+        elif source == "Set" and target in ("List", "Array"):
+            return f"Implicit conversion from {source} to {target} (O(n) copy)"
+        else:
+            return f"Implicit conversion from {source} to {target}"
+
     def _create_string_type(self):
         """Create the String struct type and helper functions.
 
@@ -2488,6 +2631,12 @@ class CodeGenerator:
         string_hash_ty = ir.FunctionType(i64, [string_ptr])
         self.string_hash = ir.Function(self.module, string_hash_ty, name="coex_string_hash")
 
+        # string_split(s: String*, delimiter: String*) -> List<String>*
+        # Splits string by delimiter, returns list of zero-copy slice views
+        list_ptr = self.list_struct.as_pointer()
+        string_split_ty = ir.FunctionType(list_ptr, [string_ptr, string_ptr])
+        self.string_split = ir.Function(self.module, string_split_ty, name="coex_string_split")
+
         # Optional types for parsing results
         int_optional = ir.LiteralStructType([ir.IntType(1), i64])
         float_optional = ir.LiteralStructType([ir.IntType(1), ir.DoubleType()])
@@ -2561,6 +2710,7 @@ class CodeGenerator:
         self._implement_string_from_hex()
         self._implement_string_from_bytes()
         self._implement_string_to_bytes()
+        self._implement_string_split()
         # Note: string_validjson is implemented after JSON type is created (needs json_parse)
 
         # Register String type methods
@@ -4324,6 +4474,166 @@ class CodeGenerator:
         empty_list = builder.call(self.list_new, [ir.Constant(i64, 1)])
         builder.ret(empty_list)
 
+    def _implement_string_split(self):
+        """Split string by delimiter, returning List of zero-copy slice views.
+
+        string_split(s: String*, delimiter: String*) -> List<String>*
+
+        Creates slice views into the original string's buffer - no data copying.
+        Each element in the returned list shares the parent string's owner pointer.
+        """
+        func = self.string_split
+        func.args[0].name = "s"
+        func.args[1].name = "delim"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+
+        s = func.args[0]
+        delim = func.args[1]
+
+        # Get source string data and size
+        src_data = builder.call(self.string_data, [s])
+        src_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_size = builder.load(src_size_ptr)
+
+        # Get delimiter data and size
+        delim_data = builder.call(self.string_data, [delim])
+        delim_size_ptr = builder.gep(delim, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        delim_size = builder.load(delim_size_ptr)
+
+        # Create result list (element size = 8 for string pointers)
+        result_list = builder.call(self.list_new, [ir.Constant(i64, 8)])
+        list_ptr = builder.alloca(self.list_struct.as_pointer(), name="result")
+        builder.store(result_list, list_ptr)
+
+        # Allocate loop variables
+        idx_ptr = builder.alloca(i64, name="idx")
+        start_ptr = builder.alloca(i64, name="start")
+        builder.store(zero, idx_ptr)
+        builder.store(zero, start_ptr)
+
+        # Check for empty delimiter
+        delim_empty = builder.icmp_unsigned("==", delim_size, zero)
+        empty_delim_block = func.append_basic_block("empty_delim")
+        scan_loop = func.append_basic_block("scan_loop")
+        builder.cbranch(delim_empty, empty_delim_block, scan_loop)
+
+        # Empty delimiter - return list with just the original string
+        builder.position_at_end(empty_delim_block)
+        temp_ptr = builder.alloca(self.string_struct.as_pointer(), name="temp")
+        builder.store(s, temp_ptr)
+        temp_i8 = builder.bitcast(temp_ptr, i8.as_pointer())
+        curr = builder.load(list_ptr)
+        result = builder.call(self.list_append, [curr, temp_i8, ir.Constant(i64, 8)])
+        builder.ret(result)
+
+        # Main scan loop - check bounds
+        builder.position_at_end(scan_loop)
+        scan_check = func.append_basic_block("scan_check")
+        try_match = func.append_basic_block("try_match")
+        add_final = func.append_basic_block("add_final")
+        done = func.append_basic_block("done")
+        builder.branch(scan_check)
+
+        builder.position_at_end(scan_check)
+        idx = builder.load(idx_ptr)
+        remaining = builder.sub(src_size, idx)
+        can_match = builder.icmp_unsigned(">=", remaining, delim_size)
+        builder.cbranch(can_match, try_match, add_final)
+
+        # Try to match delimiter at current position
+        builder.position_at_end(try_match)
+
+        # Byte-by-byte comparison loop
+        match_idx_ptr = builder.alloca(i64, name="match_idx")
+        builder.store(zero, match_idx_ptr)
+
+        match_loop = func.append_basic_block("match_loop")
+        match_body = func.append_basic_block("match_body")
+        match_success = func.append_basic_block("match_success")
+        match_fail = func.append_basic_block("match_fail")
+        match_next = func.append_basic_block("match_next")
+
+        builder.branch(match_loop)
+
+        # Check if we've matched all delimiter bytes
+        builder.position_at_end(match_loop)
+        m_idx = builder.load(match_idx_ptr)
+        all_matched = builder.icmp_unsigned(">=", m_idx, delim_size)
+        builder.cbranch(all_matched, match_success, match_body)
+
+        # Compare one byte
+        builder.position_at_end(match_body)
+        idx = builder.load(idx_ptr)
+        m_idx = builder.load(match_idx_ptr)
+        src_off = builder.add(idx, m_idx)
+        src_byte_ptr = builder.gep(src_data, [src_off])
+        src_byte = builder.load(src_byte_ptr)
+        delim_byte_ptr = builder.gep(delim_data, [m_idx])
+        delim_byte = builder.load(delim_byte_ptr)
+        eq = builder.icmp_unsigned("==", src_byte, delim_byte)
+        builder.cbranch(eq, match_next, match_fail)
+
+        # Increment match index and continue
+        builder.position_at_end(match_next)
+        m_idx = builder.load(match_idx_ptr)
+        new_m_idx = builder.add(m_idx, one)
+        builder.store(new_m_idx, match_idx_ptr)
+        builder.branch(match_loop)
+
+        # Match succeeded - add segment and skip delimiter
+        builder.position_at_end(match_success)
+        idx = builder.load(idx_ptr)
+        start = builder.load(start_ptr)
+
+        # Create slice view for segment [start, idx)
+        slice_val = builder.call(self.string_slice, [s, start, idx])
+        slice_temp = builder.alloca(self.string_struct.as_pointer(), name="slice_temp")
+        builder.store(slice_val, slice_temp)
+        slice_i8 = builder.bitcast(slice_temp, i8.as_pointer())
+        curr = builder.load(list_ptr)
+        new_list = builder.call(self.list_append, [curr, slice_i8, ir.Constant(i64, 8)])
+        builder.store(new_list, list_ptr)
+
+        # Move past delimiter
+        new_pos = builder.add(idx, delim_size)
+        builder.store(new_pos, idx_ptr)
+        builder.store(new_pos, start_ptr)
+        builder.branch(scan_check)
+
+        # Match failed - advance by 1 byte
+        builder.position_at_end(match_fail)
+        idx = builder.load(idx_ptr)
+        new_idx = builder.add(idx, one)
+        builder.store(new_idx, idx_ptr)
+        builder.branch(scan_check)
+
+        # Add final segment (always add - even if empty, to handle trailing delimiters)
+        builder.position_at_end(add_final)
+        start = builder.load(start_ptr)
+        # Create slice view for final segment [start, src_size)
+        # This handles: empty string, trailing delimiter, and normal final segment
+        final_slice = builder.call(self.string_slice, [s, start, src_size])
+        final_temp = builder.alloca(self.string_struct.as_pointer(), name="final_temp")
+        builder.store(final_slice, final_temp)
+        final_i8 = builder.bitcast(final_temp, i8.as_pointer())
+        curr = builder.load(list_ptr)
+        new_list = builder.call(self.list_append, [curr, final_i8, ir.Constant(i64, 8)])
+        builder.store(new_list, list_ptr)
+        builder.branch(done)
+
+        # Return result
+        builder.position_at_end(done)
+        final_result = builder.load(list_ptr)
+        builder.ret(final_result)
+
     def _implement_string_validjson(self):
         """Check if string is valid JSON by attempting to parse it.
 
@@ -4580,6 +4890,7 @@ class CodeGenerator:
             "int_hex": "coex_string_to_int_hex",
             "validjson": "coex_string_validjson",
             "bytes": "coex_string_to_bytes",
+            "split": "coex_string_split",
         }
 
         # Also store function references for direct access
@@ -4598,6 +4909,7 @@ class CodeGenerator:
         self.functions["coex_string_to_float"] = self.string_to_float
         self.functions["coex_string_to_int_hex"] = self.string_to_int_hex
         self.functions["coex_string_validjson"] = self.string_validjson
+        self.functions["coex_string_split"] = self.string_split
 
         # Static methods for String.from() and String.from_hex()
         self.functions["String_from"] = self.string_from_int  # Default; dispatch handles types
@@ -7161,6 +7473,8 @@ class CodeGenerator:
             "remove": "coex_map_remove",
             "len": "coex_map_len",
             "size": "coex_map_size",
+            "keys": "coex_map_keys",
+            "values": "coex_map_values",
         }
 
         self.functions["coex_map_new"] = self.map_new
@@ -7171,6 +7485,8 @@ class CodeGenerator:
         self.functions["coex_map_len"] = self.map_len
         self.functions["coex_map_size"] = self.map_size
         self.functions["coex_map_copy"] = self.map_copy
+        self.functions["coex_map_keys"] = self.map_keys
+        self.functions["coex_map_values"] = self.map_values
 
     # ========================================================================
     # Set Type Implementation
@@ -7711,6 +8027,7 @@ class CodeGenerator:
             "remove": "coex_set_remove",
             "len": "coex_set_len",
             "size": "coex_set_size",
+            "unpacked": "coex_set_to_list",
         }
 
         self.functions["coex_set_new"] = self.set_new
@@ -7720,6 +8037,7 @@ class CodeGenerator:
         self.functions["coex_set_len"] = self.set_len
         self.functions["coex_set_size"] = self.set_size
         self.functions["coex_set_copy"] = self.set_copy
+        self.functions["coex_set_to_list"] = self.set_to_list
 
     # ========================================================================
     # JSON Type Implementation
@@ -12840,6 +13158,25 @@ class CodeGenerator:
         self.var_scopes = {}
         self.scope_stack = [[]]
 
+    def _emit_warning(self, category: str, message: str, line: int = None):
+        """Emit a compiler warning that will be written as a #@ comment.
+
+        Categories:
+        - PERF: Performance-related warning (e.g., implicit conversion)
+        - WARN: General warning
+        - HINT: Suggestion for improvement
+        """
+        self.warnings.append({
+            'line': line or self.current_line,
+            'column': 1,
+            'category': category,
+            'message': message
+        })
+
+    def get_warnings(self) -> PyList[Dict]:
+        """Return the list of collected warnings."""
+        return self.warnings
+
     # ========================================================================
     # Statement Generation
     # ========================================================================
@@ -13001,6 +13338,9 @@ class CodeGenerator:
                 # Infer type from literal expression
                 inferred_coex_type = self._infer_type_from_expr(stmt.initializer)
                 self.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(stmt.initializer, StringLiteral):
+                # Track string type for split() method type inference
+                self.var_coex_types[stmt.name] = PrimitiveType("string")
             elif isinstance(stmt.initializer, MethodCallExpr):
                 # If initializer is a method call on a collection (e.g., list.set()),
                 # propagate the type from the receiver
@@ -13011,6 +13351,10 @@ class CodeGenerator:
                         # Methods that return same collection type
                         if stmt.initializer.method in ("set", "append", "remove", "pop", "insert"):
                             inferred_coex_type = receiver_type
+                            self.var_coex_types[stmt.name] = inferred_coex_type
+                        # String.split() returns List<String>
+                        elif stmt.initializer.method == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
+                            inferred_coex_type = ListType(PrimitiveType("string"))
                             self.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(stmt.initializer, CallExpr):
                 # Check if this is a method call (callee is MemberExpr: obj.method(...))
@@ -13023,6 +13367,10 @@ class CodeGenerator:
                         # Methods that return same collection type
                         if method_name in ("set", "append", "remove", "pop", "insert"):
                             inferred_coex_type = receiver_type
+                            self.var_coex_types[stmt.name] = inferred_coex_type
+                        # String.split() returns List<String>
+                        elif method_name == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
+                            inferred_coex_type = ListType(PrimitiveType("string"))
                             self.var_coex_types[stmt.name] = inferred_coex_type
 
             if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
@@ -13136,6 +13484,21 @@ class CodeGenerator:
             init_value = self._convert_to_json(init_value, stmt.initializer)
         else:
             init_value = self._generate_expression(stmt.initializer)
+
+        # Try implicit collection conversion (List <-> Array <-> Set)
+        # This allows assigning e.g. a List to an Array variable with a warning
+        if isinstance(stmt.type_annotation, (ListType, ArrayType, SetType)):
+            converted_value, was_converted = self._try_implicit_collection_conversion(
+                init_value, stmt.type_annotation
+            )
+            if was_converted:
+                # Emit a warning about the implicit conversion
+                source_struct = init_value.type.pointee.name if isinstance(init_value.type, ir.PointerType) else "unknown"
+                warning_msg = self._get_conversion_warning_message(source_struct,
+                    "struct.List" if isinstance(stmt.type_annotation, ListType) else
+                    "struct.Array" if isinstance(stmt.type_annotation, ArrayType) else "struct.Set")
+                self._emit_warning("PERF", warning_msg)
+                init_value = converted_value
 
         # Cast if needed
         init_value = self._cast_value(init_value, llvm_type)
@@ -14892,10 +15255,17 @@ class CodeGenerator:
         elem_type = self._get_list_element_type_for_pattern(stmt)
         typed_ptr = self.builder.bitcast(elem_ptr, elem_type.as_pointer())
         elem_val = self.builder.load(typed_ptr)
-        
+
         # Bind pattern variables (supports destructuring)
         self._bind_pattern(stmt.pattern, elem_val)
-        
+
+        # Track Coex type for loop variable (enables method calls on string, etc.)
+        if isinstance(stmt.pattern, IdentifierPattern):
+            # Get element type from tracked list type
+            elem_coex_type = self._get_list_element_coex_type(stmt)
+            if elem_coex_type:
+                self.var_coex_types[stmt.pattern.name] = elem_coex_type
+
         # Generate body statements
         for s in stmt.body:
             self._generate_statement(s)
@@ -16527,13 +16897,15 @@ class CodeGenerator:
                     return self._array_to_list(obj)
             return ir.Constant(ir.IntType(64), 0)
 
-        if method == "toSet":
-            # Array.toSet() -> Set
-            # Convert Array to Set (deduplicates)
+        if method == "toSet" or method == "to_set":
+            # Array.toSet() -> Set or List.to_set() -> Set
+            # Convert Array/List to Set (deduplicates)
             if isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     return self._array_to_set(obj)
+                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                    return self._list_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
         # Generic method lookup failed - raise error
@@ -18167,6 +18539,22 @@ class CodeGenerator:
             var_name = stmt.iterable.name
             if var_name in self.list_element_types:
                 return self.list_element_types[var_name]
+            # Also check var_coex_types for List element type
+            if var_name in self.var_coex_types:
+                coex_type = self.var_coex_types[var_name]
+                if isinstance(coex_type, ListType):
+                    return self._get_llvm_type(coex_type.element_type)
+
+        # Handle method call iterables (e.g., text.split("\n"))
+        if isinstance(stmt.iterable, MethodCallExpr):
+            if stmt.iterable.method == "split":
+                # split() returns List<String>
+                return self.string_struct.as_pointer()
+        elif isinstance(stmt.iterable, CallExpr):
+            # CallExpr with MemberExpr callee (e.g., text.split("\n"))
+            if isinstance(stmt.iterable.callee, MemberExpr):
+                if stmt.iterable.callee.member == "split":
+                    return self.string_struct.as_pointer()
 
         # Infer from pattern structure
         pattern = stmt.pattern
@@ -18177,6 +18565,28 @@ class CodeGenerator:
 
         # Default to i64
         return ir.IntType(64)
+
+    def _get_list_element_coex_type(self, stmt: ForStmt) -> Optional[Type]:
+        """Get the Coex AST type for list elements (for var_coex_types tracking)."""
+        # Check iterable identifier in var_coex_types
+        if isinstance(stmt.iterable, Identifier):
+            var_name = stmt.iterable.name
+            if var_name in self.var_coex_types:
+                coex_type = self.var_coex_types[var_name]
+                if isinstance(coex_type, ListType):
+                    return coex_type.element_type
+
+        # Handle method call iterables (e.g., text.split("\n"))
+        if isinstance(stmt.iterable, MethodCallExpr):
+            if stmt.iterable.method == "split":
+                return PrimitiveType("string")
+        elif isinstance(stmt.iterable, CallExpr):
+            # CallExpr with MemberExpr callee (e.g., text.split("\n"))
+            if isinstance(stmt.iterable.callee, MemberExpr):
+                if stmt.iterable.callee.member == "split":
+                    return PrimitiveType("string")
+
+        return None
 
     def _get_array_element_type_for_pattern(self, stmt: ForStmt) -> ir.Type:
         """Get the LLVM type for array elements based on pattern and tracked info."""
