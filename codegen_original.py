@@ -18,6 +18,9 @@ from coex_gc import GarbageCollector
 # Import POSIX module
 from codegen.posix import PosixGenerator
 
+# Import String module
+from codegen.strings import StringGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -287,9 +290,12 @@ class CodeGenerator:
         
         # Create list helper functions
         self._create_list_helpers()
-        
-        # Create String type and helpers
-        self._create_string_type()
+
+        # Initialize String module
+        self._strings = StringGenerator(self)
+
+        # Create String type and helpers (delegated to strings module)
+        self._strings.create_string_type()
         
         # Create Map type and helpers
         self._create_map_type()
@@ -8378,8 +8384,8 @@ class CodeGenerator:
         self._implement_json_pretty()
         self._implement_json_parse()
 
-        # Implement string.validjson() now that json_parse exists
-        self._implement_string_validjson()
+        # Implement string.validjson() now that json_parse exists (delegated to strings module)
+        self._strings.implement_string_validjson()
 
         # Register JSON type and methods
         self._register_json_methods()
