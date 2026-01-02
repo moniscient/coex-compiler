@@ -98,6 +98,7 @@ class GarbageCollector:
         self.gc_handle_table_size = None  # i64 - current table capacity
         self.gc_handle_free_list = None   # i64 - head of free slot chain (0 = empty)
         self.gc_next_handle = None        # i64 - next fresh handle to allocate
+        self.gc_handle_retired_list = None  # i64 - handles pending retirement (MI-6)
 
         # GC functions
         self.gc_init = None
@@ -116,6 +117,8 @@ class GarbageCollector:
         self.gc_handle_deref = None       # Dereference handle to get i8* pointer
         self.gc_handle_store = None       # Store pointer in handle slot
         self.gc_handle_table_grow = None  # Double table size
+        self.gc_handle_retire = None      # Add handle to retired list (MI-6 deferred reclamation)
+        self.gc_promote_retired_handles = None  # Move retired handles to free list
 
         # Dual-heap async GC functions
         self.gc_async = None
@@ -174,6 +177,9 @@ class GarbageCollector:
         self.gc_stats_alloc = None
         self.gc_stats_collect = None
         self.gc_set_trace_level = None
+        self.gc_fragmentation_report = None   # Analyze heap fragmentation
+        self.gc_dump_handle_table = None      # Dump handle table state
+        self.gc_dump_shadow_stacks = None     # Dump shadow stack frames
 
     def generate_gc_runtime(self):
         """Generate all GC runtime structures and functions"""
@@ -211,6 +217,10 @@ class GarbageCollector:
         self._implement_gc_dump_object()
         self._implement_gc_validate_heap()
         self._implement_gc_set_trace_level()
+        # Additional diagnostic functions
+        self._implement_gc_fragmentation_report()
+        self._implement_gc_dump_handle_table()
+        self._implement_gc_dump_shadow_stacks()
         # Handle-Based GC - Phase 1: Handle management functions
         self._implement_gc_handle_table_grow()
         self._implement_gc_handle_alloc()
@@ -218,6 +228,9 @@ class GarbageCollector:
         self._implement_gc_handle_deref()
         self._implement_gc_handle_store()
         self._implement_gc_ptr_to_handle()
+        # MI-6: Deferred reclamation functions
+        self._implement_gc_handle_retire()
+        self._implement_gc_promote_retired_handles()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -388,6 +401,13 @@ class GarbageCollector:
         self.gc_next_handle.initializer = ir.Constant(self.i64, 1)
         self.gc_next_handle.linkage = 'internal'
 
+        # Retired list for deferred reclamation (MI-6)
+        # Handles freed in cycle N become available in cycle N+2
+        # This prevents use-after-free when concurrent GC is enabled
+        self.gc_handle_retired_list = ir.GlobalVariable(self.module, self.i64, name="gc_handle_retired_list")
+        self.gc_handle_retired_list.initializer = ir.Constant(self.i64, 0)
+        self.gc_handle_retired_list.linkage = 'internal'
+
         # ============================================================
         # Dual-heap async GC globals
         # ============================================================
@@ -548,8 +568,9 @@ class GarbageCollector:
         gc_set_root_ty = ir.FunctionType(self.void, [self.i64_ptr, self.i64, self.i64])
         self.gc_set_root = ir.Function(self.module, gc_set_root_ty, name="coex_gc_set_root")
 
-        # gc_mark_object(ptr: i8*) -> void
-        gc_mark_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        # gc_mark_object(handle: i64) -> void
+        # Takes a handle index and marks the referenced object as live
+        gc_mark_ty = ir.FunctionType(self.void, [self.i64])
         self.gc_mark_object = ir.Function(self.module, gc_mark_ty, name="coex_gc_mark_object")
 
         # gc_scan_roots() -> void
@@ -705,6 +726,21 @@ class GarbageCollector:
         gc_set_trace_level_ty = ir.FunctionType(self.void, [self.i64])
         self.gc_set_trace_level = ir.Function(self.module, gc_set_trace_level_ty, name="coex_gc_set_trace_level")
 
+        # gc_fragmentation_report() -> void
+        # Analyze and print heap fragmentation statistics
+        gc_fragmentation_report_ty = ir.FunctionType(self.void, [])
+        self.gc_fragmentation_report = ir.Function(self.module, gc_fragmentation_report_ty, name="coex_gc_fragmentation_report")
+
+        # gc_dump_handle_table() -> void
+        # Print handle table state (allocated, free, retired handles)
+        gc_dump_handle_table_ty = ir.FunctionType(self.void, [])
+        self.gc_dump_handle_table = ir.Function(self.module, gc_dump_handle_table_ty, name="coex_gc_dump_handle_table")
+
+        # gc_dump_shadow_stacks() -> void
+        # Print all shadow stack frames and their roots
+        gc_dump_shadow_stacks_ty = ir.FunctionType(self.void, [])
+        self.gc_dump_shadow_stacks = ir.Function(self.module, gc_dump_shadow_stacks_ty, name="coex_gc_dump_shadow_stacks")
+
         # ============================================================
         # Handle Management Function Declarations (Handle-Based GC - Phase 1)
         # ============================================================
@@ -741,6 +777,17 @@ class GarbageCollector:
         # Returns 0 if ptr is null
         gc_ptr_to_handle_ty = ir.FunctionType(self.i64, [self.i8_ptr])
         self.gc_ptr_to_handle = ir.Function(self.module, gc_ptr_to_handle_ty, name="coex_gc_ptr_to_handle")
+
+        # gc_handle_retire(handle: i64) -> void
+        # Add handle to retired list for deferred reclamation (MI-6)
+        # Handles go to retired list during sweep, promoted to free list next cycle
+        gc_handle_retire_ty = ir.FunctionType(self.void, [self.i64])
+        self.gc_handle_retire = ir.Function(self.module, gc_handle_retire_ty, name="coex_gc_handle_retire")
+
+        # gc_promote_retired_handles() -> void
+        # Move all retired handles to the free list (called at start of GC cycle)
+        gc_promote_retired_ty = ir.FunctionType(self.void, [])
+        self.gc_promote_retired_handles = ir.Function(self.module, gc_promote_retired_ty, name="coex_gc_promote_retired_handles")
 
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
@@ -1246,7 +1293,9 @@ class GarbageCollector:
         builder.position_at_end(is_leaf)
         untagged_int = builder.and_(ptr_as_int, ir.Constant(self.i64, ~1 & 0xFFFFFFFFFFFFFFFF))
         untagged_ptr = builder.inttoptr(untagged_int, self.i8_ptr)
-        builder.call(self.gc_mark_object, [untagged_ptr])
+        # Convert pointer to handle for gc_mark_object
+        untagged_handle = builder.call(self.gc_ptr_to_handle, [untagged_ptr])
+        builder.call(self.gc_mark_object, [untagged_handle])
 
         # Leaf struct: { i64 hash, i64 key, i64 value }
         leaf_type = ir.LiteralStructType([self.i64, self.i64, self.i64])
@@ -1265,7 +1314,9 @@ class GarbageCollector:
         # Null check for key
         key_is_null = builder.icmp_unsigned("==", key_as_ptr, ir.Constant(self.i8_ptr, None))
         with builder.if_then(builder.not_(key_is_null)):
-            builder.call(self.gc_mark_object, [key_as_ptr])
+            # Convert pointer to handle for gc_mark_object
+            key_handle = builder.call(self.gc_ptr_to_handle, [key_as_ptr])
+            builder.call(self.gc_mark_object, [key_handle])
         builder.branch(after_key)
 
         # Check if value needs marking (flag bit 1)
@@ -1282,7 +1333,9 @@ class GarbageCollector:
         # Null check for value
         value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
         with builder.if_then(builder.not_(value_is_null)):
-            builder.call(self.gc_mark_object, [value_as_ptr])
+            # Convert pointer to handle for gc_mark_object
+            value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
+            builder.call(self.gc_mark_object, [value_handle])
         builder.branch(after_value)
 
         builder.position_at_end(after_value)
@@ -1290,8 +1343,9 @@ class GarbageCollector:
 
         # Handle internal node
         builder.position_at_end(is_internal)
-        # Mark the node itself
-        builder.call(self.gc_mark_object, [root])
+        # Mark the node itself (convert pointer to handle)
+        root_handle = builder.call(self.gc_ptr_to_handle, [root])
+        builder.call(self.gc_mark_object, [root_handle])
 
         # HAMT node struct: { i32 bitmap, i8** children }
         hamt_node_type = ir.LiteralStructType([self.i32, self.i8_ptr.as_pointer()])
@@ -1336,7 +1390,9 @@ class GarbageCollector:
 
         # Mark the children array itself (it's also gc_alloc'd)
         children_as_i8 = builder.bitcast(children_ptr, self.i8_ptr)
-        builder.call(self.gc_mark_object, [children_as_i8])
+        # Convert pointer to handle for gc_mark_object
+        children_handle = builder.call(self.gc_ptr_to_handle, [children_as_i8])
+        builder.call(self.gc_mark_object, [children_handle])
 
         # Iterate over children and recursively mark
         idx_ptr = builder.alloca(self.i32, name="idx")
@@ -1366,11 +1422,14 @@ class GarbageCollector:
 
         Phase 9 Enhancement: Handles user-defined types by looking up their
         pointer field offsets from gc_type_offsets_table and marking each field.
+
+        Handle-based signature: Takes i64 handle and dereferences to get pointer.
         """
         func = self.gc_mark_object
-        func.args[0].name = "ptr"
+        func.args[0].name = "handle"
 
         entry = func.append_basic_block("entry")
+        deref_handle = func.append_basic_block("deref_handle")
         get_header = func.append_basic_block("get_header")
         do_mark = func.append_basic_block("do_mark")
         check_type = func.append_basic_block("check_type")
@@ -1396,11 +1455,19 @@ class GarbageCollector:
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
-        ptr = func.args[0]
+        handle = func.args[0]
 
-        # Null check
-        is_null = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, get_header)
+        # Null handle check (handle == 0 means no object)
+        is_null_handle = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_handle, done, deref_handle)
+
+        # Dereference handle to get pointer
+        builder.position_at_end(deref_handle)
+        ptr = builder.call(self.gc_handle_deref, [handle])
+
+        # Null pointer check (defensive - shouldn't happen for valid handles)
+        is_null_ptr = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null_ptr, done, get_header)
 
         builder.position_at_end(get_header)
         # Get header (before user pointer)
@@ -1494,9 +1561,8 @@ class GarbageCollector:
         # Phase 6: User type fields now store i64 handles, not pointers
         field_addr = builder.inttoptr(field_addr_int, self.i64_ptr)
         field_handle = builder.load(field_addr)
-        # Deref handle to get pointer, then recursively mark
-        field_ptr = builder.call(self.gc_handle_deref, [field_handle])
-        builder.call(func, [field_ptr])
+        # gc_mark_object now takes handle directly
+        builder.call(func, [field_handle])
         builder.branch(user_next_offset)
 
         # Increment index and continue loop
@@ -1562,12 +1628,14 @@ class GarbageCollector:
         root_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         root_i64 = builder.load(root_i64_ptr)
         root_ptr = builder.inttoptr(root_i64, self.i8_ptr)  # Convert i64 to pointer
-        builder.call(func, [root_ptr])  # Recursive call
+        root_handle = builder.call(self.gc_ptr_to_handle, [root_ptr])
+        builder.call(func, [root_handle])  # Recursive call
         # Mark tail
         tail_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
         tail_i64 = builder.load(tail_i64_ptr)
         tail_ptr = builder.inttoptr(tail_i64, self.i8_ptr)  # Convert i64 to pointer
-        builder.call(func, [tail_ptr])  # Recursive call
+        tail_handle = builder.call(self.gc_ptr_to_handle, [tail_ptr])
+        builder.call(func, [tail_handle])  # Recursive call
         builder.branch(done)
 
         # Mark Array: owner pointer at field 0
@@ -1579,7 +1647,8 @@ class GarbageCollector:
         owner_i64_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         owner_i64 = builder.load(owner_i64_ptr)
         owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
-        builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
+        owner_handle = builder.call(self.gc_ptr_to_handle, [owner_ptr])
+        builder.call(func, [owner_handle])  # Recursive call - marks the data buffer
         builder.branch(done)
 
         # Mark Set: HAMT-based, root at offset 0
@@ -1608,7 +1677,8 @@ class GarbageCollector:
         owner_i64_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         owner_i64 = builder.load(owner_i64_ptr)
         owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
-        builder.call(func, [owner_ptr])  # Recursive call - marks the data buffer
+        str_owner_handle = builder.call(self.gc_ptr_to_handle, [owner_ptr])
+        builder.call(func, [str_owner_handle])  # Recursive call - marks the data buffer
         builder.branch(done)
 
         # Mark Channel: buffer pointer at offset 32 (4th i64 field)
@@ -1617,7 +1687,8 @@ class GarbageCollector:
         channel_typed = builder.bitcast(ptr, channel_ptr_type)
         buffer_ptr_ptr = builder.gep(channel_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
         buffer_ptr = builder.load(buffer_ptr_ptr)
-        builder.call(func, [buffer_ptr])  # Recursive call
+        buffer_handle = builder.call(self.gc_ptr_to_handle, [buffer_ptr])
+        builder.call(func, [buffer_handle])  # Recursive call
         builder.branch(done)
 
         # Mark PVNode: iterate through 32 children and mark each non-null one
@@ -1656,7 +1727,9 @@ class GarbageCollector:
         child_idx2 = builder.load(pv_idx)
         child_ptr_ptr2 = builder.gep(pv_children2, [child_idx2], inbounds=False)
         child_to_mark = builder.load(child_ptr_ptr2)
-        builder.call(func, [child_to_mark])  # Recursive call to gc_mark_object
+        # Convert pointer to handle for recursive call
+        child_handle = builder.call(self.gc_ptr_to_handle, [child_to_mark])
+        builder.call(func, [child_handle])  # Recursive call to gc_mark_object
         builder.branch(pv_node_next)
 
         # Increment index and continue
@@ -1685,7 +1758,8 @@ class GarbageCollector:
         json_value_ptr = builder.gep(json_typed2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         json_value_i64 = builder.load(json_value_ptr)
         json_child_ptr = builder.inttoptr(json_value_i64, self.i8_ptr)
-        builder.call(func, [json_child_ptr])  # Recursive call to mark the child
+        json_child_handle = builder.call(self.gc_ptr_to_handle, [json_child_ptr])
+        builder.call(func, [json_child_handle])  # Recursive call to mark the child
         builder.branch(mark_json_done)
 
         # JSON marking done
@@ -1762,13 +1836,10 @@ class GarbageCollector:
         is_null_handle = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
         builder.cbranch(is_null_handle, next_root, do_mark)
 
-        # Get pointer and mark
-        # Note: set_root stores raw pointers as i64 (not handles), so use inttoptr
-        # A future improvement would be to store actual handles, but this requires
-        # changing how allocations track handles through the codebase
+        # Mark the object via its handle
+        # gc_mark_object now takes i64 handle directly
         builder.position_at_end(do_mark)
-        root_ptr = builder.inttoptr(handle, self.i8_ptr)
-        builder.call(self.gc_mark_object, [root_ptr])
+        builder.call(self.gc_mark_object, [handle])
         builder.branch(next_root)
 
         builder.position_at_end(next_root)
@@ -1898,9 +1969,10 @@ class GarbageCollector:
         builder.store(next_node, prev_ptr)
         # Free the allocation (header + data)
         builder.call(self.codegen.free, [header_ptr])
-        # Phase 7: Free the handle (return to free list)
+        # MI-6: Retire the handle (add to retired list for deferred reclamation)
+        # Handle becomes available for reuse after the next GC cycle
         freed_handle = builder.load(current_handle)
-        builder.call(self.gc_handle_free, [freed_handle])
+        builder.call(self.gc_handle_retire, [freed_handle])
         # Free the allocation node
         builder.call(self.codegen.free, [curr_val])
         # Move to next (prev stays the same since we removed current)
@@ -1938,14 +2010,21 @@ class GarbageCollector:
     def _implement_gc_collect(self):
         """Run a full garbage collection cycle (high watermark model).
 
-        Phase 9: Collection Orchestration
+        Phase 9: Collection Orchestration with MI-6 Deferred Reclamation
         This implements the synchronous collection cycle:
         1. Check if GC enabled and not already in progress
         2. Set gc_in_progress = 1
-        3. Mark phase: scan roots and mark reachable objects
-        4. Sweep phase: free unmarked objects
-        5. Update statistics
-        6. Set gc_in_progress = 0
+        3. Promote retired handles from previous cycle to free list (MI-6)
+        4. Flip mark value for birth-marking
+        5. Mark phase: scan roots and mark reachable objects
+        6. Sweep phase: free unmarked objects (retire handles, don't free immediately)
+        7. Update statistics
+        8. Set gc_in_progress = 0
+
+        MI-6 Deferred Reclamation:
+        Handles swept in cycle N are added to the retired list, not the free list.
+        At the start of cycle N+1, retired handles are promoted to the free list.
+        This ensures handles are not reused until at least one full cycle after being freed.
         """
         func = self.gc_collect
 
@@ -1973,6 +2052,10 @@ class GarbageCollector:
 
         # Set gc_in_progress = 1
         builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
+
+        # MI-6: Promote retired handles from previous cycle to free list
+        # This makes handles retired in cycle N-1 available for reuse in cycle N
+        builder.call(self.gc_promote_retired_handles, [])
 
         # Phase 9: Flip gc_current_mark_value BEFORE mark phase
         # This ensures newly allocated objects (born with OLD mark value) will be
@@ -2177,19 +2260,21 @@ class GarbageCollector:
     def set_root(self, builder: ir.IRBuilder, handle_slots: ir.Value, index: int, value: ir.Value):
         """Set a root slot to a handle value.
 
-        Phase 3: Takes i64* handle_slots and stores i64 handles.
-        For backward compatibility with Phase 2, if value is a pointer,
-        we convert it to i64 using ptrtoint. In a fully handle-based system,
-        callers should pass actual handles.
+        Phase 4 fix: Takes i64* handle_slots and stores i64 handles.
+        When given a pointer, we call gc_ptr_to_handle to recover the actual
+        handle index from the object's header. This ensures gc_scan_roots can
+        use gc_handle_deref to properly dereference handles during collection.
         """
         index_val = ir.Constant(self.i64, index)
         # Convert value to i64 handle
         if value.type == self.i64:
-            # Already a handle
+            # Already a handle (i64)
             handle = value
         elif isinstance(value.type, ir.PointerType):
-            # Convert pointer to i64 (backward compatibility)
-            handle = builder.ptrtoint(value, self.i64)
+            # Convert pointer to handle using gc_ptr_to_handle
+            # This reads the handle from the object's header (forward field)
+            ptr_as_i8 = builder.bitcast(value, self.i8_ptr)
+            handle = builder.call(self.gc_ptr_to_handle, [ptr_as_i8])
         elif isinstance(value.type, ir.IntType) and value.type.width == 64:
             handle = value
         else:
@@ -2197,8 +2282,9 @@ class GarbageCollector:
             if isinstance(value.type, ir.IntType):
                 handle = builder.zext(value, self.i64)
             else:
-                # Fallback: bitcast to i64
-                handle = builder.ptrtoint(builder.bitcast(value, self.i8_ptr), self.i64)
+                # Fallback: convert to pointer then get handle
+                ptr_as_i8 = builder.bitcast(value, self.i8_ptr)
+                handle = builder.call(self.gc_ptr_to_handle, [ptr_as_i8])
         builder.call(self.gc_set_root, [handle_slots, index_val, handle])
 
     def alloc_with_deref(self, builder: ir.IRBuilder, size: ir.Value, type_id: ir.Value) -> ir.Value:
@@ -2403,9 +2489,8 @@ class GarbageCollector:
         builder.cbranch(is_null, next_slot, do_mark)
 
         builder.position_at_end(do_mark)
-        # Note: set_root stores raw pointers as i64 (not handles), so use inttoptr
-        root_ptr = builder.inttoptr(handle, self.i8_ptr)
-        builder.call(self.gc_mark_object, [root_ptr])
+        # gc_mark_object now takes i64 handle directly
+        builder.call(self.gc_mark_object, [handle])
         builder.branch(next_slot)
 
         builder.position_at_end(next_slot)
@@ -2515,13 +2600,12 @@ class GarbageCollector:
         builder.position_at_end(process_alloc)
         node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
 
-        # Phase 7: Get handle and dereference to get data pointer
+        # Phase 7: Get handle and mark directly (gc_mark_object takes i64 handle)
         handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         obj_handle = builder.load(handle_ptr)
-        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
-        # Mark the object (gc_mark_object handles null and already-marked)
-        builder.call(self.gc_mark_object, [data_ptr])
+        # Mark the object via its handle (gc_mark_object handles null and already-marked)
+        builder.call(self.gc_mark_object, [obj_handle])
 
         builder.branch(next_alloc)
 
@@ -3257,6 +3341,600 @@ class GarbageCollector:
         builder.store(level, self.gc_trace_level)
         builder.ret_void()
 
+    def _implement_gc_fragmentation_report(self):
+        """Analyze and print heap fragmentation statistics.
+
+        Walks the allocation list and computes:
+        - Total allocated objects and bytes
+        - Size distribution (small/medium/large objects)
+        - Free list length (available handle slots)
+        - Retired list length (pending reclamation)
+        """
+        func = self.gc_fragmentation_report
+
+        entry = func.append_basic_block("entry")
+        loop = func.append_basic_block("loop")
+        process_obj = func.append_basic_block("process_obj")
+        classify_size = func.append_basic_block("classify_size")
+        is_medium = func.append_basic_block("is_medium")
+        is_large = func.append_basic_block("is_large")
+        next_obj = func.append_basic_block("next_obj")
+        count_free = func.append_basic_block("count_free")
+        free_loop = func.append_basic_block("free_loop")
+        free_next = func.append_basic_block("free_next")
+        count_retired = func.append_basic_block("count_retired")
+        retired_loop = func.append_basic_block("retired_loop")
+        retired_next = func.append_basic_block("retired_next")
+        print_report = func.append_basic_block("print_report")
+
+        builder = ir.IRBuilder(entry)
+
+        # Printf for output
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Counters
+        total_objects = builder.alloca(self.i64, name="total_objects")
+        total_bytes = builder.alloca(self.i64, name="total_bytes")
+        small_count = builder.alloca(self.i64, name="small_count")   # < 64 bytes
+        medium_count = builder.alloca(self.i64, name="medium_count") # 64-512 bytes
+        large_count = builder.alloca(self.i64, name="large_count")   # > 512 bytes
+        free_count = builder.alloca(self.i64, name="free_count")
+        retired_count = builder.alloca(self.i64, name="retired_count")
+
+        # Initialize counters
+        builder.store(ir.Constant(self.i64, 0), total_objects)
+        builder.store(ir.Constant(self.i64, 0), total_bytes)
+        builder.store(ir.Constant(self.i64, 0), small_count)
+        builder.store(ir.Constant(self.i64, 0), medium_count)
+        builder.store(ir.Constant(self.i64, 0), large_count)
+        builder.store(ir.Constant(self.i64, 0), free_count)
+        builder.store(ir.Constant(self.i64, 0), retired_count)
+
+        # Current pointer for iteration
+        curr = builder.alloca(self.i8_ptr, name="curr")
+        head = builder.load(self.gc_alloc_list)
+        builder.store(head, curr)
+        builder.branch(loop)
+
+        # Loop through allocation list
+        builder.position_at_end(loop)
+        curr_val = builder.load(curr)
+        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, count_free, process_obj)
+
+        # Process object
+        builder.position_at_end(process_obj)
+        node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_ptr)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
+
+        # Get size from header
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header = builder.inttoptr(header_int, self.header_type.as_pointer())
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        obj_size = builder.load(size_ptr)
+
+        # Increment counters
+        old_total = builder.load(total_objects)
+        builder.store(builder.add(old_total, ir.Constant(self.i64, 1)), total_objects)
+        old_bytes = builder.load(total_bytes)
+        builder.store(builder.add(old_bytes, obj_size), total_bytes)
+
+        builder.branch(classify_size)
+
+        # Classify by size
+        builder.position_at_end(classify_size)
+        is_small = builder.icmp_unsigned("<", obj_size, ir.Constant(self.i64, 64))
+        builder.cbranch(is_small, next_obj, is_medium)
+
+        # Check medium (increment small count happened inline above)
+        builder.position_at_end(is_medium)
+        old_small = builder.load(small_count)
+        # Actually we need to go back and fix this - small was already branched
+        # Let me restructure this more carefully
+        is_med = builder.icmp_unsigned("<", obj_size, ir.Constant(self.i64, 512))
+        builder.cbranch(is_med, next_obj, is_large)
+
+        # Large object
+        builder.position_at_end(is_large)
+        old_large = builder.load(large_count)
+        builder.store(builder.add(old_large, ir.Constant(self.i64, 1)), large_count)
+        builder.branch(next_obj)
+
+        # Move to next object
+        builder.position_at_end(next_obj)
+        # Reload curr and get size for proper classification
+        curr_val2 = builder.load(curr)
+        node2 = builder.bitcast(curr_val2, self.alloc_node_type.as_pointer())
+        handle_ptr2 = builder.gep(node2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle2 = builder.load(handle_ptr2)
+        data_ptr2 = builder.call(self.gc_handle_deref, [obj_handle2])
+        data_int2 = builder.ptrtoint(data_ptr2, self.i64)
+        header_int2 = builder.sub(data_int2, ir.Constant(self.i64, self.HEADER_SIZE))
+        header2 = builder.inttoptr(header_int2, self.header_type.as_pointer())
+        size_ptr2 = builder.gep(header2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        obj_size2 = builder.load(size_ptr2)
+
+        # Proper size classification
+        is_small2 = builder.icmp_unsigned("<", obj_size2, ir.Constant(self.i64, 64))
+        is_med2 = builder.icmp_unsigned("<", obj_size2, ir.Constant(self.i64, 512))
+
+        # Increment appropriate counter using select
+        old_s = builder.load(small_count)
+        old_m = builder.load(medium_count)
+        old_l = builder.load(large_count)
+
+        new_s = builder.select(is_small2, builder.add(old_s, ir.Constant(self.i64, 1)), old_s)
+        builder.store(new_s, small_count)
+
+        not_small = builder.icmp_unsigned(">=", obj_size2, ir.Constant(self.i64, 64))
+        incr_med = builder.and_(not_small, is_med2)
+        new_m = builder.select(incr_med, builder.add(old_m, ir.Constant(self.i64, 1)), old_m)
+        builder.store(new_m, medium_count)
+
+        # Large already incremented in is_large block, so just advance
+        next_ptr = builder.gep(node2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_node = builder.load(next_ptr)
+        builder.store(next_node, curr)
+        builder.branch(loop)
+
+        # Count free list
+        builder.position_at_end(count_free)
+        free_head = builder.load(self.gc_handle_free_list)
+        free_curr = builder.alloca(self.i64, name="free_curr")
+        builder.store(free_head, free_curr)
+        builder.branch(free_loop)
+
+        builder.position_at_end(free_loop)
+        fc = builder.load(free_curr)
+        fc_is_zero = builder.icmp_unsigned("==", fc, ir.Constant(self.i64, 0))
+        builder.cbranch(fc_is_zero, count_retired, free_next)
+
+        builder.position_at_end(free_next)
+        old_fc = builder.load(free_count)
+        builder.store(builder.add(old_fc, ir.Constant(self.i64, 1)), free_count)
+        # Get next free from table
+        table = builder.load(self.gc_handle_table)
+        fc_val = builder.load(free_curr)
+        slot_ptr = builder.gep(table, [fc_val])
+        next_free_ptr = builder.load(slot_ptr)
+        next_free = builder.ptrtoint(next_free_ptr, self.i64)
+        builder.store(next_free, free_curr)
+        builder.branch(free_loop)
+
+        # Count retired list
+        builder.position_at_end(count_retired)
+        ret_head = builder.load(self.gc_handle_retired_list)
+        ret_curr = builder.alloca(self.i64, name="ret_curr")
+        builder.store(ret_head, ret_curr)
+        builder.branch(retired_loop)
+
+        builder.position_at_end(retired_loop)
+        rc = builder.load(ret_curr)
+        rc_is_zero = builder.icmp_unsigned("==", rc, ir.Constant(self.i64, 0))
+        builder.cbranch(rc_is_zero, print_report, retired_next)
+
+        builder.position_at_end(retired_next)
+        old_rc = builder.load(retired_count)
+        builder.store(builder.add(old_rc, ir.Constant(self.i64, 1)), retired_count)
+        table2 = builder.load(self.gc_handle_table)
+        rc_val = builder.load(ret_curr)
+        slot_ptr2 = builder.gep(table2, [rc_val])
+        next_ret_ptr = builder.load(slot_ptr2)
+        next_ret = builder.ptrtoint(next_ret_ptr, self.i64)
+        builder.store(next_ret, ret_curr)
+        builder.branch(retired_loop)
+
+        # Print report
+        builder.position_at_end(print_report)
+
+        # Header
+        hdr_str = "[GC:FRAG] === Fragmentation Report ===\n"
+        hdr_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(hdr_str) + 1), name=".frag_hdr")
+        hdr_global.global_constant = True
+        hdr_global.linkage = 'private'
+        hdr_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(hdr_str) + 1),
+                                              bytearray(hdr_str.encode('utf-8')) + bytearray([0]))
+        hdr_ptr = builder.bitcast(hdr_global, self.i8_ptr)
+        builder.call(printf, [hdr_ptr])
+
+        # Object stats
+        obj_fmt = "[GC:FRAG] Objects: %lld total, %lld bytes\n"
+        obj_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(obj_fmt) + 1), name=".frag_obj")
+        obj_global.global_constant = True
+        obj_global.linkage = 'private'
+        obj_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(obj_fmt) + 1),
+                                              bytearray(obj_fmt.encode('utf-8')) + bytearray([0]))
+        obj_ptr = builder.bitcast(obj_global, self.i8_ptr)
+        builder.call(printf, [obj_ptr, builder.load(total_objects), builder.load(total_bytes)])
+
+        # Size distribution
+        size_fmt = "[GC:FRAG] Size distribution: small=%lld, medium=%lld, large=%lld\n"
+        size_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(size_fmt) + 1), name=".frag_size")
+        size_global.global_constant = True
+        size_global.linkage = 'private'
+        size_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(size_fmt) + 1),
+                                               bytearray(size_fmt.encode('utf-8')) + bytearray([0]))
+        size_ptr = builder.bitcast(size_global, self.i8_ptr)
+        builder.call(printf, [size_ptr, builder.load(small_count), builder.load(medium_count), builder.load(large_count)])
+
+        # Handle stats
+        hdl_fmt = "[GC:FRAG] Handles: free=%lld, retired=%lld\n"
+        hdl_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(hdl_fmt) + 1), name=".frag_hdl")
+        hdl_global.global_constant = True
+        hdl_global.linkage = 'private'
+        hdl_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(hdl_fmt) + 1),
+                                              bytearray(hdl_fmt.encode('utf-8')) + bytearray([0]))
+        hdl_ptr = builder.bitcast(hdl_global, self.i8_ptr)
+        builder.call(printf, [hdl_ptr, builder.load(free_count), builder.load(retired_count)])
+
+        builder.ret_void()
+
+    def _implement_gc_dump_handle_table(self):
+        """Print handle table state including allocated, free, and retired handles.
+
+        Shows:
+        - Table size and next handle index
+        - First N allocated handles with their object pointers
+        - Free list chain
+        - Retired list chain
+        """
+        func = self.gc_dump_handle_table
+
+        entry = func.append_basic_block("entry")
+        dump_allocated = func.append_basic_block("dump_allocated")
+        alloc_loop = func.append_basic_block("alloc_loop")
+        check_slot = func.append_basic_block("check_slot")
+        print_slot = func.append_basic_block("print_slot")
+        next_slot = func.append_basic_block("next_slot")
+        dump_free = func.append_basic_block("dump_free")
+        free_loop = func.append_basic_block("free_loop")
+        print_free = func.append_basic_block("print_free")
+        free_next = func.append_basic_block("free_next")
+        dump_retired = func.append_basic_block("dump_retired")
+        retired_loop = func.append_basic_block("retired_loop")
+        print_retired = func.append_basic_block("print_retired")
+        retired_next = func.append_basic_block("retired_next")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Header
+        hdr_str = "[GC:HANDLES] === Handle Table Dump ===\n"
+        hdr_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(hdr_str) + 1), name=".hdl_hdr")
+        hdr_global.global_constant = True
+        hdr_global.linkage = 'private'
+        hdr_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(hdr_str) + 1),
+                                              bytearray(hdr_str.encode('utf-8')) + bytearray([0]))
+        hdr_ptr = builder.bitcast(hdr_global, self.i8_ptr)
+        builder.call(printf, [hdr_ptr])
+
+        # Table info
+        info_fmt = "[GC:HANDLES] Table size: %lld, next_handle: %lld\n"
+        info_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(info_fmt) + 1), name=".hdl_info")
+        info_global.global_constant = True
+        info_global.linkage = 'private'
+        info_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(info_fmt) + 1),
+                                               bytearray(info_fmt.encode('utf-8')) + bytearray([0]))
+        info_ptr = builder.bitcast(info_global, self.i8_ptr)
+        table_size = builder.load(self.gc_handle_table_size)
+        next_handle = builder.load(self.gc_next_handle)
+        builder.call(printf, [info_ptr, table_size, next_handle])
+
+        builder.branch(dump_allocated)
+
+        # Dump first 10 allocated handles
+        builder.position_at_end(dump_allocated)
+        alloc_hdr = "[GC:HANDLES] Allocated (first 10):\n"
+        alloc_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(alloc_hdr) + 1), name=".hdl_alloc")
+        alloc_global.global_constant = True
+        alloc_global.linkage = 'private'
+        alloc_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(alloc_hdr) + 1),
+                                                bytearray(alloc_hdr.encode('utf-8')) + bytearray([0]))
+        alloc_ptr = builder.bitcast(alloc_global, self.i8_ptr)
+        builder.call(printf, [alloc_ptr])
+
+        idx = builder.alloca(self.i64, name="idx")
+        printed = builder.alloca(self.i64, name="printed")
+        builder.store(ir.Constant(self.i64, 1), idx)  # Start at 1 (0 is null handle)
+        builder.store(ir.Constant(self.i64, 0), printed)
+        builder.branch(alloc_loop)
+
+        builder.position_at_end(alloc_loop)
+        i = builder.load(idx)
+        p = builder.load(printed)
+        # Stop after 10 or when we reach next_handle
+        done_alloc = builder.or_(
+            builder.icmp_unsigned(">=", p, ir.Constant(self.i64, 10)),
+            builder.icmp_unsigned(">=", i, next_handle)
+        )
+        builder.cbranch(done_alloc, dump_free, check_slot)
+
+        builder.position_at_end(check_slot)
+        table = builder.load(self.gc_handle_table)
+        i_val = builder.load(idx)
+        slot_ptr = builder.gep(table, [i_val])
+        slot_val = builder.load(slot_ptr)
+        is_null = builder.icmp_unsigned("==", slot_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, next_slot, print_slot)
+
+        builder.position_at_end(print_slot)
+        slot_fmt = "[GC:HANDLES]   handle=%lld -> ptr=%p\n"
+        slot_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(slot_fmt) + 1), name=".hdl_slot")
+        slot_global.global_constant = True
+        slot_global.linkage = 'private'
+        slot_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(slot_fmt) + 1),
+                                               bytearray(slot_fmt.encode('utf-8')) + bytearray([0]))
+        slot_fmt_ptr = builder.bitcast(slot_global, self.i8_ptr)
+        i_val2 = builder.load(idx)
+        table2 = builder.load(self.gc_handle_table)
+        slot_ptr2 = builder.gep(table2, [i_val2])
+        slot_val2 = builder.load(slot_ptr2)
+        builder.call(printf, [slot_fmt_ptr, i_val2, slot_val2])
+        old_p = builder.load(printed)
+        builder.store(builder.add(old_p, ir.Constant(self.i64, 1)), printed)
+        builder.branch(next_slot)
+
+        builder.position_at_end(next_slot)
+        old_i = builder.load(idx)
+        builder.store(builder.add(old_i, ir.Constant(self.i64, 1)), idx)
+        builder.branch(alloc_loop)
+
+        # Dump free list
+        builder.position_at_end(dump_free)
+        free_hdr = "[GC:HANDLES] Free list: "
+        free_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(free_hdr) + 1), name=".hdl_free")
+        free_global.global_constant = True
+        free_global.linkage = 'private'
+        free_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(free_hdr) + 1),
+                                               bytearray(free_hdr.encode('utf-8')) + bytearray([0]))
+        free_ptr = builder.bitcast(free_global, self.i8_ptr)
+        builder.call(printf, [free_ptr])
+
+        free_curr = builder.alloca(self.i64, name="free_curr")
+        free_head = builder.load(self.gc_handle_free_list)
+        builder.store(free_head, free_curr)
+        builder.branch(free_loop)
+
+        builder.position_at_end(free_loop)
+        fc = builder.load(free_curr)
+        fc_zero = builder.icmp_unsigned("==", fc, ir.Constant(self.i64, 0))
+        builder.cbranch(fc_zero, dump_retired, print_free)
+
+        builder.position_at_end(print_free)
+        free_fmt = "%lld -> "
+        free_fmt_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(free_fmt) + 1), name=".hdl_ff")
+        free_fmt_global.global_constant = True
+        free_fmt_global.linkage = 'private'
+        free_fmt_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(free_fmt) + 1),
+                                                   bytearray(free_fmt.encode('utf-8')) + bytearray([0]))
+        ff_ptr = builder.bitcast(free_fmt_global, self.i8_ptr)
+        fc_val = builder.load(free_curr)
+        builder.call(printf, [ff_ptr, fc_val])
+        builder.branch(free_next)
+
+        builder.position_at_end(free_next)
+        table3 = builder.load(self.gc_handle_table)
+        fc_val2 = builder.load(free_curr)
+        slot_ptr3 = builder.gep(table3, [fc_val2])
+        next_ptr = builder.load(slot_ptr3)
+        next_val = builder.ptrtoint(next_ptr, self.i64)
+        builder.store(next_val, free_curr)
+        builder.branch(free_loop)
+
+        # Dump retired list
+        builder.position_at_end(dump_retired)
+        ret_hdr = "nil\n[GC:HANDLES] Retired list: "
+        ret_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(ret_hdr) + 1), name=".hdl_ret")
+        ret_global.global_constant = True
+        ret_global.linkage = 'private'
+        ret_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(ret_hdr) + 1),
+                                              bytearray(ret_hdr.encode('utf-8')) + bytearray([0]))
+        ret_ptr = builder.bitcast(ret_global, self.i8_ptr)
+        builder.call(printf, [ret_ptr])
+
+        ret_curr = builder.alloca(self.i64, name="ret_curr")
+        ret_head = builder.load(self.gc_handle_retired_list)
+        builder.store(ret_head, ret_curr)
+        builder.branch(retired_loop)
+
+        builder.position_at_end(retired_loop)
+        rc = builder.load(ret_curr)
+        rc_zero = builder.icmp_unsigned("==", rc, ir.Constant(self.i64, 0))
+        builder.cbranch(rc_zero, done, print_retired)
+
+        builder.position_at_end(print_retired)
+        ret_fmt = "%lld -> "
+        ret_fmt_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(ret_fmt) + 1), name=".hdl_rf")
+        ret_fmt_global.global_constant = True
+        ret_fmt_global.linkage = 'private'
+        ret_fmt_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(ret_fmt) + 1),
+                                                  bytearray(ret_fmt.encode('utf-8')) + bytearray([0]))
+        rf_ptr = builder.bitcast(ret_fmt_global, self.i8_ptr)
+        rc_val = builder.load(ret_curr)
+        builder.call(printf, [rf_ptr, rc_val])
+        builder.branch(retired_next)
+
+        builder.position_at_end(retired_next)
+        table4 = builder.load(self.gc_handle_table)
+        rc_val2 = builder.load(ret_curr)
+        slot_ptr4 = builder.gep(table4, [rc_val2])
+        next_ptr2 = builder.load(slot_ptr4)
+        next_val2 = builder.ptrtoint(next_ptr2, self.i64)
+        builder.store(next_val2, ret_curr)
+        builder.branch(retired_loop)
+
+        builder.position_at_end(done)
+        end_fmt = "nil\n"
+        end_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(end_fmt) + 1), name=".hdl_end")
+        end_global.global_constant = True
+        end_global.linkage = 'private'
+        end_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(end_fmt) + 1),
+                                              bytearray(end_fmt.encode('utf-8')) + bytearray([0]))
+        end_ptr = builder.bitcast(end_global, self.i8_ptr)
+        builder.call(printf, [end_ptr])
+        builder.ret_void()
+
+    def _implement_gc_dump_shadow_stacks(self):
+        """Print all shadow stack frames and their root handles.
+
+        Walks the shadow stack from top to bottom, printing each frame's
+        handle slots and their dereferenced pointers.
+        """
+        func = self.gc_dump_shadow_stacks
+
+        entry = func.append_basic_block("entry")
+        frame_loop = func.append_basic_block("frame_loop")
+        print_frame = func.append_basic_block("print_frame")
+        root_loop = func.append_basic_block("root_loop")
+        print_root = func.append_basic_block("print_root")
+        next_root = func.append_basic_block("next_root")
+        next_frame = func.append_basic_block("next_frame")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Header
+        hdr_str = "[GC:SHADOW] === Shadow Stack Dump ===\n"
+        hdr_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(hdr_str) + 1), name=".shadow_hdr")
+        hdr_global.global_constant = True
+        hdr_global.linkage = 'private'
+        hdr_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(hdr_str) + 1),
+                                              bytearray(hdr_str.encode('utf-8')) + bytearray([0]))
+        hdr_ptr = builder.bitcast(hdr_global, self.i8_ptr)
+        builder.call(printf, [hdr_ptr])
+
+        # Print frame depth
+        depth_fmt = "[GC:SHADOW] Frame depth: %lld\n"
+        depth_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(depth_fmt) + 1), name=".shadow_depth")
+        depth_global.global_constant = True
+        depth_global.linkage = 'private'
+        depth_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(depth_fmt) + 1),
+                                                bytearray(depth_fmt.encode('utf-8')) + bytearray([0]))
+        depth_ptr = builder.bitcast(depth_global, self.i8_ptr)
+        frame_depth = builder.load(self.gc_frame_depth)
+        builder.call(printf, [depth_ptr, frame_depth])
+
+        # Current frame pointer and frame number
+        curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
+        frame_num = builder.alloca(self.i64, name="frame_num")
+        top = builder.load(self.gc_frame_top)
+        builder.store(top, curr_frame)
+        builder.store(ir.Constant(self.i64, 0), frame_num)
+        builder.branch(frame_loop)
+
+        # Frame loop
+        builder.position_at_end(frame_loop)
+        frame_val = builder.load(curr_frame)
+        is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, done, print_frame)
+
+        # Print frame header
+        builder.position_at_end(print_frame)
+        frame_fmt = "[GC:SHADOW] Frame %lld: %lld roots\n"
+        frame_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(frame_fmt) + 1), name=".shadow_frame")
+        frame_global.global_constant = True
+        frame_global.linkage = 'private'
+        frame_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(frame_fmt) + 1),
+                                                bytearray(frame_fmt.encode('utf-8')) + bytearray([0]))
+        frame_fmt_ptr = builder.bitcast(frame_global, self.i8_ptr)
+
+        frame_ptr = builder.load(curr_frame)
+        frame = builder.bitcast(frame_ptr, self.gc_frame_type.as_pointer())
+        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots = builder.load(num_roots_ptr)
+        fn = builder.load(frame_num)
+        builder.call(printf, [frame_fmt_ptr, fn, num_roots])
+
+        # Get handle slots
+        slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        slots = builder.load(slots_ptr_ptr)
+
+        # Root index
+        root_idx = builder.alloca(self.i64, name="root_idx")
+        builder.store(ir.Constant(self.i64, 0), root_idx)
+        builder.branch(root_loop)
+
+        # Root loop
+        builder.position_at_end(root_loop)
+        ri = builder.load(root_idx)
+        # Reload num_roots for comparison
+        frame_ptr2 = builder.load(curr_frame)
+        frame2 = builder.bitcast(frame_ptr2, self.gc_frame_type.as_pointer())
+        num_roots_ptr2 = builder.gep(frame2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        num_roots2 = builder.load(num_roots_ptr2)
+        done_roots = builder.icmp_unsigned(">=", ri, num_roots2)
+        builder.cbranch(done_roots, next_frame, print_root)
+
+        # Print root
+        builder.position_at_end(print_root)
+        root_fmt = "[GC:SHADOW]   [%lld] handle=%lld -> ptr=%p\n"
+        root_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(root_fmt) + 1), name=".shadow_root")
+        root_global.global_constant = True
+        root_global.linkage = 'private'
+        root_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(root_fmt) + 1),
+                                               bytearray(root_fmt.encode('utf-8')) + bytearray([0]))
+        root_fmt_ptr = builder.bitcast(root_global, self.i8_ptr)
+
+        ri_val = builder.load(root_idx)
+        # Reload slots
+        frame_ptr3 = builder.load(curr_frame)
+        frame3 = builder.bitcast(frame_ptr3, self.gc_frame_type.as_pointer())
+        slots_ptr_ptr2 = builder.gep(frame3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        slots2 = builder.load(slots_ptr_ptr2)
+        slot_ptr = builder.gep(slots2, [ri_val], inbounds=True)
+        handle = builder.load(slot_ptr)
+        ptr = builder.call(self.gc_handle_deref, [handle])
+        builder.call(printf, [root_fmt_ptr, ri_val, handle, ptr])
+        builder.branch(next_root)
+
+        # Next root
+        builder.position_at_end(next_root)
+        old_ri = builder.load(root_idx)
+        builder.store(builder.add(old_ri, ir.Constant(self.i64, 1)), root_idx)
+        builder.branch(root_loop)
+
+        # Next frame
+        builder.position_at_end(next_frame)
+        frame_ptr4 = builder.load(curr_frame)
+        frame4 = builder.bitcast(frame_ptr4, self.gc_frame_type.as_pointer())
+        parent_ptr = builder.gep(frame4, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        parent = builder.load(parent_ptr)
+        builder.store(parent, curr_frame)
+        old_fn = builder.load(frame_num)
+        builder.store(builder.add(old_fn, ir.Constant(self.i64, 1)), frame_num)
+        builder.branch(frame_loop)
+
+        # Done
+        builder.position_at_end(done)
+        end_fmt = "[GC:SHADOW] === End Shadow Stack ===\n"
+        end_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(end_fmt) + 1), name=".shadow_end")
+        end_global.global_constant = True
+        end_global.linkage = 'private'
+        end_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(end_fmt) + 1),
+                                              bytearray(end_fmt.encode('utf-8')) + bytearray([0]))
+        end_ptr = builder.bitcast(end_global, self.i8_ptr)
+        builder.call(printf, [end_ptr])
+        builder.ret_void()
+
     # ============================================================
     # Handle-Based GC - Phase 1: Handle Management Functions
     # ============================================================
@@ -3483,3 +4161,115 @@ class GarbageCollector:
         forward_ptr = builder.gep(header_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
         handle = builder.load(forward_ptr)
         builder.ret(handle)
+
+    def _implement_gc_handle_retire(self):
+        """Add a handle to the retired list for deferred reclamation (MI-6).
+
+        Instead of immediately adding freed handles to the free list,
+        we add them to a retired list. They become available for reuse
+        only after the next GC cycle completes. This prevents use-after-free
+        issues in concurrent scenarios.
+
+        The retired list uses the same structure as the free list:
+        each retired slot stores the next retired handle index.
+        """
+        func = self.gc_handle_retire
+        func.args[0].name = "handle"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        handle = func.args[0]
+
+        # Get current retired list head
+        old_head = builder.load(self.gc_handle_retired_list)
+
+        # Store old head in the slot being retired (as a pointer-sized value)
+        # This links retired handles into a chain
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [handle])
+        old_head_as_ptr = builder.inttoptr(old_head, self.i8_ptr)
+        builder.store(old_head_as_ptr, slot_ptr)
+
+        # Update retired list head to this handle
+        builder.store(handle, self.gc_handle_retired_list)
+
+        builder.ret_void()
+
+    def _implement_gc_promote_retired_handles(self):
+        """Move all retired handles to the free list.
+
+        Called at the start of each GC cycle (before sweep). This promotes
+        handles retired in the previous cycle to be available for reuse.
+
+        Algorithm:
+        1. If retired list is empty, return
+        2. Walk retired list to find the tail
+        3. Link tail to current free list head
+        4. Set free list head to retired list head
+        5. Clear retired list
+        """
+        func = self.gc_promote_retired_handles
+
+        entry = func.append_basic_block("entry")
+        check_empty = func.append_basic_block("check_empty")
+        find_tail = func.append_basic_block("find_tail")
+        check_next = func.append_basic_block("check_next")
+        advance = func.append_basic_block("advance")
+        link_lists = func.append_basic_block("link_lists")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Load retired list head
+        retired_head = builder.load(self.gc_handle_retired_list)
+        builder.branch(check_empty)
+
+        # Check if retired list is empty
+        builder.position_at_end(check_empty)
+        is_empty = builder.icmp_unsigned("==", retired_head, ir.Constant(self.i64, 0))
+        builder.cbranch(is_empty, done, find_tail)
+
+        # Find the tail of the retired list
+        builder.position_at_end(find_tail)
+        current = builder.alloca(self.i64, name="current")
+        builder.store(retired_head, current)
+        builder.branch(check_next)
+
+        # Check if current node has a next pointer
+        builder.position_at_end(check_next)
+        curr_val = builder.load(current)
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [curr_val])
+        next_ptr = builder.load(slot_ptr)
+        next_handle = builder.ptrtoint(next_ptr, self.i64)
+        has_next = builder.icmp_unsigned("!=", next_handle, ir.Constant(self.i64, 0))
+        builder.cbranch(has_next, advance, link_lists)
+
+        # Advance to next node
+        builder.position_at_end(advance)
+        builder.store(next_handle, current)
+        builder.branch(check_next)
+
+        # Link retired list tail to free list head, update free list head
+        builder.position_at_end(link_lists)
+        # current now points to the tail of retired list
+        tail = builder.load(current)
+        free_head = builder.load(self.gc_handle_free_list)
+
+        # Link tail to free list head
+        table2 = builder.load(self.gc_handle_table)
+        tail_slot_ptr = builder.gep(table2, [tail])
+        free_head_as_ptr = builder.inttoptr(free_head, self.i8_ptr)
+        builder.store(free_head_as_ptr, tail_slot_ptr)
+
+        # Set free list head to retired list head
+        builder.store(retired_head, self.gc_handle_free_list)
+
+        # Clear retired list
+        builder.store(ir.Constant(self.i64, 0), self.gc_handle_retired_list)
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
