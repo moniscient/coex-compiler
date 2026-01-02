@@ -13005,6 +13005,10 @@ class CodeGenerator:
         entry = c_main.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
+        # Initialize GC before building args array (which uses GC allocations)
+        if self.gc is not None:
+            builder.call(self.gc.gc_init, [])
+
         call_args = []
 
         if has_args:
@@ -13154,8 +13158,10 @@ class CodeGenerator:
         self.builder = ir.IRBuilder(entry)
 
         # Initialize GC at start of main function
+        # Skip if main has params (args/stdio) - gc_init is called in the C main wrapper
         if func.name == "main" and self.gc is not None:
-            self.gc.inject_gc_init(self.builder)
+            if not getattr(self, 'main_has_args', False) and not getattr(self, 'main_has_stdio', False):
+                self.gc.inject_gc_init(self.builder)
 
         # Clear locals and moved variables for this function scope
         self.locals = {}
@@ -16227,6 +16233,21 @@ class CodeGenerator:
                     if level.type != ir.IntType(64):
                         level = self.builder.sext(level, ir.IntType(64))
                     self.builder.call(self.gc.gc_set_trace_level, [level])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_fragmentation_report":
+                # Print heap fragmentation analysis
+                self.builder.call(self.gc.gc_fragmentation_report, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_dump_handle_table":
+                # Print handle table state
+                self.builder.call(self.gc.gc_dump_handle_table, [])
+                return ir.Constant(ir.IntType(64), 0)
+
+            if name == "gc_dump_shadow_stacks":
+                # Print shadow stack frames and roots
+                self.builder.call(self.gc.gc_dump_shadow_stacks, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "print":
