@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 9 COMPLETED
-**Next Phase**: Phase 10 - Extract Control Flow/Expressions/Statements
+**Current Phase**: Phase 10 COMPLETED
+**Next Phase**: Phase 11 - Extract Matrix/Modules/Atomics
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -23,7 +23,7 @@
 - [x] **Phase 7**: Extract Collections List/Array (COMPLETED 2026-01-01)
 - [x] **Phase 8**: Extract HAMT/Map/Set (COMPLETED 2026-01-01)
 - [x] **Phase 9**: Extract Type System (COMPLETED 2026-01-01)
-- [ ] **Phase 10**: Extract Control Flow/Expressions/Statements
+- [x] **Phase 10**: Extract Control Flow/Expressions/Statements (COMPLETED 2026-01-01)
 - [ ] **Phase 11**: Extract Matrix/Modules/Atomics
 - [ ] **Phase 12**: Finalize GC Modularization
 - [ ] **Phase 13**: Final Cleanup
@@ -286,6 +286,47 @@
 
 **Files Modified**:
 - `codegen_original.py` - imports HAMTGenerator, initializes `_hamt`, delegates `create_map_type()` and `create_set_type()`
+
+---
+
+### Session 8: Phase 10 - Extract Control Flow/Expressions/Statements (2026-01-01)
+
+**Completed**:
+1. Created `codegen/expressions.py` with `ExpressionsGenerator` class (~280 lines)
+2. Created `codegen/statements.py` with `StatementsGenerator` class (~200 lines)
+3. Uses delegation pattern: both generators delegate to codegen_original.py
+4. Extracted/delegated expression methods (~35 methods):
+   - Main dispatcher: `generate_expression`
+   - Literals/Identifiers: `generate_identifier`
+   - Operators: `generate_binary`, `generate_unary`, `generate_ternary`, `generate_short_circuit_and/or`
+   - Calls: `generate_call`, `generate_method_call`, `generate_array_constructor`, `generate_type_constructor`, `generate_enum_constructor`
+   - Access: `generate_member`, `generate_index`, `generate_slice`
+   - Collections: `generate_list`, `generate_map`, `generate_set`, `generate_tuple`, `generate_json_object`
+   - Comprehensions: `generate_list/set/map_comprehension`, `generate_comprehension_loop/body`
+   - Type conversion: `generate_as_expr`, `generate_json_to_*`
+   - Special: `generate_range`, `generate_lambda`, `generate_cell_access`, `generate_llvm_ir_block`
+5. Extracted/delegated statement methods (~25 methods):
+   - Main dispatcher: `generate_statement`
+   - Variables: `generate_var_decl`, `generate_var_reassignment`, `generate_assignment`, `generate_tuple_destructure`
+   - Control flow: `generate_if`, `generate_while`, `generate_cycle`, `generate_for`, `generate_match`
+   - Loop iterators: `generate_range_for`, `generate_list_for`, `generate_array_for`, `generate_map_for`, `generate_set_for`
+   - Loop control: `generate_break`, `generate_continue`
+   - Other: `generate_return`, `generate_print`, `generate_debug`
+   - Deep copy: `generate_deep_copy`, `generate_list/set/map/array/type_deep_copy`
+6. Updated `codegen_original.py` to import and initialize both generators
+7. Verified 236+ tests run passing (control_flow, basic, functions, types, advanced, json)
+
+**Pattern Used**:
+- Same delegation pattern as previous modules
+- Two separate modules for logical separation (expressions vs statements)
+- All methods delegate to parent: `self.codegen._generate_*`
+
+**Files Created**:
+- `codegen/expressions.py` - ExpressionsGenerator class with expression code generation
+- `codegen/statements.py` - StatementsGenerator class with statement code generation
+
+**Files Modified**:
+- `codegen_original.py` - imports ExpressionsGenerator and StatementsGenerator, initializes `_expressions` and `_statements`
 
 ---
 
@@ -587,8 +628,8 @@ Then:
 | codegen/collections.py | ~340 (CREATED) | ~340 (delegation pattern) |
 | codegen/hamt.py | ~590 (CREATED) | ~590 (delegation pattern) |
 | codegen/types.py | ~200 (CREATED) | ~200 (delegation pattern) |
-| codegen/expressions.py | (new) | ~1,585 |
-| codegen/statements.py | (new) | ~1,480 |
+| codegen/expressions.py | ~280 (CREATED) | ~280 (delegation pattern) |
+| codegen/statements.py | ~200 (CREATED) | ~200 (delegation pattern) |
 | codegen/posix.py | ~775 (CREATED) | ~775 |
 | codegen/matrix.py | (new) | ~585 |
 | codegen/modules.py | (new) | ~430 |
