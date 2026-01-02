@@ -16,6 +16,9 @@ This approach is portable because it doesn't depend on machine stack layout.
 from llvmlite import ir
 from typing import Dict, List as PyList, Tuple, Optional, TYPE_CHECKING
 
+# Import diagnostics submodule
+from coex_gc.diagnostics import GCDiagnostics
+
 if TYPE_CHECKING:
     from codegen import CodeGenerator
 
@@ -187,6 +190,10 @@ class GarbageCollector:
         self._create_globals()
         self._declare_functions()
         self._register_builtin_types()
+
+        # Initialize diagnostics module (after functions are declared)
+        self._diagnostics = GCDiagnostics(self)
+
         self._implement_gc_init()
         self._implement_gc_push_frame()
         self._implement_gc_pop_frame()
@@ -209,18 +216,18 @@ class GarbageCollector:
         self._implement_gc_async()
         self._implement_gc_wait_for_completion()
         self._implement_gc_grow_heaps()
-        # Phase 0: Debugging infrastructure
-        self._implement_gc_trace()
-        self._implement_gc_dump_stats()
-        self._implement_gc_dump_heap()
-        self._implement_gc_dump_roots()
-        self._implement_gc_dump_object()
-        self._implement_gc_validate_heap()
-        self._implement_gc_set_trace_level()
-        # Additional diagnostic functions
-        self._implement_gc_fragmentation_report()
-        self._implement_gc_dump_handle_table()
-        self._implement_gc_dump_shadow_stacks()
+        # Phase 0: Debugging infrastructure (delegated to diagnostics module)
+        self._diagnostics.implement_gc_trace()
+        self._diagnostics.implement_gc_dump_stats()
+        self._diagnostics.implement_gc_dump_heap()
+        self._diagnostics.implement_gc_dump_roots()
+        self._diagnostics.implement_gc_dump_object()
+        self._diagnostics.implement_gc_validate_heap()
+        self._diagnostics.implement_gc_set_trace_level()
+        # Additional diagnostic functions (delegated to diagnostics module)
+        self._diagnostics.implement_gc_fragmentation_report()
+        self._diagnostics.implement_gc_dump_handle_table()
+        self._diagnostics.implement_gc_dump_shadow_stacks()
         # Handle-Based GC - Phase 1: Handle management functions
         self._implement_gc_handle_table_grow()
         self._implement_gc_handle_alloc()

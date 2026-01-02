@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 1 COMPLETED
-**Next Phase**: Phase 2 - Extract GC Diagnostics
+**Current Phase**: Phase 2 COMPLETED
+**Next Phase**: Phase 3 - Extract GC Handle Management
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -15,7 +15,7 @@
 
 - [x] **Phase 0**: Documentation Setup (COMPLETED 2026-01-01)
 - [x] **Phase 1**: Create Package Structure (COMPLETED 2026-01-01)
-- [ ] **Phase 2**: Extract GC Diagnostics (~1,075 lines)
+- [x] **Phase 2**: Extract GC Diagnostics (COMPLETED 2026-01-01)
 - [ ] **Phase 3**: Extract GC Handle Management (~335 lines)
 - [ ] **Phase 4**: Extract Codegen POSIX (~775 lines)
 - [ ] **Phase 5**: Extract Codegen Strings (~2,400 lines)
@@ -93,6 +93,44 @@
 **Files Modified**:
 - `codegen_original.py` - import from coex_gc package
 - `coex_gc_original.py` - TYPE_CHECKING import from codegen package
+
+---
+
+### Session 2: Phase 2 - Extract GC Diagnostics (2026-01-01)
+
+**Completed**:
+1. Created `coex_gc/diagnostics.py` with `GCDiagnostics` class (~1,075 lines)
+2. Extracted 10 diagnostic methods from `coex_gc_original.py`:
+   - `implement_gc_trace`
+   - `implement_gc_dump_stats`
+   - `implement_gc_dump_heap`
+   - `implement_gc_dump_roots`
+   - `implement_gc_dump_object`
+   - `implement_gc_validate_heap`
+   - `implement_gc_set_trace_level`
+   - `implement_gc_fragmentation_report`
+   - `implement_gc_dump_handle_table`
+   - `implement_gc_dump_shadow_stacks`
+3. Updated `coex_gc_original.py` to delegate to GCDiagnostics
+4. Verified tests passing (84 GC/basic tests, 18 GC phase tests)
+
+**Pattern Used**:
+- Created `GCDiagnostics` class with property accessors for common GC attributes
+- Parent class imports and instantiates the diagnostic helper
+- Delegation via method calls (original methods still exist in parent)
+
+**Files Created**:
+- `coex_gc/diagnostics.py` - GCDiagnostics class with all diagnostic implementations
+
+**Files Modified**:
+- `coex_gc_original.py` - imports and uses GCDiagnostics for diagnostic functions
+
+**Next Session Should**:
+1. Read this file for context
+2. Execute Phase 3: Extract GC Handle Management
+   - Create `coex_gc/handles.py`
+   - Extract 8 handle management methods
+   - Run test suite to verify
 
 ---
 
@@ -302,7 +340,7 @@ Then:
 | codegen/matrix.py | (new) | ~585 |
 | codegen/modules.py | (new) | ~430 |
 | codegen/atomics.py | (new) | ~400 |
-| coex_gc/diagnostics.py | (new) | ~1,075 |
+| coex_gc/diagnostics.py | ~1,075 (CREATED) | ~1,075 |
 | coex_gc/core.py | (new) | ~1,200 |
 | coex_gc/async_gc.py | (new) | ~510 |
 | coex_gc/handles.py | (new) | ~335 |
