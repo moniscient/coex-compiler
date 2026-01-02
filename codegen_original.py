@@ -15,6 +15,9 @@ import os
 # Import garbage collector (will be initialized after module creation)
 from coex_gc import GarbageCollector
 
+# Import POSIX module
+from codegen.posix import PosixGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -336,8 +339,11 @@ class CodeGenerator:
             "Err": (1, [("error", PrimitiveType("string"))]),  # tag 1
         }
 
-        # Create built-in posix platform type
-        self._create_posix_type()
+        # Initialize POSIX module
+        self._posix = PosixGenerator(self)
+
+        # Create built-in posix platform type (delegated to posix module)
+        self._posix.create_posix_type()
 
         # Matrix registry for tracking declared matrices
         self.matrix_decls: Dict[str, 'MatrixDecl'] = {}  # name -> MatrixDecl

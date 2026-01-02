@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 3 COMPLETED
-**Next Phase**: Phase 4 - Extract Codegen POSIX
+**Current Phase**: Phase 4 COMPLETED
+**Next Phase**: Phase 5 - Extract Codegen Strings
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -17,7 +17,7 @@
 - [x] **Phase 1**: Create Package Structure (COMPLETED 2026-01-01)
 - [x] **Phase 2**: Extract GC Diagnostics (COMPLETED 2026-01-01)
 - [x] **Phase 3**: Extract GC Handle Management (COMPLETED 2026-01-01)
-- [ ] **Phase 4**: Extract Codegen POSIX (~775 lines)
+- [x] **Phase 4**: Extract Codegen POSIX (COMPLETED 2026-01-01)
 - [ ] **Phase 5**: Extract Codegen Strings (~2,400 lines)
 - [ ] **Phase 6**: Extract Codegen JSON (~1,800 lines)
 - [ ] **Phase 7**: Extract Collections List/Array (~1,775 lines)
@@ -166,6 +166,48 @@
 2. Execute Phase 4: Extract Codegen POSIX
    - Create `codegen/posix.py`
    - Extract POSIX-related methods from `codegen_original.py`
+   - Run test suite to verify
+
+---
+
+### Session 2 (continued): Phase 4 - Extract Codegen POSIX (2026-01-01)
+
+**Completed**:
+1. Created `codegen/posix.py` with `PosixGenerator` class (~775 lines)
+2. Extracted 13 POSIX methods from `codegen_original.py`:
+   - `create_posix_type` (main entry point)
+   - `_create_posix_open`
+   - `_create_posix_read_all`
+   - `_create_posix_writeln`
+   - `_create_posix_close`
+   - `_create_posix_read`
+   - `_create_posix_write`
+   - `_create_posix_seek`
+   - `_create_posix_time`
+   - `_create_posix_time_ns`
+   - `_create_posix_getenv`
+   - `_create_posix_random_seed`
+   - `_create_posix_urandom`
+3. Also extracted helper method `_get_raw_string_ptr_with_builder`
+4. Updated `codegen_original.py` to delegate to PosixGenerator
+5. Verified tests passing (118 tests across POSIX/basic/GC/types)
+
+**Pattern Used**:
+- Created PosixGenerator class with property accessors for codegen attributes
+- Single entry point `create_posix_type()` that calls all helper methods
+- Uses codegen's string_counter and _create_global_string for string constants
+
+**Files Created**:
+- `codegen/posix.py` - PosixGenerator class with all POSIX implementations
+
+**Files Modified**:
+- `codegen_original.py` - imports and uses PosixGenerator
+
+**Next Session Should**:
+1. Read this file for context
+2. Execute Phase 5: Extract Codegen Strings
+   - Create `codegen/strings.py`
+   - Extract string-related methods from `codegen_original.py`
    - Run test suite to verify
 
 ---
@@ -371,7 +413,7 @@ Then:
 | codegen/collections.py | (new) | ~1,775 |
 | codegen/expressions.py | (new) | ~1,585 |
 | codegen/statements.py | (new) | ~1,480 |
-| codegen/posix.py | (new) | ~775 |
+| codegen/posix.py | ~775 (CREATED) | ~775 |
 | codegen/types.py | (new) | ~650 |
 | codegen/matrix.py | (new) | ~585 |
 | codegen/modules.py | (new) | ~430 |
