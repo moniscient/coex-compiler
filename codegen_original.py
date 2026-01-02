@@ -39,6 +39,15 @@ from codegen.expressions import ExpressionsGenerator
 # Import Statements module
 from codegen.statements import StatementsGenerator
 
+# Import Atomics module
+from codegen.atomics import AtomicsGenerator
+
+# Import Modules module
+from codegen.modules import ModulesGenerator
+
+# Import Matrix module
+from codegen.matrix import MatrixGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -341,6 +350,15 @@ class CodeGenerator:
 
         # Initialize Statements module (statement code generation)
         self._statements = StatementsGenerator(self)
+
+        # Initialize Atomics module (atomic type implementations)
+        self._atomics = AtomicsGenerator(self)
+
+        # Initialize Modules module (import/module system)
+        self._modules = ModulesGenerator(self)
+
+        # Initialize Matrix module (cellular automata)
+        self._matrix = MatrixGenerator(self)
 
         # Create Array type and helpers (dense, contiguous collection)
         # struct Array { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }

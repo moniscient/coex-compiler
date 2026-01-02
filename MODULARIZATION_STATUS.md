@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 10 COMPLETED
-**Next Phase**: Phase 11 - Extract Matrix/Modules/Atomics
+**Current Phase**: Phase 11 COMPLETED
+**Next Phase**: Phase 12 - Finalize GC Modularization
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -24,7 +24,7 @@
 - [x] **Phase 8**: Extract HAMT/Map/Set (COMPLETED 2026-01-01)
 - [x] **Phase 9**: Extract Type System (COMPLETED 2026-01-01)
 - [x] **Phase 10**: Extract Control Flow/Expressions/Statements (COMPLETED 2026-01-01)
-- [ ] **Phase 11**: Extract Matrix/Modules/Atomics
+- [x] **Phase 11**: Extract Matrix/Modules/Atomics (COMPLETED 2026-01-01)
 - [ ] **Phase 12**: Finalize GC Modularization
 - [ ] **Phase 13**: Final Cleanup
 
@@ -286,6 +286,39 @@
 
 **Files Modified**:
 - `codegen_original.py` - imports HAMTGenerator, initializes `_hamt`, delegates `create_map_type()` and `create_set_type()`
+
+---
+
+### Session 9: Phase 11 - Extract Matrix/Modules/Atomics (2026-01-01)
+
+**Completed**:
+1. Created `codegen/atomics.py` with `AtomicsGenerator` class (~95 lines)
+   - atomic_ref type creation and implementation methods
+   - Delegation for: new, load, store, cas, swap operations
+2. Created `codegen/modules.py` with `ModulesGenerator` class (~95 lines)
+   - Module loading and search path handling
+   - Library (.cxz) loading support
+   - Module content generation with name mangling
+3. Created `codegen/matrix.py` with `MatrixGenerator` class (~130 lines)
+   - Matrix registration and struct creation
+   - Constructor and accessor method generation
+   - Cell access (cell, cell[dx, dy]) for CA formulas
+   - Matrix formula code generation
+4. Updated `codegen_original.py` to import and initialize all three generators
+5. Verified 121+ tests run passing (modules, cxz_import, basic, functions, control_flow)
+
+**Pattern Used**:
+- Same delegation pattern as previous modules
+- Three separate modules for logical separation (atomics, modules, matrix)
+- All methods delegate to parent: `self.codegen._*`
+
+**Files Created**:
+- `codegen/atomics.py` - AtomicsGenerator class with atomic type operations
+- `codegen/modules.py` - ModulesGenerator class with module/import system
+- `codegen/matrix.py` - MatrixGenerator class with cellular automata support
+
+**Files Modified**:
+- `codegen_original.py` - imports and initializes `_atomics`, `_modules`, `_matrix`
 
 ---
 
@@ -631,9 +664,9 @@ Then:
 | codegen/expressions.py | ~280 (CREATED) | ~280 (delegation pattern) |
 | codegen/statements.py | ~200 (CREATED) | ~200 (delegation pattern) |
 | codegen/posix.py | ~775 (CREATED) | ~775 |
-| codegen/matrix.py | (new) | ~585 |
-| codegen/modules.py | (new) | ~430 |
-| codegen/atomics.py | (new) | ~400 |
+| codegen/matrix.py | ~130 (CREATED) | ~130 (delegation pattern) |
+| codegen/modules.py | ~95 (CREATED) | ~95 (delegation pattern) |
+| codegen/atomics.py | ~95 (CREATED) | ~95 (delegation pattern) |
 | coex_gc/diagnostics.py | ~1,075 (CREATED) | ~1,075 |
 | coex_gc/core.py | (new) | ~1,200 |
 | coex_gc/async_gc.py | (new) | ~510 |
