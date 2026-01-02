@@ -18,6 +18,7 @@ from typing import Dict, List as PyList, Tuple, Optional, TYPE_CHECKING
 
 # Import diagnostics submodule
 from coex_gc.diagnostics import GCDiagnostics
+from coex_gc.handles import HandleManager
 
 if TYPE_CHECKING:
     from codegen import CodeGenerator
@@ -193,6 +194,8 @@ class GarbageCollector:
 
         # Initialize diagnostics module (after functions are declared)
         self._diagnostics = GCDiagnostics(self)
+        # Initialize handle management module
+        self._handles = HandleManager(self)
 
         self._implement_gc_init()
         self._implement_gc_push_frame()
@@ -228,16 +231,16 @@ class GarbageCollector:
         self._diagnostics.implement_gc_fragmentation_report()
         self._diagnostics.implement_gc_dump_handle_table()
         self._diagnostics.implement_gc_dump_shadow_stacks()
-        # Handle-Based GC - Phase 1: Handle management functions
-        self._implement_gc_handle_table_grow()
-        self._implement_gc_handle_alloc()
-        self._implement_gc_handle_free()
-        self._implement_gc_handle_deref()
-        self._implement_gc_handle_store()
-        self._implement_gc_ptr_to_handle()
-        # MI-6: Deferred reclamation functions
-        self._implement_gc_handle_retire()
-        self._implement_gc_promote_retired_handles()
+        # Handle-Based GC - Phase 1: Handle management functions (delegated to handles module)
+        self._handles.implement_gc_handle_table_grow()
+        self._handles.implement_gc_handle_alloc()
+        self._handles.implement_gc_handle_free()
+        self._handles.implement_gc_handle_deref()
+        self._handles.implement_gc_handle_store()
+        self._handles.implement_gc_ptr_to_handle()
+        # MI-6: Deferred reclamation functions (delegated to handles module)
+        self._handles.implement_gc_handle_retire()
+        self._handles.implement_gc_promote_retired_handles()
 
     def _create_types(self):
         """Create GC-related LLVM types"""

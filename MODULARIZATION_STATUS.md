@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 2 COMPLETED
-**Next Phase**: Phase 3 - Extract GC Handle Management
+**Current Phase**: Phase 3 COMPLETED
+**Next Phase**: Phase 4 - Extract Codegen POSIX
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -16,7 +16,7 @@
 - [x] **Phase 0**: Documentation Setup (COMPLETED 2026-01-01)
 - [x] **Phase 1**: Create Package Structure (COMPLETED 2026-01-01)
 - [x] **Phase 2**: Extract GC Diagnostics (COMPLETED 2026-01-01)
-- [ ] **Phase 3**: Extract GC Handle Management (~335 lines)
+- [x] **Phase 3**: Extract GC Handle Management (COMPLETED 2026-01-01)
 - [ ] **Phase 4**: Extract Codegen POSIX (~775 lines)
 - [ ] **Phase 5**: Extract Codegen Strings (~2,400 lines)
 - [ ] **Phase 6**: Extract Codegen JSON (~1,800 lines)
@@ -130,6 +130,42 @@
 2. Execute Phase 3: Extract GC Handle Management
    - Create `coex_gc/handles.py`
    - Extract 8 handle management methods
+   - Run test suite to verify
+
+---
+
+### Session 2 (continued): Phase 3 - Extract GC Handle Management (2026-01-01)
+
+**Completed**:
+1. Created `coex_gc/handles.py` with `HandleManager` class (~335 lines)
+2. Extracted 8 handle management methods from `coex_gc_original.py`:
+   - `implement_gc_handle_table_grow`
+   - `implement_gc_handle_alloc`
+   - `implement_gc_handle_free`
+   - `implement_gc_handle_deref`
+   - `implement_gc_handle_store`
+   - `implement_gc_ptr_to_handle`
+   - `implement_gc_handle_retire`
+   - `implement_gc_promote_retired_handles`
+3. Updated `coex_gc_original.py` to delegate to HandleManager
+4. Verified tests passing (139 tests across GC/basic/phase test files)
+
+**Pattern Used**:
+- Same pattern as diagnostics: property accessors for GC attributes
+- Parent class imports and instantiates HandleManager
+- Delegation via method calls
+
+**Files Created**:
+- `coex_gc/handles.py` - HandleManager class with all handle operations
+
+**Files Modified**:
+- `coex_gc_original.py` - imports and uses HandleManager for handle functions
+
+**Next Session Should**:
+1. Read this file for context
+2. Execute Phase 4: Extract Codegen POSIX
+   - Create `codegen/posix.py`
+   - Extract POSIX-related methods from `codegen_original.py`
    - Run test suite to verify
 
 ---
@@ -343,4 +379,4 @@ Then:
 | coex_gc/diagnostics.py | ~1,075 (CREATED) | ~1,075 |
 | coex_gc/core.py | (new) | ~1,200 |
 | coex_gc/async_gc.py | (new) | ~510 |
-| coex_gc/handles.py | (new) | ~335 |
+| coex_gc/handles.py | ~335 (CREATED) | ~335 |
