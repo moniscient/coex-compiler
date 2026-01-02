@@ -27,6 +27,9 @@ from codegen.json import JSONGenerator
 # Import Collections module
 from codegen.collections import CollectionsGenerator
 
+# Import HAMT module
+from codegen.hamt import HAMTGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -306,11 +309,14 @@ class CodeGenerator:
         # Create String type and helpers (delegated to strings module)
         self._strings.create_string_type()
 
-        # Create Map type and helpers
-        self._create_map_type()
+        # Initialize HAMT module
+        self._hamt = HAMTGenerator(self)
 
-        # Create Set type and helpers
-        self._create_set_type()
+        # Create Map type and helpers (delegated to hamt module)
+        self._hamt.create_map_type()
+
+        # Create Set type and helpers (delegated to hamt module)
+        self._hamt.create_set_type()
 
         # Initialize JSON module
         self._json = JSONGenerator(self)

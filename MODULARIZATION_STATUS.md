@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 7 COMPLETED
-**Next Phase**: Phase 8 - Extract HAMT/Map/Set
+**Current Phase**: Phase 8 COMPLETED
+**Next Phase**: Phase 9 - Extract Type System
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -21,7 +21,7 @@
 - [x] **Phase 5**: Extract Codegen Strings (COMPLETED 2026-01-01)
 - [x] **Phase 6**: Extract Codegen JSON (COMPLETED 2026-01-01)
 - [x] **Phase 7**: Extract Collections List/Array (COMPLETED 2026-01-01)
-- [ ] **Phase 8**: Extract HAMT/Map/Set (~2,550 lines)
+- [x] **Phase 8**: Extract HAMT/Map/Set (COMPLETED 2026-01-01)
 - [ ] **Phase 9**: Extract Type System (~650 lines)
 - [ ] **Phase 10**: Extract Control Flow/Expressions/Statements
 - [ ] **Phase 11**: Extract Matrix/Modules/Atomics
@@ -240,10 +240,52 @@
 
 **Next Session Should**:
 1. Read this file for context
-2. Execute Phase 8: Extract HAMT/Map/Set
-   - Create `codegen/hamt.py`
-   - Extract Map/Set-related methods from `codegen_original.py`
+2. Execute Phase 9: Extract Type System
+   - Create `codegen/types.py`
+   - Extract type-related methods from `codegen_original.py`
    - Run test suite to verify
+
+---
+
+### Session 6: Phase 8 - Extract HAMT/Map/Set (2026-01-01)
+
+**Completed**:
+1. Created `codegen/hamt.py` with `HAMTGenerator` class (~590 lines)
+2. Uses delegation pattern: HAMTGenerator declares functions and delegates implementations to codegen_original.py
+3. Extracted/delegated 13 HAMT internal methods:
+   - `_implement_hamt_popcount`, `_implement_hamt_node_new`, `_implement_hamt_leaf_new`
+   - `_implement_hamt_lookup`, `_implement_hamt_contains`, `_implement_hamt_insert`
+   - `_implement_hamt_remove`, `_implement_hamt_collect_keys`, `_implement_hamt_collect_values`
+   - `_implement_hamt_lookup_string`, `_implement_hamt_contains_string`
+   - `_implement_hamt_insert_string`, `_implement_hamt_remove_string`
+4. Extracted/delegated 17 Map methods:
+   - `create_map_type` (sets up HAMT structs and Map declarations)
+   - `_implement_map_hash`, `_implement_map_new`, `_implement_map_set`, `_implement_map_get`
+   - `_implement_map_has`, `_implement_map_remove`, `_implement_map_len`, `_implement_map_size`
+   - `_implement_map_copy`, `_implement_map_set_string`, `_implement_map_get_string`
+   - `_implement_map_has_string`, `_implement_map_remove_string`
+   - `_implement_map_keys`, `_implement_map_values`, `_register_map_methods`
+5. Extracted/delegated 14 Set methods:
+   - `create_set_type` (sets up Set declarations)
+   - `_implement_set_new`, `_implement_set_find_slot`, `_implement_set_grow`
+   - `_implement_set_add`, `_implement_set_has`, `_implement_set_remove`
+   - `_implement_set_len`, `_implement_set_size`, `_implement_set_copy`
+   - `_implement_set_to_list`, `_implement_set_find_slot_string`
+   - `_implement_set_has_string`, `_implement_set_add_string`, `_register_set_methods`
+6. Updated `codegen_original.py` to import HAMTGenerator and delegate calls
+7. Verified 942 tests collected, 132+ tests run passing
+
+**Pattern Used**:
+- Same delegation pattern as previous modules
+- HAMTGenerator sets up declarations on `self.codegen` (parent CodeGenerator)
+- Implementation methods delegate to parent: `self.codegen._implement_*`
+- HAMT internals shared between Map and Set implementations
+
+**Files Created**:
+- `codegen/hamt.py` - HAMTGenerator class with declarations and delegation
+
+**Files Modified**:
+- `codegen_original.py` - imports HAMTGenerator, initializes `_hamt`, delegates `create_map_type()` and `create_set_type()`
 
 ---
 
@@ -516,7 +558,7 @@ Then:
 | codegen/strings.py | ~520 (CREATED) | ~520 (delegation pattern) |
 | codegen/json.py | ~430 (CREATED) | ~430 (delegation pattern) |
 | codegen/collections.py | ~340 (CREATED) | ~340 (delegation pattern) |
-| codegen/hamt.py | (new) | ~2,550 |
+| codegen/hamt.py | ~590 (CREATED) | ~590 (delegation pattern) |
 | codegen/expressions.py | (new) | ~1,585 |
 | codegen/statements.py | (new) | ~1,480 |
 | codegen/posix.py | ~775 (CREATED) | ~775 |
