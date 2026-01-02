@@ -30,6 +30,9 @@ from codegen.collections import CollectionsGenerator
 # Import HAMT module
 from codegen.hamt import HAMTGenerator
 
+# Import Types module
+from codegen.types import TypesGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -323,6 +326,9 @@ class CodeGenerator:
 
         # Create JSON type and helpers (delegated to json module)
         self._json.create_json_type()
+
+        # Initialize Types module (type conversion and checking utilities)
+        self._types = TypesGenerator(self)
 
         # Create Array type and helpers (dense, contiguous collection)
         # struct Array { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }
