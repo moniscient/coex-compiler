@@ -13154,6 +13154,10 @@ class CodeGenerator:
         # Call user's main implementation
         result = builder.call(impl_func, call_args)
 
+        # Shutdown GC thread before exit
+        if self.gc is not None:
+            builder.call(self.gc.gc_shutdown, [])
+
         # Truncate i64 to i32 for C return
         result_32 = builder.trunc(result, i32)
         builder.ret(result_32)

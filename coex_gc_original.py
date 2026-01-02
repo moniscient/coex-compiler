@@ -137,6 +137,8 @@ class GarbageCollector:
         self.gc_sweep_heap = None
         self.gc_grow_heaps = None
         self.gc_wait_for_completion = None
+        self.gc_shutdown = None
+        self.gc_run_collection_cycle = None
 
         # Dual-heap types and globals
         self.heap_region_type = None
@@ -149,6 +151,11 @@ class GarbageCollector:
         self.gc_snapshot = None
         self.gc_thread_handle = None
 
+        # Concurrent GC state globals
+        self.gc_in_progress = None        # Flag: collection in progress
+        self.gc_shutdown_flag = None      # Flag: request thread termination
+        self.gc_trigger_threshold = None  # Allocation threshold for auto-trigger
+
         # Pthread functions
         self.pthread_create = None
         self.pthread_mutex_init = None
@@ -159,6 +166,9 @@ class GarbageCollector:
         self.pthread_cond_signal = None
         self.pthread_attr_init = None
         self.pthread_attr_setdetachstate = None
+        self.pthread_join = None
+        self.pthread_cond_broadcast = None
+        self.usleep = None
 
         # Pthread TLS and thread identity functions
         self.pthread_self = None
@@ -252,6 +262,8 @@ class GarbageCollector:
         self._implement_gc_scan_roots()
         self._implement_gc_sweep()
         self._implement_gc_collect()
+        self._implement_gc_run_collection_cycle()
+        self._implement_gc_shutdown()
         self._implement_gc_safepoint()
         self._add_nursery_stubs()  # Disabled nursery context stubs for compatibility
         # Dual-heap async GC implementations
@@ -646,6 +658,28 @@ class GarbageCollector:
         self.gc_cycle_id.linkage = 'internal'
 
         # ============================================================
+        # Concurrent GC State Globals
+        # ============================================================
+
+        # Flag: GC collection currently in progress (0 or 1)
+        self.gc_in_progress = ir.GlobalVariable(
+            self.module, self.i64, name="gc_in_progress")
+        self.gc_in_progress.initializer = ir.Constant(self.i64, 0)
+        self.gc_in_progress.linkage = 'internal'
+
+        # Flag: Request GC thread to terminate (0 or 1)
+        self.gc_shutdown_flag = ir.GlobalVariable(
+            self.module, self.i64, name="gc_shutdown_flag")
+        self.gc_shutdown_flag.initializer = ir.Constant(self.i64, 0)
+        self.gc_shutdown_flag.linkage = 'internal'
+
+        # Allocation threshold for automatic GC trigger
+        self.gc_trigger_threshold = ir.GlobalVariable(
+            self.module, self.i64, name="gc_trigger_threshold")
+        self.gc_trigger_threshold.initializer = ir.Constant(self.i64, 10000)
+        self.gc_trigger_threshold.linkage = 'internal'
+
+        # ============================================================
         # TLS Keys for Thread-Local Storage
         # ============================================================
         # Using pthread_key_t for TLS instead of LLVM's thread_local
@@ -775,6 +809,16 @@ class GarbageCollector:
         gc_wait_ty = ir.FunctionType(self.void, [])
         self.gc_wait_for_completion = ir.Function(self.module, gc_wait_ty, name="coex_gc_wait_for_completion")
 
+        # gc_shutdown() -> void
+        # Terminate the GC thread cleanly
+        gc_shutdown_ty = ir.FunctionType(self.void, [])
+        self.gc_shutdown = ir.Function(self.module, gc_shutdown_ty, name="coex_gc_shutdown")
+
+        # gc_run_collection_cycle() -> void
+        # Run a single garbage collection cycle (called by GC thread)
+        gc_run_cycle_ty = ir.FunctionType(self.void, [])
+        self.gc_run_collection_cycle = ir.Function(self.module, gc_run_cycle_ty, name="coex_gc_run_collection_cycle")
+
         # ============================================================
         # Pthread function declarations (external)
         # ============================================================
@@ -819,6 +863,21 @@ class GarbageCollector:
         # pthread_attr_setdetachstate(attr*, detachstate) -> int
         pthread_attr_setdetach_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i32])
         self.pthread_attr_setdetachstate = ir.Function(self.module, pthread_attr_setdetach_ty, name="pthread_attr_setdetachstate")
+
+        # pthread_join(thread, retval*) -> int
+        # Wait for thread to terminate
+        pthread_join_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr])
+        self.pthread_join = ir.Function(self.module, pthread_join_ty, name="pthread_join")
+
+        # pthread_cond_broadcast(cond*) -> int
+        # Wake all threads waiting on condition variable
+        pthread_cond_broadcast_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        self.pthread_cond_broadcast = ir.Function(self.module, pthread_cond_broadcast_ty, name="pthread_cond_broadcast")
+
+        # usleep(usec) -> int
+        # Sleep for microseconds (used for watermark timeout)
+        usleep_ty = ir.FunctionType(self.i32, [self.i32])
+        self.usleep = ir.Function(self.module, usleep_ty, name="usleep")
 
         # ============================================================
         # Pthread TLS and Thread Identity Functions
@@ -1216,6 +1275,35 @@ class GarbageCollector:
 
         # Register main thread
         builder.call(self.gc_register_thread, [])
+
+        # ============================================================
+        # Initialize Concurrent GC State and Spawn GC Thread
+        # ============================================================
+
+        # Initialize concurrent GC state globals
+        builder.store(ir.Constant(self.i64, 0), self.gc_in_progress)
+        builder.store(ir.Constant(self.i64, 0), self.gc_shutdown_flag)
+
+        # Spawn GC thread
+        # Allocate space for pthread_t (8 bytes on 64-bit)
+        thread_ptr_size = ir.Constant(self.i64, 8)
+        thread_ptr = builder.call(self.codegen.malloc, [thread_ptr_size])
+
+        # Get function pointer for gc_thread_main
+        gc_thread_func_ptr = builder.bitcast(self.gc_thread_main, self.i8_ptr)
+
+        # Create the GC thread
+        builder.call(self.pthread_create, [
+            thread_ptr,                       # pthread_t* (thread handle pointer)
+            ir.Constant(self.i8_ptr, None),   # attr (NULL = default)
+            gc_thread_func_ptr,               # start routine
+            ir.Constant(self.i8_ptr, None)    # arg (NULL)
+        ])
+
+        # Load and store the thread handle
+        thread_ptr_typed = builder.bitcast(thread_ptr, self.i8_ptr.as_pointer())
+        thread_handle = builder.load(thread_ptr_typed)
+        builder.store(thread_handle, self.gc_thread_handle)
 
         builder.ret_void()
 
@@ -2370,60 +2458,67 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_collect(self):
-        """Run a full garbage collection cycle (high watermark model).
+        """Synchronous garbage collection.
 
-        Phase 9: Collection Orchestration with MI-6 Deferred Reclamation
-        Thread Registry: Implements watermark protocol for multi-threaded GC.
-
-        This implements the synchronous collection cycle:
-        1. Check if GC enabled and not already in progress
-        2. Set gc_in_progress = 1
-        3. Set gc_phase = 1 (WATERMARK) and increment gc_cycle_id
-        4. Promote retired handles from previous cycle to free list (MI-6)
-        5. Set gc_phase = 2 (MARKING) and flip mark value
-        6. Mark phase: scan roots and mark reachable objects
-        7. Set gc_phase = 3 (SWEEPING)
-        8. Sweep phase: free unmarked objects
-        9. Reset all threads' watermark_active
-        10. Set gc_phase = 0 (IDLE) and gc_in_progress = 0
-        11. Update statistics
-
-        MI-6 Deferred Reclamation:
-        Handles swept in cycle N are added to the retired list, not the free list.
-        At the start of cycle N+1, retired handles are promoted to the free list.
-        This ensures handles are not reused until at least one full cycle after being freed.
+        Triggers async collection and waits for it to complete.
+        This is a simple wrapper: gc_async() + gc_wait_for_completion().
         """
         func = self.gc_collect
 
         entry = func.append_basic_block("entry")
-        check_enabled = func.append_basic_block("check_enabled")
         do_collection = func.append_basic_block("do_collection")
-        reset_watermarks = func.append_basic_block("reset_watermarks")
-        reset_loop = func.append_basic_block("reset_loop")
-        reset_thread = func.append_basic_block("reset_thread")
-        next_reset = func.append_basic_block("next_reset")
-        finalize = func.append_basic_block("finalize")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
 
         # Check if GC enabled
         gc_enabled = builder.load(self.gc_enabled)
-        builder.cbranch(gc_enabled, check_enabled, done)
-
-        builder.position_at_end(check_enabled)
-        # Check if GC already in progress (reentrant protection)
-        in_prog_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        in_progress = builder.load(in_prog_ptr)
-        is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
-        builder.cbranch(is_in_progress, done, do_collection)
+        builder.cbranch(gc_enabled, do_collection, done)
 
         builder.position_at_end(do_collection)
 
-        # Set gc_in_progress = 1
-        builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
+        # Trigger async collection
+        builder.call(self.gc_async, [])
+
+        # Wait for completion
+        builder.call(self.gc_wait_for_completion, [])
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_run_collection_cycle(self):
+        """Run a single garbage collection cycle.
+
+        Called by GC thread. Contains the core collection logic:
+        1. Promote retired handles (MI-6)
+        2. WATERMARK phase - wait for threads to acknowledge
+        3. MARKING phase - flip mark bit, scan roots
+        4. SWEEPING phase - reclaim unmarked objects
+        5. Reset watermark flags for all threads
+        6. Update statistics
+        """
+        func = self.gc_run_collection_cycle
+
+        entry = func.append_basic_block("entry")
+        watermark_wait = func.append_basic_block("watermark_wait")
+        watermark_check = func.append_basic_block("watermark_check")
+        check_thread_loop = func.append_basic_block("check_thread_loop")
+        check_one_thread = func.append_basic_block("check_one_thread")
+        check_next_thread = func.append_basic_block("check_next_thread")
+        check_done = func.append_basic_block("check_done")
+        watermark_sleep = func.append_basic_block("watermark_sleep")
+        watermark_done = func.append_basic_block("watermark_done")
+        do_mark = func.append_basic_block("do_mark")
+        do_sweep = func.append_basic_block("do_sweep")
+        reset_watermarks = func.append_basic_block("reset_watermarks")
+        reset_loop = func.append_basic_block("reset_loop")
+        reset_thread = func.append_basic_block("reset_thread")
+        next_reset = func.append_basic_block("next_reset")
+        finalize = func.append_basic_block("finalize")
+
+        builder = ir.IRBuilder(entry)
 
         # ============================================================
         # WATERMARK PHASE: Signal threads to record watermarks
@@ -2436,40 +2531,110 @@ class GarbageCollector:
         new_cycle = builder.add(old_cycle, ir.Constant(self.i64, 1))
         builder.store(new_cycle, self.gc_cycle_id)
 
-        # Note: In multi-threaded mode, we would wait for all threads to
-        # acknowledge the watermark here. For single-threaded, this is a no-op.
-
         # MI-6: Promote retired handles from previous cycle to free list
-        # This makes handles retired in cycle N-1 available for reuse in cycle N
         builder.call(self.gc_promote_retired_handles, [])
+
+        # Initialize wait counter for timeout (100 iterations * 10ms = 1 second)
+        wait_count_ptr = builder.alloca(self.i64, name="wait_count")
+        builder.store(ir.Constant(self.i64, 0), wait_count_ptr)
+
+        builder.branch(watermark_wait)
+
+        # ============================================================
+        # Wait for all threads to acknowledge watermark
+        # ============================================================
+        builder.position_at_end(watermark_wait)
+
+        # Check timeout
+        wait_count = builder.load(wait_count_ptr)
+        timed_out = builder.icmp_unsigned(">=", wait_count, ir.Constant(self.i64, 100))
+        builder.cbranch(timed_out, watermark_done, watermark_check)
+
+        builder.position_at_end(watermark_check)
+        # Check if all threads have acknowledged
+        all_acked_ptr = builder.alloca(self.i1, name="all_acked")
+        builder.store(ir.Constant(self.i1, 1), all_acked_ptr)
+
+        # Store current thread for iteration
+        curr_thread_ptr = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_check")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr_thread_ptr)
+        builder.branch(check_thread_loop)
+
+        # Loop through all threads
+        builder.position_at_end(check_thread_loop)
+        thread_val = builder.load(curr_thread_ptr)
+        thread_is_null = builder.icmp_unsigned(
+            "==",
+            builder.ptrtoint(thread_val, self.i64),
+            ir.Constant(self.i64, 0)
+        )
+        builder.cbranch(thread_is_null, check_done, check_one_thread)
+
+        builder.position_at_end(check_one_thread)
+        # Check this thread's watermark_active (field 3)
+        wm_active_ptr = builder.gep(thread_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_active = builder.load(wm_active_ptr)
+        not_acked = builder.icmp_unsigned("==", wm_active, ir.Constant(self.i64, 0))
+
+        with builder.if_then(not_acked):
+            builder.store(ir.Constant(self.i1, 0), all_acked_ptr)
+
+        builder.branch(check_next_thread)
+
+        builder.position_at_end(check_next_thread)
+        # Move to next thread
+        thread_val2 = builder.load(curr_thread_ptr)
+        next_ptr = builder.gep(thread_val2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_ptr)
+        next_thread_typed = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_typed, curr_thread_ptr)
+        builder.branch(check_thread_loop)
+
+        builder.position_at_end(check_done)
+        all_acked = builder.load(all_acked_ptr)
+        builder.cbranch(all_acked, watermark_done, watermark_sleep)
+
+        builder.position_at_end(watermark_sleep)
+        # Sleep 10ms and retry
+        builder.call(self.usleep, [ir.Constant(self.i32, 10000)])
+        old_count = builder.load(wait_count_ptr)
+        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
+        builder.store(new_count, wait_count_ptr)
+        builder.branch(watermark_wait)
 
         # ============================================================
         # MARKING PHASE: Mark all reachable objects
         # ============================================================
+        builder.position_at_end(watermark_done)
+        builder.branch(do_mark)
+
+        builder.position_at_end(do_mark)
         # Set gc_phase = 2 (MARKING)
         builder.store(ir.Constant(self.i64, 2), self.gc_phase)
 
-        # Phase 9: Flip gc_current_mark_value BEFORE mark phase
-        # This ensures newly allocated objects (born with OLD mark value) will be
-        # properly traversed, since they won't appear "already marked" with new value
+        # Flip gc_current_mark_value BEFORE mark phase
         old_mark = builder.load(self.gc_current_mark_value)
         new_mark = builder.xor(old_mark, ir.Constant(self.i64, 1))
         builder.store(new_mark, self.gc_current_mark_value)
 
-        # Phase 9: Mark phase - scan roots and mark all reachable objects
-        # Use gc_scan_roots which marks from the shadow stack
+        # Mark phase - scan roots
         builder.call(self.gc_scan_roots, [])
+        builder.branch(do_sweep)
 
         # ============================================================
         # SWEEPING PHASE: Free unmarked objects
         # ============================================================
+        builder.position_at_end(do_sweep)
         # Set gc_phase = 3 (SWEEPING)
         builder.store(ir.Constant(self.i64, 3), self.gc_phase)
 
-        # Phase 9: Sweep phase - free unmarked objects
-        # gc_sweep handles mark inversion (flips gc_current_mark_value)
+        # Sweep phase
         builder.call(self.gc_sweep, [])
-
         builder.branch(reset_watermarks)
 
         # ============================================================
@@ -2481,45 +2646,41 @@ class GarbageCollector:
         mutex = builder.load(self.gc_registry_mutex)
         builder.call(self.pthread_mutex_lock, [mutex])
 
-        # Allocate storage for current thread
-        curr_thread = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
-        head = builder.load(self.gc_thread_registry)
-        builder.store(head, curr_thread)
-
+        # Store current thread for iteration
+        reset_curr_ptr = builder.alloca(self.thread_entry_type.as_pointer(), name="reset_curr")
+        reset_head = builder.load(self.gc_thread_registry)
+        builder.store(reset_head, reset_curr_ptr)
         builder.branch(reset_loop)
 
-        # Loop through all threads
         builder.position_at_end(reset_loop)
-        thread_val = builder.load(curr_thread)
-        thread_is_null = builder.icmp_unsigned(
+        reset_thread_val = builder.load(reset_curr_ptr)
+        reset_is_null = builder.icmp_unsigned(
             "==",
-            builder.ptrtoint(thread_val, self.i64),
+            builder.ptrtoint(reset_thread_val, self.i64),
             ir.Constant(self.i64, 0)
         )
-        builder.cbranch(thread_is_null, finalize, reset_thread)
+        builder.cbranch(reset_is_null, finalize, reset_thread)
 
-        # Reset this thread's watermark
         builder.position_at_end(reset_thread)
         # Set watermark_active = 0 (field 3)
-        wm_active_ptr = builder.gep(thread_val, [
+        reset_wm_ptr = builder.gep(reset_thread_val, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), wm_active_ptr)
+        builder.store(ir.Constant(self.i64, 0), reset_wm_ptr)
         builder.branch(next_reset)
 
-        # Move to next thread
         builder.position_at_end(next_reset)
-        thread_val2 = builder.load(curr_thread)
-        next_ptr = builder.gep(thread_val2, [
+        reset_thread_val2 = builder.load(reset_curr_ptr)
+        next_reset_ptr = builder.gep(reset_thread_val2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
         ], inbounds=True)
-        next_thread_i8 = builder.load(next_ptr)
-        next_thread_ptr = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
-        builder.store(next_thread_ptr, curr_thread)
+        next_reset_i8 = builder.load(next_reset_ptr)
+        next_reset_typed = builder.bitcast(next_reset_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_reset_typed, reset_curr_ptr)
         builder.branch(reset_loop)
 
         # ============================================================
-        # Finalize: Update statistics and reset flags
+        # Finalize: Update statistics and reset phase
         # ============================================================
         builder.position_at_end(finalize)
 
@@ -2529,8 +2690,7 @@ class GarbageCollector:
         # Set gc_phase = 0 (IDLE)
         builder.store(ir.Constant(self.i64, 0), self.gc_phase)
 
-        # Phase 9: Update statistics
-        # Increment collections_completed (gc_stats offset 4 = index 32/8)
+        # Update statistics - increment collections_completed
         collections_ptr = builder.gep(self.gc_stats, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
         ], inbounds=True)
@@ -2538,30 +2698,18 @@ class GarbageCollector:
         new_collections = builder.add(old_collections, ir.Constant(self.i64, 1))
         builder.store(new_collections, collections_ptr)
 
-        # Reset allocations_since_last_gc (gc_stats offset 2 = index 16/8)
+        # Reset allocations_since_last_gc
         alloc_since_ptr = builder.gep(self.gc_stats, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), alloc_since_ptr)
 
-        # Reset bytes_since_last_gc (gc_stats offset 3 = index 24/8)
+        # Reset bytes_since_last_gc
         bytes_since_ptr = builder.gep(self.gc_stats, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), bytes_since_ptr)
 
-        # Set gc_in_progress = 0
-        builder.store(ir.Constant(self.i64, 0), in_prog_ptr)
-
-        # Also set gc_complete = 1 for compatibility
-        complete_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 1), complete_ptr)
-
-        builder.branch(done)
-
-        builder.position_at_end(done)
         builder.ret_void()
 
     def _implement_gc_safepoint(self):
@@ -3160,134 +3308,103 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_thread_main(self):
-        """GC thread main loop - waits for signal, collects, signals completion."""
+        """GC thread main loop - waits for signal, runs collection, signals completion.
+
+        Loop:
+        1. Lock mutex
+        2. While gc_in_progress == 0 && gc_shutdown_flag == 0: wait on cond_start
+        3. If gc_shutdown_flag: unlock and return
+        4. Unlock mutex
+        5. Call gc_run_collection_cycle()
+        6. Lock mutex, set gc_in_progress = 0, broadcast cond_done, unlock
+        7. Goto 1
+        """
         func = self.gc_thread_main
         func.args[0].name = "arg"
 
         entry = func.append_basic_block("entry")
+        loop_start = func.append_basic_block("loop_start")
         wait_loop = func.append_basic_block("wait_loop")
-        check_work = func.append_basic_block("check_work")
+        wait_on_cond = func.append_basic_block("wait_on_cond")
+        check_shutdown = func.append_basic_block("check_shutdown")
+        do_shutdown = func.append_basic_block("do_shutdown")
         do_collection = func.append_basic_block("do_collection")
         signal_done = func.append_basic_block("signal_done")
 
         builder = ir.IRBuilder(entry)
-        builder.branch(wait_loop)
+        builder.branch(loop_start)
 
-        # Wait loop - check for work
-        builder.position_at_end(wait_loop)
-
-        # Lock mutex
+        # Main loop - lock mutex
+        builder.position_at_end(loop_start)
         mutex_ptr = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_lock, [mutex_ptr])
+        builder.branch(wait_loop)
 
-        builder.branch(check_work)
+        # Wait loop - check for work or shutdown
+        builder.position_at_end(wait_loop)
+        in_progress = builder.load(self.gc_in_progress)
+        shutdown_flag = builder.load(self.gc_shutdown_flag)
 
-        builder.position_at_end(check_work)
-        # Check if gc_in_progress == 1
-        in_prog_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        in_progress = builder.load(in_prog_ptr)
         has_work = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+        should_shutdown = builder.icmp_unsigned("!=", shutdown_flag, ir.Constant(self.i64, 0))
+        should_wake = builder.or_(has_work, should_shutdown)
+        builder.cbranch(should_wake, check_shutdown, wait_on_cond)
 
-        # If no work, wait on condition variable
-        with builder.if_then(builder.not_(has_work)):
-            cond_start = builder.load(self.gc_cond_start)
-            mutex_ptr2 = builder.load(self.gc_mutex)
-            builder.call(self.pthread_cond_wait, [cond_start, mutex_ptr2])
+        # Wait on condition variable
+        builder.position_at_end(wait_on_cond)
+        cond_start = builder.load(self.gc_cond_start)
+        mutex_ptr2 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_cond_wait, [cond_start, mutex_ptr2])
+        builder.branch(wait_loop)
 
-        # Re-check after wait (spurious wakeup protection)
-        in_progress2 = builder.load(in_prog_ptr)
-        has_work2 = builder.icmp_unsigned("!=", in_progress2, ir.Constant(self.i64, 0))
-        builder.cbranch(has_work2, do_collection, check_work)
+        # Check if shutdown requested
+        builder.position_at_end(check_shutdown)
+        shutdown_flag2 = builder.load(self.gc_shutdown_flag)
+        is_shutdown = builder.icmp_unsigned("!=", shutdown_flag2, ir.Constant(self.i64, 0))
+        builder.cbranch(is_shutdown, do_shutdown, do_collection)
 
-        # Do collection
-        builder.position_at_end(do_collection)
-
-        # Get snapshot
-        snapshot = builder.load(self.gc_snapshot)
-
-        # Get which heap to collect
-        heap_to_collect_ptr = builder.gep(snapshot, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        heap_to_collect = builder.load(heap_to_collect_ptr)
-
-        # Unlock mutex during collection (collection is thread-safe)
+        # Shutdown - unlock and return
+        builder.position_at_end(do_shutdown)
         mutex_ptr3 = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
+        builder.ret(ir.Constant(self.i8_ptr, None))
 
-        # Phase 1: Mark from snapshot roots
-        builder.call(self.gc_mark_from_snapshot, [snapshot])
+        # Do collection - unlock mutex first (collection is safe without mutex)
+        builder.position_at_end(do_collection)
+        mutex_ptr4 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr4])
 
-        # Phase 2: Scan other heap for cross-heap pointers
-        other_heap = builder.sub(ir.Constant(self.i64, 1), heap_to_collect)
-        builder.call(self.gc_scan_cross_heap, [other_heap, heap_to_collect])
-
-        # Phase 3: Sweep collected heap
-        builder.call(self.gc_sweep_heap, [heap_to_collect])
-
-        # Free snapshot
-        roots_ptr = builder.gep(snapshot, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        roots = builder.load(roots_ptr)
-        roots_raw = builder.bitcast(roots, self.i8_ptr)
-        builder.call(self.codegen.free, [roots_raw])
-        snap_raw = builder.bitcast(snapshot, self.i8_ptr)
-        builder.call(self.codegen.free, [snap_raw])
-
+        # Run the collection cycle
+        builder.call(self.gc_run_collection_cycle, [])
         builder.branch(signal_done)
 
         # Signal completion
         builder.position_at_end(signal_done)
+        mutex_ptr5 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr5])
 
-        # Lock mutex to update state
-        mutex_ptr4 = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex_ptr4])
+        # Set gc_in_progress = 0
+        builder.store(ir.Constant(self.i64, 0), self.gc_in_progress)
 
-        # Set gc_in_progress = 0, gc_complete = 1
-        builder.store(ir.Constant(self.i64, 0), in_prog_ptr)
-        complete_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 1), complete_ptr)
-
-        # Signal completion
+        # Broadcast to all waiters
         cond_done = builder.load(self.gc_cond_done)
-        builder.call(self.pthread_cond_signal, [cond_done])
+        builder.call(self.pthread_cond_broadcast, [cond_done])
 
         # Unlock and loop back
-        mutex_ptr5 = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_unlock, [mutex_ptr5])
-
-        builder.branch(wait_loop)
-
-        # Note: Thread never returns (runs until program exits)
-        # The detached thread will be cleaned up when main exits
+        builder.branch(loop_start)
 
     def _implement_gc_async(self):
-        """Trigger async GC (Phase 9: In single-threaded mode, just do synchronous collection).
+        """Trigger asynchronous garbage collection.
 
-        In the high watermark model for single-threaded execution, gc_async
-        simply calls gc_collect since there's no separate GC thread.
-        Multi-threaded implementation would spawn/signal a GC thread.
+        Returns immediately. Collection runs on GC thread.
+        No-op if collection already in progress.
         """
         func = self.gc_async
 
         entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-
-        # Phase 9: In single-threaded mode, just do synchronous collection
-        builder.call(self.gc_collect, [])
-
-        builder.ret_void()
-
-    def _implement_gc_wait_for_completion(self):
-        """Wait for current GC cycle to complete."""
-        func = self.gc_wait_for_completion
-
-        entry = func.append_basic_block("entry")
-        check_complete = func.append_basic_block("check_complete")
-        wait_for_done = func.append_basic_block("wait_for_done")
+        already_running = func.append_basic_block("already_running")
+        trigger = func.append_basic_block("trigger")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -3296,28 +3413,155 @@ class GarbageCollector:
         mutex_ptr = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_lock, [mutex_ptr])
 
-        builder.branch(check_complete)
+        # Check if already in progress
+        in_progress = builder.load(self.gc_in_progress)
+        is_running = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+        builder.cbranch(is_running, already_running, trigger)
 
-        builder.position_at_end(check_complete)
-        # Check if gc_complete == 1
-        complete_ptr = builder.gep(self.gc_state, [
+        # Already running - just unlock and return
+        builder.position_at_end(already_running)
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.branch(done)
+
+        # Trigger collection
+        builder.position_at_end(trigger)
+        builder.store(ir.Constant(self.i64, 1), self.gc_in_progress)
+
+        # Signal GC thread
+        cond_start = builder.load(self.gc_cond_start)
+        builder.call(self.pthread_cond_signal, [cond_start])
+
+        # Unlock
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_wait_for_completion(self):
+        """Block until current GC cycle completes.
+
+        CRITICAL: Before waiting, acknowledges the watermark so the GC thread
+        doesn't deadlock waiting for this thread.
+
+        Returns immediately if no collection in progress.
+        """
+        func = self.gc_wait_for_completion
+
+        entry = func.append_basic_block("entry")
+        check_ack = func.append_basic_block("check_ack")
+        ack_watermark = func.append_basic_block("ack_watermark")
+        take_lock = func.append_basic_block("take_lock")
+        wait_loop = func.append_basic_block("wait_loop")
+        do_wait = func.append_basic_block("do_wait")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # ============================================================
+        # Before taking the mutex, acknowledge watermark if needed
+        # This prevents deadlock where GC waits for us to ack
+        # but we're blocked waiting for GC to complete
+        # ============================================================
+        # Get thread entry from TLS
+        thread_entry_key = builder.load(self.tls_key_thread_entry)
+        te_ptr = builder.call(self.pthread_getspecific, [thread_entry_key])
+        te_ptr_int = builder.ptrtoint(te_ptr, self.i64)
+        is_registered = builder.icmp_unsigned('!=', te_ptr_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_registered, check_ack, take_lock)
+
+        # Check if GC is in progress (use gc_in_progress, not gc_phase, to avoid race)
+        # gc_in_progress is set BEFORE signaling GC thread, so it's reliable here
+        builder.position_at_end(check_ack)
+        in_progress_val = builder.load(self.gc_in_progress)
+        gc_active = builder.icmp_unsigned("!=", in_progress_val, ir.Constant(self.i64, 0))
+        builder.cbranch(gc_active, ack_watermark, take_lock)
+
+        # Acknowledge watermark unconditionally
+        # We're about to wait for GC to complete, so we MUST acknowledge
+        # to prevent the GC thread from waiting for us indefinitely
+        builder.position_at_end(ack_watermark)
+        thread_entry = builder.bitcast(te_ptr, self.thread_entry_type.as_pointer())
+
+        # Get current stack depth from TLS
+        frame_depth_key = builder.load(self.tls_key_frame_depth)
+        depth_ptr = builder.call(self.pthread_getspecific, [frame_depth_key])
+        current_depth = builder.ptrtoint(depth_ptr, self.i64)
+
+        # Set watermark_depth (field 2)
+        wm_depth_ptr = builder.gep(thread_entry, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
-        is_complete = builder.load(complete_ptr)
-        completed = builder.icmp_unsigned("!=", is_complete, ir.Constant(self.i64, 0))
-        builder.cbranch(completed, done, wait_for_done)
+        builder.store(current_depth, wm_depth_ptr)
 
-        builder.position_at_end(wait_for_done)
-        # Wait on gc_cond_done
+        # Set watermark_active = 1 (field 3)
+        wm_active_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 1), wm_active_ptr)
+
+        builder.branch(take_lock)
+
+        # ============================================================
+        # Now take the lock and wait for completion
+        # ============================================================
+        builder.position_at_end(take_lock)
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+        builder.branch(wait_loop)
+
+        # Wait loop
+        builder.position_at_end(wait_loop)
+        in_progress = builder.load(self.gc_in_progress)
+        is_running = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
+        builder.cbranch(is_running, do_wait, done)
+
+        # Wait on condition
+        builder.position_at_end(do_wait)
         cond_done = builder.load(self.gc_cond_done)
         mutex_ptr2 = builder.load(self.gc_mutex)
         builder.call(self.pthread_cond_wait, [cond_done, mutex_ptr2])
-        builder.branch(check_complete)
+        builder.branch(wait_loop)
 
+        # Done - unlock and return
         builder.position_at_end(done)
-        # Unlock mutex
         mutex_ptr3 = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
+        builder.ret_void()
+
+    def _implement_gc_shutdown(self):
+        """Terminate the GC thread cleanly.
+
+        Waits for any in-progress collection, signals thread to exit,
+        and joins the thread.
+        """
+        func = self.gc_shutdown
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Wait for any in-progress collection to complete
+        builder.call(self.gc_wait_for_completion, [])
+
+        # Lock mutex
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        # Set shutdown flag
+        builder.store(ir.Constant(self.i64, 1), self.gc_shutdown_flag)
+
+        # Signal GC thread to wake up
+        cond_start = builder.load(self.gc_cond_start)
+        builder.call(self.pthread_cond_signal, [cond_start])
+
+        # Unlock
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+
+        # Join GC thread
+        gc_thread_ptr = builder.load(self.gc_thread_handle)
+        null_ptr = ir.Constant(self.i8_ptr, None)
+        builder.call(self.pthread_join, [gc_thread_ptr, null_ptr])
+
         builder.ret_void()
 
     def _implement_gc_grow_heaps(self):
