@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 11 COMPLETED
-**Next Phase**: Phase 12 - Finalize GC Modularization
+**Current Phase**: Phase 12 COMPLETED
+**Next Phase**: Phase 13 - Final Cleanup
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -25,7 +25,7 @@
 - [x] **Phase 9**: Extract Type System (COMPLETED 2026-01-01)
 - [x] **Phase 10**: Extract Control Flow/Expressions/Statements (COMPLETED 2026-01-01)
 - [x] **Phase 11**: Extract Matrix/Modules/Atomics (COMPLETED 2026-01-01)
-- [ ] **Phase 12**: Finalize GC Modularization
+- [x] **Phase 12**: Finalize GC Modularization (COMPLETED 2026-01-01)
 - [ ] **Phase 13**: Final Cleanup
 
 ---
@@ -286,6 +286,40 @@
 
 **Files Modified**:
 - `codegen_original.py` - imports HAMTGenerator, initializes `_hamt`, delegates `create_map_type()` and `create_set_type()`
+
+---
+
+### Session 10: Phase 12 - Finalize GC Modularization (2026-01-01)
+
+**Completed**:
+1. Created `coex_gc/core.py` with `GCCoreGenerator` class (~250 lines)
+   - Runtime generation: generate_gc_runtime, create_types, create_globals, declare_functions
+   - Type registration: register_type, get_type_id, finalize_type_tables
+   - Shadow stack: push_frame, pop_frame, set_root operations
+   - Allocation: gc_alloc, alloc_with_deref
+   - Mark phase: mark_object, mark_hamt, scan_roots
+   - Sweep phase: gc_sweep
+   - Collection: gc_collect, gc_safepoint
+   - Builder helpers: wrap_allocation, inject_gc_init, inject_safepoint
+2. Created `coex_gc/async_gc.py` with `AsyncGCGenerator` class (~120 lines)
+   - Snapshot operations: capture_snapshot, mark_from_snapshot
+   - Heap management: swap_heaps, scan_cross_heap, sweep_heap, grow_heaps
+   - GC thread: thread_main, gc_async, wait_for_completion
+   - Nursery stubs for future generational GC
+3. Updated `coex_gc_original.py` to import and initialize both generators
+4. Verified 140+ tests run passing (gc_phase0/1/2, basic, advanced)
+
+**Pattern Used**:
+- Same delegation pattern as codegen modules
+- Two modules for logical separation (core vs async)
+- All methods delegate to parent: `self.gc._*`
+
+**Files Created**:
+- `coex_gc/core.py` - GCCoreGenerator class with core GC operations
+- `coex_gc/async_gc.py` - AsyncGCGenerator class with async/concurrent GC
+
+**Files Modified**:
+- `coex_gc_original.py` - imports and initializes `_core`, `_async_gc`
 
 ---
 
@@ -668,6 +702,6 @@ Then:
 | codegen/modules.py | ~95 (CREATED) | ~95 (delegation pattern) |
 | codegen/atomics.py | ~95 (CREATED) | ~95 (delegation pattern) |
 | coex_gc/diagnostics.py | ~1,075 (CREATED) | ~1,075 |
-| coex_gc/core.py | (new) | ~1,200 |
-| coex_gc/async_gc.py | (new) | ~510 |
+| coex_gc/core.py | ~250 (CREATED) | ~250 (delegation pattern) |
+| coex_gc/async_gc.py | ~120 (CREATED) | ~120 (delegation pattern) |
 | coex_gc/handles.py | ~335 (CREATED) | ~335 |

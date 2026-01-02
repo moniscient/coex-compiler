@@ -19,6 +19,8 @@ from typing import Dict, List as PyList, Tuple, Optional, TYPE_CHECKING
 # Import diagnostics submodule
 from coex_gc.diagnostics import GCDiagnostics
 from coex_gc.handles import HandleManager
+from coex_gc.core import GCCoreGenerator
+from coex_gc.async_gc import AsyncGCGenerator
 
 if TYPE_CHECKING:
     from codegen import CodeGenerator
@@ -196,6 +198,10 @@ class GarbageCollector:
         self._diagnostics = GCDiagnostics(self)
         # Initialize handle management module
         self._handles = HandleManager(self)
+        # Initialize core GC module
+        self._core = GCCoreGenerator(self)
+        # Initialize async GC module
+        self._async_gc = AsyncGCGenerator(self)
 
         self._implement_gc_init()
         self._implement_gc_push_frame()
