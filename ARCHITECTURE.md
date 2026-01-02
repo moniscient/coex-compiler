@@ -86,7 +86,7 @@ coex-compiler/
 │   ├── modules.py           # Import resolution (~430 lines)
 │   └── atomics.py           # Atomic types, Result (~400 lines)
 │
-├── gc/                      # Garbage collector package
+├── coex_gc/                 # Garbage collector package (named to avoid conflict with Python's gc)
 │   ├── __init__.py          # GarbageCollector class, public interface
 │   ├── core.py              # Mark-sweep algorithm (~1,200 lines)
 │   ├── handles.py           # Handle table management (~335 lines)
@@ -129,8 +129,8 @@ coexc.py (entry point)
             ├── primitives.py                                   │
             ├── strings.py                                      │
             ├── json.py                                         │
-            ├── collections.py ◄── gc/                          │
-            ├── hamt.py ◄── gc/                                 │
+            ├── collections.py ◄── coex_gc/                      │
+            ├── hamt.py ◄── coex_gc/                            │
             ├── types.py                                        │
             ├── traits.py ◄── types.py                          │
             ├── control_flow.py                                 │
@@ -141,7 +141,7 @@ coexc.py (entry point)
             ├── modules.py                                      │
             └── atomics.py                                      │
                                                                 │
-            gc/ ◄───────────────────────────────────────────────┘
+            coex_gc/ ◄──────────────────────────────────────────┘
             ├── core.py
             ├── handles.py
             ├── shadow_stack.py

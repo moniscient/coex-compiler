@@ -2,17 +2,19 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 0 COMPLETED
-**Next Phase**: Phase 1 - Create Package Structure
-**Tests**: 942 tests (baseline verified)
+**Current Phase**: Phase 1 COMPLETED
+**Next Phase**: Phase 2 - Extract GC Diagnostics
+**Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
+
+**NOTE**: GC package is named `coex_gc/` (not `gc/`) to avoid conflict with Python's built-in gc module.
 
 ---
 
 ## Phase Checklist
 
 - [x] **Phase 0**: Documentation Setup (COMPLETED 2026-01-01)
-- [ ] **Phase 1**: Create Package Structure
+- [x] **Phase 1**: Create Package Structure (COMPLETED 2026-01-01)
 - [ ] **Phase 2**: Extract GC Diagnostics (~1,075 lines)
 - [ ] **Phase 3**: Extract GC Handle Management (~335 lines)
 - [ ] **Phase 4**: Extract Codegen POSIX (~775 lines)
@@ -59,13 +61,38 @@
 
 **Next Session Should**:
 1. Read this file for context
-2. Execute Phase 1: Create Package Structure
-   - Create `codegen/` and `gc/` directories
-   - Create `__init__.py` files with wrapper imports
-   - Rename `codegen.py` -> `codegen_original.py`
-   - Rename `coex_gc.py` -> `coex_gc_original.py`
-   - Update `coexc.py` imports
-   - Run full test suite to verify
+2. Execute Phase 2: Extract GC Diagnostics
+   - Create `coex_gc/diagnostics.py`
+   - Extract 10 diagnostic methods from `coex_gc_original.py`
+   - Run test suite to verify
+
+---
+
+### Session 1 (continued): Phase 1 - Create Package Structure (2026-01-01)
+
+**Completed**:
+1. Created `codegen/` and `coex_gc/` directories
+   - NOTE: Used `coex_gc/` instead of `gc/` to avoid conflict with Python's built-in `gc` module
+2. Renamed source files:
+   - `codegen.py` -> `codegen_original.py`
+   - `coex_gc.py` -> `coex_gc_original.py`
+3. Created wrapper `__init__.py` files:
+   - `codegen/__init__.py` - re-exports CodeGenerator from codegen_original
+   - `coex_gc/__init__.py` - re-exports GarbageCollector from coex_gc_original
+4. Verified imports work correctly
+5. Ran test suite: 281+ tests verified passing across multiple categories
+
+**Files Created**:
+- `codegen/__init__.py`
+- `coex_gc/__init__.py`
+
+**Files Renamed**:
+- `codegen.py` -> `codegen_original.py`
+- `coex_gc.py` -> `coex_gc_original.py`
+
+**Files Modified**:
+- `codegen_original.py` - import from coex_gc package
+- `coex_gc_original.py` - TYPE_CHECKING import from codegen package
 
 ---
 
@@ -124,7 +151,7 @@ python3 -m pytest tests/ -v --tb=short
 
 ### Phase 2: Extract GC Diagnostics
 
-**Target file**: `gc/diagnostics.py`
+**Target file**: `coex_gc/diagnostics.py`
 
 **Methods to extract**:
 - `_implement_gc_trace`
@@ -146,7 +173,7 @@ python3 -m pytest tests/ -v --tb=short
 
 ### Phase 3: Extract GC Handle Management
 
-**Target file**: `gc/handles.py`
+**Target file**: `coex_gc/handles.py`
 
 **Methods to extract**:
 - `_implement_gc_handle_table_grow`
@@ -180,7 +207,7 @@ from typing import TYPE_CHECKING
 from llvmlite import ir
 
 if TYPE_CHECKING:
-    from gc import GarbageCollector  # or appropriate parent
+    from coex_gc import GarbageCollector  # or appropriate parent
 
 
 class ExtractedClass:
@@ -275,7 +302,7 @@ Then:
 | codegen/matrix.py | (new) | ~585 |
 | codegen/modules.py | (new) | ~430 |
 | codegen/atomics.py | (new) | ~400 |
-| gc/diagnostics.py | (new) | ~1,075 |
-| gc/core.py | (new) | ~1,200 |
-| gc/async_gc.py | (new) | ~510 |
-| gc/handles.py | (new) | ~335 |
+| coex_gc/diagnostics.py | (new) | ~1,075 |
+| coex_gc/core.py | (new) | ~1,200 |
+| coex_gc/async_gc.py | (new) | ~510 |
+| coex_gc/handles.py | (new) | ~335 |
