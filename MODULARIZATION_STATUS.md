@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 6 COMPLETED
-**Next Phase**: Phase 7 - Extract Collections List/Array
+**Current Phase**: Phase 7 COMPLETED
+**Next Phase**: Phase 8 - Extract HAMT/Map/Set
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -20,7 +20,7 @@
 - [x] **Phase 4**: Extract Codegen POSIX (COMPLETED 2026-01-01)
 - [x] **Phase 5**: Extract Codegen Strings (COMPLETED 2026-01-01)
 - [x] **Phase 6**: Extract Codegen JSON (COMPLETED 2026-01-01)
-- [ ] **Phase 7**: Extract Collections List/Array (~1,775 lines)
+- [x] **Phase 7**: Extract Collections List/Array (COMPLETED 2026-01-01)
 - [ ] **Phase 8**: Extract HAMT/Map/Set (~2,550 lines)
 - [ ] **Phase 9**: Extract Type System (~650 lines)
 - [ ] **Phase 10**: Extract Control Flow/Expressions/Statements
@@ -240,10 +240,46 @@
 
 **Next Session Should**:
 1. Read this file for context
-2. Execute Phase 7: Extract Collections List/Array
-   - Create `codegen/collections.py`
-   - Extract List/Array-related methods from `codegen_original.py`
+2. Execute Phase 8: Extract HAMT/Map/Set
+   - Create `codegen/hamt.py`
+   - Extract Map/Set-related methods from `codegen_original.py`
    - Run test suite to verify
+
+---
+
+### Session 5: Phase 7 - Extract Collections List/Array (2026-01-01)
+
+**Completed**:
+1. Created `codegen/collections.py` with `CollectionsGenerator` class (~340 lines)
+2. Uses delegation pattern: CollectionsGenerator declares functions and delegates implementations to codegen_original.py
+3. Extracted/delegated 21 List methods:
+   - `create_list_helpers` (sets up List declarations)
+   - `_implement_list_new`, `_implement_list_append`, `_implement_list_get`
+   - `_implement_list_set`, `_implement_list_len`, `_implement_list_size`
+   - `_implement_list_copy`, `_implement_list_getrange`, `_implement_list_setrange`
+   - `_register_list_methods`
+4. Extracted/delegated 11 Array methods:
+   - `create_array_helpers` (sets up Array declarations)
+   - `_implement_array_new`, `_implement_array_get`, `_implement_array_set`
+   - `_implement_array_append`, `_implement_array_len`, `_implement_array_size`
+   - `_implement_array_copy`, `_implement_array_deep_copy`, `_implement_array_getrange`
+   - `_register_array_methods`
+5. Added conversion method delegations:
+   - `list_to_array`, `array_to_list`, `set_to_array`, `array_to_set`, `list_to_set`
+6. Updated `codegen_original.py` to import CollectionsGenerator and delegate calls
+7. Verified 942 tests collected, 255+ tests run passing
+
+**Pattern Used**:
+- Same delegation pattern as strings.py and json.py
+- CollectionsGenerator sets up declarations on `self.codegen` (parent CodeGenerator)
+- Implementation methods delegate to parent: `self.codegen._implement_*`
+- This allows incremental extraction without duplicating implementation code
+
+**Files Created**:
+- `codegen/collections.py` - CollectionsGenerator class with declarations and delegation
+
+**Files Modified**:
+- `codegen_original.py` - imports CollectionsGenerator, initializes `_collections`, delegates `create_list_helpers()` and `create_array_helpers()`
 
 ---
 
@@ -479,8 +515,8 @@ Then:
 | coex_gc.py | 4,275 | ~850 (coordinator + infrastructure) |
 | codegen/strings.py | ~520 (CREATED) | ~520 (delegation pattern) |
 | codegen/json.py | ~430 (CREATED) | ~430 (delegation pattern) |
+| codegen/collections.py | ~340 (CREATED) | ~340 (delegation pattern) |
 | codegen/hamt.py | (new) | ~2,550 |
-| codegen/collections.py | (new) | ~1,775 |
 | codegen/expressions.py | (new) | ~1,585 |
 | codegen/statements.py | (new) | ~1,480 |
 | codegen/posix.py | ~775 (CREATED) | ~775 |

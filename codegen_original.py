@@ -24,6 +24,9 @@ from codegen.strings import StringGenerator
 # Import JSON module
 from codegen.json import JSONGenerator
 
+# Import Collections module
+from codegen.collections import CollectionsGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -290,9 +293,12 @@ class CodeGenerator:
             ir.IntType(64),   # tail_len - elements in tail (1-32) (field 4) - Phase 4: widened to i64
             ir.IntType(64),   # elem_size (field 5)
         )
-        
-        # Create list helper functions
-        self._create_list_helpers()
+
+        # Initialize Collections module
+        self._collections = CollectionsGenerator(self)
+
+        # Create list helper functions (delegated to collections module)
+        self._collections.create_list_helpers()
 
         # Initialize String module
         self._strings = StringGenerator(self)
@@ -325,7 +331,8 @@ class CodeGenerator:
             ir.IntType(64),  # cap (field 3) - capacity
             ir.IntType(64),  # elem_size (field 4) - element size in bytes
         )
-        self._create_array_helpers()
+        # Create array helper functions (delegated to collections module)
+        self._collections.create_array_helpers()
 
         # NOTE: Conversion helpers (_list_to_array, _array_to_list, etc.)
         # are inline methods, not separate function declarations
