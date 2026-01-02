@@ -21,6 +21,9 @@ from codegen.posix import PosixGenerator
 # Import String module
 from codegen.strings import StringGenerator
 
+# Import JSON module
+from codegen.json import JSONGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -296,15 +299,18 @@ class CodeGenerator:
 
         # Create String type and helpers (delegated to strings module)
         self._strings.create_string_type()
-        
+
         # Create Map type and helpers
         self._create_map_type()
-        
+
         # Create Set type and helpers
         self._create_set_type()
 
-        # Create JSON type and helpers
-        self._create_json_type()
+        # Initialize JSON module
+        self._json = JSONGenerator(self)
+
+        # Create JSON type and helpers (delegated to json module)
+        self._json.create_json_type()
 
         # Create Array type and helpers (dense, contiguous collection)
         # struct Array { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }

@@ -2,8 +2,8 @@
 
 ## Quick Reference for Claude Code Sessions
 
-**Current Phase**: Phase 5 COMPLETED
-**Next Phase**: Phase 6 - Extract Codegen JSON
+**Current Phase**: Phase 6 COMPLETED
+**Next Phase**: Phase 7 - Extract Collections List/Array
 **Tests**: 942 tests (verified passing)
 **Last Updated**: 2026-01-01
 
@@ -19,7 +19,7 @@
 - [x] **Phase 3**: Extract GC Handle Management (COMPLETED 2026-01-01)
 - [x] **Phase 4**: Extract Codegen POSIX (COMPLETED 2026-01-01)
 - [x] **Phase 5**: Extract Codegen Strings (COMPLETED 2026-01-01)
-- [ ] **Phase 6**: Extract Codegen JSON (~1,800 lines)
+- [x] **Phase 6**: Extract Codegen JSON (COMPLETED 2026-01-01)
 - [ ] **Phase 7**: Extract Collections List/Array (~1,775 lines)
 - [ ] **Phase 8**: Extract HAMT/Map/Set (~2,550 lines)
 - [ ] **Phase 9**: Extract Type System (~650 lines)
@@ -240,10 +240,45 @@
 
 **Next Session Should**:
 1. Read this file for context
-2. Execute Phase 6: Extract Codegen JSON
-   - Create `codegen/json.py`
-   - Extract JSON-related methods from `codegen_original.py`
+2. Execute Phase 7: Extract Collections List/Array
+   - Create `codegen/collections.py`
+   - Extract List/Array-related methods from `codegen_original.py`
    - Run test suite to verify
+
+---
+
+### Session 4: Phase 6 - Extract Codegen JSON (2026-01-01)
+
+**Completed**:
+1. Created `codegen/json.py` with `JSONGenerator` class (~430 lines)
+2. Uses delegation pattern: JSONGenerator declares functions and delegates implementations to codegen_original.py
+3. Extracted/delegated 31 JSON methods:
+   - `create_json_type` (sets up JSON struct and all declarations)
+   - `_implement_json_new_null`, `_implement_json_new_bool`, `_implement_json_new_int`
+   - `_implement_json_new_float`, `_implement_json_new_string`, `_implement_json_new_array`
+   - `_implement_json_new_object`, `_implement_json_get_tag`, `_implement_json_get_field`
+   - `_implement_json_get_index`, `_implement_json_is_null`, `_implement_json_is_bool`
+   - `_implement_json_is_int`, `_implement_json_is_float`, `_implement_json_is_string`
+   - `_implement_json_is_array`, `_implement_json_is_object`, `_implement_json_len`
+   - `_implement_json_has`, `_implement_json_set_field`, `_implement_json_set_index`
+   - `_implement_json_append`, `_implement_json_remove`, `_implement_json_keys`
+   - `_implement_json_values`, `_implement_json_stringify`, `_implement_json_pretty`
+   - `_implement_json_parse`, `_register_json_methods`
+4. Defined JSON_TAG constants in json.py module (NULL=0, BOOL=1, INT=2, FLOAT=3, STRING=4, ARRAY=5, OBJECT=6)
+5. Updated `codegen_original.py` to import JSONGenerator and delegate calls
+6. Verified 942 tests collected, 177+ tests run passing (JSON tests: 60 tests, 59 passed, 1 xfailed expected)
+
+**Pattern Used**:
+- Same delegation pattern as strings.py
+- JSONGenerator sets up declarations on `self.codegen` (parent CodeGenerator)
+- Implementation methods delegate to parent: `self.codegen._implement_json_xxx()`
+- This allows incremental extraction without duplicating implementation code
+
+**Files Created**:
+- `codegen/json.py` - JSONGenerator class with declarations and delegation
+
+**Files Modified**:
+- `codegen_original.py` - imports JSONGenerator, initializes `_json`, delegates `create_json_type()`
 
 ---
 
@@ -443,7 +478,7 @@ Then:
 | codegen.py | 19,730 | ~500 (coordinator only) |
 | coex_gc.py | 4,275 | ~850 (coordinator + infrastructure) |
 | codegen/strings.py | ~520 (CREATED) | ~520 (delegation pattern) |
-| codegen/json.py | (new) | ~1,800 |
+| codegen/json.py | ~430 (CREATED) | ~430 (delegation pattern) |
 | codegen/hamt.py | (new) | ~2,550 |
 | codegen/collections.py | (new) | ~1,775 |
 | codegen/expressions.py | (new) | ~1,585 |
