@@ -21,6 +21,7 @@ from coex_gc.diagnostics import GCDiagnostics
 from coex_gc.handles import HandleManager
 from coex_gc.core import GCCoreGenerator
 from coex_gc.async_gc import AsyncGCGenerator
+from coex_gc.thread_registry import ThreadRegistryManager
 
 if TYPE_CHECKING:
     from codegen import CodeGenerator
@@ -159,6 +160,36 @@ class GarbageCollector:
         self.pthread_attr_init = None
         self.pthread_attr_setdetachstate = None
 
+        # Pthread TLS and thread identity functions
+        self.pthread_self = None
+        self.pthread_key_create = None
+        self.pthread_getspecific = None
+        self.pthread_setspecific = None
+
+        # ============================================================
+        # Thread Registry Infrastructure
+        # ============================================================
+        # ThreadEntry type for per-thread GC state
+        self.thread_entry_type = None
+
+        # Thread registry globals
+        self.gc_thread_registry = None    # Head of thread registry linked list
+        self.gc_thread_count = None       # Count of registered threads
+        self.gc_registry_mutex = None     # Mutex for registry modifications
+        self.gc_phase = None              # GC phase: 0=idle, 1=watermark, 2=marking, 3=sweeping
+        self.gc_cycle_id = None           # GC cycle counter (monotonically increasing)
+
+        # TLS keys for thread-local storage (pthread_key_t)
+        self.tls_key_frame_top = None     # Key for thread's shadow stack top
+        self.tls_key_frame_depth = None   # Key for thread's shadow stack depth
+        self.tls_key_thread_entry = None  # Key for thread's ThreadEntry pointer
+
+        # Thread registry functions
+        self.gc_tls_init = None           # Initialize TLS keys
+        self.gc_register_thread = None    # Register calling thread
+        self.gc_unregister_thread = None  # Unregister calling thread
+        self.gc_get_thread_entry = None   # Get calling thread's ThreadEntry
+
         # ============================================================
         # Phase 0: Debugging Infrastructure
         # ============================================================
@@ -202,6 +233,14 @@ class GarbageCollector:
         self._core = GCCoreGenerator(self)
         # Initialize async GC module
         self._async_gc = AsyncGCGenerator(self)
+        # Initialize thread registry module
+        self._thread_registry = ThreadRegistryManager(self)
+
+        # Thread registry implementations (must be before gc_init)
+        self._thread_registry.implement_gc_tls_init()
+        self._thread_registry.implement_gc_register_thread()
+        self._thread_registry.implement_gc_unregister_thread()
+        self._thread_registry.implement_gc_get_thread_entry()
 
         self._implement_gc_init()
         self._implement_gc_push_frame()
@@ -345,6 +384,25 @@ class GarbageCollector:
             # Threading metrics (offsets 136-144) - for future use
             self.i64,    # 136: total_block_events
             self.i64,    # 144: total_block_wait_ns
+        ])
+
+        # ============================================================
+        # Thread Registry Types
+        # ============================================================
+
+        # ThreadEntry: Per-thread GC state (80 bytes)
+        # Used to track each thread's shadow stack and watermark state
+        self.thread_entry_type = ir.LiteralStructType([
+            self.i64,     # 0:  thread_id - platform thread identifier (pthread_t)
+            self.i8_ptr,  # 8:  shadow_stack_head - pointer to thread's frame_top location
+            self.i64,     # 16: watermark_depth - stack depth when watermark set (0 = none)
+            self.i64,     # 24: watermark_active - 1 if acknowledged current GC cycle
+            self.i64,     # 32: stack_depth - current shadow stack depth
+            self.i64,     # 40: last_gc_cycle - last GC cycle acknowledged
+            self.i8_ptr,  # 48: tlab_base - thread-local alloc buffer (future)
+            self.i8_ptr,  # 56: tlab_cursor - current TLAB position (future)
+            self.i8_ptr,  # 64: tlab_end - end of TLAB (future)
+            self.i8_ptr,  # 72: next - next ThreadEntry in registry
         ])
 
 
@@ -552,6 +610,65 @@ class GarbageCollector:
         self.gc_type_offsets_table.initializer = ir.Constant(offsets_table_type, null_ptr_array)
         self.gc_type_offsets_table.linkage = 'internal'
 
+        # ============================================================
+        # Thread Registry Globals
+        # ============================================================
+
+        # Head of thread registry linked list
+        self.gc_thread_registry = ir.GlobalVariable(
+            self.module, self.thread_entry_type.as_pointer(), name="gc_thread_registry")
+        self.gc_thread_registry.initializer = ir.Constant(
+            self.thread_entry_type.as_pointer(), None)
+        self.gc_thread_registry.linkage = 'internal'
+
+        # Count of registered threads
+        self.gc_thread_count = ir.GlobalVariable(
+            self.module, self.i64, name="gc_thread_count")
+        self.gc_thread_count.initializer = ir.Constant(self.i64, 0)
+        self.gc_thread_count.linkage = 'internal'
+
+        # Mutex for registry modifications (pointer to allocated mutex)
+        self.gc_registry_mutex = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_registry_mutex")
+        self.gc_registry_mutex.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_registry_mutex.linkage = 'internal'
+
+        # GC phase: 0=idle, 1=watermark, 2=marking, 3=sweeping
+        self.gc_phase = ir.GlobalVariable(
+            self.module, self.i64, name="gc_phase")
+        self.gc_phase.initializer = ir.Constant(self.i64, 0)
+        self.gc_phase.linkage = 'internal'
+
+        # GC cycle counter (monotonically increasing)
+        self.gc_cycle_id = ir.GlobalVariable(
+            self.module, self.i64, name="gc_cycle_id")
+        self.gc_cycle_id.initializer = ir.Constant(self.i64, 0)
+        self.gc_cycle_id.linkage = 'internal'
+
+        # ============================================================
+        # TLS Keys for Thread-Local Storage
+        # ============================================================
+        # Using pthread_key_t for TLS instead of LLVM's thread_local
+        # attribute for maximum portability.
+
+        # TLS key for thread's shadow stack frame top (pthread_key_t stored as i64)
+        self.tls_key_frame_top = ir.GlobalVariable(
+            self.module, self.i64, name="tls_key_frame_top")
+        self.tls_key_frame_top.initializer = ir.Constant(self.i64, 0)
+        self.tls_key_frame_top.linkage = 'internal'
+
+        # TLS key for thread's shadow stack depth
+        self.tls_key_frame_depth = ir.GlobalVariable(
+            self.module, self.i64, name="tls_key_frame_depth")
+        self.tls_key_frame_depth.initializer = ir.Constant(self.i64, 0)
+        self.tls_key_frame_depth.linkage = 'internal'
+
+        # TLS key for thread's ThreadEntry pointer
+        self.tls_key_thread_entry = ir.GlobalVariable(
+            self.module, self.i64, name="tls_key_thread_entry")
+        self.tls_key_thread_entry.initializer = ir.Constant(self.i64, 0)
+        self.tls_key_thread_entry.linkage = 'internal'
+
     def _declare_functions(self):
         """Declare GC runtime functions"""
         # gc_init() -> void
@@ -702,6 +819,54 @@ class GarbageCollector:
         # pthread_attr_setdetachstate(attr*, detachstate) -> int
         pthread_attr_setdetach_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i32])
         self.pthread_attr_setdetachstate = ir.Function(self.module, pthread_attr_setdetach_ty, name="pthread_attr_setdetachstate")
+
+        # ============================================================
+        # Pthread TLS and Thread Identity Functions
+        # ============================================================
+
+        # pthread_self() -> i64 (pthread_t)
+        # Returns the calling thread's ID
+        pthread_self_ty = ir.FunctionType(self.i64, [])
+        self.pthread_self = ir.Function(self.module, pthread_self_ty, name="pthread_self")
+
+        # pthread_key_create(key*, destructor) -> int
+        # Creates a TLS key; key is an i64* (pointer to pthread_key_t)
+        pthread_key_create_ty = ir.FunctionType(self.i32, [self.i64_ptr, self.i8_ptr])
+        self.pthread_key_create = ir.Function(self.module, pthread_key_create_ty, name="pthread_key_create")
+
+        # pthread_getspecific(key) -> i8*
+        # Gets the TLS value for the given key
+        pthread_getspecific_ty = ir.FunctionType(self.i8_ptr, [self.i64])
+        self.pthread_getspecific = ir.Function(self.module, pthread_getspecific_ty, name="pthread_getspecific")
+
+        # pthread_setspecific(key, value) -> int
+        # Sets the TLS value for the given key
+        pthread_setspecific_ty = ir.FunctionType(self.i32, [self.i64, self.i8_ptr])
+        self.pthread_setspecific = ir.Function(self.module, pthread_setspecific_ty, name="pthread_setspecific")
+
+        # ============================================================
+        # Thread Registry Function Declarations
+        # ============================================================
+
+        # gc_tls_init() -> void
+        # Initialize TLS keys for thread-local storage
+        gc_tls_init_ty = ir.FunctionType(self.void, [])
+        self.gc_tls_init = ir.Function(self.module, gc_tls_init_ty, name="coex_gc_tls_init")
+
+        # gc_register_thread() -> void
+        # Register the calling thread with the GC
+        gc_register_thread_ty = ir.FunctionType(self.void, [])
+        self.gc_register_thread = ir.Function(self.module, gc_register_thread_ty, name="coex_gc_register_thread")
+
+        # gc_unregister_thread() -> void
+        # Unregister the calling thread from the GC
+        gc_unregister_thread_ty = ir.FunctionType(self.void, [])
+        self.gc_unregister_thread = ir.Function(self.module, gc_unregister_thread_ty, name="coex_gc_unregister_thread")
+
+        # gc_get_thread_entry() -> ThreadEntry*
+        # Returns the calling thread's ThreadEntry from TLS
+        gc_get_thread_entry_ty = ir.FunctionType(self.thread_entry_type.as_pointer(), [])
+        self.gc_get_thread_entry = ir.Function(self.module, gc_get_thread_entry_ty, name="coex_gc_get_thread_entry")
 
         # ============================================================
         # Phase 0: Debugging Infrastructure Function Declarations
@@ -1030,12 +1195,35 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), self.gc_handle_free_list)  # Empty free list
         builder.store(ir.Constant(self.i64, 1), self.gc_next_handle)  # Start at handle 1
 
+        # ============================================================
+        # Initialize Thread Registry Infrastructure
+        # ============================================================
+
+        # Initialize TLS keys
+        builder.call(self.gc_tls_init, [])
+
+        # Initialize registry mutex
+        registry_mutex_size = ir.Constant(self.i64, 64)
+        registry_mutex_ptr = builder.call(self.codegen.malloc, [registry_mutex_size])
+        builder.store(registry_mutex_ptr, self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_init, [
+            registry_mutex_ptr, ir.Constant(self.i8_ptr, None)
+        ])
+
+        # Initialize GC phase and cycle
+        builder.store(ir.Constant(self.i64, 0), self.gc_phase)
+        builder.store(ir.Constant(self.i64, 0), self.gc_cycle_id)
+
+        # Register main thread
+        builder.call(self.gc_register_thread, [])
+
         builder.ret_void()
 
     def _implement_gc_push_frame(self):
         """Push a new frame onto the shadow stack.
 
         Phase 3: Takes i64* handle_slots instead of i8** roots.
+        Thread Registry: Uses TLS for per-thread shadow stack.
         """
         func = self.gc_push_frame
         func.args[0].name = "num_roots"
@@ -1052,8 +1240,13 @@ class GarbageCollector:
         raw_frame = builder.call(self.codegen.malloc, [frame_size])
         frame = builder.bitcast(raw_frame, self.gc_frame_type.as_pointer())
 
+        # ============================================================
+        # Get current frame top from TLS
+        # ============================================================
+        frame_top_key = builder.load(self.tls_key_frame_top)
+        old_top = builder.call(self.pthread_getspecific, [frame_top_key])
+
         # Set parent to current top
-        old_top = builder.load(self.gc_frame_top)
         parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         builder.store(old_top, parent_ptr)
 
@@ -1065,18 +1258,55 @@ class GarbageCollector:
         slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         builder.store(handle_slots, slots_ptr_ptr)
 
-        # Update frame top
+        # ============================================================
+        # Update frame top in TLS
+        # ============================================================
+        builder.call(self.pthread_setspecific, [frame_top_key, raw_frame])
+
+        # Also update global for backward compatibility / diagnostics
         builder.store(raw_frame, self.gc_frame_top)
 
-        # Increment frame depth
-        depth = builder.load(self.gc_frame_depth)
+        # ============================================================
+        # Update frame depth in TLS
+        # ============================================================
+        frame_depth_key = builder.load(self.tls_key_frame_depth)
+        depth_ptr = builder.call(self.pthread_getspecific, [frame_depth_key])
+        depth = builder.ptrtoint(depth_ptr, self.i64)
         new_depth = builder.add(depth, ir.Constant(self.i64, 1))
+        new_depth_ptr = builder.inttoptr(new_depth, self.i8_ptr)
+        builder.call(self.pthread_setspecific, [frame_depth_key, new_depth_ptr])
+
+        # Also update global for backward compatibility / diagnostics
         builder.store(new_depth, self.gc_frame_depth)
+
+        # ============================================================
+        # Update ThreadEntry if registered
+        # ============================================================
+        thread_entry_key = builder.load(self.tls_key_thread_entry)
+        te_ptr = builder.call(self.pthread_getspecific, [thread_entry_key])
+        te_ptr_int = builder.ptrtoint(te_ptr, self.i64)
+        is_registered = builder.icmp_unsigned('!=', te_ptr_int, ir.Constant(self.i64, 0))
+
+        with builder.if_then(is_registered):
+            thread_entry = builder.bitcast(te_ptr, self.thread_entry_type.as_pointer())
+            # Update shadow_stack_head (field 1)
+            head_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+            ], inbounds=True)
+            builder.store(raw_frame, head_ptr)
+            # Update stack_depth (field 4)
+            te_depth_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+            ], inbounds=True)
+            builder.store(new_depth, te_depth_ptr)
 
         builder.ret(raw_frame)
 
     def _implement_gc_pop_frame(self):
-        """Pop a frame from the shadow stack."""
+        """Pop a frame from the shadow stack.
+
+        Thread Registry: Uses TLS for per-thread shadow stack.
+        """
         func = self.gc_pop_frame
         func.args[0].name = "frame_ptr"
 
@@ -1086,15 +1316,52 @@ class GarbageCollector:
         frame_ptr = func.args[0]
         frame = builder.bitcast(frame_ptr, self.gc_frame_type.as_pointer())
 
-        # Get parent and set as new top
+        # Get parent from frame
         parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         parent = builder.load(parent_ptr)
+
+        # ============================================================
+        # Update frame top in TLS
+        # ============================================================
+        frame_top_key = builder.load(self.tls_key_frame_top)
+        builder.call(self.pthread_setspecific, [frame_top_key, parent])
+
+        # Also update global for backward compatibility / diagnostics
         builder.store(parent, self.gc_frame_top)
 
-        # Decrement frame depth
-        depth = builder.load(self.gc_frame_depth)
+        # ============================================================
+        # Update frame depth in TLS
+        # ============================================================
+        frame_depth_key = builder.load(self.tls_key_frame_depth)
+        depth_ptr = builder.call(self.pthread_getspecific, [frame_depth_key])
+        depth = builder.ptrtoint(depth_ptr, self.i64)
         new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
+        new_depth_ptr = builder.inttoptr(new_depth, self.i8_ptr)
+        builder.call(self.pthread_setspecific, [frame_depth_key, new_depth_ptr])
+
+        # Also update global for backward compatibility / diagnostics
         builder.store(new_depth, self.gc_frame_depth)
+
+        # ============================================================
+        # Update ThreadEntry if registered
+        # ============================================================
+        thread_entry_key = builder.load(self.tls_key_thread_entry)
+        te_ptr = builder.call(self.pthread_getspecific, [thread_entry_key])
+        te_ptr_int = builder.ptrtoint(te_ptr, self.i64)
+        is_registered = builder.icmp_unsigned('!=', te_ptr_int, ir.Constant(self.i64, 0))
+
+        with builder.if_then(is_registered):
+            thread_entry = builder.bitcast(te_ptr, self.thread_entry_type.as_pointer())
+            # Update shadow_stack_head (field 1)
+            head_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+            ], inbounds=True)
+            builder.store(parent, head_ptr)
+            # Update stack_depth (field 4)
+            te_depth_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+            ], inbounds=True)
+            builder.store(new_depth, te_depth_ptr)
 
         # Free the frame
         builder.call(self.codegen.free, [frame_ptr])
@@ -1786,14 +2053,25 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_scan_roots(self):
-        """Scan shadow stack and mark all roots.
+        """Scan all threads' shadow stacks and mark all roots.
+
+        Thread Registry: Iterates through the thread registry to scan all
+        threads' shadow stacks, not just the calling thread.
 
         Phase 3: Slots now contain i64 handles instead of i8* pointers.
         We load the handle, deref to get pointer, then mark.
+
+        Fallback: If ThreadEntry.shadow_stack_head is null but the global
+        gc_frame_top is non-null, we use the global (for backward compatibility
+        with the main thread during the transition period).
         """
         func = self.gc_scan_roots
 
         entry = func.append_basic_block("entry")
+        thread_loop = func.append_basic_block("thread_loop")
+        process_thread = func.append_basic_block("process_thread")
+        check_fallback = func.append_basic_block("check_fallback")
+        use_global = func.append_basic_block("use_global")
         frame_loop = func.append_basic_block("frame_loop")
         process_frame = func.append_basic_block("process_frame")
         root_loop = func.append_basic_block("root_loop")
@@ -1801,22 +2079,73 @@ class GarbageCollector:
         do_mark = func.append_basic_block("do_mark")
         next_root = func.append_basic_block("next_root")
         next_frame = func.append_basic_block("next_frame")
+        next_thread = func.append_basic_block("next_thread")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
 
-        # curr_frame = gc_frame_top
+        # ============================================================
+        # Lock registry mutex for safe iteration
+        # ============================================================
+        mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex])
+
+        # Allocate storage for current thread entry pointer
+        curr_thread = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr_thread)
+
+        # Allocate storage for current frame
         curr_frame = builder.alloca(self.i8_ptr, name="curr_frame")
-        top = builder.load(self.gc_frame_top)
+
+        builder.branch(thread_loop)
+
+        # ============================================================
+        # Thread loop: iterate through registered threads
+        # ============================================================
+        builder.position_at_end(thread_loop)
+        thread_val = builder.load(curr_thread)
+        thread_is_null = builder.icmp_unsigned(
+            "==",
+            builder.ptrtoint(thread_val, self.i64),
+            ir.Constant(self.i64, 0)
+        )
+        builder.cbranch(thread_is_null, done, process_thread)
+
+        # Process this thread's shadow stack
+        builder.position_at_end(process_thread)
+
+        # Get shadow_stack_head from ThreadEntry (field 1)
+        head_ptr = builder.gep(thread_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        top = builder.load(head_ptr)
         builder.store(top, curr_frame)
 
+        # Check if shadow_stack_head is null - might need to use global fallback
+        top_is_null = builder.icmp_unsigned("==", top, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(top_is_null, check_fallback, frame_loop)
+
+        # ============================================================
+        # Fallback: If ThreadEntry.shadow_stack_head is null, try global
+        # This handles the case where the if_then update didn't work
+        # ============================================================
+        builder.position_at_end(check_fallback)
+        global_top = builder.load(self.gc_frame_top)
+        global_is_null = builder.icmp_unsigned("==", global_top, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(global_is_null, next_thread, use_global)
+
+        builder.position_at_end(use_global)
+        builder.store(global_top, curr_frame)
         builder.branch(frame_loop)
 
+        # ============================================================
         # Frame loop: while curr_frame != null
+        # ============================================================
         builder.position_at_end(frame_loop)
         frame_val = builder.load(curr_frame)
         is_null = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, process_frame)
+        builder.cbranch(is_null, next_thread, process_frame)
 
         # Process frame
         builder.position_at_end(process_frame)
@@ -1863,14 +2192,31 @@ class GarbageCollector:
         builder.store(next_i, root_idx)
         builder.branch(root_loop)
 
-        # Move to next frame
+        # Move to next frame in this thread's stack
         builder.position_at_end(next_frame)
         parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         parent = builder.load(parent_ptr)
         builder.store(parent, curr_frame)
         builder.branch(frame_loop)
 
+        # ============================================================
+        # Move to next thread in registry
+        # ============================================================
+        builder.position_at_end(next_thread)
+        thread_val2 = builder.load(curr_thread)
+        next_ptr = builder.gep(thread_val2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_ptr)
+        next_thread_ptr = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_ptr, curr_thread)
+        builder.branch(thread_loop)
+
+        # ============================================================
+        # Done - unlock mutex and return
+        # ============================================================
         builder.position_at_end(done)
+        builder.call(self.pthread_mutex_unlock, [mutex])
         builder.ret_void()
 
     def _implement_gc_sweep(self):
@@ -2027,15 +2373,20 @@ class GarbageCollector:
         """Run a full garbage collection cycle (high watermark model).
 
         Phase 9: Collection Orchestration with MI-6 Deferred Reclamation
+        Thread Registry: Implements watermark protocol for multi-threaded GC.
+
         This implements the synchronous collection cycle:
         1. Check if GC enabled and not already in progress
         2. Set gc_in_progress = 1
-        3. Promote retired handles from previous cycle to free list (MI-6)
-        4. Flip mark value for birth-marking
-        5. Mark phase: scan roots and mark reachable objects
-        6. Sweep phase: free unmarked objects (retire handles, don't free immediately)
-        7. Update statistics
-        8. Set gc_in_progress = 0
+        3. Set gc_phase = 1 (WATERMARK) and increment gc_cycle_id
+        4. Promote retired handles from previous cycle to free list (MI-6)
+        5. Set gc_phase = 2 (MARKING) and flip mark value
+        6. Mark phase: scan roots and mark reachable objects
+        7. Set gc_phase = 3 (SWEEPING)
+        8. Sweep phase: free unmarked objects
+        9. Reset all threads' watermark_active
+        10. Set gc_phase = 0 (IDLE) and gc_in_progress = 0
+        11. Update statistics
 
         MI-6 Deferred Reclamation:
         Handles swept in cycle N are added to the retired list, not the free list.
@@ -2047,6 +2398,11 @@ class GarbageCollector:
         entry = func.append_basic_block("entry")
         check_enabled = func.append_basic_block("check_enabled")
         do_collection = func.append_basic_block("do_collection")
+        reset_watermarks = func.append_basic_block("reset_watermarks")
+        reset_loop = func.append_basic_block("reset_loop")
+        reset_thread = func.append_basic_block("reset_thread")
+        next_reset = func.append_basic_block("next_reset")
+        finalize = func.append_basic_block("finalize")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -2069,9 +2425,29 @@ class GarbageCollector:
         # Set gc_in_progress = 1
         builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
 
+        # ============================================================
+        # WATERMARK PHASE: Signal threads to record watermarks
+        # ============================================================
+        # Set gc_phase = 1 (WATERMARK)
+        builder.store(ir.Constant(self.i64, 1), self.gc_phase)
+
+        # Increment gc_cycle_id
+        old_cycle = builder.load(self.gc_cycle_id)
+        new_cycle = builder.add(old_cycle, ir.Constant(self.i64, 1))
+        builder.store(new_cycle, self.gc_cycle_id)
+
+        # Note: In multi-threaded mode, we would wait for all threads to
+        # acknowledge the watermark here. For single-threaded, this is a no-op.
+
         # MI-6: Promote retired handles from previous cycle to free list
         # This makes handles retired in cycle N-1 available for reuse in cycle N
         builder.call(self.gc_promote_retired_handles, [])
+
+        # ============================================================
+        # MARKING PHASE: Mark all reachable objects
+        # ============================================================
+        # Set gc_phase = 2 (MARKING)
+        builder.store(ir.Constant(self.i64, 2), self.gc_phase)
 
         # Phase 9: Flip gc_current_mark_value BEFORE mark phase
         # This ensures newly allocated objects (born with OLD mark value) will be
@@ -2084,9 +2460,74 @@ class GarbageCollector:
         # Use gc_scan_roots which marks from the shadow stack
         builder.call(self.gc_scan_roots, [])
 
+        # ============================================================
+        # SWEEPING PHASE: Free unmarked objects
+        # ============================================================
+        # Set gc_phase = 3 (SWEEPING)
+        builder.store(ir.Constant(self.i64, 3), self.gc_phase)
+
         # Phase 9: Sweep phase - free unmarked objects
         # gc_sweep handles mark inversion (flips gc_current_mark_value)
         builder.call(self.gc_sweep, [])
+
+        builder.branch(reset_watermarks)
+
+        # ============================================================
+        # Reset all threads' watermark_active flags
+        # ============================================================
+        builder.position_at_end(reset_watermarks)
+
+        # Lock registry mutex
+        mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex])
+
+        # Allocate storage for current thread
+        curr_thread = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
+        head = builder.load(self.gc_thread_registry)
+        builder.store(head, curr_thread)
+
+        builder.branch(reset_loop)
+
+        # Loop through all threads
+        builder.position_at_end(reset_loop)
+        thread_val = builder.load(curr_thread)
+        thread_is_null = builder.icmp_unsigned(
+            "==",
+            builder.ptrtoint(thread_val, self.i64),
+            ir.Constant(self.i64, 0)
+        )
+        builder.cbranch(thread_is_null, finalize, reset_thread)
+
+        # Reset this thread's watermark
+        builder.position_at_end(reset_thread)
+        # Set watermark_active = 0 (field 3)
+        wm_active_ptr = builder.gep(thread_val, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), wm_active_ptr)
+        builder.branch(next_reset)
+
+        # Move to next thread
+        builder.position_at_end(next_reset)
+        thread_val2 = builder.load(curr_thread)
+        next_ptr = builder.gep(thread_val2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_ptr)
+        next_thread_ptr = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_ptr, curr_thread)
+        builder.branch(reset_loop)
+
+        # ============================================================
+        # Finalize: Update statistics and reset flags
+        # ============================================================
+        builder.position_at_end(finalize)
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [mutex])
+
+        # Set gc_phase = 0 (IDLE)
+        builder.store(ir.Constant(self.i64, 0), self.gc_phase)
 
         # Phase 9: Update statistics
         # Increment collections_completed (gc_stats offset 4 = index 32/8)
@@ -2124,7 +2565,7 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_safepoint(self):
-        """Implement safe-point check for automatic GC triggering.
+        """Implement safe-point check for automatic GC triggering and watermark.
 
         This function is safe to call at function entry because:
         1. All previous operations have completed
@@ -2132,10 +2573,17 @@ class GarbageCollector:
         3. No intermediate allocations exist yet
 
         Checks if allocation count >= threshold and triggers GC if so.
+
+        Thread Registry: Also implements the watermark protocol:
+        - If gc_phase != 0 (GC in progress), acknowledge the watermark
+        - Set watermark_depth and watermark_active in ThreadEntry
         """
         func = self.gc_safepoint
 
         entry = func.append_basic_block("entry")
+        check_watermark = func.append_basic_block("check_watermark")
+        ack_watermark = func.append_basic_block("ack_watermark")
+        check_threshold = func.append_basic_block("check_threshold")
         do_gc = func.append_basic_block("do_gc")
         done = func.append_basic_block("done")
 
@@ -2143,10 +2591,69 @@ class GarbageCollector:
 
         # Check if GC is enabled
         gc_enabled = builder.load(self.gc_enabled)
-        enabled_check = func.append_basic_block("enabled_check")
-        builder.cbranch(gc_enabled, enabled_check, done)
+        builder.cbranch(gc_enabled, check_watermark, done)
 
-        builder.position_at_end(enabled_check)
+        # ============================================================
+        # Check if GC phase requires watermark acknowledgment
+        # ============================================================
+        builder.position_at_end(check_watermark)
+
+        # Load current GC phase (0=idle, 1=watermark, 2=marking, 3=sweeping)
+        phase = builder.load(self.gc_phase)
+        gc_active = builder.icmp_unsigned("!=", phase, ir.Constant(self.i64, 0))
+
+        # Get thread entry from TLS
+        thread_entry_key = builder.load(self.tls_key_thread_entry)
+        te_ptr = builder.call(self.pthread_getspecific, [thread_entry_key])
+        te_ptr_int = builder.ptrtoint(te_ptr, self.i64)
+        is_registered = builder.icmp_unsigned('!=', te_ptr_int, ir.Constant(self.i64, 0))
+
+        # If GC active AND thread is registered, check if we need to acknowledge
+        should_check_ack = builder.and_(gc_active, is_registered)
+        builder.cbranch(should_check_ack, ack_watermark, check_threshold)
+
+        # ============================================================
+        # Acknowledge watermark if not already done for this cycle
+        # ============================================================
+        builder.position_at_end(ack_watermark)
+        thread_entry = builder.bitcast(te_ptr, self.thread_entry_type.as_pointer())
+
+        # Check if already acknowledged this cycle
+        cycle = builder.load(self.gc_cycle_id)
+        last_cycle_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)
+        ], inbounds=True)
+        last_cycle = builder.load(last_cycle_ptr)
+        already_acked = builder.icmp_unsigned("==", last_cycle, cycle)
+
+        # If not already acknowledged, set watermark
+        with builder.if_then(builder.not_(already_acked)):
+            # Get current stack depth from TLS
+            frame_depth_key = builder.load(self.tls_key_frame_depth)
+            depth_ptr = builder.call(self.pthread_getspecific, [frame_depth_key])
+            current_depth = builder.ptrtoint(depth_ptr, self.i64)
+
+            # Set watermark_depth (field 2)
+            wm_depth_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+            ], inbounds=True)
+            builder.store(current_depth, wm_depth_ptr)
+
+            # Set watermark_active = 1 (field 3)
+            wm_active_ptr = builder.gep(thread_entry, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+            ], inbounds=True)
+            builder.store(ir.Constant(self.i64, 1), wm_active_ptr)
+
+            # Set last_gc_cycle = current cycle (field 5)
+            builder.store(cycle, last_cycle_ptr)
+
+        builder.branch(check_threshold)
+
+        # ============================================================
+        # Check allocation threshold
+        # ============================================================
+        builder.position_at_end(check_threshold)
 
         # Check if allocation count >= threshold
         count = builder.load(self.gc_alloc_count)
