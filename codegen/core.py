@@ -54,6 +54,24 @@ from codegen.loops import LoopGenerator
 # Import Comprehension generator module
 from codegen.comprehensions import ComprehensionGenerator
 
+# Import Generics handler module
+from codegen.generics import GenericsHandler
+
+# Import Flow Control generator module
+from codegen.flow_control import FlowControlGenerator
+
+# Import Expression generator module
+from codegen.expressions import ExpressionGenerator
+
+# Import Statement generator module
+from codegen.statements import StatementGenerator
+
+# Import Conversion generator module
+from codegen.conversions import ConversionGenerator
+
+# Import Trait generator module
+from codegen.traits import TraitGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -409,619 +427,117 @@ class CodeGenerator:
         # Comprehension generation helpers moved to codegen/comprehensions.py - ComprehensionGenerator class
         self._comprehensions = ComprehensionGenerator(self)
 
+        # Generics/monomorphization helpers moved to codegen/generics.py - GenericsHandler class
+        self._generics = GenericsHandler(self)
+
+        # Flow control helpers moved to codegen/flow_control.py - FlowControlGenerator class
+        self._flow_control = FlowControlGenerator(self)
+
+        # Expression generation helpers moved to codegen/expressions.py - ExpressionGenerator class
+        self._expressions = ExpressionGenerator(self)
+
+        # Statement generation helpers moved to codegen/statements.py - StatementGenerator class
+        self._statements = StatementGenerator(self)
+
+        # Conversion helpers moved to codegen/conversions.py - ConversionGenerator class
+        self._conversions = ConversionGenerator(self)
+
+        # Trait helpers moved to codegen/traits.py - TraitGenerator class
+        self._traits = TraitGenerator(self)
+
     # List helpers moved to codegen/list.py - ListGenerator class
     # HAMT/Map/Set helpers moved to codegen/hamt.py - HamtGenerator class
 
     # Array helpers moved to codegen/array.py - ArrayGenerator class
+    # Conversion helpers moved to codegen/conversions.py - ConversionGenerator class
 
     def _list_to_array(self, list_ptr: ir.Value) -> ir.Value:
-        """Convert a List to an Array (List.packed() -> Array).
-
-        Creates a new Array with the same elements as the List.
-        For Persistent Vector List, we iterate using list_get since
-        the data is stored in a tree structure, not contiguously.
-        """
-        func = self.builder.function
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-
-        # Get List length
-        list_len = self.builder.call(self.list_len, [list_ptr])
-
-        # Get List elem_size (field 5 in PV structure)
-        elem_size_ptr = self.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
-        elem_size = self.builder.load(elem_size_ptr)
-
-        # Create new Array with same capacity as List length
-        array_ptr = self.builder.call(self.array_new, [list_len, elem_size])
-
-        # Set Array len = list_len (field 2 in Array layout)
-        array_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        self.builder.store(list_len, array_len_ptr)
-
-        # Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.builder.load(array_owner_handle_ptr)
-        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        array_offset = self.builder.load(array_offset_ptr)
-        array_data = self.builder.gep(array_owner, [array_offset])
-
-        # For Persistent Vector List, we can't just memcpy - we need to iterate
-        # through the list using list_get since data may be in tree structure.
-        # Loop through each element and copy to array
-
-        idx_alloca = self.builder.alloca(i64, name="list_to_arr_idx")
-        self.builder.store(ir.Constant(i64, 0), idx_alloca)
-
-        cond_block = func.append_basic_block("list_to_arr_cond")
-        body_block = func.append_basic_block("list_to_arr_body")
-        end_block = func.append_basic_block("list_to_arr_end")
-
-        self.builder.branch(cond_block)
-
-        # Condition: idx < list_len
-        self.builder.position_at_end(cond_block)
-        idx = self.builder.load(idx_alloca)
-        cond = self.builder.icmp_signed("<", idx, list_len)
-        self.builder.cbranch(cond, body_block, end_block)
-
-        # Body: copy element from list to array
-        self.builder.position_at_end(body_block)
-        idx = self.builder.load(idx_alloca)
-
-        # Get element from list
-        elem_ptr = self.builder.call(self.list_get, [list_ptr, idx])
-
-        # Calculate destination in array
-        offset = self.builder.mul(idx, elem_size)
-        dest_ptr = self.builder.gep(array_data, [offset])
-
-        # Copy element
-        self.builder.call(self.memcpy, [dest_ptr, elem_ptr, elem_size])
-
-        # Increment index
-        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
-        self.builder.store(next_idx, idx_alloca)
-        self.builder.branch(cond_block)
-
-        # End
-        self.builder.position_at_end(end_block)
-
-        return array_ptr
+        """Delegate to ConversionGenerator."""
+        return self._conversions.list_to_array(list_ptr)
 
     def _set_to_array(self, set_ptr: ir.Value) -> ir.Value:
-        """Convert a Set to an Array (Set.packed() -> Array).
-
-        Creates a new Array with the elements from the HAMT-based Set.
-        Uses set_to_list to collect keys, then copies to array.
-        """
-        func = self.builder.function
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-
-        # Get Set len (number of elements)
-        set_len = self.builder.call(self.set_len, [set_ptr])
-
-        # Create Array with capacity = set_len, elem_size = 8 (i64 keys)
-        elem_size = ir.Constant(i64, 8)
-        array_ptr = self.builder.call(self.array_new, [set_len, elem_size])
-
-        # Get list of keys from set using set_to_list (HAMT-based)
-        key_list = self.builder.call(self.set_to_list, [set_ptr])
-
-        # Get list data pointer (field 3 in List struct) - Phase 4: handle
-        list_data_handle_ptr = self.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        list_data_handle = self.builder.load(list_data_handle_ptr)
-        list_data = self.builder.inttoptr(list_data_handle, i8_ptr)
-
-        # Get array data pointer: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.builder.load(array_owner_handle_ptr)
-        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        array_offset = self.builder.load(array_offset_ptr)
-        array_data = self.builder.gep(array_owner, [array_offset])
-
-        # Copy list data to array: len * 8 bytes
-        copy_size = self.builder.mul(set_len, elem_size)
-        self.builder.call(self.memcpy, [array_data, list_data, copy_size])
-
-        # Set array len (field 2 in Array layout)
-        arr_len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        self.builder.store(set_len, arr_len_ptr)
-
-        return array_ptr
+        """Delegate to ConversionGenerator."""
+        return self._conversions.set_to_array(set_ptr)
 
     def _array_to_list(self, array_ptr: ir.Value) -> ir.Value:
-        """Convert an Array to a List (Array.unpacked() -> List).
-
-        Creates a new List with the same elements as the Array.
-        For Persistent Vector List, we iterate through the array and
-        append each element to build the list.
-        """
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-
-        func = self.builder.function
-
-        # Get Array length
-        array_len = self.builder.call(self.array_len, [array_ptr])
-
-        # Get Array elem_size (field 4 in Array layout)
-        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        elem_size = self.builder.load(elem_size_ptr)
-
-        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.builder.load(array_owner_handle_ptr)
-        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        array_offset = self.builder.load(array_offset_ptr)
-        array_data = self.builder.gep(array_owner, [array_offset])
-
-        # Create new empty List with same elem_size
-        list_ptr = self.builder.call(self.list_new, [elem_size])
-
-        # Store list_ptr in alloca since list_append returns new list
-        list_alloca = self.builder.alloca(self.list_struct.as_pointer(), name="arr_to_list")
-        self.builder.store(list_ptr, list_alloca)
-
-        # Loop through array elements and append to list
-        idx_alloca = self.builder.alloca(i64, name="arr_to_list_idx")
-        self.builder.store(ir.Constant(i64, 0), idx_alloca)
-
-        cond_block = func.append_basic_block("arr_to_list_cond")
-        body_block = func.append_basic_block("arr_to_list_body")
-        end_block = func.append_basic_block("arr_to_list_end")
-
-        self.builder.branch(cond_block)
-
-        # Condition: idx < array_len
-        self.builder.position_at_end(cond_block)
-        idx = self.builder.load(idx_alloca)
-        cond = self.builder.icmp_signed("<", idx, array_len)
-        self.builder.cbranch(cond, body_block, end_block)
-
-        # Body: get element from array and append to list
-        self.builder.position_at_end(body_block)
-        idx = self.builder.load(idx_alloca)
-
-        # Calculate source address in array
-        offset = self.builder.mul(idx, elem_size)
-        elem_ptr = self.builder.gep(array_data, [offset])
-
-        # Append element to list
-        current_list = self.builder.load(list_alloca)
-        new_list = self.builder.call(self.list_append, [current_list, elem_ptr, elem_size])
-        self.builder.store(new_list, list_alloca)
-
-        # Increment index
-        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
-        self.builder.store(next_idx, idx_alloca)
-        self.builder.branch(cond_block)
-
-        # End
-        self.builder.position_at_end(end_block)
-        return self.builder.load(list_alloca)
+        """Delegate to ConversionGenerator."""
+        return self._conversions.array_to_list(array_ptr)
 
     def _array_to_set(self, array_ptr: ir.Value, elem_is_ptr: bool = False) -> ir.Value:
-        """Convert an Array to a Set (Array.toSet() -> Set).
-
-        Creates a new Set with the same elements as the Array.
-        Duplicate elements in the Array are deduplicated.
-        """
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-
-        func = self.builder.function
-
-        # Get Array length
-        array_len = self.builder.call(self.array_len, [array_ptr])
-
-        # Get Array elem_size (field 4 in Array layout)
-        elem_size_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
-        elem_size = self.builder.load(elem_size_ptr)
-
-        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.builder.load(array_owner_handle_ptr)
-        array_owner = self.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        array_offset = self.builder.load(array_offset_ptr)
-        array_data = self.builder.gep(array_owner, [array_offset])
-
-        # Create new empty Set with flags indicating element type
-        flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
-        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
-
-        # Store set_ptr in alloca since set_add returns new set
-        set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="arr_to_set")
-        self.builder.store(set_ptr, set_alloca)
-
-        # Loop through array elements and add to set
-        idx_alloca = self.builder.alloca(i64, name="arr_to_set_idx")
-        self.builder.store(ir.Constant(i64, 0), idx_alloca)
-
-        cond_block = func.append_basic_block("arr_to_set_cond")
-        body_block = func.append_basic_block("arr_to_set_body")
-        end_block = func.append_basic_block("arr_to_set_end")
-
-        self.builder.branch(cond_block)
-
-        # Condition: idx < array_len
-        self.builder.position_at_end(cond_block)
-        idx = self.builder.load(idx_alloca)
-        cond = self.builder.icmp_signed("<", idx, array_len)
-        self.builder.cbranch(cond, body_block, end_block)
-
-        # Body: get element from array and add to set
-        self.builder.position_at_end(body_block)
-        idx = self.builder.load(idx_alloca)
-
-        # Calculate source address in array and load value
-        offset = self.builder.mul(idx, elem_size)
-        elem_ptr = self.builder.gep(array_data, [offset])
-        # Load element as i64 (assuming elements are stored as i64)
-        typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
-        elem_val = self.builder.load(typed_ptr)
-
-        # Add element to set (set_add returns new set)
-        current_set = self.builder.load(set_alloca)
-        new_set = self.builder.call(self.set_add, [current_set, elem_val])
-        self.builder.store(new_set, set_alloca)
-
-        # Increment index
-        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
-        self.builder.store(next_idx, idx_alloca)
-        self.builder.branch(cond_block)
-
-        # End
-        self.builder.position_at_end(end_block)
-        return self.builder.load(set_alloca)
+        """Delegate to ConversionGenerator."""
+        return self._conversions.array_to_set(array_ptr, elem_is_ptr)
 
     def _list_to_set(self, list_ptr: ir.Value, elem_is_ptr: bool = False) -> ir.Value:
-        """Convert a List to a Set (List.to_set() -> Set).
-
-        Creates a new Set with the same elements as the List.
-        Duplicate elements in the List are deduplicated.
-        """
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-
-        func = self.builder.function
-
-        # Get List length
-        list_len = self.builder.call(self.list_len, [list_ptr])
-
-        # Create new empty Set with flags indicating element type
-        flags = self.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0
-        set_ptr = self.builder.call(self.set_new, [ir.Constant(i64, flags)])
-
-        # Store set_ptr in alloca since set_add returns new set
-        set_alloca = self.builder.alloca(self.set_struct.as_pointer(), name="list_to_set")
-        self.builder.store(set_ptr, set_alloca)
-
-        # Loop through list elements and add to set
-        idx_alloca = self.builder.alloca(i64, name="list_to_set_idx")
-        self.builder.store(ir.Constant(i64, 0), idx_alloca)
-
-        cond_block = func.append_basic_block("list_to_set_cond")
-        body_block = func.append_basic_block("list_to_set_body")
-        end_block = func.append_basic_block("list_to_set_end")
-
-        self.builder.branch(cond_block)
-
-        # Condition: idx < list_len
-        self.builder.position_at_end(cond_block)
-        idx = self.builder.load(idx_alloca)
-        cond = self.builder.icmp_signed("<", idx, list_len)
-        self.builder.cbranch(cond, body_block, end_block)
-
-        # Body: get element from list and add to set
-        self.builder.position_at_end(body_block)
-        idx = self.builder.load(idx_alloca)
-
-        # Get element from list using list_get
-        elem_ptr = self.builder.call(self.list_get, [list_ptr, idx])
-        # Load element as i64 (assuming elements are stored as i64)
-        typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
-        elem_val = self.builder.load(typed_ptr)
-
-        # Add element to set (set_add returns new set)
-        current_set = self.builder.load(set_alloca)
-        new_set = self.builder.call(self.set_add, [current_set, elem_val])
-        self.builder.store(new_set, set_alloca)
-
-        # Increment index
-        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
-        self.builder.store(next_idx, idx_alloca)
-        self.builder.branch(cond_block)
-
-        # End
-        self.builder.position_at_end(end_block)
-        return self.builder.load(set_alloca)
+        """Delegate to ConversionGenerator."""
+        return self._conversions.list_to_set(list_ptr, elem_is_ptr)
 
     def _try_implicit_collection_conversion(self, value: ir.Value, target_type: Type, value_type: Type = None) -> Tuple[ir.Value, bool]:
-        """Try to implicitly convert between collection types.
-
-        Returns (converted_value, was_converted) where was_converted is True if
-        an implicit conversion was performed (and a warning should be emitted).
-
-        Supported conversions:
-        - List<T> -> Array<T> (via .packed())
-        - Array<T> -> List<T> (via .unpacked())
-        - List<T> -> Set<T> (via .to_set(), deduplicates)
-        - Set<T> -> List<T> (via .unpacked())
-        - Set<T> -> Array<T> (via .packed())
-        - Array<T> -> Set<T> (via .toSet(), deduplicates)
-        """
-        if not isinstance(value.type, ir.PointerType):
-            return value, False
-
-        pointee = value.type.pointee
-        if not hasattr(pointee, 'name'):
-            return value, False
-
-        source_struct = pointee.name  # e.g., "struct.List"
-
-        # Determine target collection type
-        if isinstance(target_type, ListType):
-            target_struct = "struct.List"
-        elif isinstance(target_type, ArrayType):
-            target_struct = "struct.Array"
-        elif isinstance(target_type, SetType):
-            target_struct = "struct.Set"
-        else:
-            return value, False
-
-        # No conversion needed if types match
-        if source_struct == target_struct:
-            return value, False
-
-        # Perform conversion based on source -> target
-        if source_struct == "struct.List" and target_struct == "struct.Array":
-            return self._list_to_array(value), True
-        elif source_struct == "struct.Array" and target_struct == "struct.List":
-            return self._array_to_list(value), True
-        elif source_struct == "struct.List" and target_struct == "struct.Set":
-            return self._list_to_set(value), True
-        elif source_struct == "struct.Set" and target_struct == "struct.List":
-            # set_to_list is available via coex_set_to_list
-            return self.builder.call(self.set_to_list, [value]), True
-        elif source_struct == "struct.Set" and target_struct == "struct.Array":
-            return self._set_to_array(value), True
-        elif source_struct == "struct.Array" and target_struct == "struct.Set":
-            return self._array_to_set(value), True
-
-        return value, False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.try_implicit_collection_conversion(value, target_type, value_type)
 
     def _get_conversion_warning_message(self, source_struct: str, target_struct: str) -> str:
-        """Get the warning message for an implicit collection conversion."""
-        source_name = source_struct.replace("struct.", "")
-        target_name = target_struct.replace("struct.", "")
-
-        # Map struct names to user-friendly names
-        names = {"List": "List", "Array": "Array", "Set": "Set"}
-        source = names.get(source_name, source_name)
-        target = names.get(target_name, target_name)
-
-        if source == "List" and target == "Array":
-            return f"Implicit conversion from {source} to {target} (O(n) copy to contiguous memory)"
-        elif source == "Array" and target == "List":
-            return f"Implicit conversion from {source} to {target} (O(n) copy to persistent vector)"
-        elif source in ("List", "Array") and target == "Set":
-            return f"Implicit conversion from {source} to {target} (O(n) with deduplication)"
-        elif source == "Set" and target in ("List", "Array"):
-            return f"Implicit conversion from {source} to {target} (O(n) copy)"
-        else:
-            return f"Implicit conversion from {source} to {target}"
+        """Delegate to ConversionGenerator."""
+        return self._conversions.get_conversion_warning_message(source_struct, target_struct)
 
     def _is_primitive_coex_type(self, coex_type: Type) -> bool:
-        """Check if a Coex type is a primitive (int, float, bool, byte, char)."""
-        if isinstance(coex_type, PrimitiveType):
-            return coex_type.name in ("int", "float", "bool", "byte", "char")
-        return False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.is_primitive_coex_type(coex_type)
 
     def _needs_parameter_copy(self, coex_type: Type) -> bool:
-        """Check if a parameter type needs to be copied on function entry.
-
-        With immutable heap semantics, function parameters never need copying.
-        All heap types (collections, strings, UDTs) are immutable:
-        - Collections: mutation operations return new objects
-        - Strings: immutable
-        - UDTs: field assignment creates new struct (copy-on-write)
-
-        Sharing references is semantically equivalent to copying because no
-        binding can observe mutations through another binding.
-        """
-        return False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.needs_parameter_copy(coex_type)
 
     def _is_heap_type(self, coex_type: Type) -> bool:
-        """Check if a Coex type is heap-allocated and needs GC root tracking.
-
-        Heap types that need tracking:
-        - Collections (List, Set, Map, Array)
-        - String (heap-allocated)
-        - User-defined types (all heap-allocated)
-
-        NOT tracked (stack types):
-        - int, float, bool, byte, char
-        - Tuples of primitives (value types)
-        """
-        if coex_type is None:
-            return False
-        if isinstance(coex_type, PrimitiveType):
-            # Primitives are stack-allocated
-            if coex_type.name in ("int", "float", "bool", "byte", "char"):
-                return False
-            # string is heap-allocated
-            if coex_type.name == "string":
-                return True
-        if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
-            return True
-        if isinstance(coex_type, NamedType):
-            # String is heap-allocated
-            if coex_type.name == "string":
-                return True
-            # User-defined types are heap-allocated
-            if coex_type.name in self.type_fields:
-                return True
-            # Generic types that expand to collections
-            if coex_type.type_args:
-                return True
-        if isinstance(coex_type, TupleType):
-            # Tuples are stack values, but we don't track them as roots
-            # (their contents are copied at assignment)
-            return False
-        return False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.is_heap_type(coex_type)
 
     def _compute_map_flags(self, key_type: Type, value_type: Type) -> int:
-        """Compute the GC flags for a Map based on key and value types.
-
-        Returns an integer with:
-        - bit 0 set if key is a heap pointer
-        - bit 1 set if value is a heap pointer
-        """
-        flags = 0
-        if self._is_heap_type(key_type):
-            flags |= self.MAP_FLAG_KEY_IS_PTR
-        if self._is_heap_type(value_type):
-            flags |= self.MAP_FLAG_VALUE_IS_PTR
-        return flags
+        """Delegate to ConversionGenerator."""
+        return self._conversions.compute_map_flags(key_type, value_type)
 
     def _compute_set_flags(self, elem_type: Type) -> int:
-        """Compute the GC flags for a Set based on element type.
-
-        Returns an integer with:
-        - bit 0 set if element is a heap pointer
-        """
-        flags = 0
-        if self._is_heap_type(elem_type):
-            flags |= self.MAP_FLAG_KEY_IS_PTR  # Reuse same flag for set elements
-        return flags
+        """Delegate to ConversionGenerator."""
+        return self._conversions.compute_set_flags(elem_type)
 
     def _is_collection_coex_type(self, coex_type: Type) -> bool:
-        """Check if a Coex type is a collection (List, Set, Map, Array, String)."""
-        if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
-            return True
-        if isinstance(coex_type, NamedType) and coex_type.name == "string":
-            return True
-        return False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.is_collection_coex_type(coex_type)
 
     def _get_receiver_type(self, expr: Expr) -> Optional[Type]:
-        """Get the Coex type of a receiver expression (handles chained method calls).
-
-        For expressions like a.set(0, x).set(1, y):
-        - The outermost call has callee.object = a.set(0, x) (another CallExpr)
-        - We recursively find the innermost Identifier to get its type
-        """
-        if isinstance(expr, Identifier):
-            # Direct variable reference
-            if expr.name in self.var_coex_types:
-                return self.var_coex_types[expr.name]
-            return None
-        elif isinstance(expr, CallExpr):
-            # Chained method call: recurse into the callee's object
-            if isinstance(expr.callee, MemberExpr):
-                return self._get_receiver_type(expr.callee.object)
-        elif isinstance(expr, MemberExpr):
-            # Member expression without call
-            return self._get_receiver_type(expr.object)
-        return None
+        """Delegate to ConversionGenerator."""
+        return self._conversions.get_receiver_type(expr)
 
     def _needs_deep_copy(self, coex_type: Type) -> bool:
-        """Check if a type needs deep copy (has nested collections)."""
-        if isinstance(coex_type, ListType):
-            return self._is_collection_coex_type(coex_type.element_type)
-        if isinstance(coex_type, ArrayType):
-            return self._is_collection_coex_type(coex_type.element_type)
-        if isinstance(coex_type, SetType):
-            return self._is_collection_coex_type(coex_type.element_type)
-        if isinstance(coex_type, MapType):
-            return self._is_collection_coex_type(coex_type.value_type)
-        if isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
-            # Check if user type has any collection fields
-            for field_name, field_type in self.type_fields[coex_type.name]:
-                if self._is_collection_coex_type(field_type):
-                    return True
-        return False
+        """Delegate to ConversionGenerator."""
+        return self._conversions.needs_deep_copy(coex_type)
 
     def _generate_move_or_eager_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Generate code for := (move/eager assign) semantics.
-
-        With GC-managed memory (no refcounting), this is simplified:
-        - For arrays: just return the pointer; array_set/append create copies on mutation
-        - For strings: just return the pointer; strings are immutable
-        - For collections: return pointer; mutation creates new structures
-
-        The copy-on-write happens at mutation time, not at assignment time.
-        """
-        # All types: just return the value
-        # GC handles memory; mutation operations create new copies when needed
-        return value
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_move_or_eager_copy(value, coex_type)
 
     def _generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Generate code to 'deep-copy' a value based on its Coex type.
-
-        With immutable heap semantics, heap-allocated values don't need copying.
-        Sharing references is semantically equivalent to copying because no
-        binding can observe mutations through another binding:
-        - Collections: mutation operations return new objects
-        - Strings: immutable
-        - UDTs: field assignment creates new struct (copy-on-write)
-
-        This function returns value unchanged for all types.
-        """
-        # All types: return value unchanged
-        # - Primitives are stack-allocated value types
-        # - Heap types are immutable - sharing is equivalent to copying
-        return value
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_deep_copy(value, coex_type)
 
     def _generate_list_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy a list (identity function with immutable heap semantics).
-
-        With immutable heap semantics, deep copy is unnecessary.
-        Sharing the reference is semantically equivalent.
-        """
-        return src
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_list_deep_copy(src, elem_type)
 
     def _generate_set_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy a set (identity function with immutable heap semantics).
-
-        With immutable heap semantics, deep copy is unnecessary.
-        Sharing the reference is semantically equivalent.
-        """
-        return src
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_set_deep_copy(src, elem_type)
 
     def _generate_map_deep_copy(self, src: ir.Value, key_type: Type, value_type: Type) -> ir.Value:
-        """Deep copy a map (identity function with immutable heap semantics).
-
-        With immutable heap semantics, deep copy is unnecessary.
-        Sharing the reference is semantically equivalent.
-        """
-        return src
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_map_deep_copy(src, key_type, value_type)
 
     def _generate_array_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy an array (identity function with immutable heap semantics).
-
-        With immutable heap semantics, deep copy is unnecessary.
-        Sharing the reference is semantically equivalent.
-        """
-        return src
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_array_deep_copy(src, elem_type)
 
     def _generate_type_deep_copy(self, src: ir.Value, coex_type: NamedType) -> ir.Value:
-        """Deep copy a user-defined type (identity function with immutable heap semantics).
-
-        With copy-on-write field assignment, UDTs are now immutable like collections.
-        Sharing the reference is semantically equivalent to copying.
-        """
-        return src
+        """Delegate to ConversionGenerator."""
+        return self._conversions.generate_type_deep_copy(src, coex_type)
 
     # ========================================================================
     # Atomic Reference type moved to codegen/atomic.py - AtomicGenerator class
@@ -1306,91 +822,33 @@ class CodeGenerator:
         """
         return self.ffi_link_args
 
+    # Trait helpers moved to codegen/traits.py - TraitGenerator class
+
     def _register_trait(self, trait_decl: 'TraitDecl'):
-        """Register a trait definition"""
-        self.traits[trait_decl.name] = trait_decl
-    
+        """Delegate to TraitGenerator."""
+        return self._traits.register_trait(trait_decl)
+
     def _check_trait_implementations(self, type_decl: TypeDecl):
-        """Check which traits a type implements and record them"""
-        implemented = []
-        
-        # Get the type's methods (name -> FunctionDecl)
-        type_methods = {m.name: m for m in type_decl.methods}
-        
-        # Check each trait
-        for trait_name, trait_decl in self.traits.items():
-            if self._type_implements_trait(type_decl, trait_decl, type_methods):
-                implemented.append(trait_name)
-        
-        self.type_implements[type_decl.name] = implemented
-    
-    def _type_implements_trait(self, type_decl: TypeDecl, trait_decl: 'TraitDecl', 
-                                type_methods: Dict[str, FunctionDecl]) -> bool:
-        """Check if a type implements all methods of a trait"""
-        for trait_method in trait_decl.methods:
-            if trait_method.name not in type_methods:
-                return False
-            
-            type_method = type_methods[trait_method.name]
-            
-            # Check method signature compatibility
-            if not self._methods_compatible(trait_method, type_method):
-                return False
-        
-        return True
-    
+        """Delegate to TraitGenerator."""
+        return self._traits.check_trait_implementations(type_decl)
+
+    def _type_implements_trait(self, type_decl: TypeDecl, trait_decl: 'TraitDecl',
+                               type_methods: Dict[str, FunctionDecl]) -> bool:
+        """Delegate to TraitGenerator."""
+        return self._traits.type_implements_trait(type_decl, trait_decl, type_methods)
+
     def _methods_compatible(self, trait_method: FunctionDecl, type_method: FunctionDecl) -> bool:
-        """Check if a type's method is compatible with a trait method signature"""
-        # Check parameter count
-        if len(trait_method.params) != len(type_method.params):
-            return False
-        
-        # Check return type compatibility (simplified - could be more precise)
-        # For now, just check they both have return types or both don't
-        trait_has_return = trait_method.return_type is not None
-        type_has_return = type_method.return_type is not None
-        if trait_has_return != type_has_return:
-            return False
-        
-        return True
-    
+        """Delegate to TraitGenerator."""
+        return self._traits.methods_compatible(trait_method, type_method)
+
     def _check_trait_bound(self, type_name: str, trait_name: str) -> bool:
-        """Check if a type satisfies a trait bound"""
-        # Handle monomorphized type names (e.g., "Pair_int_float")
-        base_type = type_name.split('_')[0] if '_' in type_name else type_name
-        
-        # Check if type explicitly implements the trait
-        if type_name in self.type_implements:
-            if trait_name in self.type_implements[type_name]:
-                return True
-        
-        # Check base type for generics
-        if base_type in self.type_implements:
-            if trait_name in self.type_implements[base_type]:
-                return True
-        
-        # Check primitive types for built-in traits
-        if self._primitive_implements_trait(type_name, trait_name):
-            return True
-        
-        return False
-    
+        """Delegate to TraitGenerator."""
+        return self._traits.check_trait_bound(type_name, trait_name)
+
     def _primitive_implements_trait(self, type_name: str, trait_name: str) -> bool:
-        """Check if a primitive type implements a built-in trait"""
-        # Define which primitives implement which traits
-        primitive_traits = {
-            "int": ["Numeric", "Comparable", "Eq", "Hash", "Display"],
-            "float": ["Numeric", "Comparable", "Display"],
-            "bool": ["Eq", "Hash", "Display"],
-            "string": ["Eq", "Hash", "Display", "Comparable"],
-            "byte": ["Numeric", "Comparable", "Eq", "Hash"],
-        }
-        
-        if type_name in primitive_traits:
-            return trait_name in primitive_traits[type_name]
-        
-        return False
-    
+        """Delegate to TraitGenerator."""
+        return self._traits.primitive_implements_trait(type_name, trait_name)
+
     def _register_type(self, type_decl: TypeDecl):
         """Register a user-defined type"""
         # Store the AST for later reference
@@ -1450,124 +908,30 @@ class CodeGenerator:
                     ref_offsets.append(i * 8)
             self.gc.register_type(mangled_name, size, ref_offsets)
     
+    # ========================================================================
+    # Generics/Monomorphization (delegated to codegen/generics.py)
+    # ========================================================================
+
     def _substitute_type(self, coex_type: Type) -> Type:
         """Substitute type parameters with concrete types"""
-        if not self.type_substitutions:
-            return coex_type
-        
-        if isinstance(coex_type, NamedType):
-            # Check if this is a type parameter
-            if coex_type.name in self.type_substitutions:
-                return self.type_substitutions[coex_type.name]
-            # Check if it has type args that need substitution
-            if coex_type.type_args:
-                new_args = [self._substitute_type(arg) for arg in coex_type.type_args]
-                return NamedType(coex_type.name, new_args)
-        elif isinstance(coex_type, ListType):
-            return ListType(self._substitute_type(coex_type.element_type))
-        elif isinstance(coex_type, OptionalType):
-            return OptionalType(self._substitute_type(coex_type.inner))
-        elif isinstance(coex_type, ResultType):
-            return ResultType(
-                self._substitute_type(coex_type.ok_type),
-                self._substitute_type(coex_type.err_type)
-            )
-        elif isinstance(coex_type, TupleType):
-            new_elements = [(name, self._substitute_type(t)) for name, t in coex_type.elements]
-            return TupleType(new_elements)
-        elif isinstance(coex_type, FunctionType):
-            new_params = [self._substitute_type(t) for t in coex_type.param_types]
-            new_ret = self._substitute_type(coex_type.return_type) if coex_type.return_type else None
-            return FunctionType(coex_type.kind, new_params, new_ret)
-        
-        return coex_type
-    
+        return self._generics.substitute_type(coex_type)
+
     def _mangle_generic_name(self, base_name: str, type_args: PyList[Type]) -> str:
         """Create mangled name for monomorphized generic: Pair_int_float"""
-        parts = [base_name]
-        for arg in type_args:
-            parts.append(self._type_to_string(arg))
-        return "_".join(parts)
-    
+        return self._generics.mangle_generic_name(base_name, type_args)
+
     def _type_to_string(self, coex_type: Type) -> str:
         """Convert type to string for name mangling"""
-        if isinstance(coex_type, PrimitiveType):
-            return coex_type.name
-        elif isinstance(coex_type, NamedType):
-            if coex_type.type_args:
-                args = "_".join(self._type_to_string(a) for a in coex_type.type_args)
-                return f"{coex_type.name}_{args}"
-            return coex_type.name
-        elif isinstance(coex_type, ListType):
-            return f"List_{self._type_to_string(coex_type.element_type)}"
-        elif isinstance(coex_type, OptionalType):
-            return f"Opt_{self._type_to_string(coex_type.inner)}"
-        elif isinstance(coex_type, ResultType):
-            ok_str = self._type_to_string(coex_type.ok_type)
-            err_str = self._type_to_string(coex_type.err_type)
-            return f"Result_{ok_str}_{err_str}"
-        else:
-            return "unknown"
-    
+        return self._generics.type_to_string(coex_type)
+
     def _monomorphize_type(self, name: str, type_args: PyList[Type]) -> str:
         """Monomorphize a generic type with concrete type arguments"""
-        if name not in self.generic_types:
-            return name  # Not a generic type
-        
-        mangled_name = self._mangle_generic_name(name, type_args)
-        
-        # Already monomorphized?
-        if mangled_name in self.type_registry:
-            return mangled_name
-        
-        # Get the generic type declaration
-        type_decl = self.generic_types[name]
-        
-        # Check trait bounds
-        for param, arg in zip(type_decl.type_params, type_args):
-            for bound in param.bounds:
-                type_name = self._type_to_string(arg)
-                if not self._check_trait_bound(type_name, bound):
-                    # Trait bound not satisfied - for now, continue anyway
-                    pass
-        
-        # Set up type substitutions
-        old_subs = self.type_substitutions.copy()
-        self.type_substitutions = {}
-        for param, arg in zip(type_decl.type_params, type_args):
-            self.type_substitutions[param.name] = arg
-        
-        # Register the concrete type
-        self._register_concrete_type(mangled_name, type_decl)
-        
-        # Store AST reference with mangled name
-        self.type_decls[mangled_name] = type_decl
-        
-        # Check trait implementations for the monomorphized type
-        self._check_monomorphized_trait_implementations(mangled_name, type_decl)
-        
-        # Monomorphize and declare methods
-        self._declare_type_methods_monomorphized(mangled_name, type_decl)
-        
-        # Restore substitutions
-        self.type_substitutions = old_subs
-        
-        return mangled_name
-    
+        return self._generics.monomorphize_type(name, type_args)
+
     def _check_monomorphized_trait_implementations(self, mangled_name: str, type_decl: TypeDecl):
         """Check which traits a monomorphized type implements"""
-        implemented = []
-        
-        # Get the type's methods (name -> FunctionDecl)
-        type_methods = {m.name: m for m in type_decl.methods}
-        
-        # Check each trait
-        for trait_name, trait_decl in self.traits.items():
-            if self._type_implements_trait(type_decl, trait_decl, type_methods):
-                implemented.append(trait_name)
-        
-        self.type_implements[mangled_name] = implemented
-    
+        return self._generics.check_monomorphized_trait_implementations(mangled_name, type_decl)
+
     def _declare_type_methods_monomorphized(self, mangled_type_name: str, type_decl: TypeDecl):
         """Declare methods for a monomorphized type"""
         return self._functions.declare_type_methods_monomorphized(mangled_type_name, type_decl)
@@ -1582,227 +946,34 @@ class CodeGenerator:
 
     def _infer_type_args(self, func_name: str, args: PyList[Expr]) -> Optional[PyList[Type]]:
         """Infer type arguments for a generic function from call arguments"""
-        if func_name not in self.generic_functions:
-            return None
-        
-        func_decl = self.generic_functions[func_name]
-        type_params = func_decl.type_params
-        
-        # Map type parameter names to inferred types
-        inferred = {}
-        param_names = {tp.name for tp in type_params}
-        
-        for i, (param, arg) in enumerate(zip(func_decl.params, args)):
-            param_type = param.type_annotation
-            inferred_type = self._infer_type_from_expr(arg)
-            
-            # Match parameter type against inferred type
-            self._unify_types_with_params(param_type, inferred_type, inferred, param_names)
-        
-        # Build result in order of type parameters
-        result = []
-        for tp in type_params:
-            if tp.name in inferred:
-                result.append(inferred[tp.name])
-            else:
-                # Default to int if can't infer
-                result.append(PrimitiveType("int"))
-        
-        return result
-    
-    def _infer_type_args_from_constructor(self, type_name: str, args: PyList[Expr], 
-                                           named_args: Dict[str, Expr]) -> Optional[PyList[Type]]:
+        return self._generics.infer_type_args(func_name, args)
+
+    def _infer_type_args_from_constructor(self, type_name: str, args: PyList[Expr],
+                                          named_args: Dict[str, Expr]) -> Optional[PyList[Type]]:
         """Infer type arguments for a generic type constructor"""
-        if type_name not in self.generic_types:
-            return None
-        
-        type_decl = self.generic_types[type_name]
-        type_params = type_decl.type_params
-        
-        # Build a mapping from type parameter names to their inferred types
-        inferred = {}
-        
-        # Map field names to their declared types
-        field_types = {f.name: f.type_annotation for f in type_decl.fields}
-        
-        # Infer from named arguments
-        for field_name, arg_expr in named_args.items():
-            if field_name in field_types:
-                declared_type = field_types[field_name]
-                inferred_type = self._infer_type_from_expr(arg_expr)
-                self._unify_type_constructor(declared_type, inferred_type, inferred, type_params)
-        
-        # Infer from positional arguments
-        for i, arg_expr in enumerate(args):
-            if i < len(type_decl.fields):
-                declared_type = type_decl.fields[i].type_annotation
-                inferred_type = self._infer_type_from_expr(arg_expr)
-                self._unify_type_constructor(declared_type, inferred_type, inferred, type_params)
-        
-        # Build result in order of type parameters
-        result = []
-        for tp in type_params:
-            if tp.name in inferred:
-                result.append(inferred[tp.name])
-            else:
-                # Default to int if can't infer
-                result.append(PrimitiveType("int"))
-        
-        return result
-    
-    def _unify_type_constructor(self, declared_type: Type, inferred_type: Type, 
-                                 inferred: Dict[str, Type], type_params: PyList[TypeParam]):
+        return self._generics.infer_type_args_from_constructor(type_name, args, named_args)
+
+    def _unify_type_constructor(self, declared_type: Type, inferred_type: Type,
+                                inferred: Dict[str, Type], type_params: PyList[TypeParam]):
         """Unify a declared field type with an inferred argument type"""
-        param_names = {tp.name for tp in type_params}
-        
-        if isinstance(declared_type, NamedType):
-            if declared_type.name in param_names:
-                # This field has a type parameter type - infer it
-                if declared_type.name not in inferred:
-                    inferred[declared_type.name] = inferred_type
-        elif isinstance(declared_type, ListType):
-            if isinstance(inferred_type, ListType):
-                self._unify_type_constructor(declared_type.element_type, 
-                                              inferred_type.element_type, inferred, type_params)
-    
+        return self._generics.unify_type_constructor(declared_type, inferred_type, inferred, type_params)
+
     def _infer_type_from_expr(self, expr: Expr) -> Type:
         """Infer the Coex type of an expression"""
-        if isinstance(expr, IntLiteral):
-            return PrimitiveType("int")
-        elif isinstance(expr, FloatLiteral):
-            return PrimitiveType("float")
-        elif isinstance(expr, BoolLiteral):
-            return PrimitiveType("bool")
-        elif isinstance(expr, StringLiteral):
-            return PrimitiveType("string")
-        elif isinstance(expr, Identifier):
-            # Look up variable type
-            name = expr.name
-            if name in self.locals:
-                llvm_type = self.locals[name].type.pointee
-                return self._llvm_type_to_coex(llvm_type)
-        elif isinstance(expr, ListExpr):
-            if expr.elements:
-                elem_type = self._infer_type_from_expr(expr.elements[0])
-                return ListType(elem_type)
-            return ListType(PrimitiveType("int"))
-        elif isinstance(expr, MapExpr):
-            if expr.entries:
-                key_type = self._infer_type_from_expr(expr.entries[0][0])
-                value_type = self._infer_type_from_expr(expr.entries[0][1])
-                return MapType(key_type, value_type)
-            return MapType(PrimitiveType("int"), PrimitiveType("int"))
-        elif isinstance(expr, JsonObjectExpr):
-            return PrimitiveType("json")
-        elif isinstance(expr, SetExpr):
-            if expr.elements:
-                elem_type = self._infer_type_from_expr(expr.elements[0])
-                return SetType(elem_type)
-            return SetType(PrimitiveType("int"))
-        elif isinstance(expr, CallExpr):
-            # Check if this is a type constructor call (e.g., Point(10, 20))
-            func_name = expr.callee.name if isinstance(expr.callee, Identifier) else None
-            if func_name and func_name in self.type_fields:
-                # This is a user type constructor
-                return NamedType(func_name)
-        elif isinstance(expr, MemberExpr):
-            # Check if accessing a field on a JSON object
-            obj_type = self._infer_type_from_expr(expr.object)
-            if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
-                return PrimitiveType("json")
-            # For UDTs, look up the field type
-            if isinstance(obj_type, NamedType) and obj_type.name in self.type_fields:
-                for field_name, field_type in self.type_fields[obj_type.name]:
-                    if field_name == expr.member:
-                        return field_type
-        elif isinstance(expr, IndexExpr):
-            # Check if indexing a JSON object
-            obj_type = self._infer_type_from_expr(expr.object)
-            if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
-                return PrimitiveType("json")
-            # For lists, return element type
-            if isinstance(obj_type, ListType):
-                return obj_type.element_type
-            # For arrays, return element type
-            if isinstance(obj_type, ArrayType):
-                return obj_type.element_type
-            # For maps, return value type
-            if isinstance(obj_type, MapType):
-                return obj_type.value_type
+        return self._generics.infer_type_from_expr(expr)
 
-        # Default
-        return PrimitiveType("int")
-    
     def _llvm_type_to_coex(self, llvm_type: ir.Type) -> Type:
         """Convert LLVM type back to Coex type (approximate)"""
-        if isinstance(llvm_type, ir.IntType):
-            if llvm_type.width == 1:
-                return PrimitiveType("bool")
-            elif llvm_type.width == 8:
-                return PrimitiveType("byte")
-            else:
-                return PrimitiveType("int")
-        elif isinstance(llvm_type, ir.DoubleType):
-            return PrimitiveType("float")
-        elif isinstance(llvm_type, ir.PointerType):
-            pointee = llvm_type.pointee
-            if isinstance(pointee, ir.IntType) and pointee.width == 8:
-                return PrimitiveType("string")
-            # Check for struct types
-            if hasattr(pointee, 'name'):
-                if pointee.name.startswith("struct."):
-                    type_name = pointee.name[7:]
-                    # json is a primitive type, not a named type
-                    if type_name == "Json":
-                        return PrimitiveType("json")
-                    return NamedType(type_name)
-        return PrimitiveType("int")
-    
-    def _unify_types_with_params(self, param_type: Type, arg_type: Type, 
-                                  inferred: Dict[str, Type], param_names: set):
+        return self._generics.llvm_type_to_coex(llvm_type)
+
+    def _unify_types_with_params(self, param_type: Type, arg_type: Type,
+                                 inferred: Dict[str, Type], param_names: set):
         """Unify a parameter type with an argument type to infer type parameters"""
-        if isinstance(param_type, NamedType):
-            # Check if it's a type parameter
-            if param_type.name in param_names:
-                # It's a type parameter - infer it
-                if param_type.name not in inferred:
-                    inferred[param_type.name] = arg_type
-        elif isinstance(param_type, ListType):
-            if isinstance(arg_type, ListType):
-                self._unify_types_with_params(param_type.element_type, arg_type.element_type, 
-                                               inferred, param_names)
-        elif isinstance(param_type, OptionalType):
-            if isinstance(arg_type, OptionalType):
-                self._unify_types_with_params(param_type.inner, arg_type.inner,
-                                               inferred, param_names)
-        elif isinstance(param_type, ResultType):
-            if isinstance(arg_type, ResultType):
-                self._unify_types_with_params(param_type.ok_type, arg_type.ok_type,
-                                               inferred, param_names)
-                self._unify_types_with_params(param_type.err_type, arg_type.err_type,
-                                               inferred, param_names)
+        return self._generics.unify_types_with_params(param_type, arg_type, inferred, param_names)
 
     def _unify_types(self, param_type: Type, arg_type: Type, inferred: Dict[str, Type]):
         """Unify a parameter type with an argument type to infer type parameters (legacy)"""
-        # This version looks up params from current function - may not work correctly
-        if isinstance(param_type, NamedType):
-            # Check if it's a type parameter
-            if param_type.name in [tp.name for tp in self.generic_functions.get(
-                    self.current_function.name if self.current_function else "", 
-                    FunctionDecl(FunctionKind.FUNC, "", [])).type_params]:
-                # It's a type parameter - infer it
-                if param_type.name not in inferred:
-                    inferred[param_type.name] = arg_type
-        elif isinstance(param_type, ListType):
-            if isinstance(arg_type, ListType):
-                self._unify_types(param_type.element_type, arg_type.element_type, inferred)
-        elif isinstance(param_type, OptionalType):
-            if isinstance(arg_type, OptionalType):
-                self._unify_types(param_type.inner, arg_type.inner, inferred)
-        elif isinstance(param_type, ResultType):
-            if isinstance(arg_type, ResultType):
-                self._unify_types(param_type.ok_type, arg_type.ok_type, inferred)
-                self._unify_types(param_type.err_type, arg_type.err_type, inferred)
+        return self._generics.unify_types(param_type, arg_type, inferred)
 
     def _register_enum_type(self, type_decl: TypeDecl):
         """Register an enum type as a tagged union"""
@@ -2008,47 +1179,45 @@ class CodeGenerator:
         return self.warnings
 
     # ========================================================================
-    # Statement Generation
+    # Statement Generation - delegated to StatementGenerator
     # ========================================================================
 
     def _generate_statement(self, stmt: Stmt):
-        """Generate code for a statement"""
-        if isinstance(stmt, VarDecl):
-            self._generate_var_decl(stmt)
-        elif isinstance(stmt, TupleDestructureStmt):
-            self._generate_tuple_destructure(stmt)
-        elif isinstance(stmt, Assignment):
-            self._generate_assignment(stmt)
-        elif isinstance(stmt, SliceAssignment):
-            self._generate_slice_assignment(stmt)
-        elif isinstance(stmt, ReturnStmt):
-            self._generate_return(stmt)
-        elif isinstance(stmt, PrintStmt):
-            self._generate_print(stmt)
-        elif isinstance(stmt, DebugStmt):
-            self._generate_debug(stmt)
-        elif isinstance(stmt, IfStmt):
-            self._generate_if(stmt)
-        elif isinstance(stmt, WhileStmt):
-            self._generate_while(stmt)
-        elif isinstance(stmt, CycleStmt):
-            self._generate_cycle(stmt)
-        elif isinstance(stmt, ForStmt):
-            self._generate_for(stmt)
-        elif isinstance(stmt, ForAssignStmt):
-            self._generate_for_assign(stmt)
-        elif isinstance(stmt, BreakStmt):
-            self._generate_break()
-        elif isinstance(stmt, ContinueStmt):
-            self._generate_continue()
-        elif isinstance(stmt, MatchStmt):
-            self._generate_match(stmt)
-        elif isinstance(stmt, LlvmIrStmt):
-            self._generate_llvm_ir_block(stmt)
-        elif isinstance(stmt, ExprStmt):
-            self._generate_expression(stmt.expr)
-    
+        """Generate code for a statement - delegated to StatementGenerator"""
+        return self._statements.generate_statement(stmt)
+
     def _generate_var_decl(self, stmt: VarDecl):
+        """Generate var decl - delegated to StatementGenerator"""
+        return self._statements.generate_var_decl(stmt)
+
+    def _generate_tuple_destructure(self, stmt: 'TupleDestructureStmt'):
+        """Generate tuple destructure - delegated to StatementGenerator"""
+        return self._statements.generate_tuple_destructure(stmt)
+
+    def _generate_assignment(self, stmt: Assignment):
+        """Generate assignment - delegated to StatementGenerator"""
+        return self._statements.generate_assignment(stmt)
+
+    def _generate_slice_assignment(self, stmt: SliceAssignment):
+        """Generate slice assignment - delegated to StatementGenerator"""
+        return self._statements.generate_slice_assignment(stmt)
+
+    def _generate_return(self, stmt: ReturnStmt):
+        """Generate return - delegated to StatementGenerator"""
+        return self._statements.generate_return(stmt)
+
+    def _generate_print(self, stmt: PrintStmt):
+        """Generate print - delegated to StatementGenerator"""
+        return self._statements.generate_print(stmt)
+
+    def _generate_debug(self, stmt: DebugStmt):
+        """Generate debug - delegated to StatementGenerator"""
+        return self._statements.generate_debug(stmt)
+
+    # NOTE: Old statement implementations below are now dead code.
+    # The delegation methods above will be used. The old code remains temporarily.
+
+    def _OLD_generate_var_decl(self, stmt: VarDecl):
         """Generate a local variable declaration or reassignment"""
         # Track whether this is a new variable for scope registration
         is_new_var = stmt.name not in self.locals
@@ -3031,61 +2200,9 @@ class CodeGenerator:
         return None
     
     def _generate_return(self, stmt: ReturnStmt):
-        """Generate a return statement"""
-        if stmt.value:
-            # Special handling for returning nil to an optional type
-            func = self.builder.function
-            ret_type = func.function_type.return_type
+        """Generate a return statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_return(stmt)
 
-            if isinstance(stmt.value, NilLiteral) and isinstance(ret_type, ir.LiteralStructType):
-                # Check if return type is an optional (has i1 flag + value)
-                if len(ret_type.elements) == 2 and isinstance(ret_type.elements[0], ir.IntType):
-                    if ret_type.elements[0].width == 1:
-                        # Generate nil optional directly: {has_value=false, value=0}
-                        inner_type = ret_type.elements[1]
-                        value = ir.Constant(ret_type, ir.Undefined)
-                        value = self.builder.insert_value(value, ir.Constant(ir.IntType(1), 0), 0)
-                        if isinstance(inner_type, ir.IntType):
-                            value = self.builder.insert_value(value, ir.Constant(inner_type, 0), 1)
-                        elif isinstance(inner_type, ir.DoubleType):
-                            value = self.builder.insert_value(value, ir.Constant(inner_type, 0.0), 1)
-                        else:
-                            value = self.builder.insert_value(value, ir.Constant(inner_type, None), 1)
-
-                        # Pop GC frame before returning
-                        if self.gc_frame is not None and self.gc is not None:
-                            self.gc.pop_frame(self.builder, self.gc_frame)
-
-                        self.builder.ret(value)
-                        return
-
-            value = self._generate_expression(stmt.value)
-
-            # In matrix formula context, write to buffer and continue loop
-            if self.current_matrix is not None:
-                self._generate_matrix_return(value)
-                # Branch to x_loop_inc (next cell)
-                # Find the increment block
-                for block in func.blocks:
-                    if block.name == "x_loop_inc":
-                        self.builder.branch(block)
-                        return
-
-            # Cast to function return type if needed (e.g., wrap in optional)
-            value = self._cast_value(value, ret_type)
-
-            # Pop GC frame before returning
-            if self.gc_frame is not None and self.gc is not None:
-                self.gc.pop_frame(self.builder, self.gc_frame)
-
-            self.builder.ret(value)
-        else:
-            # Pop GC frame before returning
-            if self.gc_frame is not None and self.gc is not None:
-                self.gc.pop_frame(self.builder, self.gc_frame)
-
-            self.builder.ret_void()
-    
     def _generate_print(self, stmt: PrintStmt):
         """Generate a print statement"""
         # Skip if printing is disabled
@@ -3198,297 +2315,32 @@ class CodeGenerator:
         self.builder.call(self.fflush, [null_ptr])
 
     def _generate_if(self, stmt: IfStmt):
-        """Generate an if statement"""
-        func = self.builder.function
-        
-        then_block = func.append_basic_block("if_then")
-        merge_block = func.append_basic_block("if_merge")
-        
-        # Create else-if and else blocks
-        else_blocks = []
-        for _ in stmt.else_if_clauses:
-            else_blocks.append(func.append_basic_block("elif_cond"))
-        
-        if stmt.else_body:
-            else_block = func.append_basic_block("if_else")
-        else:
-            else_block = merge_block
-        
-        # Generate condition
-        cond = self._generate_expression(stmt.condition)
-        cond = self._to_bool(cond)
-        
-        # Branch
-        first_else = else_blocks[0] if else_blocks else else_block
-        self.builder.cbranch(cond, then_block, first_else)
-        
-        # Generate then block
-        self.builder.position_at_end(then_block)
-        self._enter_scope()  # Variables declared in then-block are scoped here
-        for s in stmt.then_body:
-            self._generate_statement(s)
-            if self.builder.block.is_terminated:
-                break
-        self._exit_scope()  # Clean up variables from then-block
-        if not self.builder.block.is_terminated:
-            self.builder.branch(merge_block)
+        """Generate an if statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_if(stmt)
 
-        # Generate else-if blocks
-        for i, (elif_cond, elif_body) in enumerate(stmt.else_if_clauses):
-            self.builder.position_at_end(else_blocks[i])
-            cond = self._generate_expression(elif_cond)
-            cond = self._to_bool(cond)
-
-            elif_then = func.append_basic_block("elif_then")
-            next_else = else_blocks[i + 1] if i + 1 < len(else_blocks) else else_block
-
-            self.builder.cbranch(cond, elif_then, next_else)
-
-            self.builder.position_at_end(elif_then)
-            self._enter_scope()  # Variables declared in elif-block are scoped here
-            for s in elif_body:
-                self._generate_statement(s)
-                if self.builder.block.is_terminated:
-                    break
-            self._exit_scope()  # Clean up variables from elif-block
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_block)
-
-        # Generate else block
-        if stmt.else_body:
-            self.builder.position_at_end(else_block)
-            self._enter_scope()  # Variables declared in else-block are scoped here
-            for s in stmt.else_body:
-                self._generate_statement(s)
-                if self.builder.block.is_terminated:
-                    break
-            self._exit_scope()  # Clean up variables from else-block
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_block)
-        
-        self.builder.position_at_end(merge_block)
-    
     def _to_bool(self, value: ir.Value) -> ir.Value:
-        """Convert value to boolean (i1)"""
-        if value.type == ir.IntType(1):
-            return value
-        elif isinstance(value.type, ir.IntType):
-            return self.builder.icmp_signed("!=", value, ir.Constant(value.type, 0))
-        elif isinstance(value.type, ir.DoubleType):
-            return self.builder.fcmp_ordered("!=", value, ir.Constant(value.type, 0.0))
-        elif isinstance(value.type, ir.PointerType):
-            # Check if this is a Result pointer - convert to bool based on tag
-            if hasattr(self, 'result_struct') and value.type == self.result_struct.as_pointer():
-                # Result<T, E> -> bool: true if Ok (tag == 0), false if Err (tag == 1)
-                tag_ptr = self.builder.gep(value, [
-                    ir.Constant(ir.IntType(32), 0),
-                    ir.Constant(ir.IntType(32), 0)  # tag field
-                ])
-                tag = self.builder.load(tag_ptr)
-                return self.builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
-            # Regular pointer: true if non-null
-            null = ir.Constant(value.type, None)
-            return self.builder.icmp_unsigned("!=", value, null)
-        return value
-    
+        """Convert value to boolean (i1) - delegated to FlowControlGenerator"""
+        return self._flow_control.to_bool(value)
+
     def _generate_while(self, stmt: WhileStmt):
-        """Generate a standard while loop: while condition block
-
-        Equivalent to other languages' while loop.
-        Note: 'while true' is equivalent to 'loop'.
-        """
-        func = self.builder.function
-
-        # PRE-ALLOCATE all local variables used in the loop body
-        local_vars = self._collect_local_variables(stmt.body)
-        for lv_name in local_vars:
-            if lv_name not in self.locals:
-                lv_alloca = self.builder.alloca(ir.IntType(64), name=lv_name)
-                self.locals[lv_name] = lv_alloca
-                self.placeholder_vars.add(lv_name)
-
-        # Create basic blocks
-        cond_block = func.append_basic_block("while_cond")
-        body_block = func.append_basic_block("while_body")
-        exit_block = func.append_basic_block("while_exit")
-
-        # Save loop blocks for break/continue
-        old_exit = self.loop_exit_block
-        old_continue = self.loop_continue_block
-        self.loop_exit_block = exit_block
-        self.loop_continue_block = cond_block
-
-        # Jump to condition check
-        self.builder.branch(cond_block)
-
-        # Generate condition check
-        self.builder.position_at_end(cond_block)
-        cond_val = self._generate_expression(stmt.condition)
-        cond_bool = self._to_bool(cond_val)
-        self.builder.cbranch(cond_bool, body_block, exit_block)
-
-        # Generate loop body
-        self.builder.position_at_end(body_block)
-        for s in stmt.body:
-            self._generate_statement(s)
-            if self.builder.block.is_terminated:
-                break
-
-        if not self.builder.block.is_terminated:
-            self.builder.branch(cond_block)
-
-        # Continue after loop
-        self.builder.position_at_end(exit_block)
-
-        # Restore loop blocks
-        self.loop_exit_block = old_exit
-        self.loop_continue_block = old_continue
+        """Generate a while loop - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_while(stmt)
 
     def _generate_cycle(self, stmt: CycleStmt):
-        """Generate a cycle statement with double-buffered semantics.
-
-        Syntax: while condition cycle block
-
-        Variables declared inside the cycle block exist in two buffers.
-        Reads see the 'read' buffer (previous generation).
-        Writes go to the 'write' buffer (current generation).
-        At iteration end, buffers swap and condition is checked in outer scope.
-        """
-        func = self.builder.function
-
-        # Phase 1: Analyze the body to find variables declared inside
-        cycle_vars = self._find_cycle_declared_vars(stmt.body)
-
-        # Phase 2: Create double-buffered storage for cycle variables
-        read_buffers: Dict[str, ir.AllocaInst] = {}   # var_name -> alloca for read buffer
-        write_buffers: Dict[str, ir.AllocaInst] = {}  # var_name -> alloca for write buffer
-        cycle_var_types: Dict[str, ir.Type] = {}      # var_name -> LLVM type
-
-        for var_name, var_type in cycle_vars.items():
-            if var_type:
-                llvm_type = self._get_llvm_type(var_type)
-            else:
-                llvm_type = ir.IntType(64)  # Default to i64 for unknown types
-            cycle_var_types[var_name] = llvm_type
-            read_buffers[var_name] = self.builder.alloca(llvm_type, name=f"{var_name}_read")
-            write_buffers[var_name] = self.builder.alloca(llvm_type, name=f"{var_name}_write")
-
-            # Initialize both buffers to zero/null
-            if isinstance(llvm_type, ir.IntType):
-                zero = ir.Constant(llvm_type, 0)
-            elif isinstance(llvm_type, ir.DoubleType):
-                zero = ir.Constant(llvm_type, 0.0)
-            elif isinstance(llvm_type, ir.PointerType):
-                zero = ir.Constant(llvm_type, None)
-            else:
-                zero = ir.Constant(llvm_type, None)
-            self.builder.store(zero, read_buffers[var_name])
-            self.builder.store(zero, write_buffers[var_name])
-
-        # Phase 3: Create basic blocks
-        body_block = func.append_basic_block("cycle_body")
-        swap_block = func.append_basic_block("cycle_swap")
-        cond_block = func.append_basic_block("cycle_cond")
-        exit_block = func.append_basic_block("cycle_exit")
-
-        # Save loop blocks for break/continue
-        old_exit = self.loop_exit_block
-        old_continue = self.loop_continue_block
-        self.loop_exit_block = exit_block
-        self.loop_continue_block = swap_block  # continue commits and checks condition
-
-        # Phase 4: Initial condition check (enter cycle only if condition true)
-        init_cond = self._generate_expression(stmt.condition)
-        init_cond_bool = self._to_bool(init_cond)
-        self.builder.cbranch(init_cond_bool, body_block, exit_block)
-
-        # Phase 5: Push cycle context and generate body
-        self.builder.position_at_end(body_block)
-
-        cycle_context = {
-            'read_buffers': read_buffers,
-            'write_buffers': write_buffers,
-            'cycle_vars': set(cycle_vars.keys()),
-            'var_types': cycle_var_types
-        }
-        self._cycle_context_stack.append(cycle_context)
-
-        # Generate body statements
-        for s in stmt.body:
-            self._generate_statement(s)
-            if self.builder.block.is_terminated:
-                break
-
-        if not self.builder.block.is_terminated:
-            self.builder.branch(swap_block)
-
-        # Pop cycle context before swap (condition is in outer scope)
-        self._cycle_context_stack.pop()
-
-        # Phase 6: Buffer swap - copy write buffer to read buffer
-        self.builder.position_at_end(swap_block)
-        for var_name in cycle_vars:
-            write_val = self.builder.load(write_buffers[var_name])
-            self.builder.store(write_val, read_buffers[var_name])
-        self.builder.branch(cond_block)
-
-        # Phase 7: Condition check (in outer scope, after swap)
-        self.builder.position_at_end(cond_block)
-        cond_val = self._generate_expression(stmt.condition)
-        cond_bool = self._to_bool(cond_val)
-        self.builder.cbranch(cond_bool, body_block, exit_block)
-
-        # Phase 8: Exit and cleanup
-        self.builder.position_at_end(exit_block)
-
-        # Restore loop blocks
-        self.loop_exit_block = old_exit
-        self.loop_continue_block = old_continue
+        """Generate a cycle block - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_cycle(stmt)
 
     def _find_cycle_declared_vars(self, stmts: PyList[Stmt]) -> Dict[str, Optional[Type]]:
-        """Find all variables declared within a list of statements.
-
-        Returns dict of var_name -> type_annotation (or None if inferred).
-        Recursively scans into control flow but not into nested cycles.
-        """
-        declared: Dict[str, Optional[Type]] = {}
-
-        for stmt in stmts:
-            if isinstance(stmt, VarDecl):
-                declared[stmt.name] = stmt.type_annotation
-            elif isinstance(stmt, Assignment):
-                # Simple assignment to new identifier declares a var
-                if isinstance(stmt.target, Identifier) and stmt.op == AssignOp.ASSIGN:
-                    name = stmt.target.name
-                    # Only count as declaration if not already known
-                    if name not in declared and name not in self.locals:
-                        declared[name] = None
-            elif isinstance(stmt, IfStmt):
-                # Recurse into branches
-                declared.update(self._find_cycle_declared_vars(stmt.then_body))
-                for _, body in stmt.else_if_clauses:
-                    declared.update(self._find_cycle_declared_vars(body))
-                if stmt.else_body:
-                    declared.update(self._find_cycle_declared_vars(stmt.else_body))
-            elif isinstance(stmt, ForStmt):
-                # Do NOT count the for loop variable as a cycle variable
-                # For loop manages its own iteration variable
-                declared.update(self._find_cycle_declared_vars(stmt.body))
-            elif isinstance(stmt, WhileStmt):
-                declared.update(self._find_cycle_declared_vars(stmt.body))
-            # Note: Don't recurse into nested CycleStmt - those have their own scope
-
-        return declared
+        """Find cycle-declared vars - delegated to FlowControlGenerator"""
+        return self._flow_control.find_cycle_declared_vars(stmts)
 
     def _in_cycle_context(self) -> bool:
-        """Check if currently generating code inside a cycle block."""
-        return len(self._cycle_context_stack) > 0
+        """Check if in cycle context - delegated to FlowControlGenerator"""
+        return self._flow_control.in_cycle_context()
 
     def _get_cycle_context(self) -> Optional[Dict]:
-        """Get the current cycle context, or None if not in a cycle."""
-        if self._cycle_context_stack:
-            return self._cycle_context_stack[-1]
-        return None
+        """Get cycle context - delegated to FlowControlGenerator"""
+        return self._flow_control.get_cycle_context()
 
     # ========================================================================
     # Loop Nursery Support - moved to codegen/loops.py - LoopGenerator class
@@ -3548,743 +2400,103 @@ class CodeGenerator:
         return self._loops.generate_for_assign(stmt)
 
     def _generate_break(self):
-        """Generate a break statement"""
-        if self.loop_exit_block:
-            self.builder.branch(self.loop_exit_block)
-    
+        """Generate a break statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_break()
+
     def _generate_continue(self):
-        """Generate a continue statement"""
-        if self.loop_continue_block:
-            self.builder.branch(self.loop_continue_block)
-    
+        """Generate a continue statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_continue()
+
     def _generate_match(self, stmt: MatchStmt):
-        """Generate a match statement"""
-        func = self.builder.function
-        
-        subject = self._generate_expression(stmt.subject)
-        merge_block = func.append_basic_block("match_merge")
-        
-        # For each arm, generate a comparison and branch
-        next_block = None
-        for i, arm in enumerate(stmt.arms):
-            if next_block:
-                self.builder.position_at_end(next_block)
-            
-            arm_block = func.append_basic_block(f"match_arm_{i}")
-            next_block = func.append_basic_block(f"match_next_{i}") if i < len(stmt.arms) - 1 else merge_block
-            
-            # Generate pattern match
-            matched = self._generate_pattern_match(subject, arm.pattern)
-            
-            # Add guard if present
-            if arm.guard:
-                guard_block = func.append_basic_block(f"match_guard_{i}")
-                self.builder.cbranch(matched, guard_block, next_block)
-                self.builder.position_at_end(guard_block)
-                guard = self._generate_expression(arm.guard)
-                guard = self._to_bool(guard)
-                self.builder.cbranch(guard, arm_block, next_block)
-            else:
-                self.builder.cbranch(matched, arm_block, next_block)
-            
-            # Generate arm body
-            self.builder.position_at_end(arm_block)
-            for s in arm.body:
-                self._generate_statement(s)
-                if self.builder.block.is_terminated:
-                    break
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_block)
-        
-        self.builder.position_at_end(merge_block)
-    
+        """Generate a match statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_match(stmt)
+
     def _generate_pattern_match(self, subject: ir.Value, pattern: Pattern) -> ir.Value:
-        """Generate code to match a pattern, returns i1"""
-        if isinstance(pattern, WildcardPattern):
-            return ir.Constant(ir.IntType(1), 1)
-        
-        elif isinstance(pattern, LiteralPattern):
-            literal = self._generate_expression(pattern.value)
-            if isinstance(subject.type, ir.IntType):
-                return self.builder.icmp_signed("==", subject, literal)
-            elif isinstance(subject.type, ir.DoubleType):
-                return self.builder.fcmp_ordered("==", subject, literal)
-            return ir.Constant(ir.IntType(1), 0)
-        
-        elif isinstance(pattern, IdentifierPattern):
-            # Check if this identifier is actually an enum variant (no-arg variant)
-            enum_info = self._find_enum_variant(pattern.name)
-            if enum_info:
-                # This is an enum variant without arguments
-                enum_name, variant_name = enum_info
-                tag, fields = self.enum_variants[enum_name][variant_name]
-                
-                # Get tag from subject
-                tag_ptr = self.builder.gep(subject, [
-                    ir.Constant(ir.IntType(32), 0),
-                    ir.Constant(ir.IntType(32), 0)
-                ], inbounds=True)
-                subject_tag = self.builder.load(tag_ptr)
-                
-                # Compare tags
-                expected_tag = ir.Constant(ir.IntType(64), tag)
-                return self.builder.icmp_signed("==", subject_tag, expected_tag)
-            
-            # Regular identifier - bind value to name
-            alloca = self.builder.alloca(subject.type, name=pattern.name)
-            self.builder.store(subject, alloca)
-            self.locals[pattern.name] = alloca
-            return ir.Constant(ir.IntType(1), 1)
-        
-        elif isinstance(pattern, ConstructorPattern):
-            # Enum variant pattern: Circle(r) or Circle(radius: r)
-            variant_name = pattern.name
-            
-            # Find which enum this variant belongs to
-            enum_info = self._find_enum_variant(variant_name)
-            if not enum_info:
-                # Unknown variant, always fail
-                return ir.Constant(ir.IntType(1), 0)
-            
-            enum_name, _ = enum_info
-            tag, fields = self.enum_variants[enum_name][variant_name]
-            
-            # Get tag from subject
-            tag_ptr = self.builder.gep(subject, [
-                ir.Constant(ir.IntType(32), 0),
-                ir.Constant(ir.IntType(32), 0)
-            ], inbounds=True)
-            subject_tag = self.builder.load(tag_ptr)
-            
-            # Compare tags
-            expected_tag = ir.Constant(ir.IntType(64), tag)
-            tag_match = self.builder.icmp_signed("==", subject_tag, expected_tag)
-            
-            # Bind pattern arguments to fields
-            # pattern.args are the sub-patterns for each field
-            for i, sub_pattern in enumerate(pattern.args):
-                if i < len(fields):
-                    field_name, field_type = fields[i]
-                    
-                    # Get field pointer (index i+1, after tag)
-                    field_ptr = self.builder.gep(subject, [
-                        ir.Constant(ir.IntType(32), 0),
-                        ir.Constant(ir.IntType(32), i + 1)
-                    ], inbounds=True)
-                    field_val = self.builder.load(field_ptr)
+        """Generate pattern match - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_pattern_match(subject, pattern)
 
-                    # Convert back to proper type if needed
-                    if isinstance(field_type, PrimitiveType) and field_type.name == "float":
-                        field_val = self.builder.bitcast(field_val, ir.DoubleType())
-                    # Phase 6: Reference type fields store i64 handles - convert to pointer
-                    elif self._is_reference_type(field_type):
-                        ptr_type = self._get_llvm_type(field_type)
-                        field_val = self.builder.inttoptr(field_val, ptr_type)
-                    
-                    # If sub-pattern is an identifier, bind it
-                    if isinstance(sub_pattern, IdentifierPattern):
-                        alloca = self.builder.alloca(field_val.type, name=sub_pattern.name)
-                        self.builder.store(field_val, alloca)
-                        self.locals[sub_pattern.name] = alloca
-                    # WildcardPattern: don't bind
-                    # Other patterns: would need recursive matching
-            
-            return tag_match
-        
-        # Default: match
-        return ir.Constant(ir.IntType(1), 1)
-    
     # ========================================================================
-    # Expression Generation
+    # Expression Generation - delegated to ExpressionGenerator
     # ========================================================================
-    
+
     def _generate_expression(self, expr: Expr) -> ir.Value:
-        """Generate code for an expression"""
-        if isinstance(expr, IntLiteral):
-            return ir.Constant(ir.IntType(64), expr.value)
-        
-        elif isinstance(expr, FloatLiteral):
-            return ir.Constant(ir.DoubleType(), expr.value)
-        
-        elif isinstance(expr, BoolLiteral):
-            return ir.Constant(ir.IntType(1), 1 if expr.value else 0)
-        
-        elif isinstance(expr, StringLiteral):
-            return self._get_string_ptr(expr.value)
-        
-        elif isinstance(expr, NilLiteral):
-            return ir.Constant(ir.IntType(64), 0)
-        
-        elif isinstance(expr, Identifier):
-            return self._generate_identifier(expr)
-        
-        elif isinstance(expr, BinaryExpr):
-            return self._generate_binary(expr)
-        
-        elif isinstance(expr, UnaryExpr):
-            return self._generate_unary(expr)
-        
-        elif isinstance(expr, CallExpr):
-            return self._generate_call(expr)
-        
-        elif isinstance(expr, MethodCallExpr):
-            return self._generate_method_call(expr)
-        
-        elif isinstance(expr, MemberExpr):
-            return self._generate_member(expr)
-        
-        elif isinstance(expr, IndexExpr):
-            return self._generate_index(expr)
+        """Generate code for an expression - delegated to ExpressionGenerator"""
+        return self._expressions.generate_expression(expr)
 
-        elif isinstance(expr, SliceExpr):
-            return self._generate_slice(expr)
+    # The following expression methods are kept for backwards compatibility
+    # and are delegated to the ExpressionGenerator
 
-        elif isinstance(expr, TernaryExpr):
-            return self._generate_ternary(expr)
-        
-        elif isinstance(expr, ListExpr):
-            return self._generate_list(expr)
-        
-        elif isinstance(expr, MapExpr):
-            return self._generate_map(expr)
-
-        elif isinstance(expr, SetExpr):
-            return self._generate_set(expr)
-
-        elif isinstance(expr, JsonObjectExpr):
-            return self._generate_json_object(expr)
-
-        elif isinstance(expr, ListComprehension):
-            return self._generate_list_comprehension(expr)
-        
-        elif isinstance(expr, SetComprehension):
-            return self._generate_set_comprehension(expr)
-        
-        elif isinstance(expr, MapComprehension):
-            return self._generate_map_comprehension(expr)
-        
-        elif isinstance(expr, TupleExpr):
-            return self._generate_tuple(expr)
-        
-        elif isinstance(expr, RangeExpr):
-            return self._generate_range(expr)
-        
-        elif isinstance(expr, LambdaExpr):
-            return self._generate_lambda(expr)
-        
-        elif isinstance(expr, SelfExpr):
-            # Return self pointer if available
-            if "self" in self.locals:
-                return self.builder.load(self.locals["self"])
-            return ir.Constant(ir.IntType(64), 0)
-        
-        elif isinstance(expr, CellExpr):
-            # Matrix cell reference - current cell value
-            return self._generate_cell_access()
-        
-        elif isinstance(expr, CellIndexExpr):
-            # Matrix cell[dx, dy] - relative neighbor access
-            return self._generate_cell_index_access(expr)
-
-        elif isinstance(expr, LlvmIrExpr):
-            return self._generate_llvm_ir_block(expr)
-
-        elif isinstance(expr, AsExpr):
-            return self._generate_as_expr(expr)
-
-        else:
-            return ir.Constant(ir.IntType(64), 0)
-    
     def _generate_identifier(self, expr: Identifier) -> ir.Value:
-        """Generate code for identifier reference"""
-        name = expr.name
+        """Generate code for identifier - delegated to ExpressionGenerator"""
+        return self._expressions.generate_identifier(expr)
 
-        # Check for use-after-move
-        if name in self.moved_vars:
-            raise RuntimeError(
-                f"Use of moved variable '{name}': variable was moved and can no longer be used. "
-                f"Assign a new value to '{name}' before using it again."
-            )
-
-        # Check if we're in a cycle and this is a cycle variable
-        ctx = self._get_cycle_context()
-        if ctx and name in ctx['cycle_vars']:
-            # Read from read buffer (previous generation)
-            read_buf = ctx['read_buffers'][name]
-            return self.builder.load(read_buf, name=name)
-
-        if name in self.locals:
-            return self.builder.load(self.locals[name], name=name)
-        elif name in self.functions:
-            return self.functions[name]
-        else:
-            # Check if it's a field access in a method context
-            if self.current_type and "self" in self.locals:
-                field_idx = self._get_field_index(self.current_type, name)
-                if field_idx is not None:
-                    self_ptr = self.builder.load(self.locals["self"])
-                    field_ptr = self.builder.gep(self_ptr, [
-                        ir.Constant(ir.IntType(32), 0),
-                        ir.Constant(ir.IntType(32), field_idx)
-                    ], inbounds=True)
-                    return self.builder.load(field_ptr, name=name)
-            
-            # Unknown variable - raise error
-            raise RuntimeError(f"Undeclared identifier '{name}': variable has not been declared in this scope")
-    
     def _generate_binary(self, expr: BinaryExpr) -> ir.Value:
-        """Generate code for binary expression"""
-        # Short-circuit evaluation for logical ops
-        if expr.op == BinaryOp.AND:
-            return self._generate_short_circuit_and(expr)
-        elif expr.op == BinaryOp.OR:
-            return self._generate_short_circuit_or(expr)
-        
-        left = self._generate_expression(expr.left)
-        right = self._generate_expression(expr.right)
-        
-        # Check for String operations
-        is_string = (isinstance(left.type, ir.PointerType) and 
-                     hasattr(left.type.pointee, 'name') and 
-                     left.type.pointee.name == "struct.String")
-        
-        if is_string:
-            if expr.op == BinaryOp.ADD:
-                # String concatenation: a + b -> string_concat(a, b)
-                return self.builder.call(self.string_concat, [left, right])
-            elif expr.op == BinaryOp.EQ:
-                # String equality: a == b -> string_eq(a, b)
-                return self.builder.call(self.string_eq, [left, right])
-            elif expr.op == BinaryOp.NE:
-                # String inequality: a != b -> !string_eq(a, b)
-                eq_result = self.builder.call(self.string_eq, [left, right])
-                return self.builder.not_(eq_result)
-        
-        # Promote types if needed
-        if left.type != right.type:
-            if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.DoubleType):
-                left = self.builder.sitofp(left, ir.DoubleType())
-            elif isinstance(left.type, ir.DoubleType) and isinstance(right.type, ir.IntType):
-                right = self.builder.sitofp(right, ir.DoubleType())
-            elif isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-                # Promote smaller to larger
-                if left.type.width < right.type.width:
-                    left = self.builder.sext(left, right.type)
-                elif right.type.width < left.type.width:
-                    right = self.builder.sext(right, left.type)
-        
-        is_float = isinstance(left.type, ir.DoubleType)
-        
-        if expr.op == BinaryOp.ADD:
-            return self.builder.fadd(left, right) if is_float else self.builder.add(left, right)
-        elif expr.op == BinaryOp.SUB:
-            return self.builder.fsub(left, right) if is_float else self.builder.sub(left, right)
-        elif expr.op == BinaryOp.MUL:
-            return self.builder.fmul(left, right) if is_float else self.builder.mul(left, right)
-        elif expr.op == BinaryOp.DIV:
-            return self.builder.fdiv(left, right) if is_float else self.builder.sdiv(left, right)
-        elif expr.op == BinaryOp.MOD:
-            return self.builder.frem(left, right) if is_float else self.builder.srem(left, right)
-        elif expr.op == BinaryOp.EQ:
-            return self.builder.fcmp_ordered("==", left, right) if is_float else self.builder.icmp_signed("==", left, right)
-        elif expr.op == BinaryOp.NE:
-            return self.builder.fcmp_ordered("!=", left, right) if is_float else self.builder.icmp_signed("!=", left, right)
-        elif expr.op == BinaryOp.LT:
-            return self.builder.fcmp_ordered("<", left, right) if is_float else self.builder.icmp_signed("<", left, right)
-        elif expr.op == BinaryOp.GT:
-            return self.builder.fcmp_ordered(">", left, right) if is_float else self.builder.icmp_signed(">", left, right)
-        elif expr.op == BinaryOp.LE:
-            return self.builder.fcmp_ordered("<=", left, right) if is_float else self.builder.icmp_signed("<=", left, right)
-        elif expr.op == BinaryOp.GE:
-            return self.builder.fcmp_ordered(">=", left, right) if is_float else self.builder.icmp_signed(">=", left, right)
-        elif expr.op == BinaryOp.NULL_COALESCE:
-            # a ?? b -> if a has value, return unwrapped a, else return b
-            # Handle optional types (struct {i1, T})
-            if isinstance(left.type, ir.LiteralStructType) and len(left.type.elements) == 2:
-                if isinstance(left.type.elements[0], ir.IntType) and left.type.elements[0].width == 1:
-                    # This is an optional type - extract has_value and value
-                    has_value = self.builder.extract_value(left, 0, name="has_value")
-                    value = self.builder.extract_value(left, 1, name="opt_value")
-                    return self.builder.select(has_value, value, right)
-            # Handle pointer types (nil = null pointer)
-            elif isinstance(left.type, ir.PointerType):
-                null_ptr = ir.Constant(left.type, None)
-                is_not_null = self.builder.icmp_unsigned("!=", left, null_ptr)
-                return self.builder.select(is_not_null, left, right)
-            # Fallback: treat as boolean check
-            cond = self._to_bool(left)
-            return self.builder.select(cond, left, right)
-        
-        return ir.Constant(ir.IntType(64), 0)
-    
-    def _generate_short_circuit_and(self, expr: BinaryExpr) -> ir.Value:
-        """Generate short-circuit AND"""
-        func = self.builder.function
-        
-        eval_right = func.append_basic_block("and_right")
-        merge = func.append_basic_block("and_merge")
-        
-        left = self._generate_expression(expr.left)
-        left_bool = self._to_bool(left)
-        left_block = self.builder.block
-        
-        self.builder.cbranch(left_bool, eval_right, merge)
-        
-        self.builder.position_at_end(eval_right)
-        right = self._generate_expression(expr.right)
-        right_bool = self._to_bool(right)
-        right_block = self.builder.block
-        self.builder.branch(merge)
-        
-        self.builder.position_at_end(merge)
-        phi = self.builder.phi(ir.IntType(1))
-        phi.add_incoming(ir.Constant(ir.IntType(1), 0), left_block)
-        phi.add_incoming(right_bool, right_block)
-        
-        return phi
-    
-    def _generate_short_circuit_or(self, expr: BinaryExpr) -> ir.Value:
-        """Generate short-circuit OR"""
-        func = self.builder.function
-        
-        eval_right = func.append_basic_block("or_right")
-        merge = func.append_basic_block("or_merge")
-        
-        left = self._generate_expression(expr.left)
-        left_bool = self._to_bool(left)
-        left_block = self.builder.block
-        
-        self.builder.cbranch(left_bool, merge, eval_right)
-        
-        self.builder.position_at_end(eval_right)
-        right = self._generate_expression(expr.right)
-        right_bool = self._to_bool(right)
-        right_block = self.builder.block
-        self.builder.branch(merge)
-        
-        self.builder.position_at_end(merge)
-        phi = self.builder.phi(ir.IntType(1))
-        phi.add_incoming(ir.Constant(ir.IntType(1), 1), left_block)
-        phi.add_incoming(right_bool, right_block)
-        
-        return phi
-    
+        """Generate code for binary expression - delegated to ExpressionGenerator"""
+        return self._expressions.generate_binary(expr)
+
     def _generate_unary(self, expr: UnaryExpr) -> ir.Value:
-        """Generate code for unary expression"""
-        operand = self._generate_expression(expr.operand)
-        
-        if expr.op == UnaryOp.NEG:
-            if isinstance(operand.type, ir.DoubleType):
-                return self.builder.fneg(operand)
-            else:
-                return self.builder.neg(operand)
-        elif expr.op == UnaryOp.NOT:
-            if operand.type == ir.IntType(1):
-                return self.builder.not_(operand)
-            else:
-                # Compare to zero
-                cond = self._to_bool(operand)
-                return self.builder.not_(cond)
-        elif expr.op == UnaryOp.AWAIT:
-            # In sequential mode, await just returns the value
-            return operand
-        
-        return operand
-    
+        """Generate code for unary expression - delegated to ExpressionGenerator"""
+        return self._expressions.generate_unary(expr)
+
     def _generate_call(self, expr: CallExpr) -> ir.Value:
-        """Generate code for function call"""
-        if isinstance(expr.callee, Identifier):
-            name = expr.callee.name
-            explicit_type_args = expr.callee.type_args if hasattr(expr.callee, 'type_args') else []
+        """Generate code for function call - delegated to ExpressionGenerator"""
+        return self._expressions.generate_call(expr)
 
-            # Handle Array constructor specially: Array(capacity, initial_value)
-            # This needs special handling because Array is a built-in type
-            if name == "Array":
-                return self._generate_array_constructor(expr.args)
+    def _generate_method_call(self, expr: MethodCallExpr) -> ir.Value:
+        """Generate code for method call - delegated to ExpressionGenerator"""
+        return self._expressions.generate_method_call(expr)
 
-            # Check if this is a type constructor: Point(x: 1, y: 2)
-            if name in self.type_registry:
-                return self._generate_type_constructor(name, expr.args, expr.named_args)
-            
-            # Check if this is a generic type constructor: Pair<int, float>(first: 1, second: 2.0)
-            if name in self.generic_types:
-                # Use explicit type args if provided, otherwise infer
-                if explicit_type_args:
-                    type_args = explicit_type_args
-                else:
-                    type_args = self._infer_type_args_from_constructor(name, expr.args, expr.named_args)
-                if type_args:
-                    mangled_name = self._monomorphize_type(name, type_args)
-                    return self._generate_type_constructor(mangled_name, expr.args, expr.named_args)
-            
-            # Check if this is an enum variant constructor: Circle(radius: 5.0)
-            enum_info = self._find_enum_variant(name)
-            if enum_info:
-                enum_name, variant_name = enum_info
-                return self._generate_enum_constructor(enum_name, variant_name, expr.args, expr.named_args)
-            
-            # Built-in functions
-            if name == "range":
-                # range() returns iterator - handle in for loop
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_member(self, expr: MemberExpr) -> ir.Value:
+        """Generate code for member access - delegated to ExpressionGenerator"""
+        return self._expressions.generate_member(expr)
 
-            if name == "str":
-                # str(x) - for now just return the value
-                if expr.args:
-                    return self._generate_expression(expr.args[0])
-                return ir.Constant(ir.IntType(64), 0)
-            
-            if name == "int":
-                if expr.args:
-                    val = self._generate_expression(expr.args[0])
-                    if isinstance(val.type, ir.DoubleType):
-                        return self.builder.fptosi(val, ir.IntType(64))
-                    return self._cast_value(val, ir.IntType(64))
-                return ir.Constant(ir.IntType(64), 0)
-            
-            if name == "float":
-                if expr.args:
-                    val = self._generate_expression(expr.args[0])
-                    if isinstance(val.type, ir.IntType):
-                        return self.builder.sitofp(val, ir.DoubleType())
-                    return val
-                return ir.Constant(ir.DoubleType(), 0.0)
-            
-            if name == "sqrt":
-                # Would need to link math library
-                if expr.args:
-                    val = self._generate_expression(expr.args[0])
-                    # For now just return the value
-                    return val
-                return ir.Constant(ir.DoubleType(), 0.0)
+    def _generate_index(self, expr: IndexExpr) -> ir.Value:
+        """Generate code for index access - delegated to ExpressionGenerator"""
+        return self._expressions.generate_index(expr)
 
-            if name == "gc":
-                # Trigger garbage collection (waits for completion)
-                self.builder.call(self.gc.gc_collect, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_slice(self, expr: SliceExpr) -> ir.Value:
+        """Generate code for slice access - delegated to ExpressionGenerator"""
+        return self._expressions.generate_slice(expr)
 
-            if name == "gc_async":
-                # Trigger async garbage collection (returns immediately)
-                self.builder.call(self.gc.gc_async, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_ternary(self, expr: TernaryExpr) -> ir.Value:
+        """Generate code for ternary expression - delegated to ExpressionGenerator"""
+        return self._expressions.generate_ternary(expr)
 
-            # Phase 0: GC debugging infrastructure builtins
-            if name == "gc_dump_stats":
-                # Print GC statistics
-                self.builder.call(self.gc.gc_dump_stats, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_list(self, expr: ListExpr) -> ir.Value:
+        """Generate code for list literal - delegated to ExpressionGenerator"""
+        return self._expressions.generate_list(expr)
 
-            if name == "gc_dump_heap":
-                # Print all objects in the heap
-                self.builder.call(self.gc.gc_dump_heap, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_map(self, expr: MapExpr) -> ir.Value:
+        """Generate code for map literal - delegated to ExpressionGenerator"""
+        return self._expressions.generate_map(expr)
 
-            if name == "gc_dump_roots":
-                # Print all roots from shadow stack
-                self.builder.call(self.gc.gc_dump_roots, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_set(self, expr: SetExpr) -> ir.Value:
+        """Generate code for set literal - delegated to ExpressionGenerator"""
+        return self._expressions.generate_set(expr)
 
-            if name == "gc_validate_heap":
-                # Validate heap integrity - returns 0 if valid, error code otherwise
-                result = self.builder.call(self.gc.gc_validate_heap, [])
-                return result
+    def _generate_tuple(self, expr: TupleExpr) -> ir.Value:
+        """Generate code for tuple literal - delegated to ExpressionGenerator"""
+        return self._expressions.generate_tuple(expr)
 
-            if name == "gc_set_trace_level":
-                # Set GC trace verbosity level (0-4)
-                if expr.args:
-                    level = self._generate_expression(expr.args[0])
-                    if level.type != ir.IntType(64):
-                        level = self.builder.sext(level, ir.IntType(64))
-                    self.builder.call(self.gc.gc_set_trace_level, [level])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_range(self, expr: RangeExpr) -> ir.Value:
+        """Generate code for range expression - delegated to ExpressionGenerator"""
+        return self._expressions.generate_range(expr)
 
-            if name == "gc_fragmentation_report":
-                # Print heap fragmentation analysis
-                self.builder.call(self.gc.gc_fragmentation_report, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_cell_access(self) -> ir.Value:
+        """Generate code for cell access - delegated to ExpressionGenerator"""
+        return self._expressions.generate_cell_access()
 
-            if name == "gc_dump_handle_table":
-                # Print handle table state
-                self.builder.call(self.gc.gc_dump_handle_table, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _generate_cell_index_access(self, expr: CellIndexExpr) -> ir.Value:
+        """Generate code for cell index access - delegated to ExpressionGenerator"""
+        return self._expressions.generate_cell_index_access(expr)
 
-            if name == "gc_dump_shadow_stacks":
-                # Print shadow stack frames and roots
-                self.builder.call(self.gc.gc_dump_shadow_stacks, [])
-                return ir.Constant(ir.IntType(64), 0)
+    def _bind_pattern(self, pattern, value):
+        """Bind pattern variables - delegated to ExpressionGenerator"""
+        return self._expressions.bind_pattern(pattern, value)
 
-            if name == "print":
-                # print(value) - generate appropriate print based on type
-                if expr.args:
-                    value = self._generate_expression(expr.args[0])
-                    
-                    if isinstance(value.type, ir.IntType):
-                        if value.type.width == 1:
-                            # Boolean
-                            true_block = self.builder.append_basic_block("print_true")
-                            false_block = self.builder.append_basic_block("print_false")
-                            merge_block = self.builder.append_basic_block("print_merge")
-                            
-                            self.builder.cbranch(value, true_block, false_block)
-                            
-                            self.builder.position_at_end(true_block)
-                            fmt_ptr = self.builder.bitcast(self._true_str, ir.IntType(8).as_pointer())
-                            self.builder.call(self.printf, [fmt_ptr])
-                            self.builder.branch(merge_block)
-                            
-                            self.builder.position_at_end(false_block)
-                            fmt_ptr = self.builder.bitcast(self._false_str, ir.IntType(8).as_pointer())
-                            self.builder.call(self.printf, [fmt_ptr])
-                            self.builder.branch(merge_block)
-                            
-                            self.builder.position_at_end(merge_block)
-                        else:
-                            # Integer
-                            fmt_ptr = self.builder.bitcast(self._int_fmt, ir.IntType(8).as_pointer())
-                            if value.type.width < 64:
-                                value = self.builder.sext(value, ir.IntType(64))
-                            self.builder.call(self.printf, [fmt_ptr, value])
-                    
-                    elif isinstance(value.type, ir.DoubleType):
-                        fmt_ptr = self.builder.bitcast(self._float_fmt, ir.IntType(8).as_pointer())
-                        self.builder.call(self.printf, [fmt_ptr, value])
-                    
-                    elif isinstance(value.type, ir.PointerType):
-                        pointee = value.type.pointee
-                        if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                            self.builder.call(self.string_print, [value])
-                        else:
-                            fmt_ptr = self.builder.bitcast(self._str_fmt, ir.IntType(8).as_pointer())
-                            self.builder.call(self.printf, [fmt_ptr, value])
-
-                    # Flush stdout to ensure output appears in correct order
-                    null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
-                    self.builder.call(self.fflush, [null_ptr])
-
-                return ir.Constant(ir.IntType(64), 0)
-
-            # Check for replace alias: abs -> math.abs
-            if name in self.replace_aliases:
-                module_name, qualified_name = self.replace_aliases[name]
-                module_info = self.loaded_modules[module_name]
-                if qualified_name in module_info.functions:
-                    mangled = module_info.functions[qualified_name]
-                    func = self.functions[mangled]
-                    args = []
-                    for i, arg in enumerate(expr.args):
-                        arg_val = self._generate_expression(arg)
-                        if i < len(func.args):
-                            expected = func.args[i].type
-                            arg_val = self._cast_value(arg_val, expected)
-                        args.append(arg_val)
-                    return self.builder.call(func, args)
-                else:
-                    raise RuntimeError(f"Function '{qualified_name}' not found in module '{module_name}'")
-
-            # Check if this is an extern function call
-            extern_decls = getattr(self, 'extern_function_decls', {})
-            if name in extern_decls:
-                return self._generate_extern_call(name, expr.args, extern_decls[name])
-
-            # Look up function
-            if name in self.functions:
-                func = self.functions[name]
-                args = []
-                for i, arg in enumerate(expr.args):
-                    arg_val = self._generate_expression(arg)
-                    # Cast to expected type
-                    if i < len(func.args):
-                        expected = func.args[i].type
-                        arg_val = self._cast_value(arg_val, expected)
-                    args.append(arg_val)
-                return self.builder.call(func, args)
-            
-            # Check for generic function
-            if name in self.generic_functions:
-                # Use explicit type args if provided, otherwise infer
-                if explicit_type_args:
-                    type_args = explicit_type_args
-                else:
-                    type_args = self._infer_type_args(name, expr.args)
-                if type_args:
-                    mangled = self._monomorphize_function(name, type_args)
-                    func = self.functions[mangled]
-                    args = []
-                    for i, arg in enumerate(expr.args):
-                        arg_val = self._generate_expression(arg)
-                        if i < len(func.args):
-                            expected = func.args[i].type
-                            arg_val = self._cast_value(arg_val, expected)
-                        args.append(arg_val)
-                    return self.builder.call(func, args)
-        
-        elif isinstance(expr.callee, MemberExpr):
-            # Check for module-qualified call: module.function(args)
-            if isinstance(expr.callee.object, Identifier):
-                possible_module = expr.callee.object.name
-                func_name = expr.callee.member
-
-                # Check if this is a loaded module
-                if possible_module in self.loaded_modules:
-                    module_info = self.loaded_modules[possible_module]
-                    if func_name in module_info.functions:
-                        mangled = module_info.functions[func_name]
-                        func = self.functions[mangled]
-                        args = []
-                        for i, arg in enumerate(expr.args):
-                            arg_val = self._generate_expression(arg)
-                            if i < len(func.args):
-                                expected = func.args[i].type
-                                arg_val = self._cast_value(arg_val, expected)
-                            args.append(arg_val)
-                        return self.builder.call(func, args)
-                    else:
-                        raise RuntimeError(f"Function '{func_name}' not found in module '{possible_module}'")
-
-            # Check for Type.new() pattern
-            if isinstance(expr.callee.object, Identifier):
-                type_name = expr.callee.object.name
-                if type_name in self.type_registry and expr.callee.member == "new":
-                    return self._generate_type_new(type_name, expr.args)
-
-                # Check for EnumType.VariantName(args) pattern
-                if type_name in self.enum_variants:
-                    variant_name = expr.callee.member
-                    if variant_name in self.enum_variants[type_name]:
-                        return self._generate_enum_constructor(type_name, variant_name, expr.args, expr.named_args)
-
-            # Static method call: Type.method()
-            return self._generate_method_call(MethodCallExpr(
-                expr.callee.object, expr.callee.member, expr.args))
-        
-        # If we get here with an Identifier callee, check if it's a function pointer in locals
-        if isinstance(expr.callee, Identifier):
-            name = expr.callee.name
-            if name in self.locals:
-                # Load the function pointer
-                ptr = self.locals[name]
-                func_ptr = self.builder.load(ptr)
-                
-                # Check if it's a function pointer type
-                if isinstance(func_ptr.type, ir.PointerType) and isinstance(func_ptr.type.pointee, ir.FunctionType):
-                    # Generate arguments
-                    args = []
-                    for arg in expr.args:
-                        arg_val = self._generate_expression(arg)
-                        args.append(arg_val)
-                    
-                    # Indirect call through function pointer
-                    return self.builder.call(func_ptr, args)
-                
-                # Also handle case where func_ptr IS a function (not a pointer to pointer)
-                if isinstance(func_ptr.type, ir.FunctionType):
-                    args = []
-                    for arg in expr.args:
-                        arg_val = self._generate_expression(arg)
-                        args.append(arg_val)
-                    return self.builder.call(func_ptr, args)
-        
-        return ir.Constant(ir.IntType(64), 0)
+    # ========================================================================
+    # Constructor Methods (kept in core.py, called from expressions.py)
+    # ========================================================================
 
     def _generate_array_constructor(self, args: PyList['Expr']) -> ir.Value:
         """Generate code for Array(capacity, initial_value) constructor.
