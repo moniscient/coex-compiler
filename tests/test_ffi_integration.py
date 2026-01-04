@@ -184,6 +184,10 @@ class TestRuntimeLibrary:
             text=True
         )
 
+        # Skip if nm can't read the library format (cross-platform: e.g., macOS lib on Linux)
+        if "file format not recognized" in result.stderr:
+            pytest.skip("nm cannot read library format (cross-platform build)")
+
         # Check for key FFI support functions
         assert "coex_ffi_instance_create" in result.stdout
         assert "coex_ffi_instance_destroy" in result.stdout
