@@ -42,6 +42,9 @@ from codegen.result import ResultGenerator
 # Import Matrix/CA generator module
 from codegen.matrix import MatrixGenerator
 
+# Import Module/FFI generator module
+from codegen.modules import ModuleGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -384,6 +387,9 @@ class CodeGenerator:
         self.current_matrix: Optional[str] = None
         self.current_cell_x: Optional[ir.Value] = None
         self.current_cell_y: Optional[ir.Value] = None
+
+        # Module/FFI helpers moved to codegen/modules.py - ModuleGenerator class
+        self._modules = ModuleGenerator(self)
 
     # List helpers moved to codegen/list.py - ListGenerator class
     # HAMT/Map/Set helpers moved to codegen/hamt.py - HamtGenerator class
@@ -1193,10 +1199,10 @@ class CodeGenerator:
         for imp in program.imports:
             if imp.is_library:
                 # Library import: import "path/to/lib.cxz"
-                self._load_library(imp.library_path, imp.module)
+                self._modules.load_library(imp.library_path, imp.module)
             else:
                 # Module import: import math
-                self._load_module(imp.module)
+                self._modules.load_module(imp.module)
 
         # Register replace aliases
         for rep in program.replaces:
@@ -1270,323 +1276,9 @@ class CodeGenerator:
         return self.get_ir()
 
     # ========================================================================
-    # Module Loading
+    # Module Loading and FFI Library Loading
+    # moved to codegen/modules.py - ModuleGenerator class
     # ========================================================================
-
-    def _find_module_file(self, module_name: str) -> Optional[tuple]:
-        """Find module file in search paths.
-
-        Returns:
-            Tuple of (path, is_library) where is_library is True for .cxz files,
-            or None if not found.
-        """
-        # Check for both .coex (source) and .cxz (library) files
-        # Prefer .coex if both exist
-        for ext, is_library in [('.coex', False), ('.cxz', True)]:
-            filename = f"{module_name}{ext}"
-            for path in self.module_search_paths:
-                full_path = os.path.join(path, filename)
-                if os.path.exists(full_path):
-                    return (full_path, is_library)
-
-        return None
-
-    def _load_module(self, module_name: str) -> ModuleInfo:
-        """Load and compile a module, returning its info"""
-        # Check cache
-        if module_name in self.loaded_modules:
-            return self.loaded_modules[module_name]
-
-        # Find module file (checks both .coex and .cxz)
-        result = self._find_module_file(module_name)
-        if not result:
-            searched = ", ".join(self.module_search_paths)
-            raise RuntimeError(f"Module not found: {module_name} (searched: {searched})")
-
-        module_path, is_library = result
-
-        # If it's a .cxz library, delegate to library loader
-        if is_library:
-            self._load_library(module_path, module_name)
-            # Create a placeholder ModuleInfo for consistency
-            # The actual symbols are in loaded_libraries
-            return ModuleInfo(name=module_name, path=module_path, program=None)
-
-        # Parse module
-        from antlr4 import FileStream, CommonTokenStream
-        from CoexLexer import CoexLexer
-        from CoexParser import CoexParser
-        from ast_builder import ASTBuilder
-
-        input_stream = FileStream(module_path)
-        lexer = CoexLexer(input_stream)
-        token_stream = CommonTokenStream(lexer)
-        parser = CoexParser(token_stream)
-        tree = parser.program()
-
-        builder = ASTBuilder()
-        program = builder.build(tree)
-
-        # Create module info
-        module_info = ModuleInfo(
-            name=module_name,
-            path=module_path,
-            program=program,
-        )
-
-        # Generate code for module with name mangling
-        saved_module = self.current_module
-        self.current_module = module_name
-
-        self._generate_module_contents(program, module_info)
-
-        self.current_module = saved_module
-        self.loaded_modules[module_name] = module_info
-
-        return module_info
-
-    def _generate_module_contents(self, program: Program, module_info: ModuleInfo):
-        """Generate code for module contents with name mangling"""
-        prefix = f"__{module_info.name}__"
-
-        # Register traits from module
-        for trait_decl in program.traits:
-            self._register_trait(trait_decl)
-
-        # Register types with mangled names
-        mangled_type_decls = []
-        for type_decl in program.types:
-            mangled = f"{prefix}{type_decl.name}"
-            # Store original name mapping
-            module_info.types[type_decl.name] = mangled
-            # Create a copy of the type decl with mangled name
-            mangled_type_decl = TypeDecl(
-                name=mangled,
-                type_params=type_decl.type_params,
-                fields=type_decl.fields,
-                methods=type_decl.methods,
-                variants=type_decl.variants
-            )
-            self._register_type(mangled_type_decl)
-            mangled_type_decls.append(mangled_type_decl)
-
-            # Also register under unqualified name for use within this library's methods
-            # This allows Regex(handle, pattern) to work inside compile_flags()
-            if type_decl.name not in self.type_registry:
-                self.type_registry[type_decl.name] = self.type_registry[mangled]
-            if type_decl.name not in self.type_fields:
-                self.type_fields[type_decl.name] = self.type_fields[mangled]
-            if mangled in self.type_methods and type_decl.name not in self.type_methods:
-                self.type_methods[type_decl.name] = self.type_methods[mangled]
-
-        # Declare type methods (must happen before generating functions that may call them)
-        for mangled_type_decl in mangled_type_decls:
-            self._declare_type_methods(mangled_type_decl)
-
-        # Register method functions under unqualified names for static method calls
-        # e.g., __regex__Regex_compile_flags -> Regex_compile_flags
-        for type_decl in program.types:
-            mangled_type_name = f"{prefix}{type_decl.name}"
-            if mangled_type_name in self.type_methods:
-                for method_name, mangled_method in self.type_methods[mangled_type_name].items():
-                    unqualified_method = f"{type_decl.name}_{method_name}"
-                    if mangled_method in self.functions and unqualified_method not in self.functions:
-                        self.functions[unqualified_method] = self.functions[mangled_method]
-
-        # Declare and generate functions with mangled names
-        for func in program.functions:
-            if func.name == "main":
-                continue  # Skip main in modules
-
-            # Extern functions should NOT be mangled - they link to C code
-            if func.kind == FunctionKind.EXTERN:
-                # Use original name for extern functions
-                module_info.functions[func.name] = func.name
-                self.func_decls[func.name] = func
-                self._declare_function(func)
-                continue
-
-            mangled = f"{prefix}{func.name}"
-            module_info.functions[func.name] = mangled
-
-            # Create mangled function declaration
-            mangled_func = FunctionDecl(
-                kind=func.kind,
-                name=mangled,
-                type_params=func.type_params,
-                params=func.params,
-                return_type=func.return_type,
-                body=func.body
-            )
-
-            # Store for return type inference
-            self.func_decls[mangled] = mangled_func
-
-            # Declare and generate
-            self._declare_function(mangled_func)
-            self._generate_function(mangled_func)
-
-        # Generate type method bodies
-        for mangled_type_decl in mangled_type_decls:
-            self._generate_type_methods(mangled_type_decl)
-
-    # ========================================================================
-    # FFI Library Loading
-    # ========================================================================
-
-    def _load_library(self, library_path: str, library_name: str):
-        """Load a .cxz library and register its FFI symbols.
-
-        Args:
-            library_path: Path to the .cxz file (relative or absolute)
-            library_name: Extracted library name (e.g., "regex" from "regex.cxz")
-        """
-        # Check if already loaded
-        if library_name in self.loaded_libraries:
-            return self.loaded_libraries[library_name]
-
-        # Initialize CXZ loader lazily
-        if self.cxz_loader is None:
-            self.cxz_loader = CXZLoader(search_paths=self.module_search_paths)
-
-        # Load the library
-        try:
-            loaded_lib = self.cxz_loader.load(library_path)
-        except CXZError as e:
-            raise RuntimeError(f"Failed to load library '{library_name}': {e}")
-
-        # Create library info
-        lib_info = LibraryInfo(
-            name=library_name,
-            path=library_path,
-            loaded_lib=loaded_lib,
-            symbols=loaded_lib.get_ffi_symbols()
-        )
-        self.loaded_libraries[library_name] = lib_info
-
-        # Aggregate FFI symbols for quick lookup
-        for sym_name, sym in lib_info.symbols.items():
-            self.ffi_symbols[sym_name] = sym
-
-        # Collect link arguments
-        self.ffi_link_args.extend(loaded_lib.get_link_args())
-
-        # Declare FFI runtime functions if not already done
-        self._declare_ffi_runtime()
-
-        # Parse and process the library's Coex source files
-        self._process_library_sources(lib_info)
-
-        return lib_info
-
-    def _process_library_sources(self, lib_info: LibraryInfo):
-        """Process Coex source files from a library.
-
-        Parses extern declarations and registers them, along with
-        types and wrapper functions defined in the library.
-        """
-        from antlr4 import CommonTokenStream, InputStream
-        from CoexLexer import CoexLexer
-        from CoexParser import CoexParser
-        from ast_builder import ASTBuilder
-
-        for filename, source in lib_info.loaded_lib.coex_sources.items():
-            # Parse the source
-            input_stream = InputStream(source)
-            lexer = CoexLexer(input_stream)
-            token_stream = CommonTokenStream(lexer)
-            parser = CoexParser(token_stream)
-            tree = parser.program()
-
-            builder = ASTBuilder()
-            program = builder.build(tree)
-
-            # Create a pseudo-module for this library source
-            module_info = ModuleInfo(
-                name=lib_info.name,
-                path=f"{lib_info.path}:{filename}",
-                program=program
-            )
-
-            # Process the contents with library name prefix
-            saved_module = self.current_module
-            self.current_module = lib_info.name
-
-            # Register types and generate functions from library
-            self._generate_module_contents(program, module_info)
-
-            self.current_module = saved_module
-
-            # Also register the module info for qualified access
-            if lib_info.name not in self.loaded_modules:
-                self.loaded_modules[lib_info.name] = module_info
-
-            # Register library functions under their unqualified names for direct access
-            # This allows users to call regex_match() instead of regex.regex_match()
-            for original_name, mangled_name in module_info.functions.items():
-                if mangled_name in self.functions and original_name not in self.functions:
-                    self.functions[original_name] = self.functions[mangled_name]
-
-            # Also register extern function declarations for the library
-            if hasattr(self, 'extern_function_decls'):
-                for original_name, mangled_name in module_info.functions.items():
-                    if mangled_name in self.extern_function_decls and original_name not in self.extern_function_decls:
-                        self.extern_function_decls[original_name] = self.extern_function_decls[mangled_name]
-
-            # Register library types under their unqualified names for direct access
-            # This allows users to use Regex instead of regex.Regex
-            for original_name, mangled_name in module_info.types.items():
-                if mangled_name in self.type_registry and original_name not in self.type_registry:
-                    self.type_registry[original_name] = self.type_registry[mangled_name]
-                if mangled_name in self.type_fields and original_name not in self.type_fields:
-                    self.type_fields[original_name] = self.type_fields[mangled_name]
-                if mangled_name in self.type_methods and original_name not in self.type_methods:
-                    self.type_methods[original_name] = self.type_methods[mangled_name]
-                    # Also register method functions under unqualified names
-                    # e.g., __regex__Regex_compile_flags -> Regex_compile_flags
-                    for method_name, mangled_method in self.type_methods[mangled_name].items():
-                        unqualified_method = f"{original_name}_{method_name}"
-                        if mangled_method in self.functions and unqualified_method not in self.functions:
-                            self.functions[unqualified_method] = self.functions[mangled_method]
-
-    def _declare_ffi_runtime(self):
-        """Declare the FFI runtime support functions."""
-        if self._ffi_runtime_declared:
-            return
-
-        i64 = ir.IntType(64)
-        i8_ptr = ir.IntType(8).as_pointer()
-        void = ir.VoidType()
-
-        # int64_t coex_ffi_instance_create(const char* library_name)
-        create_type = ir.FunctionType(i64, [i8_ptr])
-        self._ffi_instance_create = ir.Function(
-            self.module, create_type, name="coex_ffi_instance_create"
-        )
-        self._ffi_instance_create.linkage = 'external'
-
-        # void coex_ffi_instance_destroy(int64_t instance_id)
-        destroy_type = ir.FunctionType(void, [i64])
-        self._ffi_instance_destroy = ir.Function(
-            self.module, destroy_type, name="coex_ffi_instance_destroy"
-        )
-        self._ffi_instance_destroy.linkage = 'external'
-
-        # void coex_ffi_enter(int64_t instance_id)
-        enter_type = ir.FunctionType(void, [i64])
-        self._ffi_enter = ir.Function(
-            self.module, enter_type, name="coex_ffi_enter"
-        )
-        self._ffi_enter.linkage = 'external'
-
-        # void coex_ffi_exit(int64_t instance_id)
-        exit_type = ir.FunctionType(void, [i64])
-        self._ffi_exit = ir.Function(
-            self.module, exit_type, name="coex_ffi_exit"
-        )
-        self._ffi_exit.linkage = 'external'
-
-        self._ffi_runtime_declared = True
 
     def get_ffi_link_args(self) -> PyList[str]:
         """Get the link arguments for FFI libraries.
