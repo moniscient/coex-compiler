@@ -1,0 +1,68 @@
+This specification outlines the requirements for **Claude Code** to refactor the existing **Coex Concurrent GC (v2)** implementation. The goal is to transition from a passive Snapshot-at-the-Beginning (SATB) collector to an active **Tombstone-assisted Generational Sweep** collector.
+
+This optimization reduces "floating garbage" and prevents the GC from wasting cycles tracing unreachable object trees, while maintaining the non-blocking execution core to the Coex architecture.
+
+---
+
+### Specification: Tombstone & Generational Sweep Optimization
+
+#### 1. Objective
+
+Refactor the Shadow Stack and Sweep logic to allow the mutator to signal object "death" via tombstones and allow the GC to bypass "new" objects using birth-marks.
+
+#### 2. Mutator Side: `gc_pop_frame` (Tombstone Injection)
+
+The `gc_pop_frame` function must be updated from a simple index-restore to a "clearing" loop.
+
+* **Requirements:**
+* Load the current `tls_handle_top` and the `saved_handle_top` from the `frame_stack`.
+* **Loop:** For every index  where :
+* Store a **Zombie Marker** (`0xFFFFFFFFFFFFFFFF`) into `handle_stack[i]`.
+* The store must use **Release** ordering (or be followed by a release fence) to ensure the GC thread sees the tombstone before it sees a retired `handle_top`.
+
+
+* Restore `tls_handle_top` to `saved_handle_top`.
+
+
+
+#### 3. GC Side: `gc_run_collection_cycle` (Tombstone Awareness)
+
+The marking phase must be updated to ignore these tombstones to prevent unnecessary graph traversals.
+
+* **Requirements:**
+* In the `process_handle` block, after loading a handle from the `handle_stack`:
+* Perform an **Acquire Load** on the slot pointer.
+* Compare the value against the Zombie Marker (`-1`).
+* If the value is the Zombie Marker OR Null, immediately branch to `next_handle`, bypassing the call to `gc_mark_from_handle`.
+
+
+
+
+
+#### 4. GC Side: `gc_sweep` (Birth-Marking Optimization)
+
+The sweep phase should leverage the fact that objects allocated *during* the current cycle are inherently live in an immutable heap.
+
+* **Requirements:**
+* Update `gc_sweep` to load the current `gc_cycle_id`.
+* **The Logic:** An object is garbage **ONLY IF** `object.mark < gc_sweep_threshold`.
+* **Optimization:** If `object.mark == current_cycle_id`, the object was born during this collection and is guaranteed to be live; the sweeper should skip the reclamation logic for this object.
+
+
+
+#### 5. Summary of Architectural Changes
+
+| Component | Change | Reason |
+| --- | --- | --- |
+| **Shadow Stack** | Mutator writes `-1` to popped slots. | Prevents tracing "Zombie" trees. |
+| **Mark Phase** | GC performs `Acquire` load + check for `-1`. | Safety: ensures visibility of the Tombstone. |
+| **Sweep Phase** | Use `cycle_id` as a virtual nursery boundary. | Bypasses checks for newly allocated objects. |
+| **Object Header** | Ensure `mark` field is initialized to `gc_cycle_id` on `malloc`. | Establishes the Birth-Mark. |
+
+---
+
+### Implementation Notes for Claude Code
+
+* **Memory Ordering:** Ensure the use of `STLR` for tombstone writes and `LDAPR` for tombstone reads to align with the Release-Acquire proof of correctness.
+* **Latency:** Acknowledge that `gc_pop_frame` is now  relative to the number of roots in the frame. This is the intended trade-off to keep the GC marking phase .
+* **Immutability:** No write barriers are required; the tombstone is only placed on the shadow stack (mutator-owned), never on the heap (immutable).

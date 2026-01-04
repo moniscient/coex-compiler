@@ -1,0 +1,39 @@
+# Minimal FFI Test Library
+# A simple library to test the .cxz FFI infrastructure
+
+[library]
+name = "minimal"
+version = "1.0.0"
+description = "Minimal FFI test library"
+source = ["main.coex"]
+
+[ffi.minimal_ext]
+source = ["wrapper.c"]
+headers = ["."]
+system_headers = []
+system_libs = []
+
+[[ffi.minimal_ext.symbols]]
+name = "coex_minimal_add"
+params = ["int", "int"]
+returns = "int"
+
+[[ffi.minimal_ext.symbols]]
+name = "coex_minimal_greet"
+params = ["string"]
+returns = "int"
+
+[[ffi.minimal_ext.symbols]]
+name = "coex_minimal_create_handle"
+params = ["int"]
+returns = "int"
+
+[[ffi.minimal_ext.symbols]]
+name = "coex_minimal_get_value"
+params = ["int"]
+returns = "int"
+
+[[ffi.minimal_ext.symbols]]
+name = "coex_minimal_free_handle"
+params = ["int"]
+returns = "int"

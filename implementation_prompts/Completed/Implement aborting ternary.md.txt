@@ -1,0 +1,108 @@
+
+**Implement Result-to-bool casting and extended ternary operator**
+
+This task adds two related features:
+
+1. Implicit conversion of `Result<T, E>` to `bool` (true if ok, false if error)
+2. An exit variant of the ternary operator using `!` instead of `;`
+
+**Result to bool conversion**
+
+A `Result<T, E>` type implicitly converts to `bool` in any boolean context. It returns `true` if the Result contains a value (success) and `false` if the Result contains an error (failure). This enables Result values in conditionals, boolean expressions, and the ternary operator condition position.
+
+**Extended ternary operator**
+
+The ternary operator now supports two forms for the false branch:
+
+```
+condition ? true_expr ; false_expr   # continuation: evaluate false_expr, use as value
+condition ? true_expr ! false_expr   # exit: evaluate false_expr, return from function
+```
+
+The `;` variant behaves as currently implemented—the entire ternary expression evaluates to either `true_expr` or `false_expr`.
+
+The `!` variant evaluates `true_expr` if the condition is true, and the expression takes that value. If the condition is false, `false_expr` is evaluated and the function immediately returns that value. The `!` branch has type `!` (never), allowing it to unify with any type for the overall expression.
+
+**Result destructuring pattern**
+
+Combined with tuple destructuring, this enables idiomatic error handling:
+
+```
+(value, err) = result_expr ? value ! err
+```
+
+The `result_expr` must have type `Result<T, E>`. The tuple destructuring binds `value: T` and `err: E` from the Result's fields. The bool conversion tests success/failure:
+
+- If ok: `value` is valid, expression yields `value`, assignment completes
+- If error: `err` is valid, function returns `err`
+
+**Grammar changes**
+
+Update the ternary expression rule:
+
+```
+ternaryExpr : orExpr ('?' expression (';' | '!') expression)?
+```
+
+**Examples**
+
+```
+# Simple ternary with continuation (existing behavior)
+sign = x >= 0 ? 1 ; -1
+
+# Simple ternary with exit
+validated = is_valid(input) ? input ! Result(error: "invalid")
+
+# Result destructuring with propagation
+(file, err) = read_file(path) ? file ! err
+
+# Result destructuring with error transformation
+(file, err) = read_file(path) ? file ! "Read failed: " + err
+
+# Result destructuring with recovery
+(config, err) = load_config(path) ? config ; default_config()
+
+# Chained error propagation
+func process(path: string) -> Result<Output, string>
+  (file, err) = read_file(path) ? file ! err
+  (data, err) = parse(file) ? data ! err
+  (result, err) = validate(data) ? result ! err
+  return Result(value: transform(result))
+~
+```
+
+**Implementation notes**
+
+1. **Lexer**: No changes needed—`!` is likely already a token for logical not.
+
+2. **Parser**: Modify `ternaryExpr` to accept either `;` or `!` as the branch separator. Track which variant was used in the AST node.
+
+3. **AST**: Extend the ternary expression node to include a flag or enum indicating continuation (`;`) vs exit (`!`) semantics.
+
+4. **Type checking**: 
+   - For `;` variant: both branches must unify to a common type
+   - For `!` variant: false branch must be compatible with function return type; the overall expression has the type of the true branch (since the false branch has type `!` which unifies with anything)
+
+5. **Result bool conversion**: When a `Result<T, E>` appears in boolean context, generate code that tests whether the value field is populated (or equivalently, whether the error field is nil).
+
+6. **Code generation**: 
+   - For `;` variant: generate conditional as currently implemented
+   - For `!` variant: generate conditional where false branch emits a function return instead of a branch merge
+
+7. **Tuple destructuring with Result**: When the pattern `(a, b) = expr` appears where `expr` has type `Result<T, E>`, bind `a` to the value field and `b` to the error field. Both fields are accessible but only one will be valid at runtime depending on which branch executes.
+
+**Test cases**
+
+- Result bool conversion in if statements
+- Result bool conversion in boolean expressions (and, or, not)
+- Ternary with `;` (existing behavior preserved)
+- Ternary with `!` returning from function
+- Result destructuring with `!` for error propagation
+- Result destructuring with `;` for recovery
+- Nested ternary expressions with mixed `;` and `!`
+- Type checking: `!` branch type must match function return type
+- Type checking: expression type is true branch type when using `!`
+
+---
+
+Does this capture everything? Any adjustments before we finalize?

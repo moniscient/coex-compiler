@@ -1,0 +1,45 @@
+# Minimal FFI Test Library
+# Provides simple functions to test the Coex FFI infrastructure
+
+# Extern declarations for C wrapper functions
+extern coex_minimal_add(a: int, b: int) -> int
+~
+
+extern coex_minimal_greet(name: string) -> int
+~
+
+extern coex_minimal_create_handle(value: int) -> int
+~
+
+extern coex_minimal_get_value(handle: int) -> int
+~
+
+extern coex_minimal_free_handle(handle: int) -> int
+~
+
+# High-level Coex API
+
+func add(a: int, b: int) -> int
+    return coex_minimal_add(a, b)
+~
+
+func greet(name: string) -> int
+    return coex_minimal_greet(name)
+~
+
+type Handle:
+    id: int
+
+    func create(value: int) -> Handle
+        id = coex_minimal_create_handle(value)
+        return Handle(id)
+    ~
+
+    func get(self) -> int
+        return coex_minimal_get_value(self.id)
+    ~
+
+    func free(self) -> int
+        return coex_minimal_free_handle(self.id)
+    ~
+~

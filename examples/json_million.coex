@@ -1,0 +1,14 @@
+#@ [MOVE] Variable 'nums' is not used after this assignment. Consider: j := nums (move instead of copy)
+func main() -> int
+    # Build list of integers 0 through 1,000,000 (1,000,001 elements)
+    nums: List<int> = [i for i in 0..1000001]
+
+    # Convert list to JSON array
+    j: json = nums
+
+    # Serialize to string and print
+    s: string = j as string
+    print(s)
+
+    return 0
+~

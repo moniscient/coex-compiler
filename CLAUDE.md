@@ -15,13 +15,6 @@ python3 coexc.py source.coex -o output
 antlr -Dlanguage=Python3 -visitor Coex.g4
 ```
 
-## Related Documentation
-
-- **ARCHITECTURE.md** - Detailed compiler architecture, module dependency graph, target structure
-- **MODULARIZATION_STATUS.md** - Current progress on breaking up monolithic files, session handoff notes
-
-The compiler is being modularized from two large files (~24,000 lines total) into focused packages. See MODULARIZATION_STATUS.md for current phase and next steps.
-
 ## Directives
 
 Always use a test-first methodology when implementing a feature or troubleshooting a bug. Develop a test that expresses the bug as a failure or shows the feature lacking generating an erorr, and then work towards a solution that resolves the test. 
