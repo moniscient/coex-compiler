@@ -24,7 +24,7 @@ from ast_nodes import (
     ListExpr, MapExpr, SetExpr, TupleExpr, RangeExpr, LambdaExpr,
     SelfExpr, CellExpr, CellIndexExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
-    IdentifierPattern, WildcardPattern, TuplePattern
+    IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind
 )
 
 if TYPE_CHECKING:
@@ -1253,6 +1253,11 @@ class ExpressionGenerator:
             # Look up function
             if name in cg.functions:
                 func = cg.functions[name]
+
+                # Check if this is a task function call
+                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.TASK:
+                    return self._generate_task_call(name, func, expr.args)
+
                 args = []
                 for i, arg in enumerate(expr.args):
                     arg_val = self.generate_expression(arg)
@@ -1341,6 +1346,78 @@ class ExpressionGenerator:
                     return cg.builder.call(func_ptr, args)
 
         return ir.Constant(ir.IntType(64), 0)
+
+    # ========================================================================
+    # Task Call
+    # ========================================================================
+
+    def _generate_task_call(self, name: str, func: ir.Function,
+                            args: PyList) -> ir.Value:
+        """Generate code for a task function call.
+
+        Currently executes synchronously (spawn, join immediately, return result).
+        This matches the "single assignment" semantics where result is used.
+
+        Args:
+            name: Task function name
+            func: LLVM function for the task
+            args: List of argument expressions
+
+        Returns:
+            Result from the task
+        """
+        cg = self.cg
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Emit warning for single task assignment (executes sequentially)
+        cg._emit_warning(
+            "WARN",
+            f"Single task assignment '{name}(...)' executes sequentially. "
+            f"Use 'for', 'first', or 'most' for concurrent execution."
+        )
+
+        # Get task function declaration
+        task_decl = cg.func_decls[name]
+
+        # Evaluate arguments
+        arg_values = []
+        for i, arg in enumerate(args):
+            arg_val = self.generate_expression(arg)
+            if i < len(func.args):
+                expected = func.args[i].type
+                arg_val = cg._cast_value(arg_val, expected)
+            arg_values.append(arg_val)
+
+        # Spawn the task using TaskGenerator
+        thread_handle, closure_ptr = cg._task.spawn_task(
+            cg.builder,
+            task_decl,
+            func,
+            arg_values,
+            add_to_nursery=False  # We'll join immediately
+        )
+
+        # Join immediately (synchronous execution for now)
+        cg.builder.call(cg._task.task_join, [thread_handle])
+
+        # Extract result from closure
+        result_field = cg.builder.gep(
+            closure_ptr,
+            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            inbounds=True,
+            name="result_field"
+        )
+        result_ptr = cg.builder.load(result_field, name="result_ptr")
+
+        # Convert result back to expected type
+        result = cg.builder.ptrtoint(result_ptr, i64, name="result")
+
+        # Free the closure
+        cg.builder.call(cg._task.closure_free, [closure_ptr])
+
+        return result
 
     # ========================================================================
     # Method Call

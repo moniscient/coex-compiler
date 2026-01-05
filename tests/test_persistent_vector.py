@@ -112,8 +112,8 @@ func main() -> int
     inner2 = [4, 5, 6]
     outer = [inner1, inner2]
     print(outer.len())
-    first = outer.get(0)
-    print(first.get(0))
+    elem = outer.get(0)
+    print(elem.get(0))
     return 0
 ~
 ''', "2\n1\n")

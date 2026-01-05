@@ -53,9 +53,9 @@ func main() -> int
     
     def test_func_with_locals(self, expect_output):
         expect_output('''
-func sum_range(first: int, last: int) -> int
+func sum_range(start: int, last: int) -> int
     sum: int = 0
-    for i in range(first, last)
+    for i in range(start, last)
         sum += i
     ~
     return sum

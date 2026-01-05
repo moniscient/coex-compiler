@@ -53,9 +53,9 @@ func main() -> int
         expect_output('''
 func main() -> int
     text = "Hello, World!"
-    first := text[0:7]
-    second := first[0:5]
-    print(second)
+    slice1 := text[0:7]
+    slice2 := slice1[0:5]
+    print(slice2)
     return 0
 ~
 ''', "Hello\n")
@@ -139,11 +139,11 @@ func main() -> int
         expect_output('''
 func main() -> int
     arr = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    first := arr[2:8]
-    second := first[1:4]
-    print(second.len())
-    print(second.get(0))
-    print(second.get(2))
+    slice1 := arr[2:8]
+    slice2 := slice1[1:4]
+    print(slice2.len())
+    print(slice2.get(0))
+    print(slice2.get(2))
     return 0
 ~
 ''', "3\n3\n5\n")

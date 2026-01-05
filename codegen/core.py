@@ -72,6 +72,9 @@ from codegen.conversions import ConversionGenerator
 # Import Trait generator module
 from codegen.traits import TraitGenerator
 
+# Import Task generator module (for concurrent task support)
+from codegen.task import TaskGenerator
+
 # Import CXZ library loader (for FFI support)
 from cxz_loader import CXZLoader, LoadedLibrary, FFISymbol, CXZError
 
@@ -444,6 +447,10 @@ class CodeGenerator:
 
         # Trait helpers moved to codegen/traits.py - TraitGenerator class
         self._traits = TraitGenerator(self)
+
+        # Task concurrency moved to codegen/task.py - TaskGenerator class
+        self._task = TaskGenerator(self)
+        self._task.create_task_types()
 
     # List helpers moved to codegen/list.py - ListGenerator class
     # HAMT/Map/Set helpers moved to codegen/hamt.py - HamtGenerator class
@@ -2398,6 +2405,20 @@ class CodeGenerator:
     def _generate_for_assign(self, stmt: ForAssignStmt):
         """Generate results = for item in items expr - delegated to LoopGenerator"""
         return self._loops.generate_for_assign(stmt)
+
+    def _generate_first_assign(self, stmt):
+        """Generate result = first item in items expr - delegated to LoopGenerator
+
+        Returns first successful result, cancels remaining tasks.
+        """
+        return self._loops.generate_first_assign(stmt)
+
+    def _generate_most_assign(self, stmt):
+        """Generate (results, errors) = most item in items expr - delegated to LoopGenerator
+
+        Returns tuple of (successful_results, errors), no cancellation.
+        """
+        return self._loops.generate_most_assign(stmt)
 
     def _generate_break(self):
         """Generate a break statement - delegated to FlowControlGenerator"""

@@ -503,6 +503,24 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#firstAssignStmt.
+    def enterFirstAssignStmt(self, ctx:CoexParser.FirstAssignStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#firstAssignStmt.
+    def exitFirstAssignStmt(self, ctx:CoexParser.FirstAssignStmtContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#mostAssignStmt.
+    def enterMostAssignStmt(self, ctx:CoexParser.MostAssignStmtContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#mostAssignStmt.
+    def exitMostAssignStmt(self, ctx:CoexParser.MostAssignStmtContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#whileStmt.
     def enterWhileStmt(self, ctx:CoexParser.WhileStmtContext):
         pass

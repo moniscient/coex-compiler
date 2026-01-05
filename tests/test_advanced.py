@@ -28,13 +28,13 @@ func main() -> int
         """Generic type with two type parameters."""
         expect_output('''
 type Pair<A, B>:
-    first: A
-    second: B
+    fst: A
+    snd: B
 ~
 
 func main() -> int
     p: Pair<int, int> = Pair<int, int>(10, 20)
-    print(p.first + p.second)
+    print(p.fst + p.snd)
     return 0
 ~
 ''', "30\n")

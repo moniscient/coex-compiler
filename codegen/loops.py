@@ -12,12 +12,13 @@ from typing import TYPE_CHECKING, Optional, Dict, Set
 from typing import List as PyList
 
 from ast_nodes import (
-    ForStmt, ForAssignStmt, Stmt, Expr, VarDecl, IfStmt, WhileStmt,
+    ForStmt, ForAssignStmt, FirstAssignStmt, MostAssignStmt,
+    Stmt, Expr, VarDecl, IfStmt, WhileStmt,
     Assignment, ExprStmt, ReturnStmt, CallExpr, Identifier, MemberExpr,
     MethodCallExpr, BinaryExpr, UnaryExpr, TernaryExpr, IndexExpr,
     SliceExpr, ListExpr, TupleExpr, RangeExpr, LambdaExpr, MapExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, Type, ListType,
-    PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral
+    PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral, FunctionKind
 )
 
 if TYPE_CHECKING:
@@ -436,6 +437,9 @@ class LoopGenerator:
         current = cg.builder.load(loop_var)
         next_val = cg.builder.add(current, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_val, loop_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         # Exit
@@ -565,6 +569,9 @@ class LoopGenerator:
         current = cg.builder.load(loop_var)
         next_val = cg.builder.add(current, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_val, loop_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         cg.builder.position_at_end(exit_block)
@@ -673,6 +680,9 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         # Exit
@@ -751,6 +761,9 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         # Exit
@@ -837,6 +850,9 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         # Exit
@@ -923,6 +939,9 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
+        # Inject cancellation safepoint at loop back-edge
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
         cg.builder.branch(cond_block)
 
         # Exit
@@ -933,16 +952,981 @@ class LoopGenerator:
         cg.loop_continue_block = old_continue
 
     def generate_for_assign(self, stmt: ForAssignStmt):
-        """Generate results = for item in items expr"""
-        cg = self.cg
-        # This is syntactic sugar for map operation
-        # For now, implement as a simple loop that doesn't return a list
-        # Full implementation would need list creation
+        """Generate results = for item in items expr ~
 
-        # Just generate as regular for loop for now
-        from ast_nodes import ExprStmt
-        for_stmt = ForStmt(stmt.pattern, stmt.iterable, [ExprStmt(stmt.body_expr)])
-        self.generate_for(for_stmt)
+        When the body expression is a task call, this generates parallel
+        execution: spawn all tasks, join all, collect results in order.
+
+        For non-task expressions, generates sequential map operation.
+        """
+        cg = self.cg
+
+        # Check if body is a task call
+        is_task_call = self._is_task_call(stmt.body_expr)
+
+        if is_task_call and cg._task is not None:
+            result = self._generate_parallel_for_assign(stmt)
+        else:
+            result = self._generate_sequential_for_assign(stmt)
+
+        # Store result in target variable
+        if stmt.target in cg.locals:
+            cg.builder.store(result, cg.locals[stmt.target])
+        else:
+            var_ptr = cg.builder.alloca(result.type, name=stmt.target)
+            cg.locals[stmt.target] = var_ptr
+            cg.builder.store(result, var_ptr)
+
+    def _is_task_call(self, expr: Expr) -> bool:
+        """Check if expression is a call to a task function."""
+        cg = self.cg
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name
+                if name in cg.func_decls:
+                    return cg.func_decls[name].kind == FunctionKind.TASK
+        return False
+
+    def _generate_sequential_for_assign(self, stmt: ForAssignStmt) -> ir.Value:
+        """Generate sequential map: iterate and collect results in list."""
+        cg = self.cg
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Create result list
+        elem_size = ir.Constant(i64, 8)  # Results are i64 handles
+        result_list = cg.builder.call(cg.list_new, [elem_size])
+        result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
+        cg.builder.store(result_list, result_alloca)
+
+        # Get iterable length and iterator
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        # Loop blocks
+        func = cg.builder.block.function
+        loop_header = func.append_basic_block("for_assign_header")
+        loop_body = func.append_basic_block("for_assign_body")
+        loop_end = func.append_basic_block("for_assign_end")
+
+        # Initialize index
+        idx_alloca = cg.builder.alloca(i64, name="for_idx")
+        cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+        cg.builder.branch(loop_header)
+
+        # Loop header: check index < length
+        cg.builder.position_at_end(loop_header)
+        idx = cg.builder.load(idx_alloca)
+        cond = cg.builder.icmp_signed("<", idx, list_len)
+        cg.builder.cbranch(cond, loop_body, loop_end)
+
+        # Loop body: get element, evaluate expression, append result
+        cg.builder.position_at_end(loop_body)
+
+        # Get current element
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        # Bind loop variable
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate body expression
+        body_result = cg._generate_expression(stmt.body_expr)
+
+        # Append to result list
+        temp = cg.builder.alloca(i64, name="temp")
+        if body_result.type != i64:
+            body_result = cg._cast_value(body_result, i64)
+        cg.builder.store(body_result, temp)
+        temp_ptr = cg.builder.bitcast(temp, i8_ptr)
+
+        current_list = cg.builder.load(result_alloca)
+        new_list = cg.builder.call(cg.list_append, [current_list, temp_ptr, elem_size])
+        cg.builder.store(new_list, result_alloca)
+
+        # Increment index
+        next_idx = cg.builder.add(idx, ir.Constant(i64, 1))
+        cg.builder.store(next_idx, idx_alloca)
+        cg.builder.branch(loop_header)
+
+        # End
+        cg.builder.position_at_end(loop_end)
+        return cg.builder.load(result_alloca)
+
+    def _generate_parallel_for_assign(self, stmt: ForAssignStmt) -> ir.Value:
+        """Generate parallel map: spawn all tasks, join all, collect results.
+
+        Pattern:
+        1. Count items in collection
+        2. Allocate arrays for thread handles and closures
+        3. Spawn loop: for each item, spawn task, store handle/closure
+        4. Join loop: for each spawned task, join thread
+        5. Collect loop: for each closure, extract result, append to list
+        6. Cleanup: free closures
+        7. Return result list
+        """
+        cg = self.cg
+        task_gen = cg._task
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Extract task call info
+        call_expr = stmt.body_expr
+        if not isinstance(call_expr, CallExpr) or not isinstance(call_expr.callee, Identifier):
+            # Fallback to sequential
+            return self._generate_sequential_for_assign(stmt)
+
+        task_name = call_expr.callee.name
+        task_decl = cg.func_decls[task_name]
+        task_llvm_func = cg.functions[task_name]
+
+        # Get iterable and its length
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        func = cg.builder.block.function
+
+        # Allocate arrays for handles and closures (max 1024 tasks)
+        # For larger collections, we'd need dynamic allocation
+        max_tasks = 1024
+        thread_handle_arr = cg.builder.alloca(
+            ir.ArrayType(i64, max_tasks), name="task_handles"
+        )
+        closure_ptr_arr = cg.builder.alloca(
+            ir.ArrayType(task_gen.closure_ptr_type, max_tasks), name="task_closures"
+        )
+
+        # Track actual count
+        count_alloca = cg.builder.alloca(i64, name="task_count")
+        cg.builder.store(ir.Constant(i64, 0), count_alloca)
+
+        # =====================================================================
+        # Phase 1: Spawn loop - spawn all tasks
+        # =====================================================================
+        spawn_header = func.append_basic_block("spawn_header")
+        spawn_body = func.append_basic_block("spawn_body")
+        spawn_done = func.append_basic_block("spawn_done")
+
+        idx_alloca = cg.builder.alloca(i64, name="spawn_idx")
+        cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        # Header: check idx < len
+        cg.builder.position_at_end(spawn_header)
+        idx = cg.builder.load(idx_alloca)
+        cond = cg.builder.icmp_signed("<", idx, list_len)
+        cg.builder.cbranch(cond, spawn_body, spawn_done)
+
+        # Body: get element, spawn task
+        cg.builder.position_at_end(spawn_body)
+
+        # Get current element from iterable
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        # Bind loop variable for argument evaluation
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate task call arguments
+        arg_values = []
+        for arg in call_expr.args:
+            arg_val = cg._generate_expression(arg)
+            arg_values.append(arg_val)
+
+        # Spawn the task
+        thread_handle, closure_ptr = task_gen.spawn_task(
+            cg.builder,
+            task_decl,
+            task_llvm_func,
+            arg_values,
+            add_to_nursery=False  # We manage our own arrays
+        )
+
+        # Store handle and closure
+        idx_i32 = cg.builder.trunc(idx, i32)
+        handle_slot = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(thread_handle, handle_slot)
+
+        closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(closure_ptr, closure_slot)
+
+        # Increment spawn count
+        current_count = cg.builder.load(count_alloca)
+        cg.builder.store(cg.builder.add(current_count, ir.Constant(i64, 1)), count_alloca)
+
+        # Increment idx
+        next_idx = cg.builder.add(idx, ir.Constant(i64, 1))
+        cg.builder.store(next_idx, idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        cg.builder.position_at_end(spawn_done)
+        final_count = cg.builder.load(count_alloca)
+
+        # =====================================================================
+        # Phase 2: Join loop - wait for all tasks
+        # =====================================================================
+        join_header = func.append_basic_block("join_header")
+        join_body = func.append_basic_block("join_body")
+        join_done = func.append_basic_block("join_done")
+
+        join_idx = cg.builder.alloca(i64, name="join_idx")
+        cg.builder.store(ir.Constant(i64, 0), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_header)
+        j_idx = cg.builder.load(join_idx)
+        j_cond = cg.builder.icmp_signed("<", j_idx, final_count)
+        cg.builder.cbranch(j_cond, join_body, join_done)
+
+        cg.builder.position_at_end(join_body)
+        j_idx_i32 = cg.builder.trunc(j_idx, i32)
+
+        # Load thread handle
+        handle_ptr = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), j_idx_i32],
+            inbounds=True
+        )
+        thread_handle = cg.builder.load(handle_ptr)
+
+        # Join thread
+        cg.builder.call(task_gen.task_join, [thread_handle])
+
+        # Increment
+        cg.builder.store(cg.builder.add(j_idx, ir.Constant(i64, 1)), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_done)
+
+        # =====================================================================
+        # Phase 3: Collect loop - gather results into list
+        # =====================================================================
+        elem_size = ir.Constant(i64, 8)
+        result_list = cg.builder.call(cg.list_new, [elem_size])
+        result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
+        cg.builder.store(result_list, result_alloca)
+
+        collect_header = func.append_basic_block("collect_header")
+        collect_body = func.append_basic_block("collect_body")
+        collect_done = func.append_basic_block("collect_done")
+
+        collect_idx = cg.builder.alloca(i64, name="collect_idx")
+        cg.builder.store(ir.Constant(i64, 0), collect_idx)
+        cg.builder.branch(collect_header)
+
+        cg.builder.position_at_end(collect_header)
+        c_idx = cg.builder.load(collect_idx)
+        c_cond = cg.builder.icmp_signed("<", c_idx, final_count)
+        cg.builder.cbranch(c_cond, collect_body, collect_done)
+
+        cg.builder.position_at_end(collect_body)
+        c_idx_i32 = cg.builder.trunc(c_idx, i32)
+
+        # Load closure
+        closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), c_idx_i32],
+            inbounds=True
+        )
+        closure_ptr = cg.builder.load(closure_slot)
+
+        # Extract result from closure
+        result_field = cg.builder.gep(
+            closure_ptr,
+            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            inbounds=True
+        )
+        result_ptr = cg.builder.load(result_field)
+        result_val = cg.builder.ptrtoint(result_ptr, i64)
+
+        # Append to result list
+        temp = cg.builder.alloca(i64, name="result_temp")
+        cg.builder.store(result_val, temp)
+        temp_ptr = cg.builder.bitcast(temp, i8_ptr)
+
+        current_list = cg.builder.load(result_alloca)
+        new_list = cg.builder.call(cg.list_append, [current_list, temp_ptr, elem_size])
+        cg.builder.store(new_list, result_alloca)
+
+        # Free the closure
+        cg.builder.call(task_gen.closure_free, [closure_ptr])
+
+        # Increment
+        cg.builder.store(cg.builder.add(c_idx, ir.Constant(i64, 1)), collect_idx)
+        cg.builder.branch(collect_header)
+
+        cg.builder.position_at_end(collect_done)
+        return cg.builder.load(result_alloca)
+
+    # ========================================================================
+    # First-Assign Statement (Racing)
+    # ========================================================================
+
+    def generate_first_assign(self, stmt: FirstAssignStmt):
+        """Generate result = first item in items expr ~
+
+        Spawns all tasks in parallel and returns the first successful result.
+        Remaining tasks are cancelled once a result is obtained.
+
+        Racing algorithm:
+        1. Spawn all tasks, collect handles and closures
+        2. Call task_wait_any to wait for first completion
+        3. Cancel all other tasks
+        4. Join all threads (including cancelled ones)
+        5. Extract result from winner
+        6. Free all closures
+        """
+        cg = self.cg
+        task_gen = cg._task
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Verify body is a task call
+        if not self._is_task_call(stmt.body_expr):
+            cg._emit_warning(
+                "WARN",
+                "'first' requires a task call in body, falling back to sequential"
+            )
+            # Fallback to sequential - just take first result
+            for_assign = ForAssignStmt(
+                target=stmt.target,
+                pattern=stmt.pattern,
+                iterable=stmt.iterable,
+                body_expr=stmt.body_expr
+            )
+            self.generate_for_assign(for_assign)
+            return
+
+        # Extract task call info
+        call_expr = stmt.body_expr
+        task_name = call_expr.callee.name
+        task_decl = cg.func_decls[task_name]
+        task_llvm_func = cg.functions[task_name]
+
+        # Get iterable and its length
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        func = cg.builder.block.function
+
+        # Allocate arrays for handles and closures
+        max_tasks = 1024
+        thread_handle_arr = cg.builder.alloca(
+            ir.ArrayType(i64, max_tasks), name="first_handles"
+        )
+        closure_ptr_arr = cg.builder.alloca(
+            ir.ArrayType(task_gen.closure_ptr_type, max_tasks), name="first_closures"
+        )
+
+        # Also need an array of closure pointers for wait_any (TaskClosure**)
+        closure_ptr_ptr_arr = cg.builder.alloca(
+            ir.ArrayType(task_gen.closure_ptr_type, max_tasks), name="first_closure_ptrs"
+        )
+
+        count_alloca = cg.builder.alloca(i64, name="first_count")
+        cg.builder.store(ir.Constant(i64, 0), count_alloca)
+
+        # =====================================================================
+        # Phase 1: Spawn all tasks
+        # =====================================================================
+        spawn_header = func.append_basic_block("first_spawn_header")
+        spawn_body = func.append_basic_block("first_spawn_body")
+        spawn_done = func.append_basic_block("first_spawn_done")
+
+        idx_alloca = cg.builder.alloca(i64, name="first_spawn_idx")
+        cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        cg.builder.position_at_end(spawn_header)
+        idx = cg.builder.load(idx_alloca)
+        cond = cg.builder.icmp_signed("<", idx, list_len)
+        cg.builder.cbranch(cond, spawn_body, spawn_done)
+
+        cg.builder.position_at_end(spawn_body)
+
+        # Get element and bind loop variable
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate task arguments
+        arg_values = []
+        for arg in call_expr.args:
+            arg_val = cg._generate_expression(arg)
+            arg_values.append(arg_val)
+
+        # Spawn task
+        thread_handle, closure_ptr = task_gen.spawn_task(
+            cg.builder,
+            task_decl,
+            task_llvm_func,
+            arg_values,
+            add_to_nursery=False
+        )
+
+        # Store handle and closure
+        idx_i32 = cg.builder.trunc(idx, i32)
+        handle_slot = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(thread_handle, handle_slot)
+
+        closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(closure_ptr, closure_slot)
+
+        # Also store in closure_ptr_ptr_arr for wait_any
+        ptr_slot = cg.builder.gep(
+            closure_ptr_ptr_arr,
+            [ir.Constant(i32, 0), idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(closure_ptr, ptr_slot)
+
+        # Increment count and index
+        current_count = cg.builder.load(count_alloca)
+        cg.builder.store(cg.builder.add(current_count, ir.Constant(i64, 1)), count_alloca)
+        cg.builder.store(cg.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        cg.builder.position_at_end(spawn_done)
+        final_count = cg.builder.load(count_alloca)
+
+        # =====================================================================
+        # Phase 2: Wait for first completion and cancel others
+        # =====================================================================
+        # Check if we have any tasks
+        has_tasks = cg.builder.icmp_signed(">", final_count, ir.Constant(i64, 0))
+        wait_block = func.append_basic_block("first_wait")
+        empty_block = func.append_basic_block("first_empty")
+        after_wait = func.append_basic_block("first_after_wait")
+
+        cg.builder.cbranch(has_tasks, wait_block, empty_block)
+
+        # Wait block: call wait_any
+        cg.builder.position_at_end(wait_block)
+        closure_arr_ptr = cg.builder.gep(
+            closure_ptr_ptr_arr,
+            [ir.Constant(i32, 0), ir.Constant(i32, 0)],
+            inbounds=True
+        )
+        count_i32 = cg.builder.trunc(final_count, i32)
+        winner_idx = cg.builder.call(
+            task_gen.task_wait_any,
+            [closure_arr_ptr, count_i32],
+            name="winner_idx"
+        )
+
+        # Cancel all other tasks
+        cancel_header = func.append_basic_block("first_cancel_header")
+        cancel_body = func.append_basic_block("first_cancel_body")
+        cancel_done = func.append_basic_block("first_cancel_done")
+
+        cancel_idx = cg.builder.alloca(i64, name="cancel_idx")
+        cg.builder.store(ir.Constant(i64, 0), cancel_idx)
+        cg.builder.branch(cancel_header)
+
+        cg.builder.position_at_end(cancel_header)
+        c_idx = cg.builder.load(cancel_idx)
+        c_cond = cg.builder.icmp_signed("<", c_idx, final_count)
+        cg.builder.cbranch(c_cond, cancel_body, cancel_done)
+
+        cg.builder.position_at_end(cancel_body)
+        c_idx_i32 = cg.builder.trunc(c_idx, i32)
+        winner_idx_i64 = cg.builder.sext(winner_idx, i64)
+        is_winner = cg.builder.icmp_signed("==", c_idx, winner_idx_i64)
+
+        cancel_this = func.append_basic_block("first_cancel_this")
+        skip_cancel = func.append_basic_block("first_skip_cancel")
+
+        cg.builder.cbranch(is_winner, skip_cancel, cancel_this)
+
+        # Cancel non-winners
+        cg.builder.position_at_end(cancel_this)
+        cancel_closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), c_idx_i32],
+            inbounds=True
+        )
+        cancel_closure = cg.builder.load(cancel_closure_slot)
+        cg.builder.call(task_gen.task_cancel, [cancel_closure])
+        cg.builder.branch(skip_cancel)
+
+        cg.builder.position_at_end(skip_cancel)
+        cg.builder.store(cg.builder.add(c_idx, ir.Constant(i64, 1)), cancel_idx)
+        cg.builder.branch(cancel_header)
+
+        cg.builder.position_at_end(cancel_done)
+
+        # =====================================================================
+        # Phase 3: Join all threads
+        # =====================================================================
+        join_header = func.append_basic_block("first_join_header")
+        join_body = func.append_basic_block("first_join_body")
+        join_done = func.append_basic_block("first_join_done")
+
+        join_idx = cg.builder.alloca(i64, name="first_join_idx")
+        cg.builder.store(ir.Constant(i64, 0), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_header)
+        j_idx = cg.builder.load(join_idx)
+        j_cond = cg.builder.icmp_signed("<", j_idx, final_count)
+        cg.builder.cbranch(j_cond, join_body, join_done)
+
+        cg.builder.position_at_end(join_body)
+        j_idx_i32 = cg.builder.trunc(j_idx, i32)
+        join_handle_slot = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), j_idx_i32],
+            inbounds=True
+        )
+        join_handle = cg.builder.load(join_handle_slot)
+        cg.builder.call(task_gen.task_join, [join_handle])
+        cg.builder.store(cg.builder.add(j_idx, ir.Constant(i64, 1)), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_done)
+
+        # Extract winner's result
+        winner_idx_i32 = winner_idx
+        winner_closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), winner_idx_i32],
+            inbounds=True
+        )
+        winner_closure = cg.builder.load(winner_closure_slot)
+        result_field = cg.builder.gep(
+            winner_closure,
+            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            inbounds=True
+        )
+        result_ptr = cg.builder.load(result_field)
+        wait_result = cg.builder.ptrtoint(result_ptr, i64)
+
+        # =====================================================================
+        # Phase 4: Free all closures
+        # =====================================================================
+        free_header = func.append_basic_block("first_free_header")
+        free_body = func.append_basic_block("first_free_body")
+        free_done = func.append_basic_block("first_free_done")
+
+        free_idx = cg.builder.alloca(i64, name="first_free_idx")
+        cg.builder.store(ir.Constant(i64, 0), free_idx)
+        cg.builder.branch(free_header)
+
+        cg.builder.position_at_end(free_header)
+        f_idx = cg.builder.load(free_idx)
+        f_cond = cg.builder.icmp_signed("<", f_idx, final_count)
+        cg.builder.cbranch(f_cond, free_body, free_done)
+
+        cg.builder.position_at_end(free_body)
+        f_idx_i32 = cg.builder.trunc(f_idx, i32)
+        free_closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), f_idx_i32],
+            inbounds=True
+        )
+        free_closure = cg.builder.load(free_closure_slot)
+        cg.builder.call(task_gen.closure_free, [free_closure])
+        cg.builder.store(cg.builder.add(f_idx, ir.Constant(i64, 1)), free_idx)
+        cg.builder.branch(free_header)
+
+        cg.builder.position_at_end(free_done)
+        cg.builder.branch(after_wait)
+
+        # Empty block: no tasks, return 0
+        cg.builder.position_at_end(empty_block)
+        empty_result = ir.Constant(i64, 0)
+        cg.builder.branch(after_wait)
+
+        # Merge results
+        cg.builder.position_at_end(after_wait)
+        result_phi = cg.builder.phi(i64, name="first_result")
+        result_phi.add_incoming(wait_result, free_done)
+        result_phi.add_incoming(empty_result, empty_block)
+
+        # Store in target variable
+        if stmt.target in cg.locals:
+            cg.builder.store(result_phi, cg.locals[stmt.target])
+        else:
+            var_ptr = cg.builder.alloca(i64, name=stmt.target)
+            cg.locals[stmt.target] = var_ptr
+            cg.builder.store(result_phi, var_ptr)
+
+    # ========================================================================
+    # Most-Assign Statement (Best Effort)
+    # ========================================================================
+
+    def generate_most_assign(self, stmt: MostAssignStmt):
+        """Generate (results, errors) = most item in items expr ~
+
+        Spawns all tasks and waits for all to complete.
+        Returns tuple of (successful_results, errors).
+        No cancellation - all tasks run to completion.
+
+        Algorithm:
+        1. Spawn all tasks, collect closures and handles
+        2. Wait for all tasks to complete
+        3. Check each closure: exception? -> errors, result -> results
+        4. Free all closures
+        """
+        cg = self.cg
+        func = cg.builder.function
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        elem_size = ir.Constant(i64, 8)
+
+        # Check if body is a task call first
+        call_expr = stmt.body_expr
+        if not self._is_task_call(call_expr):
+            # Fallback to sequential for non-task calls - use for-collection
+            for_assign = ForAssignStmt(
+                target="_most_temp",
+                pattern=stmt.pattern,
+                iterable=stmt.iterable,
+                body_expr=stmt.body_expr
+            )
+            result_list = self._generate_parallel_for_assign(for_assign)
+            errors_list = cg.builder.call(cg.list_new, [elem_size])
+
+            # Store results and errors
+            if stmt.results_target in cg.locals:
+                cg.builder.store(result_list, cg.locals[stmt.results_target])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=stmt.results_target)
+                cg.locals[stmt.results_target] = var_ptr
+                cg.builder.store(result_list, var_ptr)
+            if stmt.errors_target in cg.locals:
+                cg.builder.store(errors_list, cg.locals[stmt.errors_target])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=stmt.errors_target)
+                cg.locals[stmt.errors_target] = var_ptr
+                cg.builder.store(errors_list, var_ptr)
+
+            # Track types for fallback case
+            cg.var_coex_types[stmt.results_target] = ListType(PrimitiveType("int"))
+            cg.var_coex_types[stmt.errors_target] = ListType(PrimitiveType("int"))
+            return
+
+        # Get task_gen now that we know it's a task call
+        task_gen = cg._task
+
+        # Extract task info
+        task_name = call_expr.callee.name
+        task_decl = cg.func_decls[task_name]
+        task_llvm_func = cg.functions[task_name]
+
+        # Evaluate iterable
+        iterable_val = cg._generate_expression(stmt.iterable)
+
+        # Get collection length
+        len_val = cg.builder.call(cg.list_len, [iterable_val], name="most_len")
+
+        # Check for empty collection
+        is_empty = cg.builder.icmp_signed("==", len_val, ir.Constant(i64, 0))
+        empty_block = func.append_basic_block("most_empty")
+        spawn_block = func.append_basic_block("most_spawn_init")
+        after_wait = func.append_basic_block("most_after_wait")
+
+        cg.builder.cbranch(is_empty, empty_block, spawn_block)
+
+        # =====================================================================
+        # Phase 1: Spawn all tasks
+        # =====================================================================
+        cg.builder.position_at_end(spawn_block)
+
+        # Allocate arrays for closures and handles
+        max_tasks = 1024
+        thread_handle_arr = cg.builder.alloca(
+            ir.ArrayType(i64, max_tasks), name="most_handles"
+        )
+        closure_ptr_arr = cg.builder.alloca(
+            ir.ArrayType(task_gen.closure_ptr_type, max_tasks), name="most_closures"
+        )
+
+        # Spawn loop
+        spawn_header = func.append_basic_block("most_spawn_header")
+        spawn_body = func.append_basic_block("most_spawn_body")
+        spawn_done = func.append_basic_block("most_spawn_done")
+
+        spawn_idx = cg.builder.alloca(i64, name="most_spawn_idx")
+        cg.builder.store(ir.Constant(i64, 0), spawn_idx)
+        cg.builder.branch(spawn_header)
+
+        cg.builder.position_at_end(spawn_header)
+        s_idx = cg.builder.load(spawn_idx)
+        s_cond = cg.builder.icmp_signed("<", s_idx, len_val)
+        cg.builder.cbranch(s_cond, spawn_body, spawn_done)
+
+        cg.builder.position_at_end(spawn_body)
+
+        # Get current element from iterable
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, s_idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        # Bind loop variable for argument evaluation
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate task call arguments
+        arg_values = []
+        for arg in call_expr.args:
+            arg_val = cg._generate_expression(arg)
+            arg_values.append(arg_val)
+
+        # Spawn the task
+        thread_handle, closure_ptr = task_gen.spawn_task(
+            cg.builder,
+            task_decl,
+            task_llvm_func,
+            arg_values,
+            add_to_nursery=False  # We manage our own arrays
+        )
+
+        # Store handle and closure
+        s_idx_i32 = cg.builder.trunc(s_idx, i32)
+        handle_slot = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), s_idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(thread_handle, handle_slot)
+
+        closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), s_idx_i32],
+            inbounds=True
+        )
+        cg.builder.store(closure_ptr, closure_slot)
+
+        cg.builder.store(cg.builder.add(s_idx, ir.Constant(i64, 1)), spawn_idx)
+        cg.builder.branch(spawn_header)
+
+        cg.builder.position_at_end(spawn_done)
+        final_count = len_val
+
+        # =====================================================================
+        # Phase 2: Join all threads and collect results
+        # =====================================================================
+        # Create results list and errors list
+        # Use list struct pointer type so method calls work
+        list_ptr_type = cg.list_struct.as_pointer()
+
+        results_list = cg.builder.call(cg.list_new, [elem_size], name="most_results")
+        results_alloca = cg.builder.alloca(list_ptr_type, name="most_results_ptr")
+        cg.builder.store(results_list, results_alloca)
+
+        errors_list = cg.builder.call(cg.list_new, [elem_size], name="most_errors")
+        errors_alloca = cg.builder.alloca(list_ptr_type, name="most_errors_ptr")
+        cg.builder.store(errors_list, errors_alloca)
+
+        # Join and collect loop
+        join_header = func.append_basic_block("most_join_header")
+        join_body = func.append_basic_block("most_join_body")
+        join_done = func.append_basic_block("most_join_done")
+
+        join_idx = cg.builder.alloca(i64, name="most_join_idx")
+        cg.builder.store(ir.Constant(i64, 0), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_header)
+        j_idx = cg.builder.load(join_idx)
+        j_cond = cg.builder.icmp_signed("<", j_idx, final_count)
+        cg.builder.cbranch(j_cond, join_body, join_done)
+
+        cg.builder.position_at_end(join_body)
+        j_idx_i32 = cg.builder.trunc(j_idx, i32)
+
+        # Load handle and join
+        join_handle_slot = cg.builder.gep(
+            thread_handle_arr,
+            [ir.Constant(i32, 0), j_idx_i32],
+            inbounds=True
+        )
+        join_handle = cg.builder.load(join_handle_slot)
+        cg.builder.call(task_gen.task_join, [join_handle])
+
+        # Load closure and extract result
+        join_closure_slot = cg.builder.gep(
+            closure_ptr_arr,
+            [ir.Constant(i32, 0), j_idx_i32],
+            inbounds=True
+        )
+        join_closure = cg.builder.load(join_closure_slot)
+
+        # Check exception field (index 2)
+        exception_field = cg.builder.gep(
+            join_closure,
+            [ir.Constant(i32, 0), ir.Constant(i32, 2)],
+            inbounds=True
+        )
+        exception_ptr = cg.builder.load(exception_field)
+        exception_val = cg.builder.ptrtoint(exception_ptr, i64)
+        has_exception = cg.builder.icmp_signed("!=", exception_val, ir.Constant(i64, 0))
+
+        add_to_results = func.append_basic_block("most_add_result")
+        add_to_errors = func.append_basic_block("most_add_error")
+        join_next = func.append_basic_block("most_join_next")
+
+        cg.builder.cbranch(has_exception, add_to_errors, add_to_results)
+
+        # Add to results (no exception)
+        cg.builder.position_at_end(add_to_results)
+        result_field = cg.builder.gep(
+            join_closure,
+            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            inbounds=True
+        )
+        result_ptr = cg.builder.load(result_field)
+        result_val = cg.builder.ptrtoint(result_ptr, i64)
+
+        # Store to temp, bitcast to i8*, and append
+        result_temp = cg.builder.alloca(i64, name="result_temp")
+        cg.builder.store(result_val, result_temp)
+        result_temp_ptr = cg.builder.bitcast(result_temp, i8_ptr)
+        current_results = cg.builder.load(results_alloca)
+        new_results = cg.builder.call(cg.list_append, [current_results, result_temp_ptr, elem_size])
+        cg.builder.store(new_results, results_alloca)
+        cg.builder.branch(join_next)
+
+        # Add to errors (has exception)
+        cg.builder.position_at_end(add_to_errors)
+        error_temp = cg.builder.alloca(i64, name="error_temp")
+        cg.builder.store(exception_val, error_temp)
+        error_temp_ptr = cg.builder.bitcast(error_temp, i8_ptr)
+        current_errors = cg.builder.load(errors_alloca)
+        new_errors = cg.builder.call(cg.list_append, [current_errors, error_temp_ptr, elem_size])
+        cg.builder.store(new_errors, errors_alloca)
+        cg.builder.branch(join_next)
+
+        cg.builder.position_at_end(join_next)
+
+        # Free closure
+        cg.builder.call(task_gen.closure_free, [join_closure])
+
+        cg.builder.store(cg.builder.add(j_idx, ir.Constant(i64, 1)), join_idx)
+        cg.builder.branch(join_header)
+
+        cg.builder.position_at_end(join_done)
+        # Load final lists from allocas after all appends
+        final_results_from_join = cg.builder.load(results_alloca)
+        final_errors_from_join = cg.builder.load(errors_alloca)
+        cg.builder.branch(after_wait)
+
+        # Empty block: no tasks
+        cg.builder.position_at_end(empty_block)
+        empty_results_list = cg.builder.call(cg.list_new, [elem_size], name="empty_results")
+        empty_errors_list = cg.builder.call(cg.list_new, [elem_size], name="empty_errors")
+        cg.builder.branch(after_wait)
+
+        # Merge with phi nodes - using list pointer type
+        cg.builder.position_at_end(after_wait)
+        final_results = cg.builder.phi(list_ptr_type, name="most_final_results")
+        final_results.add_incoming(final_results_from_join, join_done)
+        final_results.add_incoming(empty_results_list, empty_block)
+
+        final_errors = cg.builder.phi(list_ptr_type, name="most_final_errors")
+        final_errors.add_incoming(final_errors_from_join, join_done)
+        final_errors.add_incoming(empty_errors_list, empty_block)
+
+        # Store results in results_target (using list pointer type)
+        if stmt.results_target in cg.locals:
+            cg.builder.store(final_results, cg.locals[stmt.results_target])
+        else:
+            var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
+            cg.locals[stmt.results_target] = var_ptr
+            cg.builder.store(final_results, var_ptr)
+
+        # Store errors in errors_target (using list pointer type)
+        if stmt.errors_target in cg.locals:
+            cg.builder.store(final_errors, cg.locals[stmt.errors_target])
+        else:
+            var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
+            cg.locals[stmt.errors_target] = var_ptr
+            cg.builder.store(final_errors, var_ptr)
+
+        # Track types for method calls on results/errors
+        # Results is List<return_type>, errors is List<int> (error codes)
+        result_elem_type = task_decl.return_type if task_decl.return_type else PrimitiveType("int")
+        cg.var_coex_types[stmt.results_target] = ListType(result_elem_type)
+        cg.var_coex_types[stmt.errors_target] = ListType(PrimitiveType("int"))
 
     # ========================================================================
     # Element Type Inference

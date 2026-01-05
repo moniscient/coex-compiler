@@ -225,6 +225,8 @@ controlFlowStmt
     : ifStmt
     | forStmt
     | forAssignStmt
+    | firstAssignStmt
+    | mostAssignStmt
     | whileStmt
     | cycleStmt
     | matchStmt
@@ -314,6 +316,18 @@ forStmt
 // For-assign pattern: results = for i in items expr ~
 forAssignStmt
     : IDENTIFIER ASSIGN FOR bindingPattern IN expression expression COLON? NEWLINE* block
+    ;
+
+// First-assign pattern: result = first i in items expr ~
+// Returns the first successful result, cancelling remaining tasks
+firstAssignStmt
+    : IDENTIFIER ASSIGN FIRST bindingPattern IN expression expression COLON? NEWLINE* block
+    ;
+
+// Most-assign pattern: (results, errors) = most i in items expr ~
+// Returns tuple of (successful results, errors) - no cancellation
+mostAssignStmt
+    : LPAREN IDENTIFIER COMMA IDENTIFIER RPAREN ASSIGN MOST bindingPattern IN expression expression COLON? NEWLINE* block
     ;
 
 // While loop (standard while condition)
@@ -687,6 +701,10 @@ CASE        : 'case' ;
 SELECT      : 'select' ;
 WITHIN      : 'within' ;
 AS          : 'as' ;
+
+// Concurrent collection keywords
+FIRST       : 'first' ;
+MOST        : 'most' ;
 
 // Control flow modifiers
 BREAK       : 'break' ;

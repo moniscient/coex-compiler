@@ -583,10 +583,57 @@ class ForAssignStmt(Stmt):
     pattern: Union[str, Pattern]  # str for backward compat, Pattern for destructuring
     iterable: Expr
     body_expr: Expr
-    
+
     @property
     def var_name(self) -> Optional[str]:
         """Backward compatibility"""
+        if isinstance(self.pattern, str):
+            return self.pattern
+        if isinstance(self.pattern, IdentifierPattern):
+            return self.pattern.name
+        return None
+
+
+@dataclass
+class FirstAssignStmt(Stmt):
+    """result = first item in items expr ~
+
+    Spawns all tasks, returns the first successful result.
+    Remaining tasks are cancelled once a result is obtained.
+    If all tasks fail, raises an aggregate error.
+    """
+    target: str
+    pattern: Union[str, Pattern]
+    iterable: Expr
+    body_expr: Expr
+
+    @property
+    def var_name(self) -> Optional[str]:
+        """Get variable name from pattern."""
+        if isinstance(self.pattern, str):
+            return self.pattern
+        if isinstance(self.pattern, IdentifierPattern):
+            return self.pattern.name
+        return None
+
+
+@dataclass
+class MostAssignStmt(Stmt):
+    """(results, errors) = most item in items expr ~
+
+    Spawns all tasks and waits for all to complete.
+    Returns a tuple of (successful_results, errors).
+    No cancellation - all tasks run to completion.
+    """
+    results_target: str  # Variable for successful results list
+    errors_target: str   # Variable for errors list
+    pattern: Union[str, Pattern]
+    iterable: Expr
+    body_expr: Expr
+
+    @property
+    def var_name(self) -> Optional[str]:
+        """Get variable name from pattern."""
         if isinstance(self.pattern, str):
             return self.pattern
         if isinstance(self.pattern, IdentifierPattern):

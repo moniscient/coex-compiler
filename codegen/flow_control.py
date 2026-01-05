@@ -241,6 +241,9 @@ class FlowControlGenerator:
                 break
 
         if not cg.builder.block.is_terminated:
+            # Inject cancellation safepoint at loop back-edge
+            if cg._task is not None:
+                cg._task.inject_safepoint(cg.builder, exit_block)
             cg.builder.branch(cond_block)
 
         # Continue after loop

@@ -675,6 +675,10 @@ class ASTBuilder:
             return self.visit_for_stmt(child)
         elif isinstance(child, CoexParser.ForAssignStmtContext):
             return self.visit_for_assign_stmt(child)
+        elif isinstance(child, CoexParser.FirstAssignStmtContext):
+            return self.visit_first_assign_stmt(child)
+        elif isinstance(child, CoexParser.MostAssignStmtContext):
+            return self.visit_most_assign_stmt(child)
         elif isinstance(child, CoexParser.WhileStmtContext):
             return self.visit_while_stmt(child)
         elif isinstance(child, CoexParser.CycleStmtContext):
@@ -725,7 +729,32 @@ class ASTBuilder:
         iterable = self.visit_expression(ctx.expression(0))
         body_expr = self.visit_expression(ctx.expression(1))
         return ForAssignStmt(target, pattern, iterable, body_expr)
-    
+
+    def visit_first_assign_stmt(self, ctx: CoexParser.FirstAssignStmtContext) -> FirstAssignStmt:
+        """Visit a first-assign statement: result = first i in items expr ~
+
+        Returns the first successful result, cancelling remaining tasks.
+        """
+        target = ctx.IDENTIFIER().getText()
+        pattern = self.visit_binding_pattern(ctx.bindingPattern())
+        iterable = self.visit_expression(ctx.expression(0))
+        body_expr = self.visit_expression(ctx.expression(1))
+        return FirstAssignStmt(target, pattern, iterable, body_expr)
+
+    def visit_most_assign_stmt(self, ctx: CoexParser.MostAssignStmtContext) -> MostAssignStmt:
+        """Visit a most-assign statement: (results, errors) = most i in items expr ~
+
+        Returns tuple of (successful_results, errors) - no cancellation.
+        """
+        # Grammar: (IDENTIFIER, IDENTIFIER) = most pattern in expr expr ~
+        identifiers = ctx.IDENTIFIER()
+        results_target = identifiers[0].getText()
+        errors_target = identifiers[1].getText()
+        pattern = self.visit_binding_pattern(ctx.bindingPattern())
+        iterable = self.visit_expression(ctx.expression(0))
+        body_expr = self.visit_expression(ctx.expression(1))
+        return MostAssignStmt(results_target, errors_target, pattern, iterable, body_expr)
+
     def visit_binding_pattern(self, ctx) -> Pattern:
         """Visit a binding pattern (for destructuring in for loops and comprehensions)"""
         if ctx.IDENTIFIER():

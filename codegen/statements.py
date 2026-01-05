@@ -16,6 +16,7 @@ from typing import List as PyList
 from ast_nodes import (
     Stmt, VarDecl, Assignment, SliceAssignment, ReturnStmt, PrintStmt, DebugStmt,
     IfStmt, WhileStmt, CycleStmt, ForStmt, ForAssignStmt, BreakStmt, ContinueStmt,
+    FirstAssignStmt, MostAssignStmt,
     MatchStmt, ExprStmt, LlvmIrStmt, TupleDestructureStmt, TupleExpr,
     Identifier, MemberExpr, IndexExpr, CallExpr, MethodCallExpr,
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
@@ -62,6 +63,10 @@ class StatementGenerator:
             cg._generate_for(stmt)
         elif isinstance(stmt, ForAssignStmt):
             cg._generate_for_assign(stmt)
+        elif isinstance(stmt, FirstAssignStmt):
+            cg._generate_first_assign(stmt)
+        elif isinstance(stmt, MostAssignStmt):
+            cg._generate_most_assign(stmt)
         elif isinstance(stmt, BreakStmt):
             cg._generate_break()
         elif isinstance(stmt, ContinueStmt):
@@ -685,11 +690,19 @@ class StatementGenerator:
             ret_type = func.function_type.return_type
             ret_val = cg._cast_value(ret_val, ret_type)
 
+            # Join nursery tasks before return (structured concurrency guarantee)
+            if cg._task is not None and cg._task.has_active_nursery():
+                cg._task.join_nursery(cg.builder)
+
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)
 
             cg.builder.ret(ret_val)
         else:
+            # Join nursery tasks before return (structured concurrency guarantee)
+            if cg._task is not None and cg._task.has_active_nursery():
+                cg._task.join_nursery(cg.builder)
+
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)
             cg.builder.ret_void()

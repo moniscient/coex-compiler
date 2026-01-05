@@ -104,11 +104,11 @@ func create_garbage()
 ~
 
 func main() -> int
-    first = [1]
+    list1 = [1]
     create_garbage()
     last = [3]
     gc()
-    print(first.get(0))
+    print(list1.get(0))
     print(last.get(0))
     return 0
 ~

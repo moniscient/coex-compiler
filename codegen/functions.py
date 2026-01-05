@@ -326,8 +326,11 @@ class FunctionGenerator:
                         visit_stmts(elif_body)
                     if stmt.else_body:
                         visit_stmts(stmt.else_body)
-                elif isinstance(stmt, (ForStmt, ForAssignStmt)):
+                elif isinstance(stmt, ForStmt):
                     visit_stmts(stmt.body)
+                elif isinstance(stmt, ForAssignStmt):
+                    # ForAssignStmt has body_expr, not body
+                    pass
                 elif isinstance(stmt, WhileStmt):
                     visit_stmts(stmt.body)
                 elif isinstance(stmt, MatchStmt):
@@ -380,6 +383,10 @@ class FunctionGenerator:
         cg.moved_vars = set()
         cg.current_function = func
 
+        # Reset task nursery state for new function
+        if cg._task is not None:
+            cg._task.reset_for_function()
+
         # ====================================================================
         # GC Shadow Stack Integration
         # ====================================================================
@@ -407,6 +414,15 @@ class FunctionGenerator:
 
             # Store mapping of var_name -> root_index
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+        # ====================================================================
+
+        # ====================================================================
+        # Task Nursery Initialization
+        # ====================================================================
+        # Initialize nursery for bare task calls if this function might spawn tasks
+        # The nursery tracks thread handles and closures for join-at-exit
+        if cg._task is not None:
+            cg._task.init_nursery(cg.builder, max_tasks=64)
         # ====================================================================
 
         # GC Safe-point check: trigger GC if allocation threshold exceeded
@@ -447,6 +463,10 @@ class FunctionGenerator:
 
         # Add implicit return if needed
         if not cg.builder.block.is_terminated:
+            # Join nursery tasks before return (structured concurrency guarantee)
+            if cg._task is not None and cg._task.has_active_nursery():
+                cg._task.join_nursery(cg.builder)
+
             # Pop GC frame before implicit return
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)
@@ -525,6 +545,10 @@ class FunctionGenerator:
         cg._reset_function_scope()
         old_current_function = cg.current_function
         cg.current_function = func_decl
+
+        # Reset task nursery state for new function
+        if cg._task is not None:
+            cg._task.reset_for_function()
 
         # Save and initialize GC state for this monomorphized function
         old_gc_frame = getattr(cg, 'gc_frame', None)
@@ -880,6 +904,10 @@ class FunctionGenerator:
         cg._reset_function_scope()
         cg.current_function = method
         cg.current_type = type_name
+
+        # Reset task nursery state for new method
+        if cg._task is not None:
+            cg._task.reset_for_function()
 
         # Initialize GC state for this method
         cg.gc_frame = None
