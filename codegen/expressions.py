@@ -1130,10 +1130,15 @@ class ExpressionGenerator:
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
+                # Run GC synchronously
+                # NOTE: Until Phase 4 (TLAB allocation), GC must be synchronous
+                # to avoid race conditions on the allocation list.
                 cg.builder.call(cg.gc.gc_collect, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "gc_async":
+                # Trigger GC via the background thread (non-blocking)
+                # This will run collection asynchronously
                 cg.builder.call(cg.gc.gc_async, [])
                 return ir.Constant(ir.IntType(64), 0)
 
