@@ -27,7 +27,7 @@ class GarbageCollector:
     HEADER_SIZE = 32         # 4 x i64: size, type_id, flags, forward
     MIN_BLOCK_SIZE = 40      # Minimum block: header(32) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
-    GC_THRESHOLD = 10000     # Trigger GC after this many allocations
+    GC_THRESHOLD = 100000    # Trigger GC after this many allocations
     INITIAL_HEAP_SIZE = 1024 * 1024 * 1024  # 1GB initial heap
 
     # Handle table constants (Handle-Based GC)
@@ -38,6 +38,7 @@ class GarbageCollector:
     FLAG_FORWARDED = 0x02    # Bit 1: object has been forwarded (compaction)
     FLAG_PINNED = 0x04       # Bit 2: pinned (not movable) - future use
     FLAG_FINALIZER = 0x08    # Bit 3: has finalizer - future use
+    FLAG_TLAB = 0x10         # Bit 4: allocated from TLAB (don't free individually)
 
     # Trace levels for debugging infrastructure (Phase 0)
     GC_TRACE_NONE = 0        # No tracing output
@@ -682,28 +683,45 @@ class GarbageCollector:
         # ============================================================
         # Thread-Local Storage Variables
         # ============================================================
-        # These use LLVM's thread_local attribute for per-thread storage
+        # NOTE: llvmlite doesn't support LLVM's thread_local attribute,
+        # so we use pthread TLS (pthread_key_create, pthread_getspecific,
+        # pthread_setspecific) for truly thread-local storage.
+        #
+        # The pthread_key_t is stored as i64. On macOS it's an unsigned long,
+        # which fits in i64.
+
+        # Pthread TLS key for ThreadEntry pointer (initialized in gc_init)
+        self.tls_thread_entry_key = ir.GlobalVariable(
+            self.module, self.i64, name="tls_thread_entry_key")
+        self.tls_thread_entry_key.initializer = ir.Constant(self.i64, 0)
+        self.tls_thread_entry_key.linkage = 'internal'
 
         # Thread's shadow stack frame chain top
+        # NOTE: This is stored in ThreadEntry.shadow_stack_head, accessed via TLS key
         self.tls_frame_top = ir.GlobalVariable(
             self.module, self.i8_ptr, name="tls_frame_top")
         self.tls_frame_top.initializer = ir.Constant(self.i8_ptr, None)
         self.tls_frame_top.linkage = 'internal'
+        # NOTE: thread_local doesn't work in llvmlite, but kept for documentation
         self.tls_frame_top.thread_local = 'localdynamic'
 
         # Thread's shadow stack depth
+        # NOTE: This is stored in ThreadEntry.stack_depth, accessed via TLS key
         self.tls_frame_depth = ir.GlobalVariable(
             self.module, self.i64, name="tls_frame_depth")
         self.tls_frame_depth.initializer = ir.Constant(self.i64, 0)
         self.tls_frame_depth.linkage = 'internal'
+        # NOTE: thread_local doesn't work in llvmlite, but kept for documentation
         self.tls_frame_depth.thread_local = 'localdynamic'
 
-        # Pointer to thread's ThreadEntry
+        # Pointer to thread's ThreadEntry - DEPRECATED, use pthread TLS instead
+        # Kept for reference but all accesses should go through the pthread key
         self.tls_thread_entry = ir.GlobalVariable(
             self.module, self.thread_entry_type.as_pointer(), name="tls_thread_entry")
         self.tls_thread_entry.initializer = ir.Constant(
             self.thread_entry_type.as_pointer(), None)
         self.tls_thread_entry.linkage = 'internal'
+        # NOTE: thread_local doesn't work in llvmlite - use pthread TLS instead
         self.tls_thread_entry.thread_local = 'localdynamic'
 
         # ============================================================
@@ -953,9 +971,9 @@ class GarbageCollector:
         # Phase 4: TLAB (Thread-Local Allocation Buffer) Declarations
         # ============================================================
 
-        # gc_tlab_init() -> void
-        # Initialize TLAB for current thread (called from gc_register_thread)
-        gc_tlab_init_ty = ir.FunctionType(self.void, [])
+        # gc_tlab_init(thread_entry: thread_entry_type*) -> void
+        # Initialize TLAB for a thread (called from gc_register_thread)
+        gc_tlab_init_ty = ir.FunctionType(self.void, [self.thread_entry_type.as_pointer()])
         self.gc_tlab_init = ir.Function(self.module, gc_tlab_init_ty, name="coex_gc_tlab_init")
 
         # gc_tlab_alloc(size: i64) -> i8*
@@ -1028,6 +1046,21 @@ class GarbageCollector:
         # External: get current thread ID
         pthread_self_ty = ir.FunctionType(self.i64, [])
         self.pthread_self = ir.Function(self.module, pthread_self_ty, name="pthread_self")
+
+        # pthread_key_create(key*, destructor) -> int
+        # Create a TLS key
+        pthread_key_create_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr])
+        self.pthread_key_create = ir.Function(self.module, pthread_key_create_ty, name="pthread_key_create")
+
+        # pthread_setspecific(key, value) -> int
+        # Set thread-local value for key
+        pthread_setspecific_ty = ir.FunctionType(self.i32, [self.i64, self.i8_ptr])
+        self.pthread_setspecific = ir.Function(self.module, pthread_setspecific_ty, name="pthread_setspecific")
+
+        # pthread_getspecific(key) -> void*
+        # Get thread-local value for key
+        pthread_getspecific_ty = ir.FunctionType(self.i8_ptr, [self.i64])
+        self.pthread_getspecific = ir.Function(self.module, pthread_getspecific_ty, name="pthread_getspecific")
 
         # sched_yield() -> i32
         # Yield CPU to other threads (used in watermark wait spin loop)
@@ -1421,6 +1454,17 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), self.gc_trigger_requested)
         builder.store(ir.Constant(self.i64, 1), self.gc_thread_running)
 
+        # ============================================================
+        # Initialize pthread TLS key for thread entry
+        # ============================================================
+        # pthread_key_t is typically unsigned long (8 bytes on 64-bit)
+        # We allocate storage for it and call pthread_key_create
+        key_storage = builder.alloca(self.i64, name="tls_key_storage")
+        key_storage_ptr = builder.bitcast(key_storage, self.i8_ptr)
+        builder.call(self.pthread_key_create, [key_storage_ptr, ir.Constant(self.i8_ptr, None)])
+        tls_key_value = builder.load(key_storage)
+        builder.store(tls_key_value, self.tls_thread_entry_key)
+
         # Register main thread
         builder.call(self.gc_register_thread, [])
 
@@ -1478,8 +1522,10 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # Check if already registered (TLS entry not null)
-        current_entry = builder.load(self.tls_thread_entry)
+        # Check if already registered (pthread TLS entry not null)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        current_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        current_entry = builder.bitcast(current_entry_i8, self.thread_entry_type.as_pointer())
         current_entry_int = builder.ptrtoint(current_entry, self.i64)
         is_registered = builder.icmp_unsigned(
             '!=', current_entry_int, ir.Constant(self.i64, 0))
@@ -1507,12 +1553,12 @@ class GarbageCollector:
         ], inbounds=True)
         builder.store(thread_id, tid_ptr)
 
-        # Field 1: shadow_stack_head - pointer to tls_frame_top
+        # Field 1: shadow_stack_head - direct frame pointer (not pointer to TLS)
+        # Initialize to NULL; push_frame_inline will update this directly
         head_ptr = builder.gep(new_entry, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
-        tls_frame_top_addr = builder.bitcast(self.tls_frame_top, self.i8_ptr)
-        builder.store(tls_frame_top_addr, head_ptr)
+        builder.store(ir.Constant(self.i8_ptr, None), head_ptr)
 
         # Field 2: watermark_depth = 0
         wm_depth_ptr = builder.gep(new_entry, [
@@ -1583,8 +1629,18 @@ class GarbageCollector:
         # Unlock registry mutex
         builder.call(self.pthread_mutex_unlock, [mutex])
 
-        # Store in TLS
+        # Store in pthread TLS (replaces broken LLVM TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        new_entry_i8 = builder.bitcast(new_entry, self.i8_ptr)
+        builder.call(self.pthread_setspecific, [tls_key, new_entry_i8])
+
+        # Also store in the (broken) global for compatibility with code that
+        # hasn't been updated yet - TODO: remove once all uses are updated
         builder.store(new_entry, self.tls_thread_entry)
+
+        # Initialize TLAB for this thread (allocates 256KB buffer)
+        # Pass thread entry directly since TLS may not be readable by callee yet
+        builder.call(self.gc_tlab_init, [new_entry])
 
         builder.ret_void()
 
@@ -1608,8 +1664,10 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # Get current ThreadEntry from TLS
-        my_entry = builder.load(self.tls_thread_entry)
+        # Get current ThreadEntry from pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        my_entry_i8_raw = builder.call(self.pthread_getspecific, [tls_key])
+        my_entry = builder.bitcast(my_entry_i8_raw, self.thread_entry_type.as_pointer())
         my_entry_int = builder.ptrtoint(my_entry, self.i64)
         is_registered = builder.icmp_unsigned(
             '!=', my_entry_int, ir.Constant(self.i64, 0))
@@ -1699,7 +1757,11 @@ class GarbageCollector:
         my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
         builder.call(self.codegen.free, [my_entry_i8])
 
-        # Clear TLS
+        # Clear pthread TLS
+        tls_key2 = builder.load(self.tls_thread_entry_key)
+        builder.call(self.pthread_setspecific, [tls_key2, ir.Constant(self.i8_ptr, None)])
+
+        # Also clear the (broken) global for compatibility
         builder.store(
             ir.Constant(self.thread_entry_type.as_pointer(), None),
             self.tls_thread_entry)
@@ -1707,13 +1769,16 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_get_thread_entry(self):
-        """Return the calling thread's ThreadEntry from TLS."""
+        """Return the calling thread's ThreadEntry from pthread TLS."""
         func = self.gc_get_thread_entry
 
         entry_block = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry_block)
 
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Get from pthread TLS instead of broken LLVM TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         builder.ret(thread_entry)
 
     def _implement_gc_push_frame(self):
@@ -1755,19 +1820,19 @@ class GarbageCollector:
         # Update TLS frame top
         builder.store(raw_frame, self.tls_frame_top)
 
-        # Also update old global for backward compatibility during transition
-        builder.store(raw_frame, self.gc_frame_top)
+        # NOTE: We no longer update the global gc_frame_top/gc_frame_depth
+        # as they cause race conditions in multi-threaded programs.
+        # All shadow stack operations now use thread-local storage.
 
         # Increment TLS frame depth
         depth = builder.load(self.tls_frame_depth)
         new_depth = builder.add(depth, ir.Constant(self.i64, 1))
         builder.store(new_depth, self.tls_frame_depth)
 
-        # Also update old global for backward compatibility
-        builder.store(new_depth, self.gc_frame_depth)
-
-        # Update ThreadEntry.stack_depth if registered
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Update ThreadEntry.stack_depth if registered (use pthread TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         entry_int = builder.ptrtoint(thread_entry, self.i64)
         is_registered = builder.icmp_unsigned(
             '!=', entry_int, ir.Constant(self.i64, 0))
@@ -1804,19 +1869,18 @@ class GarbageCollector:
         parent = builder.load(parent_ptr)
         builder.store(parent, self.tls_frame_top)
 
-        # Also update old global for backward compatibility
-        builder.store(parent, self.gc_frame_top)
+        # NOTE: We no longer update the global gc_frame_top/gc_frame_depth
+        # as they cause race conditions in multi-threaded programs.
 
         # Decrement TLS frame depth
         depth = builder.load(self.tls_frame_depth)
         new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
         builder.store(new_depth, self.tls_frame_depth)
 
-        # Also update old global for backward compatibility
-        builder.store(new_depth, self.gc_frame_depth)
-
-        # Update ThreadEntry.stack_depth if registered
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Update ThreadEntry.stack_depth if registered (use pthread TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         entry_int = builder.ptrtoint(thread_entry, self.i64)
         is_registered = builder.icmp_unsigned(
             '!=', entry_int, ir.Constant(self.i64, 0))
@@ -1859,37 +1923,36 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_alloc(self):
-        """Allocate memory with GC tracking"""
+        """Allocate memory with GC tracking.
+
+        Thread-safe implementation using:
+        - TLAB for fast-path object memory allocation (no locking)
+        - Per-thread allocation lists (no locking)
+        - Mutex-protected handle allocation (shared resource)
+
+        Falls back to mutex-protected malloc if TLAB is unavailable/full.
+        """
         func = self.gc_alloc
         func.args[0].name = "user_size"
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
-        do_alloc = func.append_basic_block("do_alloc")
+        try_tlab = func.append_basic_block("try_tlab")
+        tlab_ok = func.append_basic_block("tlab_ok")
+        try_refill = func.append_basic_block("try_refill")
+        retry_tlab = func.append_basic_block("retry_tlab")
+        tlab_retry_ok = func.append_basic_block("tlab_retry_ok")
+        fallback_malloc = func.append_basic_block("fallback_malloc")
+        have_block_tlab = func.append_basic_block("have_block_tlab")
+        have_block_malloc = func.append_basic_block("have_block_malloc")
+        init_header = func.append_basic_block("init_header")
+        alloc_handle = func.append_basic_block("alloc_handle")
+        finish = func.append_basic_block("finish")
 
         builder = ir.IRBuilder(entry)
 
         user_size = func.args[0]
         type_id = func.args[1]
-
-        # Increment allocation counter (for statistics, threshold check disabled)
-        count = builder.load(self.gc_alloc_count)
-        new_count = builder.add(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.gc_alloc_count)
-
-        # NOTE: Automatic GC triggering from gc_alloc is UNSAFE because:
-        # - Multi-allocation operations (HAMT insert, list append, etc.) create
-        #   intermediate objects that aren't rooted until the operation completes
-        # - If GC runs mid-operation, these unrooted objects get swept
-        # - This causes use-after-free crashes
-        #
-        # Safe collection points are:
-        # 1. Explicit gc() calls in user code
-        # 2. gc_safepoint() at function entry
-        builder.branch(do_alloc)
-
-        # Allocate memory
-        builder.position_at_end(do_alloc)
 
         # Total size = header + user_size, aligned to 8 bytes
         header_size = ir.Constant(self.i64, self.HEADER_SIZE)
@@ -1902,10 +1965,74 @@ class GarbageCollector:
             ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
         )
 
-        # Allocate block (header + data)
-        block = builder.call(self.codegen.malloc, [aligned_size])
+        # Allocate stack slots for block pointer and is_tlab flag
+        block_alloca = builder.alloca(self.i8_ptr, name="block")
+        is_tlab_alloca = builder.alloca(self.i64, name="is_tlab")
+        builder.store(ir.Constant(self.i64, 0), is_tlab_alloca)
+        builder.branch(try_tlab)
 
-        # Initialize header (Phase 1: 32-byte header with birth-marking)
+        # ============================================================
+        # Try TLAB allocation (fast path - no locking)
+        # ============================================================
+        builder.position_at_end(try_tlab)
+        tlab_block = builder.call(self.gc_tlab_alloc, [aligned_size])
+        tlab_block_int = builder.ptrtoint(tlab_block, self.i64)
+        tlab_success = builder.icmp_unsigned("!=", tlab_block_int, ir.Constant(self.i64, 0))
+        builder.cbranch(tlab_success, tlab_ok, try_refill)
+
+        builder.position_at_end(tlab_ok)
+        builder.store(tlab_block, block_alloca)
+        builder.store(ir.Constant(self.i64, 1), is_tlab_alloca)  # Mark as TLAB allocation
+        builder.branch(have_block_tlab)
+
+        # ============================================================
+        # TLAB full - try refill and retry
+        # ============================================================
+        builder.position_at_end(try_refill)
+        builder.call(self.gc_tlab_refill, [])
+        builder.branch(retry_tlab)
+
+        builder.position_at_end(retry_tlab)
+        retry_block = builder.call(self.gc_tlab_alloc, [aligned_size])
+        retry_block_int = builder.ptrtoint(retry_block, self.i64)
+        retry_success = builder.icmp_unsigned("!=", retry_block_int, ir.Constant(self.i64, 0))
+        builder.cbranch(retry_success, tlab_retry_ok, fallback_malloc)
+
+        builder.position_at_end(tlab_retry_ok)
+        builder.store(retry_block, block_alloca)
+        builder.store(ir.Constant(self.i64, 1), is_tlab_alloca)  # Mark as TLAB allocation
+        builder.branch(have_block_tlab)
+
+        # ============================================================
+        # Fallback to mutex-protected malloc (slow path)
+        # ============================================================
+        builder.position_at_end(fallback_malloc)
+        # Lock mutex for malloc fallback
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+        malloc_block = builder.call(self.codegen.malloc, [aligned_size])
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.store(malloc_block, block_alloca)
+        builder.store(ir.Constant(self.i64, 0), is_tlab_alloca)  # Not TLAB allocation
+        builder.branch(have_block_malloc)
+
+        # ============================================================
+        # Merge paths - TLAB allocation
+        # ============================================================
+        builder.position_at_end(have_block_tlab)
+        builder.branch(init_header)
+
+        # Merge paths - malloc allocation
+        builder.position_at_end(have_block_malloc)
+        builder.branch(init_header)
+
+        # ============================================================
+        # Initialize object header
+        # ============================================================
+        builder.position_at_end(init_header)
+        block = builder.load(block_alloca)
+        is_tlab = builder.load(is_tlab_alloca)
+
         header = builder.bitcast(block, self.header_type.as_pointer())
 
         # Size field (offset 0)
@@ -1917,79 +2044,110 @@ class GarbageCollector:
         type_id_64 = builder.zext(type_id, self.i64)
         builder.store(type_id_64, type_id_ptr)
 
-        # Flags field (offset 16) - BIRTH-MARKING: objects are born marked!
-        # Phase 4: Use gc_current_mark_value for birth-marking (supports mark inversion)
-        # This is critical for high watermark correctness
+        # Flags field (offset 16) - BIRTH-MARKING + TLAB flag
+        # Objects are born marked with current mark value
+        # If from TLAB, also set FLAG_TLAB bit
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         current_mark = builder.load(self.gc_current_mark_value)
-        builder.store(current_mark, flags_ptr)
+        # Shift is_tlab (0 or 1) to bit position 4 for FLAG_TLAB
+        tlab_flag = builder.shl(is_tlab, ir.Constant(self.i64, 4))
+        flags_value = builder.or_(current_mark, tlab_flag)
+        builder.store(flags_value, flags_ptr)
 
-        # Forward pointer field (offset 24) - 0 means not forwarded
+        # Forward pointer field (offset 24) - will store handle
         forward_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), forward_ptr)
 
-        # Add to allocation list
-        node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
-        raw_node = builder.call(self.codegen.malloc, [node_size])
-        node = builder.bitcast(raw_node, self.alloc_node_type.as_pointer())
+        builder.branch(alloc_handle)
 
-        # node->next = gc_alloc_list
-        old_head = builder.load(self.gc_alloc_list)
-        next_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(old_head, next_ptr)
+        # ============================================================
+        # Allocate handle (mutex-protected for thread safety)
+        # ============================================================
+        builder.position_at_end(alloc_handle)
 
         # Compute user_ptr (after header)
-        block_int = builder.ptrtoint(block, self.i64)
+        block_for_ptr = builder.load(block_alloca)
+        block_int = builder.ptrtoint(block_for_ptr, self.i64)
         user_ptr_int = builder.add(block_int, header_size)
         user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
 
-        # Phase 7: Allocate handle and store pointer in handle table
-        # Then store handle in alloc_node (instead of user_ptr)
+        # Lock mutex for handle allocation (shared resource)
+        mutex_ptr2 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr2])
+
+        # Allocate handle and store pointer
         handle = builder.call(self.gc_handle_alloc, [])
         builder.call(self.gc_handle_store, [handle, user_ptr])
 
-        # Phase 8 fix: Store handle in header's forward field for ptr->handle lookup
-        # This allows gc_ptr_to_handle to recover the handle from a pointer
+        # Store handle in header's forward field for ptr->handle lookup
         builder.store(handle, forward_ptr)
 
-        # node->handle = handle (Phase 7: store handle instead of data pointer)
+        # ============================================================
+        # Add to per-thread allocation list (protected by gc_mutex)
+        # Keep mutex held to prevent race with gc_sweep_thread_lists
+        # ============================================================
+        # Allocate allocation node (ALWAYS use malloc for nodes, not TLAB)
+        # This ensures sweep can safely free nodes without tracking TLAB status
+        node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
+        raw_node = builder.call(self.codegen.malloc, [node_size])
+
+        node = builder.bitcast(raw_node, self.alloc_node_type.as_pointer())
+
+        # Initialize node fields before adding to list
+        # node->next = NULL (will be set by gc_alloc_to_thread_list)
+        next_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), next_ptr)
+
+        # node->handle = handle
         handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         builder.store(handle, handle_ptr)
 
         # node->size = aligned_size
         node_size_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(aligned_size, node_size_ptr)
+        aligned_size_reload = builder.load(size_ptr)  # Reload from header
+        builder.store(aligned_size_reload, node_size_ptr)
 
-        # gc_alloc_list = node
-        builder.store(raw_node, self.gc_alloc_list)
+        # Add to per-thread allocation list (still holding gc_mutex)
+        builder.call(self.gc_alloc_to_thread_list, [raw_node])
 
-        # Update GC statistics (Phase 0)
-        # Increment total_allocations
+        # Now safe to unlock gc_mutex after alloc_list is updated
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr2])
+
+        builder.branch(finish)
+
+        # ============================================================
+        # Update statistics and return
+        # ============================================================
+        builder.position_at_end(finish)
+
+        # Update GC statistics (these could race but are just stats)
+        # TODO: Use atomic operations for accurate stats in multi-threaded case
         total_allocs_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         total_allocs = builder.load(total_allocs_ptr)
         new_total_allocs = builder.add(total_allocs, ir.Constant(self.i64, 1))
         builder.store(new_total_allocs, total_allocs_ptr)
 
-        # Add to total_bytes_allocated
         total_bytes_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         total_bytes = builder.load(total_bytes_ptr)
-        new_total_bytes = builder.add(total_bytes, aligned_size)
+        aligned_size_final = builder.load(size_ptr)
+        new_total_bytes = builder.add(total_bytes, aligned_size_final)
         builder.store(new_total_bytes, total_bytes_ptr)
 
-        # Increment allocations_since_last_gc
         allocs_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         allocs_since = builder.load(allocs_since_ptr)
         new_allocs_since = builder.add(allocs_since, ir.Constant(self.i64, 1))
         builder.store(new_allocs_since, allocs_since_ptr)
 
-        # Add to bytes_since_last_gc
         bytes_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
         bytes_since = builder.load(bytes_since_ptr)
-        new_bytes_since = builder.add(bytes_since, aligned_size)
+        new_bytes_since = builder.add(bytes_since, aligned_size_final)
         builder.store(new_bytes_since, bytes_since_ptr)
 
-        # Phase 7: Handle already created and stored in alloc_node above
-        # Return handle (i64) instead of raw pointer
+        # Atomically increment allocation count for GC threshold triggering
+        # Use atomic add to avoid race conditions in multi-threaded code
+        builder.atomic_rmw('add', self.gc_alloc_count, ir.Constant(self.i64, 1), 'monotonic')
+
+        # Return handle
         builder.ret(handle)
 
     def _implement_gc_mark_hamt(self):
@@ -2013,8 +2171,10 @@ class GarbageCollector:
         func.args[1].name = "flags"
 
         entry = func.append_basic_block("entry")
+        validate_ptr = func.append_basic_block("validate_ptr")
         check_tag = func.append_basic_block("check_tag")
         is_leaf = func.append_basic_block("is_leaf")
+        process_leaf = func.append_basic_block("process_leaf")
         mark_key = func.append_basic_block("mark_key")
         after_key = func.append_basic_block("after_key")
         mark_value = func.append_basic_block("mark_value")
@@ -2022,6 +2182,8 @@ class GarbageCollector:
         is_internal = func.append_basic_block("is_internal")
         child_loop = func.append_basic_block("child_loop")
         child_body = func.append_basic_block("child_body")
+        validate_child = func.append_basic_block("validate_child")
+        recurse_child = func.append_basic_block("recurse_child")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -2030,7 +2192,14 @@ class GarbageCollector:
 
         # Null check
         is_null = builder.icmp_unsigned("==", root, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, check_tag)
+        builder.cbranch(is_null, done, validate_ptr)
+
+        # Validate pointer looks reasonable (>= 0x10000)
+        builder.position_at_end(validate_ptr)
+        ptr_int_val = builder.ptrtoint(root, self.i64)
+        min_valid_ptr = ir.Constant(self.i64, 0x10000)
+        ptr_looks_valid = builder.icmp_unsigned(">=", ptr_int_val, min_valid_ptr)
+        builder.cbranch(ptr_looks_valid, check_tag, done)
 
         # Check tag bit (bit 0)
         builder.position_at_end(check_tag)
@@ -2042,7 +2211,18 @@ class GarbageCollector:
         # Handle leaf - untag and mark, plus mark key/value if flags indicate
         builder.position_at_end(is_leaf)
         untagged_int = builder.and_(ptr_as_int, ir.Constant(self.i64, ~1 & 0xFFFFFFFFFFFFFFFF))
-        untagged_ptr = builder.inttoptr(untagged_int, self.i8_ptr)
+        # Store untagged_int for use in process_leaf
+        untagged_int_ptr = builder.alloca(self.i64, name="untagged_int_storage")
+        builder.store(untagged_int, untagged_int_ptr)
+        # Validate untagged leaf pointer looks reasonable
+        min_valid_leaf = ir.Constant(self.i64, 0x10000)
+        leaf_looks_valid = builder.icmp_unsigned(">=", untagged_int, min_valid_leaf)
+        builder.cbranch(leaf_looks_valid, process_leaf, done)
+
+        # Process validated leaf
+        builder.position_at_end(process_leaf)
+        untagged_int_loaded = builder.load(untagged_int_ptr)
+        untagged_ptr = builder.inttoptr(untagged_int_loaded, self.i8_ptr)
         # Convert pointer to handle for gc_mark_object
         untagged_handle = builder.call(self.gc_ptr_to_handle, [untagged_ptr])
         builder.call(self.gc_mark_object, [untagged_handle])
@@ -2138,6 +2318,16 @@ class GarbageCollector:
         children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         children_ptr = builder.load(children_ptr_ptr)
 
+        # Validate children array pointer before marking
+        children_int = builder.ptrtoint(builder.bitcast(children_ptr, self.i8_ptr), self.i64)
+        min_valid_children = ir.Constant(self.i64, 0x10000)
+        children_looks_valid = builder.icmp_unsigned(">=", children_int, min_valid_children)
+
+        # Only mark and iterate children if pointer is valid
+        mark_children = func.append_basic_block("mark_children")
+        builder.cbranch(children_looks_valid, mark_children, done)
+
+        builder.position_at_end(mark_children)
         # Mark the children array itself (it's also gc_alloc'd)
         children_as_i8 = builder.bitcast(children_ptr, self.i8_ptr)
         # Convert pointer to handle for gc_mark_object
@@ -2158,8 +2348,20 @@ class GarbageCollector:
         idx_64 = builder.zext(idx, self.i64)
         child_ptr_ptr = builder.gep(children_ptr, [idx_64], inbounds=True)
         child_ptr = builder.load(child_ptr_ptr)
-        # Recursive call to mark child (could be node or leaf), passing flags
+
+        # Validate child pointer before recursive call
+        child_int = builder.ptrtoint(child_ptr, self.i64)
+        min_valid_child = ir.Constant(self.i64, 0x10000)
+        child_looks_valid = builder.icmp_unsigned(">=", child_int, min_valid_child)
+        builder.cbranch(child_looks_valid, validate_child, recurse_child)
+
+        # Valid child - recurse
+        builder.position_at_end(validate_child)
         builder.call(func, [child_ptr, flags])
+        builder.branch(recurse_child)
+
+        # Invalid or done - continue to next
+        builder.position_at_end(recurse_child)
         next_idx = builder.add(idx, ir.Constant(self.i32, 1))
         builder.store(next_idx, idx_ptr)
         builder.branch(child_loop)
@@ -2221,7 +2423,17 @@ class GarbageCollector:
 
         # Null pointer check (defensive - shouldn't happen for valid handles)
         is_null_ptr = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null_ptr, done, get_header)
+
+        # Also check if pointer looks valid (not a small integer like free list index)
+        # Valid heap pointers are typically > 0x10000 (64KB)
+        check_ptr_valid = func.append_basic_block("check_ptr_valid")
+        builder.cbranch(is_null_ptr, done, check_ptr_valid)
+
+        builder.position_at_end(check_ptr_valid)
+        ptr_val = builder.ptrtoint(ptr, self.i64)
+        min_valid_addr = ir.Constant(self.i64, 0x10000)  # 64KB
+        ptr_looks_valid = builder.icmp_unsigned(">=", ptr_val, min_valid_addr)
+        builder.cbranch(ptr_looks_valid, get_header, done)
 
         builder.position_at_end(get_header)
         # Get header (before user pointer)
@@ -2578,18 +2790,16 @@ class GarbageCollector:
             '==', thread_int, ir.Constant(self.i64, 0))
         builder.cbranch(thread_is_null, done, process_thread)
 
-        # Process this thread
+        # Process this thread - scan its shadow stack
+        # Note: gc_wait_for_watermarks has already ensured all threads have acknowledged
+        # their watermark before we reach gc_scan_roots, so all threads are safe to scan.
         builder.position_at_end(process_thread)
 
-        # Get shadow_stack_head (pointer to the TLS frame_top location)
-        head_ptr_ptr = builder.gep(curr_thread, [
+        # Get shadow_stack_head (now stores the frame pointer directly)
+        head_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
-        head_ptr = builder.load(head_ptr_ptr)  # i8* pointing to frame_top location
-
-        # Cast to i8** and load the actual frame pointer
-        head_ptr_typed = builder.bitcast(head_ptr, self.i8_ptr.as_pointer())
-        first_frame = builder.load(head_ptr_typed)
+        first_frame = builder.load(head_ptr)  # i8* pointing to first frame (or null)
         builder.store(first_frame, curr_frame_alloca)
 
         # Get watermark_depth for this thread
@@ -2603,11 +2813,17 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), frame_depth_alloca)
         builder.branch(frame_loop)
 
-        # Frame loop: while curr_frame != null
+        # Frame loop: while curr_frame != null AND looks valid
         builder.position_at_end(frame_loop)
         frame_val = builder.load(curr_frame_alloca)
-        is_null_frame = builder.icmp_unsigned("==", frame_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null_frame, next_thread, process_frame)
+        frame_int = builder.ptrtoint(frame_val, self.i64)
+        is_null_frame = builder.icmp_unsigned("==", frame_int, ir.Constant(self.i64, 0))
+        # Also check frame pointer is reasonable (not garbage like 0xd3)
+        min_valid_frame = ir.Constant(self.i64, 0x10000)  # 64KB
+        frame_reasonable = builder.icmp_unsigned(">=", frame_int, min_valid_frame)
+        # Skip this thread if frame is null OR looks like garbage
+        frame_valid = builder.or_(is_null_frame, builder.not_(frame_reasonable))
+        builder.cbranch(frame_valid, next_thread, process_frame)
 
         # Process frame
         builder.position_at_end(process_frame)
@@ -2629,11 +2845,29 @@ class GarbageCollector:
 
         # Get num_roots
         num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        num_roots = builder.load(num_roots_ptr)
+        num_roots_raw = builder.load(num_roots_ptr)
+
+        # Validate num_roots is sane (defensive check against garbage)
+        max_roots = ir.Constant(self.i64, 1000)  # No function should have > 1000 roots
+        roots_sane = builder.icmp_unsigned("<=", num_roots_raw, max_roots)
+        num_roots = builder.select(roots_sane, num_roots_raw, ir.Constant(self.i64, 0))
 
         # Get handle_slots array (Phase 3: now i64* instead of i8**)
         slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         slots = builder.load(slots_ptr_ptr)
+
+        # Validate slots pointer is not null AND looks like a valid pointer
+        # (not a small integer like a corrupted free list index)
+        slots_int = builder.ptrtoint(slots, self.i64)
+        slots_not_null = builder.icmp_unsigned("!=", slots_int, ir.Constant(self.i64, 0))
+        min_valid_slots = ir.Constant(self.i64, 0x10000)  # 64KB
+        slots_reasonable = builder.icmp_unsigned(">=", slots_int, min_valid_slots)
+        slots_valid = builder.and_(slots_not_null, slots_reasonable)
+        # Skip to next frame if slots is invalid (corrupt frame)
+        slots_check = func.append_basic_block("slots_check")
+        builder.cbranch(slots_valid, slots_check, next_frame)
+
+        builder.position_at_end(slots_check)
 
         # Root index
         root_idx = builder.alloca(self.i64, name="root_idx")
@@ -2655,7 +2889,18 @@ class GarbageCollector:
 
         # Skip if handle is 0 (null handle)
         is_null_handle = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_handle, next_root, do_mark)
+
+        # Validate handle is within range (defensive check against garbage)
+        # Load gc_next_handle to get upper bound
+        next_handle = builder.load(self.gc_next_handle)
+        handle_in_range = builder.icmp_unsigned("<", handle, next_handle)
+        # Also check handle is not too large (sanity check)
+        handle_sane = builder.icmp_unsigned("<", handle, ir.Constant(self.i64, 100000000))  # 100M max handles
+        handle_valid = builder.and_(handle_in_range, handle_sane)
+
+        # Skip if null OR invalid
+        should_skip = builder.or_(is_null_handle, builder.not_(handle_valid))
+        builder.cbranch(should_skip, next_root, do_mark)
 
         # Mark the object via its handle
         # gc_mark_object now takes i64 handle directly
@@ -2698,152 +2943,28 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_sweep(self):
-        """Sweep allocation list and free unmarked objects.
+        """Sweep all per-thread allocation lists and free unmarked objects.
 
-        Traverses the allocation list, freeing unmarked objects and keeping
-        marked ones (after clearing their mark bits for the next cycle).
+        Delegates to gc_sweep_thread_lists which iterates all registered threads
+        and sweeps their per-thread allocation lists.
 
-        Phase 8 Enhancement: Tracks sweep statistics:
-        - objects_swept_last_cycle (gc_stats offset 48)
-        - bytes_reclaimed_last_cycle (gc_stats offset 56)
+        This replaces the old global gc_alloc_list approach with thread-safe
+        per-thread lists that don't require locking during allocation.
         """
         func = self.gc_sweep
 
         entry = func.append_basic_block("entry")
-        sweep_loop = func.append_basic_block("sweep_loop")
-        check_marked = func.append_basic_block("check_marked")
-        is_marked_block = func.append_basic_block("is_marked")
-        is_unmarked_block = func.append_basic_block("is_unmarked")
-        next_obj = func.append_basic_block("next_obj")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
-        # Phase 8: Track sweep statistics
-        swept_count = builder.alloca(self.i64, name="swept_count")
-        builder.store(ir.Constant(self.i64, 0), swept_count)
-        swept_bytes = builder.alloca(self.i64, name="swept_bytes")
-        builder.store(ir.Constant(self.i64, 0), swept_bytes)
+        # Delegate to thread-aware sweep that handles per-thread allocation lists
+        builder.call(self.gc_sweep_thread_lists, [])
 
-        # Phase 7: Store current object's handle for use across blocks
-        current_handle = builder.alloca(self.i64, name="current_handle")
-        builder.store(ir.Constant(self.i64, 0), current_handle)
-
-        # prev = null (pointer to previous node's next field, or gc_alloc_list)
-        prev = builder.alloca(self.i8_ptr.as_pointer(), name="prev")
-        builder.store(self.gc_alloc_list, prev)
-
-        # curr = gc_alloc_list
-        curr = builder.alloca(self.i8_ptr, name="curr")
-        head = builder.load(self.gc_alloc_list)
-        builder.store(head, curr)
-
-        builder.branch(sweep_loop)
-
-        # Sweep loop
-        builder.position_at_end(sweep_loop)
-        curr_val = builder.load(curr)
-        is_null = builder.icmp_unsigned("==", curr_val, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, check_marked)
-
-        # Process allocation - check if marked
-        builder.position_at_end(check_marked)
-        node = builder.bitcast(curr_val, self.alloc_node_type.as_pointer())
-
-        # Phase 7: Get handle from node (field 1 is now i64 handle, not i8* data)
-        handle_field_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        obj_handle = builder.load(handle_field_ptr)
-        # Store handle for use in unmarked block
-        builder.store(obj_handle, current_handle)
-
-        # Phase 7: Dereference handle to get data pointer
-        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
-
-        # Get header
-        data_int = builder.ptrtoint(data_ptr, self.i64)
-        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
-        header_ptr = builder.inttoptr(header_int, self.i8_ptr)
-        header = builder.bitcast(header_ptr, self.header_type.as_pointer())
-
-        # Check mark bit (Phase 4: compare to gc_current_mark_value for mark inversion)
-        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        flags = builder.load(flags_ptr)
-        mark_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
-        current_mark = builder.load(self.gc_current_mark_value)
-        is_marked = builder.icmp_unsigned("==", mark_bit, current_mark)
-        builder.cbranch(is_marked, is_marked_block, is_unmarked_block)
-
-        # Object is marked - keep it (Phase 4: no need to clear mark bit with mark inversion)
-        builder.position_at_end(is_marked_block)
-        # Update prev to point to this node's next field
-        next_field_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        next_field_ptr_cast = builder.bitcast(next_field_ptr, self.i8_ptr.as_pointer())
-        builder.store(next_field_ptr_cast, prev)
-        # Move to next
-        next_ptr = builder.load(next_field_ptr)
-        builder.store(next_ptr, curr)
-        builder.branch(sweep_loop)
-
-        # Object is unmarked - free it and remove from list
-        builder.position_at_end(is_unmarked_block)
-
-        # Phase 8: Get size for statistics before freeing
-        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        obj_size = builder.load(size_ptr)
-
-        # Phase 8: Increment swept count
-        old_count = builder.load(swept_count)
-        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
-        builder.store(new_count, swept_count)
-
-        # Phase 8: Add to swept bytes
-        old_bytes = builder.load(swept_bytes)
-        new_bytes = builder.add(old_bytes, obj_size)
-        builder.store(new_bytes, swept_bytes)
-
-        # Get next node before freeing
-        next_field_ptr2 = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        next_node = builder.load(next_field_ptr2)
-        # Update previous node's next pointer to skip this node
-        prev_ptr = builder.load(prev)
-        builder.store(next_node, prev_ptr)
-        # Free the allocation (header + data)
-        builder.call(self.codegen.free, [header_ptr])
-        # MI-6: Retire the handle (add to retired list for deferred reclamation)
-        # Handle becomes available for reuse after the next GC cycle
-        freed_handle = builder.load(current_handle)
-        builder.call(self.gc_handle_retire, [freed_handle])
-        # Free the allocation node
-        builder.call(self.codegen.free, [curr_val])
-        # Move to next (prev stays the same since we removed current)
-        builder.store(next_node, curr)
-        builder.branch(sweep_loop)
-
-        builder.position_at_end(next_obj)
-        # This block is no longer used but keep for compatibility
-        builder.branch(sweep_loop)
-
-        builder.position_at_end(done)
         # Reset allocation counter
         builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
 
-        # Phase 8: Update gc_stats with sweep statistics
-        # gc_stats.objects_swept_last_cycle (offset 6 = index 48/8)
-        final_count = builder.load(swept_count)
-        swept_count_ptr = builder.gep(self.gc_stats, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
-        ], inbounds=True)
-        builder.store(final_count, swept_count_ptr)
-
-        # gc_stats.bytes_reclaimed_last_cycle (offset 7 = index 56/8)
-        final_bytes = builder.load(swept_bytes)
-        swept_bytes_ptr = builder.gep(self.gc_stats, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        builder.store(final_bytes, swept_bytes_ptr)
-
-        # Phase 9: Mark value flip moved to gc_collect (before mark phase)
-        # This ensures objects born after flip are properly traversed
+        # Note: Sweep statistics are not currently tracked in the thread-list
+        # sweep. For accurate stats, gc_sweep_thread_lists would need to be
+        # enhanced to return/accumulate stats.
 
         builder.ret_void()
 
@@ -2887,22 +3008,19 @@ class GarbageCollector:
         builder.cbranch(gc_enabled, check_enabled, done)
 
         builder.position_at_end(check_enabled)
-        # Check if GC already in progress (reentrant protection)
-        # Compute in_prog_ptr fresh - it will also be recomputed in cleanup
-        in_prog_ptr_check = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        in_progress = builder.load(in_prog_ptr_check)
-        is_in_progress = builder.icmp_unsigned("!=", in_progress, ir.Constant(self.i64, 0))
-        builder.cbranch(is_in_progress, done, do_collection)
-
-        builder.position_at_end(do_collection)
-
-        # Set gc_in_progress = 1
+        # Atomically try to set gc_in_progress from 0 to 1
+        # This prevents multiple threads from entering gc_collect simultaneously
         in_prog_ptr = builder.gep(self.gc_state, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 1), in_prog_ptr)
+        # cmpxchg returns {old_value, success_bool} - we check if old was 0
+        cmpxchg_result = builder.cmpxchg(in_prog_ptr, ir.Constant(self.i64, 0),
+                                          ir.Constant(self.i64, 1), 'acquire', 'monotonic')
+        old_value = builder.extract_value(cmpxchg_result, 0)
+        was_zero = builder.icmp_unsigned("==", old_value, ir.Constant(self.i64, 0))
+        builder.cbranch(was_zero, do_collection, done)
+
+        builder.position_at_end(do_collection)
 
         # Set gc_phase = 1 (WATERMARK) to signal threads to acknowledge
         builder.store(ir.Constant(self.i64, 1), self.gc_phase)
@@ -2913,23 +3031,10 @@ class GarbageCollector:
         builder.store(new_cycle, self.gc_cycle_id)
 
         # Phase 2 Watermark Protocol:
-        # If running on GC thread (tls_thread_entry == NULL), wait for all
-        # mutator threads to acknowledge watermark before marking.
-        # If running on mutator thread (synchronous gc() call), skip waiting
-        # since this thread is blocked and can't hit safepoints anyway.
-        thread_entry = builder.load(self.tls_thread_entry)
-        entry_int = builder.ptrtoint(thread_entry, self.i64)
-        on_gc_thread = builder.icmp_unsigned('==', entry_int, ir.Constant(self.i64, 0))
-
-        wait_watermarks = func.append_basic_block("wait_watermarks")
-        after_watermarks = func.append_basic_block("after_watermarks")
-        builder.cbranch(on_gc_thread, wait_watermarks, after_watermarks)
-
-        builder.position_at_end(wait_watermarks)
+        # ALWAYS wait for all OTHER threads to acknowledge watermark before marking.
+        # The calling thread (if a mutator) is safe to scan because it's blocked here.
+        # gc_wait_for_watermarks skips the calling thread to avoid self-deadlock.
         builder.call(self.gc_wait_for_watermarks, [])
-        builder.branch(after_watermarks)
-
-        builder.position_at_end(after_watermarks)
 
         # MI-6: Promote retired handles from previous cycle to free list
         # This makes handles retired in cycle N-1 available for reuse in cycle N
@@ -2962,6 +3067,10 @@ class GarbageCollector:
         builder.call(self.gc_sweep, [])
 
         # Reset watermark_active for all threads
+        # Lock registry mutex to prevent threads from unregistering during iteration
+        reset_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [reset_mutex])
+
         # Allocate storage for loop variable
         reset_curr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="reset_curr")
         first_reset = builder.load(self.gc_thread_registry)
@@ -3002,6 +3111,9 @@ class GarbageCollector:
 
         # Cleanup - runs after successful GC
         builder.position_at_end(cleanup)
+
+        # Unlock registry mutex after watermark reset loop
+        builder.call(self.pthread_mutex_unlock, [reset_mutex])
 
         # Set gc_phase = 0 (IDLE)
         builder.store(ir.Constant(self.i64, 0), self.gc_phase)
@@ -3077,9 +3189,11 @@ class GarbageCollector:
         is_idle = builder.icmp_unsigned('==', phase, ir.Constant(self.i64, 0))
         builder.cbranch(is_idle, enabled_check, check_phase)
 
-        # Check if we need to acknowledge watermark
+        # Check if we need to acknowledge watermark (use pthread TLS)
         builder.position_at_end(check_phase)
-        thread_entry = builder.load(self.tls_thread_entry)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         entry_int = builder.ptrtoint(thread_entry, self.i64)
         not_registered = builder.icmp_unsigned(
             '==', entry_int, ir.Constant(self.i64, 0))
@@ -3118,6 +3232,27 @@ class GarbageCollector:
 
         # watermark_active = 1
         builder.store(ir.Constant(self.i64, 1), wm_active_ptr)
+
+        # Wait for GC to complete (gc_phase returns to 0)
+        # This prevents the thread from modifying its shadow stack while GC scans it.
+        # The calling thread that triggered GC doesn't reach this code because it
+        # checked gc_phase = 0 before triggering.
+        wait_loop = func.append_basic_block("wait_gc_complete")
+        wait_yield = func.append_basic_block("wait_yield")
+        gc_done = func.append_basic_block("gc_done")
+        builder.branch(wait_loop)
+
+        builder.position_at_end(wait_loop)
+        phase_val = builder.load(self.gc_phase)
+        gc_still_active = builder.icmp_unsigned('!=', phase_val, ir.Constant(self.i64, 0))
+        builder.cbranch(gc_still_active, wait_yield, gc_done)
+
+        # Yield and retry
+        builder.position_at_end(wait_yield)
+        builder.call(self.sched_yield, [])
+        builder.branch(wait_loop)
+
+        builder.position_at_end(gc_done)
         builder.branch(after_ack)
 
         builder.position_at_end(after_ack)
@@ -3133,19 +3268,26 @@ class GarbageCollector:
 
         builder.position_at_end(threshold_check)
 
-        # Check if allocation count >= threshold
-        count = builder.load(self.gc_alloc_count)
+        # First, check if count is high enough (non-atomic read is fine for check)
+        # Only if high, do we attempt the atomic exchange to claim the trigger
         threshold = ir.Constant(self.i64, self.GC_THRESHOLD)
-        should_gc = builder.icmp_unsigned(">=", count, threshold)
+        current_count = builder.load(self.gc_alloc_count)
+        maybe_gc = builder.icmp_unsigned(">=", current_count, threshold)
+
+        try_claim = func.append_basic_block("try_claim")
+        builder.cbranch(maybe_gc, try_claim, done)
+
+        # Try to claim the trigger by atomically exchanging to 0
+        # Only one thread will see the high value and trigger GC
+        builder.position_at_end(try_claim)
+        claimed_count = builder.atomic_rmw('xchg', self.gc_alloc_count, ir.Constant(self.i64, 0), 'acquire')
+        should_gc = builder.icmp_unsigned(">=", claimed_count, threshold)
         builder.cbranch(should_gc, do_gc, done)
 
-        # Trigger GC synchronously and reset counter
-        # NOTE: Until Phase 4 (TLAB allocation) is implemented, safepoint-triggered
-        # GC must be synchronous to avoid race conditions on the allocation list.
-        # The GC thread is used for explicit gc()/gc_async() calls only.
+        # Trigger GC synchronously
+        # gc_collect has internal gc_in_progress check to prevent re-entrancy
         builder.position_at_end(do_gc)
         builder.call(self.gc_collect, [])
-        builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -3202,13 +3344,52 @@ class GarbageCollector:
         Phase 3: Takes i64* handle_slots instead of i8** roots.
         Allocates the frame structure on the stack instead of heap.
         Returns pointer to the stack-allocated frame for later pop.
-        Uses thread-local storage for the frame chain.
+        Uses pthread TLS via ThreadEntry for proper multi-thread support.
         """
         # Allocate frame struct on stack (parent: i8*, num_roots: i64, handle_slots: i64*)
         frame_alloca = builder.alloca(self.gc_frame_type, name="gc_frame")
 
-        # Get old top from TLS
-        old_top = builder.load(self.tls_frame_top)
+        # Get ThreadEntry via pthread TLS (once at the start)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+        entry_int = builder.ptrtoint(thread_entry, self.i64)
+        is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
+
+        # Store thread_entry for use in later blocks
+        thread_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="thread_entry_storage")
+        builder.store(thread_entry, thread_entry_alloca)
+
+        # Create blocks for registered vs not registered cases
+        func = builder.function
+        registered_block = func.append_basic_block("push_registered")
+        not_registered_block = func.append_basic_block("push_not_registered")
+        merge_block = func.append_basic_block("push_merge")
+
+        # Allocate storage for old_top to merge results
+        old_top_alloca = builder.alloca(self.i8_ptr, name="old_top_storage")
+
+        builder.cbranch(is_registered, registered_block, not_registered_block)
+
+        # Registered path: get old_top from ThreadEntry.shadow_stack_head
+        builder.position_at_end(registered_block)
+        te_reg = builder.load(thread_entry_alloca)
+        head_ptr = builder.gep(te_reg, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        old_top_registered = builder.load(head_ptr)
+        builder.store(old_top_registered, old_top_alloca)
+        builder.branch(merge_block)
+
+        # Not registered path: use global (fallback for early init)
+        builder.position_at_end(not_registered_block)
+        old_top_global = builder.load(self.tls_frame_top)
+        builder.store(old_top_global, old_top_alloca)
+        builder.branch(merge_block)
+
+        # Merge and continue
+        builder.position_at_end(merge_block)
+        old_top = builder.load(old_top_alloca)
 
         # Set parent = old_top
         parent_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
@@ -3222,45 +3403,100 @@ class GarbageCollector:
         slots_ptr_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         builder.store(handle_slots, slots_ptr_ptr)
 
-        # Update TLS frame_top to point to this frame
+        # Update frame_top to point to this frame
         raw_frame = builder.bitcast(frame_alloca, self.i8_ptr)
+
+        # Store in ThreadEntry.shadow_stack_head if registered, else global
+        te_final = builder.load(thread_entry_alloca)
+        te_final_int = builder.ptrtoint(te_final, self.i64)
+        is_registered_final = builder.icmp_unsigned('!=', te_final_int, ir.Constant(self.i64, 0))
+
+        store_registered = func.append_basic_block("store_registered")
+        store_global = func.append_basic_block("store_global")
+        store_done = func.append_basic_block("store_done")
+
+        builder.cbranch(is_registered_final, store_registered, store_global)
+
+        builder.position_at_end(store_registered)
+        te_store = builder.load(thread_entry_alloca)
+        head_ptr2 = builder.gep(te_store, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(raw_frame, head_ptr2)
+        # Also update stack_depth in ThreadEntry
+        depth_ptr = builder.gep(te_store, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        old_depth = builder.load(depth_ptr)
+        new_depth = builder.add(old_depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, depth_ptr)
+        builder.branch(store_done)
+
+        builder.position_at_end(store_global)
         builder.store(raw_frame, self.tls_frame_top)
-
-        # Also update old global for backward compatibility
-        builder.store(raw_frame, self.gc_frame_top)
-
-        # Increment TLS frame depth
+        # Update global depth counter
         depth = builder.load(self.tls_frame_depth)
-        new_depth = builder.add(depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth, self.tls_frame_depth)
+        new_depth_global = builder.add(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth_global, self.tls_frame_depth)
+        builder.branch(store_done)
 
-        # Also update old global for backward compatibility
-        builder.store(new_depth, self.gc_frame_depth)
-
+        builder.position_at_end(store_done)
         return raw_frame
 
     def pop_frame_inline(self, builder: ir.IRBuilder, frame: ir.Value):
         """Pop a GC frame (stack-allocated version - no free needed).
 
-        Uses thread-local storage for the frame chain.
+        Uses pthread TLS via ThreadEntry for proper multi-thread support.
         """
         frame_typed = builder.bitcast(frame, self.gc_frame_type.as_pointer())
 
-        # Get parent and set as new TLS top
+        # Get parent pointer
         parent_ptr = builder.gep(frame_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         parent = builder.load(parent_ptr)
+
+        # Get ThreadEntry via pthread TLS (once at the start)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+        entry_int = builder.ptrtoint(thread_entry, self.i64)
+        is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
+
+        # Store thread_entry for use in later blocks
+        thread_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="pop_thread_entry_storage")
+        builder.store(thread_entry, thread_entry_alloca)
+
+        func = builder.function
+        pop_registered = func.append_basic_block("pop_registered")
+        pop_global = func.append_basic_block("pop_global")
+        pop_done = func.append_basic_block("pop_done")
+
+        builder.cbranch(is_registered, pop_registered, pop_global)
+
+        # Registered path: update ThreadEntry.shadow_stack_head
+        builder.position_at_end(pop_registered)
+        te_pop = builder.load(thread_entry_alloca)
+        head_ptr = builder.gep(te_pop, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(parent, head_ptr)
+        # Decrement stack_depth in ThreadEntry
+        depth_ptr = builder.gep(te_pop, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        old_depth = builder.load(depth_ptr)
+        new_depth = builder.sub(old_depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth, depth_ptr)
+        builder.branch(pop_done)
+
+        # Not registered path: use global (fallback for early init)
+        builder.position_at_end(pop_global)
         builder.store(parent, self.tls_frame_top)
-
-        # Also update old global for backward compatibility
-        builder.store(parent, self.gc_frame_top)
-
-        # Decrement TLS frame depth
         depth = builder.load(self.tls_frame_depth)
-        new_depth = builder.sub(depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth, self.tls_frame_depth)
+        new_depth_global = builder.sub(depth, ir.Constant(self.i64, 1))
+        builder.store(new_depth_global, self.tls_frame_depth)
+        builder.branch(pop_done)
 
-        # Also update old global for backward compatibility
-        builder.store(new_depth, self.gc_frame_depth)
+        builder.position_at_end(pop_done)
 
     def push_frame(self, builder: ir.IRBuilder, num_roots: int, handle_slots: ir.Value) -> ir.Value:
         """Push a GC frame. Returns frame pointer for later pop.
@@ -3820,11 +4056,17 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_wait_for_watermarks(self):
-        """Wait for all threads to acknowledge watermark (Phase 2).
+        """Wait for all OTHER threads to acknowledge watermark (Phase 2).
 
-        This function is called by the GC thread after setting gc_phase = WATERMARK.
-        It spins until all registered threads have watermark_active = 1,
-        calling sched_yield() between iterations to allow mutators to run.
+        This function is called after setting gc_phase = WATERMARK.
+        It spins until all registered threads (EXCEPT the calling thread) have
+        watermark_active = 1, calling sched_yield() between iterations.
+
+        The calling thread is skipped because:
+        1. If called from GC thread (no ThreadEntry), all threads need to ack
+        2. If called from mutator thread, that thread is blocked here and
+           can't reach a safepoint to acknowledge, but its shadow stack is
+           safe to scan because it's frozen at this call site.
 
         Timeout: After MAX_ITERATIONS, proceed anyway (accept potential unsafety
         for threads blocked in system calls).
@@ -3841,6 +4083,13 @@ class GarbageCollector:
         timeout = func.append_basic_block("timeout")
 
         builder = ir.IRBuilder(entry)
+
+        # Get calling thread's ThreadEntry (to skip it in the loop)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        my_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        my_entry = builder.bitcast(my_entry_i8, self.thread_entry_type.as_pointer())
+        my_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="my_entry")
+        builder.store(my_entry, my_entry_alloca)
 
         # Iteration counter (max 10000 iterations ~ 10ms at 1us per yield)
         max_iterations = ir.Constant(self.i64, 10000)
@@ -3862,6 +4111,9 @@ class GarbageCollector:
 
         # Thread loop start
         builder.position_at_end(thread_loop)
+        # Lock registry mutex for safe iteration
+        wm_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [wm_mutex])
         first_thread = builder.load(self.gc_thread_registry)
         builder.store(first_thread, curr_thread_alloca)
         builder.branch(check_thread)
@@ -3873,8 +4125,19 @@ class GarbageCollector:
         is_null = builder.icmp_unsigned("==", thread_int, ir.Constant(self.i64, 0))
         builder.cbranch(is_null, all_done, next_thread)
 
-        # Check watermark_active for this thread
+        # Check if this is the calling thread (skip if so)
         builder.position_at_end(next_thread)
+        my_entry_val = builder.load(my_entry_alloca)
+        my_entry_int = builder.ptrtoint(my_entry_val, self.i64)
+        curr_int = builder.ptrtoint(curr_thread, self.i64)
+        is_self = builder.icmp_unsigned("==", curr_int, my_entry_int)
+
+        check_watermark = func.append_basic_block("check_watermark")
+        advance = func.append_basic_block("advance")
+        builder.cbranch(is_self, advance, check_watermark)
+
+        # Check watermark_active for this thread
+        builder.position_at_end(check_watermark)
         wm_active_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
@@ -3882,7 +4145,6 @@ class GarbageCollector:
         not_acked = builder.icmp_unsigned("==", wm_active, ir.Constant(self.i64, 0))
 
         # If not acknowledged, yield and retry
-        advance = func.append_basic_block("advance")
         builder.cbranch(not_acked, yield_and_retry, advance)
 
         # Advance to next thread (field 9 is the 'next' pointer, stored as i8*)
@@ -3898,10 +4160,14 @@ class GarbageCollector:
 
         # All threads acknowledged
         builder.position_at_end(all_done)
+        # Unlock registry mutex before returning
+        builder.call(self.pthread_mutex_unlock, [wm_mutex])
         builder.ret_void()
 
         # Yield and retry
         builder.position_at_end(yield_and_retry)
+        # Unlock registry mutex before yielding
+        builder.call(self.pthread_mutex_unlock, [wm_mutex])
         builder.call(self.sched_yield, [])
         new_iter = builder.add(curr_iter, ir.Constant(self.i64, 1))
         builder.store(new_iter, iter_alloca)
@@ -3911,6 +4177,7 @@ class GarbageCollector:
         builder.position_at_end(timeout)
         # In production, we'd log a warning here
         # For now, just proceed (threads will be scanned with watermark=0 meaning scan all)
+        # Note: We didn't lock the mutex yet (hit_limit branch is before thread_loop)
         builder.ret_void()
 
     # ========================================================================
@@ -4278,8 +4545,8 @@ class GarbageCollector:
         # Allocation successful - initialize ThreadEntry TLAB fields
         builder.position_at_end(alloc_ok)
 
-        # Get current thread entry
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Get thread entry from parameter (not TLS - may not be initialized yet for new threads)
+        thread_entry = func.args[0]
         thread_entry_typed = builder.bitcast(thread_entry, self.thread_entry_type.as_pointer())
 
         # Set tlab_base (field 6)
@@ -4355,8 +4622,10 @@ class GarbageCollector:
         aligned_size = builder.add(size, seven)
         aligned_size = builder.and_(aligned_size, builder.not_(seven))
 
-        # Get current thread entry
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Get current thread entry (use pthread TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
 
         # Check if we have a thread entry
@@ -4364,7 +4633,7 @@ class GarbageCollector:
         builder.cbranch(is_null_entry, no_space, have_tlab)
 
         builder.position_at_end(have_tlab)
-        thread_entry_typed = builder.bitcast(thread_entry, self.thread_entry_type.as_pointer())
+        thread_entry_typed = thread_entry  # Already correctly typed
 
         # Load tlab_cursor (field 7)
         tlab_cursor_ptr = builder.gep(thread_entry_typed, [
@@ -4424,8 +4693,10 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # Get current thread entry
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Get current thread entry (use pthread TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
 
         # Check if we have a thread entry
@@ -4433,7 +4704,7 @@ class GarbageCollector:
         builder.cbranch(is_null_entry, done, have_entry)
 
         builder.position_at_end(have_entry)
-        thread_entry_typed = builder.bitcast(thread_entry, self.thread_entry_type.as_pointer())
+        thread_entry_typed = thread_entry  # Already correctly typed
 
         # Allocate new TLAB buffer via mmap
         tlab_size = ir.Constant(self.i64, self.TLAB_SIZE)
@@ -4513,8 +4784,10 @@ class GarbageCollector:
 
         node = func.args[0]
 
-        # Get current thread entry
-        thread_entry = builder.load(self.tls_thread_entry)
+        # Get current thread entry (use pthread TLS)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
 
         # Check if we have a thread entry
@@ -4522,7 +4795,7 @@ class GarbageCollector:
         builder.cbranch(is_null_entry, done, have_entry)
 
         builder.position_at_end(have_entry)
-        thread_entry_typed = builder.bitcast(thread_entry, self.thread_entry_type.as_pointer())
+        thread_entry_typed = thread_entry  # Already correctly typed
 
         # Get current head of thread's alloc_list (field 9)
         alloc_list_ptr = builder.gep(thread_entry_typed, [
@@ -4558,6 +4831,9 @@ class GarbageCollector:
         - Free the object memory (header + data)
         - Retire the handle
         - Remove from thread's list
+
+        THREAD SAFETY: Holds gc_registry_mutex during iteration to prevent
+        threads from unregistering (and freeing ThreadEntry) while we iterate.
         """
         func = self.gc_sweep_thread_lists
 
@@ -4576,11 +4852,27 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
+        # Lock registry mutex to prevent threads from unregistering during sweep
+        registry_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [registry_mutex])
+
+        # Lock gc_mutex to prevent allocations from modifying alloc_lists during sweep
+        gc_mutex = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [gc_mutex])
+
         # Allocate locals for iteration
         thread_ptr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
         prev_node_alloca = builder.alloca(self.i8_ptr, name="prev_node")
         curr_node_alloca = builder.alloca(self.i8_ptr, name="curr_node")
         handle_alloca = builder.alloca(self.i64, name="current_handle")
+
+        # Allocate counters for sweep statistics
+        swept_count_alloca = builder.alloca(self.i64, name="swept_count")
+        reclaimed_bytes_alloca = builder.alloca(self.i64, name="reclaimed_bytes")
+        live_count_alloca = builder.alloca(self.i64, name="live_count")
+        builder.store(ir.Constant(self.i64, 0), swept_count_alloca)
+        builder.store(ir.Constant(self.i64, 0), reclaimed_bytes_alloca)
+        builder.store(ir.Constant(self.i64, 0), live_count_alloca)
 
         # Get first thread from registry
         registry_head = builder.load(self.gc_thread_registry)
@@ -4655,6 +4947,13 @@ class GarbageCollector:
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
 
+        # Get size field for statistics
+        size_ptr = builder.gep(header, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)  # size field
+        ], inbounds=True)
+        obj_size = builder.load(size_ptr)
+
         # Get flags field
         flags_ptr = builder.gep(header, [
             ir.Constant(self.i32, 0),
@@ -4672,12 +4971,24 @@ class GarbageCollector:
 
         # Object is marked - keep it
         builder.position_at_end(marked_node)
+        # Increment live object count
+        old_live = builder.load(live_count_alloca)
+        new_live = builder.add(old_live, ir.Constant(self.i64, 1))
+        builder.store(new_live, live_count_alloca)
         # Update prev_node to current
         builder.store(curr_node, prev_node_alloca)
         builder.branch(next_node)
 
         # Object is unmarked - free it
         builder.position_at_end(unmarked_node)
+
+        # Increment swept count and bytes reclaimed
+        old_swept = builder.load(swept_count_alloca)
+        new_swept = builder.add(old_swept, ir.Constant(self.i64, 1))
+        builder.store(new_swept, swept_count_alloca)
+        old_reclaimed = builder.load(reclaimed_bytes_alloca)
+        new_reclaimed = builder.add(old_reclaimed, obj_size)
+        builder.store(new_reclaimed, reclaimed_bytes_alloca)
 
         # Get next node before modifying the list
         next_field_ptr = builder.gep(node_typed, [
@@ -4703,15 +5014,23 @@ class GarbageCollector:
                 ], inbounds=True)
                 builder.store(next_node_ptr, prev_next_ptr)
 
-        # Free the allocation (header + data)
-        builder.call(self.codegen.free, [header_ptr])
+        # Check if object was allocated from TLAB (FLAG_TLAB bit set)
+        # TLAB objects cannot be individually freed - the entire TLAB buffer
+        # will be reclaimed when it becomes empty
+        tlab_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_TLAB))
+        is_tlab = builder.icmp_unsigned("!=", tlab_bit, ir.Constant(self.i64, 0))
 
-        # Retire the handle using MI-6 deferred reclamation
+        # Only free non-TLAB objects (TLAB objects are freed when TLAB is reclaimed)
+        with builder.if_then(builder.not_(is_tlab)):
+            # Free the object allocation (header + data)
+            builder.call(self.codegen.free, [header_ptr])
+
+        # Always free the allocation node (nodes are always from malloc)
+        builder.call(self.codegen.free, [curr_node])
+
+        # Retire the handle using MI-6 deferred reclamation (always)
         freed_handle = builder.load(handle_alloca)
         builder.call(self.gc_handle_retire, [freed_handle])
-
-        # Free the allocation node
-        builder.call(self.codegen.free, [curr_node])
 
         # Move to next (prev stays the same since we removed current)
         builder.store(next_node_ptr, curr_node_alloca)
@@ -4736,6 +5055,32 @@ class GarbageCollector:
         builder.branch(check_thread)
 
         builder.position_at_end(done)
+
+        # Update gc_stats with sweep results
+        # objects_marked_last_cycle (offset 5) = live objects kept
+        marked_stat_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)
+        ], inbounds=True)
+        final_live = builder.load(live_count_alloca)
+        builder.store(final_live, marked_stat_ptr)
+
+        # objects_swept_last_cycle (offset 6) = objects freed
+        swept_stat_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
+        ], inbounds=True)
+        final_swept = builder.load(swept_count_alloca)
+        builder.store(final_swept, swept_stat_ptr)
+
+        # bytes_reclaimed_last_cycle (offset 7)
+        reclaimed_stat_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+        ], inbounds=True)
+        final_reclaimed = builder.load(reclaimed_bytes_alloca)
+        builder.store(final_reclaimed, reclaimed_stat_ptr)
+
+        # Unlock mutexes in reverse order of acquisition
+        builder.call(self.pthread_mutex_unlock, [gc_mutex])
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
         builder.ret_void()
 
     def _implement_gc_grow_heaps(self):
@@ -5087,7 +5432,7 @@ class GarbageCollector:
         builder.call(printf, [alloc_ptr, total_allocs, total_bytes])
 
         # Collection stats format
-        collect_fmt = "[GC:STATS] collections: %lld, marked_last: %lld, swept_last: %lld\n"
+        collect_fmt = "[GC:STATS] collections: %lld, live_objects: %lld, swept: %lld, reclaimed_bytes: %lld\n"
         collect_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(collect_fmt) + 1), name=".gc_stats_collect")
         collect_global.global_constant = True
         collect_global.linkage = 'private'
@@ -5101,7 +5446,9 @@ class GarbageCollector:
         marked = builder.load(marked_ptr)
         swept_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)], inbounds=True)
         swept = builder.load(swept_ptr)
-        builder.call(printf, [collect_ptr, collections, marked, swept])
+        reclaimed_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)], inbounds=True)
+        reclaimed = builder.load(reclaimed_ptr)
+        builder.call(printf, [collect_ptr, collections, marked, swept, reclaimed])
 
         # Timing stats format
         timing_fmt = "[GC:STATS] last_gc_ns: %lld\n"

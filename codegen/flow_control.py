@@ -241,9 +241,13 @@ class FlowControlGenerator:
                 break
 
         if not cg.builder.block.is_terminated:
-            # Inject cancellation safepoint at loop back-edge
+            # Inject safepoint at loop back-edge for GC watermark acknowledgment
+            # Task's inject_safepoint also calls gc_safepoint, so we only need
+            # to call it directly if not in a task context
             if cg._task is not None:
                 cg._task.inject_safepoint(cg.builder, exit_block)
+            else:
+                cg.builder.call(cg.gc.gc_safepoint, [])
             cg.builder.branch(cond_block)
 
         # Continue after loop

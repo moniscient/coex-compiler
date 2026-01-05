@@ -661,6 +661,11 @@ class TaskGenerator:
         If cancelled, branches to the loop exit block for early termination.
         Safe to call from any context - returns immediately if not in a task.
 
+        Also calls the GC safepoint to acknowledge watermarks for GC
+        synchronization. This is critical for the watermark protocol to work -
+        without safepoints at loop backedges, a thread in a long loop would
+        never acknowledge the GC watermark and GC would hang waiting.
+
         This is the preferred method for loop back-edge safepoints as it
         doesn't require tracking the closure pointer through the call stack.
 
@@ -669,6 +674,10 @@ class TaskGenerator:
             loop_exit_block: Block to branch to if cancelled
         """
         i32 = ir.IntType(32)
+
+        # First, call GC safepoint for watermark acknowledgment
+        # This must happen at loop backedges to allow GC coordination
+        builder.call(self.cg.gc.gc_safepoint, [])
 
         # Call TLS-based check: returns 1 if cancelled, 0 otherwise
         is_cancelled = builder.call(

@@ -437,9 +437,13 @@ class LoopGenerator:
         current = cg.builder.load(loop_var)
         next_val = cg.builder.add(current, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_val, loop_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         # Exit
@@ -569,9 +573,13 @@ class LoopGenerator:
         current = cg.builder.load(loop_var)
         next_val = cg.builder.add(current, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_val, loop_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         cg.builder.position_at_end(exit_block)
@@ -680,9 +688,13 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         # Exit
@@ -761,9 +773,13 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         # Exit
@@ -850,9 +866,13 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         # Exit
@@ -939,9 +959,13 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
-        # Inject cancellation safepoint at loop back-edge
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
+        # Task's inject_safepoint also calls gc_safepoint, so we only need
+        # to call it directly if not in a task context
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
 
         # Exit

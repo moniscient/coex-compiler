@@ -251,6 +251,14 @@ def compile_coex(source_path: str, output_path: str = None,
                 print(f"Warning: FFI runtime library not found at {ffi_runtime}")
                 print("Build it with: cd runtime && make")
 
+        # Add task runtime library (always needed for parallel for comprehensions)
+        task_runtime = os.path.join(runtime_dir, "libcoex_task.a")
+        if os.path.exists(task_runtime):
+            link_cmd.append(task_runtime)
+        else:
+            print(f"Warning: Task runtime library not found at {task_runtime}")
+            print("Build it with: cd runtime && make")
+
         result = subprocess.run(
             link_cmd,
             capture_output=True,
