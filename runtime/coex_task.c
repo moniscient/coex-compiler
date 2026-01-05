@@ -5,6 +5,9 @@
  * for Coex structured concurrency.
  */
 
+/* Enable POSIX features (clock_gettime, etc.) on Linux with -std=c11 */
+#define _POSIX_C_SOURCE 199309L
+
 #include "coex_task.h"
 #include <stdlib.h>
 #include <string.h>
