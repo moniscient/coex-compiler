@@ -423,8 +423,12 @@ class GarbageCollector:
             self.i8_ptr,  # 72: alloc_list - per-thread allocation list head (Phase 4)
             self.i64,     # 80: tlab_epoch - GC epoch when TLAB was issued
             self.i8_ptr,  # 88: next - next ThreadEntry in registry (stored as i8*)
+            # Segmented shadow stack fields (Phase 5)
+            self.i8_ptr,  # 96:  segment_base - first segment pointer (never changes)
+            self.i8_ptr,  # 104: segment_current - active segment pointer
+            self.i64,     # 112: slot_index - current absolute slot position (= watermark)
         ])
-        # Total: 96 bytes
+        # Total: 120 bytes
 
         # TLAB configuration
         self.TLAB_SIZE = 256 * 1024  # 256KB per TLAB
@@ -1538,8 +1542,8 @@ class GarbageCollector:
         # Do registration
         builder.position_at_end(do_register)
 
-        # Allocate ThreadEntry (96 bytes = 12 fields × 8 bytes)
-        entry_size = ir.Constant(self.i64, 96)
+        # Allocate ThreadEntry (120 bytes = 15 fields × 8 bytes)
+        entry_size = ir.Constant(self.i64, 120)
         raw_entry = builder.call(self.codegen.malloc, [entry_size])
         new_entry = builder.bitcast(raw_entry, self.thread_entry_type.as_pointer())
 
@@ -1608,6 +1612,36 @@ class GarbageCollector:
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
         ], inbounds=True)
         builder.store(ir.Constant(self.i8_ptr, None), next_ptr)
+
+        # ============================================================
+        # Segmented Shadow Stack Initialization (Phase 5)
+        # ============================================================
+        # Allocate first segment for this thread's shadow stack
+        first_segment = builder.call(self.gc_segment_alloc, [])
+        first_segment_i8 = builder.bitcast(first_segment, self.i8_ptr)
+
+        # Field 12: segment_base - first segment pointer (never changes)
+        seg_base_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 12)
+        ], inbounds=True)
+        builder.store(first_segment_i8, seg_base_ptr)
+
+        # Field 13: segment_current - active segment (initially same as base)
+        seg_curr_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 13)
+        ], inbounds=True)
+        builder.store(first_segment_i8, seg_curr_ptr)
+
+        # Field 14: slot_index = 0 (no slots used yet)
+        slot_idx_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), slot_idx_ptr)
+
+        # Also update TLS globals for fast access from frame functions
+        builder.store(first_segment, self.tls_segment_base)
+        builder.store(first_segment, self.tls_segment_current)
+        builder.store(ir.Constant(self.i64, 0), self.tls_slot_index)
 
         # Lock registry mutex
         mutex = builder.load(self.gc_registry_mutex)
@@ -1753,6 +1787,52 @@ class GarbageCollector:
         # Unlock mutex
         builder.call(self.pthread_mutex_unlock, [mutex])
 
+        # ============================================================
+        # Free segment chain (Phase 5)
+        # ============================================================
+        # Walk segments from segment_base via `next` pointers and munmap each
+        seg_base_ptr = builder.gep(my_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 12)
+        ], inbounds=True)
+        seg_base_i8 = builder.load(seg_base_ptr)
+        first_seg = builder.bitcast(seg_base_i8, self.stack_segment_type.as_pointer())
+
+        # Create segment free loop
+        seg_loop = func.append_basic_block("seg_free_loop")
+        seg_free = func.append_basic_block("seg_free")
+        seg_done = func.append_basic_block("seg_done")
+
+        seg_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="seg_to_free")
+        builder.store(first_seg, seg_alloca)
+        builder.branch(seg_loop)
+
+        # Segment free loop
+        builder.position_at_end(seg_loop)
+        seg = builder.load(seg_alloca)
+        seg_int = builder.ptrtoint(seg, self.i64)
+        seg_is_null = builder.icmp_unsigned('==', seg_int, ir.Constant(self.i64, 0))
+        builder.cbranch(seg_is_null, seg_done, seg_free)
+
+        # Free this segment
+        builder.position_at_end(seg_free)
+        # Get next before freeing
+        next_ptr = builder.gep(seg, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        next_seg_i8 = builder.load(next_ptr)
+        next_seg = builder.bitcast(next_seg_i8, self.stack_segment_type.as_pointer())
+
+        # munmap this segment (4KB)
+        seg_as_i8 = builder.bitcast(seg, self.i8_ptr)
+        seg_size = ir.Constant(self.i64, self.SEGMENT_SIZE)
+        builder.call(self.munmap, [seg_as_i8, seg_size])
+
+        # Move to next segment
+        builder.store(next_seg, seg_alloca)
+        builder.branch(seg_loop)
+
+        builder.position_at_end(seg_done)
+
         # Free ThreadEntry
         my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
         builder.call(self.codegen.free, [my_entry_i8])
@@ -1765,6 +1845,15 @@ class GarbageCollector:
         builder.store(
             ir.Constant(self.thread_entry_type.as_pointer(), None),
             self.tls_thread_entry)
+
+        # Clear segment TLS globals
+        builder.store(
+            ir.Constant(self.stack_segment_type.as_pointer(), None),
+            self.tls_segment_base)
+        builder.store(
+            ir.Constant(self.stack_segment_type.as_pointer(), None),
+            self.tls_segment_current)
+        builder.store(ir.Constant(self.i64, 0), self.tls_slot_index)
 
         builder.ret_void()
 
@@ -2736,27 +2825,24 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_scan_roots(self):
-        """Scan roots from all registered threads.
+        """Scan roots from all registered threads using segmented shadow stacks.
 
-        Iterates the thread registry and marks handles from each thread's
-        shadow stack. For single-threaded operation (the current case),
-        this falls back to scanning the main thread's TLS shadow stack.
-
-        Phase 3: Slots now contain i64 handles instead of i8* pointers.
-        We load the handle, then mark it directly.
+        Phase 5: Uses segment-based shadow stack scanning.
+        For each thread, walks segments from segment_base via `next` pointers,
+        scanning slots up to slot_index (the watermark).
         """
         func = self.gc_scan_roots
 
         entry = func.append_basic_block("entry")
         thread_loop = func.append_basic_block("thread_loop")
         process_thread = func.append_basic_block("process_thread")
-        frame_loop = func.append_basic_block("frame_loop")
-        process_frame = func.append_basic_block("process_frame")
-        root_loop = func.append_basic_block("root_loop")
+        segment_loop = func.append_basic_block("segment_loop")
+        scan_segment = func.append_basic_block("scan_segment")
+        slot_loop = func.append_basic_block("slot_loop")
         check_handle = func.append_basic_block("check_handle")
         do_mark = func.append_basic_block("do_mark")
-        next_root = func.append_basic_block("next_root")
-        next_frame = func.append_basic_block("next_frame")
+        next_slot = func.append_basic_block("next_slot")
+        next_segment = func.append_basic_block("next_segment")
         next_thread = func.append_basic_block("next_thread")
         done = func.append_basic_block("done")
 
@@ -2773,10 +2859,11 @@ class GarbageCollector:
         first_thread = builder.load(self.gc_thread_registry)
         builder.store(first_thread, curr_thread_alloca)
 
-        # Allocate storage for current frame and frame depth
-        curr_frame_alloca = builder.alloca(self.i8_ptr, name="curr_frame")
-        frame_depth_alloca = builder.alloca(self.i64, name="frame_depth")
-        watermark_depth_alloca = builder.alloca(self.i64, name="watermark_depth")
+        # Allocate storage for segment iteration
+        curr_segment_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="curr_segment")
+        watermark_alloca = builder.alloca(self.i64, name="watermark")  # Total slots to scan
+        scanned_alloca = builder.alloca(self.i64, name="scanned")  # Slots scanned so far
+        slot_idx_alloca = builder.alloca(self.i64, name="slot_idx")  # Current slot in segment
 
         builder.branch(thread_loop)
 
@@ -2786,154 +2873,143 @@ class GarbageCollector:
 
         # Check if null
         thread_int = builder.ptrtoint(curr_thread, self.i64)
-        thread_is_null = builder.icmp_unsigned(
-            '==', thread_int, ir.Constant(self.i64, 0))
+        thread_is_null = builder.icmp_unsigned('==', thread_int, ir.Constant(self.i64, 0))
         builder.cbranch(thread_is_null, done, process_thread)
 
-        # Process this thread - scan its shadow stack
-        # Note: gc_wait_for_watermarks has already ensured all threads have acknowledged
-        # their watermark before we reach gc_scan_roots, so all threads are safe to scan.
+        # Process this thread - scan its segmented shadow stack
         builder.position_at_end(process_thread)
 
-        # Get shadow_stack_head (now stores the frame pointer directly)
-        head_ptr = builder.gep(curr_thread, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        # Get segment_base (offset 96) - first segment pointer
+        seg_base_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 12)
         ], inbounds=True)
-        first_frame = builder.load(head_ptr)  # i8* pointing to first frame (or null)
-        builder.store(first_frame, curr_frame_alloca)
+        seg_base_i8 = builder.load(seg_base_ptr)
+        seg_base = builder.bitcast(seg_base_i8, self.stack_segment_type.as_pointer())
 
-        # Get watermark_depth for this thread
-        wm_depth_ptr = builder.gep(curr_thread, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        # Get slot_index (offset 112) - this is the watermark (total slots in use)
+        slot_idx_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)
         ], inbounds=True)
-        watermark_depth = builder.load(wm_depth_ptr)
-        builder.store(watermark_depth, watermark_depth_alloca)
+        watermark = builder.load(slot_idx_ptr)
+        builder.store(watermark, watermark_alloca)
 
-        # Initialize frame depth counter
-        builder.store(ir.Constant(self.i64, 0), frame_depth_alloca)
-        builder.branch(frame_loop)
+        # Check if segment_base is valid (not null)
+        seg_base_int = builder.ptrtoint(seg_base, self.i64)
+        seg_base_valid = builder.icmp_unsigned('!=', seg_base_int, ir.Constant(self.i64, 0))
 
-        # Frame loop: while curr_frame != null AND looks valid
-        builder.position_at_end(frame_loop)
-        frame_val = builder.load(curr_frame_alloca)
-        frame_int = builder.ptrtoint(frame_val, self.i64)
-        is_null_frame = builder.icmp_unsigned("==", frame_int, ir.Constant(self.i64, 0))
-        # Also check frame pointer is reasonable (not garbage like 0xd3)
-        min_valid_frame = ir.Constant(self.i64, 0x10000)  # 64KB
-        frame_reasonable = builder.icmp_unsigned(">=", frame_int, min_valid_frame)
-        # Skip this thread if frame is null OR looks like garbage
-        frame_valid = builder.or_(is_null_frame, builder.not_(frame_reasonable))
-        builder.cbranch(frame_valid, next_thread, process_frame)
+        # Also check watermark > 0 (any slots to scan)
+        has_slots = builder.icmp_unsigned('>', watermark, ir.Constant(self.i64, 0))
+        should_scan = builder.and_(seg_base_valid, has_slots)
+        builder.cbranch(should_scan, segment_loop, next_thread)
 
-        # Process frame
-        builder.position_at_end(process_frame)
-        frame = builder.bitcast(frame_val, self.gc_frame_type.as_pointer())
+        # Segment loop: iterate segments from base
+        builder.position_at_end(segment_loop)
+        builder.store(seg_base, curr_segment_alloca)
+        builder.store(ir.Constant(self.i64, 0), scanned_alloca)
+        builder.branch(scan_segment)
 
-        # Check watermark: only scan if depth < watermark_depth
-        # (or if watermark_depth == 0, meaning no watermark, scan all)
-        curr_depth = builder.load(frame_depth_alloca)
-        wm_depth = builder.load(watermark_depth_alloca)
-        wm_is_zero = builder.icmp_unsigned('==', wm_depth, ir.Constant(self.i64, 0))
-        depth_ok = builder.icmp_unsigned('<', curr_depth, wm_depth)
-        should_scan = builder.or_(wm_is_zero, depth_ok)
+        # Scan current segment
+        builder.position_at_end(scan_segment)
+        segment = builder.load(curr_segment_alloca)
+        seg_int = builder.ptrtoint(segment, self.i64)
+        is_null_segment = builder.icmp_unsigned('==', seg_int, ir.Constant(self.i64, 0))
 
-        scan_frame = func.append_basic_block("scan_frame")
-        builder.cbranch(should_scan, scan_frame, next_frame)
+        # Check if we've scanned enough slots (reached watermark)
+        scanned = builder.load(scanned_alloca)
+        wm = builder.load(watermark_alloca)
+        done_scanning = builder.icmp_unsigned('>=', scanned, wm)
 
-        # Scan this frame's slots
-        builder.position_at_end(scan_frame)
+        # Stop if segment is null OR we've reached watermark
+        should_stop = builder.or_(is_null_segment, done_scanning)
+        builder.cbranch(should_stop, next_thread, slot_loop)
 
-        # Get num_roots
-        num_roots_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        num_roots_raw = builder.load(num_roots_ptr)
+        # Initialize slot loop for this segment
+        builder.position_at_end(slot_loop)
+        builder.store(ir.Constant(self.i64, 0), slot_idx_alloca)
+        builder.branch(check_handle)
 
-        # Validate num_roots is sane (defensive check against garbage)
-        max_roots = ir.Constant(self.i64, 1000)  # No function should have > 1000 roots
-        roots_sane = builder.icmp_unsigned("<=", num_roots_raw, max_roots)
-        num_roots = builder.select(roots_sane, num_roots_raw, ir.Constant(self.i64, 0))
-
-        # Get handle_slots array (Phase 3: now i64* instead of i8**)
-        slots_ptr_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        slots = builder.load(slots_ptr_ptr)
-
-        # Validate slots pointer is not null AND looks like a valid pointer
-        # (not a small integer like a corrupted free list index)
-        slots_int = builder.ptrtoint(slots, self.i64)
-        slots_not_null = builder.icmp_unsigned("!=", slots_int, ir.Constant(self.i64, 0))
-        min_valid_slots = ir.Constant(self.i64, 0x10000)  # 64KB
-        slots_reasonable = builder.icmp_unsigned(">=", slots_int, min_valid_slots)
-        slots_valid = builder.and_(slots_not_null, slots_reasonable)
-        # Skip to next frame if slots is invalid (corrupt frame)
-        slots_check = func.append_basic_block("slots_check")
-        builder.cbranch(slots_valid, slots_check, next_frame)
-
-        builder.position_at_end(slots_check)
-
-        # Root index
-        root_idx = builder.alloca(self.i64, name="root_idx")
-        builder.store(ir.Constant(self.i64, 0), root_idx)
-
-        builder.branch(root_loop)
-
-        # Root loop: for i in 0..num_roots
-        builder.position_at_end(root_loop)
-        i = builder.load(root_idx)
-        done_roots = builder.icmp_unsigned(">=", i, num_roots)
-        builder.cbranch(done_roots, next_frame, check_handle)
-
-        # Check handle (Phase 3: load i64 handle from slot)
+        # Check each handle in segment
         builder.position_at_end(check_handle)
-        i_val = builder.load(root_idx)
-        slot_ptr = builder.gep(slots, [i_val], inbounds=True)
+        slot_in_seg = builder.load(slot_idx_alloca)
+        slots_per_seg = ir.Constant(self.i64, self.SEGMENT_SLOTS)
+
+        # Calculate how many slots to scan in this segment
+        # slots_to_scan = min(SEGMENT_SLOTS, watermark - scanned)
+        scanned_now = builder.load(scanned_alloca)
+        remaining = builder.sub(wm, scanned_now)
+        remaining_capped = builder.select(
+            builder.icmp_unsigned('<', remaining, slots_per_seg),
+            remaining,
+            slots_per_seg
+        )
+
+        # Done with this segment?
+        done_segment = builder.icmp_unsigned('>=', slot_in_seg, remaining_capped)
+        builder.cbranch(done_segment, next_segment, do_mark)
+
+        # Load and mark handle
+        builder.position_at_end(do_mark)
+        # Get segment slots array (field 3)
+        slots_ptr = builder.gep(segment, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 3),  # slots array
+            ir.Constant(self.i32, 0)   # first element
+        ], inbounds=True)
+
+        current_slot = builder.load(slot_idx_alloca)
+        slot_ptr = builder.gep(slots_ptr, [current_slot], inbounds=True)
         handle = builder.load(slot_ptr)
 
-        # Skip if handle is 0 (null handle)
-        is_null_handle = builder.icmp_unsigned("==", handle, ir.Constant(self.i64, 0))
+        # Skip if handle is 0 (null)
+        is_null_handle = builder.icmp_unsigned('==', handle, ir.Constant(self.i64, 0))
 
-        # Validate handle is within range (defensive check against garbage)
-        # Load gc_next_handle to get upper bound
+        # Validate handle is within range
         next_handle = builder.load(self.gc_next_handle)
-        handle_in_range = builder.icmp_unsigned("<", handle, next_handle)
-        # Also check handle is not too large (sanity check)
-        handle_sane = builder.icmp_unsigned("<", handle, ir.Constant(self.i64, 100000000))  # 100M max handles
+        handle_in_range = builder.icmp_unsigned('<', handle, next_handle)
+        handle_sane = builder.icmp_unsigned('<', handle, ir.Constant(self.i64, 100000000))
         handle_valid = builder.and_(handle_in_range, handle_sane)
 
-        # Skip if null OR invalid
         should_skip = builder.or_(is_null_handle, builder.not_(handle_valid))
-        builder.cbranch(should_skip, next_root, do_mark)
 
-        # Mark the object via its handle
-        # gc_mark_object now takes i64 handle directly
-        builder.position_at_end(do_mark)
+        mark_block = func.append_basic_block("mark_handle")
+        builder.cbranch(should_skip, next_slot, mark_block)
+
+        builder.position_at_end(mark_block)
         builder.call(self.gc_mark_object, [handle])
-        builder.branch(next_root)
+        builder.branch(next_slot)
 
-        builder.position_at_end(next_root)
-        next_i = builder.add(i_val, ir.Constant(self.i64, 1))
-        builder.store(next_i, root_idx)
-        builder.branch(root_loop)
+        # Advance to next slot
+        builder.position_at_end(next_slot)
+        curr_slot = builder.load(slot_idx_alloca)
+        next_slot_idx = builder.add(curr_slot, ir.Constant(self.i64, 1))
+        builder.store(next_slot_idx, slot_idx_alloca)
+        builder.branch(check_handle)
 
-        # Move to next frame
-        builder.position_at_end(next_frame)
-        parent_ptr = builder.gep(frame, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        parent = builder.load(parent_ptr)
-        builder.store(parent, curr_frame_alloca)
+        # Move to next segment
+        builder.position_at_end(next_segment)
+        # Update scanned count
+        scanned_before = builder.load(scanned_alloca)
+        # Use slots_per_seg as we always scan full segments until last one
+        scanned_after = builder.add(scanned_before, slots_per_seg)
+        builder.store(scanned_after, scanned_alloca)
 
-        # Increment frame depth
-        old_depth = builder.load(frame_depth_alloca)
-        new_depth = builder.add(old_depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth, frame_depth_alloca)
-
-        builder.branch(frame_loop)
+        # Get next segment: segment->next (field 1)
+        next_ptr = builder.gep(segment, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        next_seg_i8 = builder.load(next_ptr)
+        next_seg = builder.bitcast(next_seg_i8, self.stack_segment_type.as_pointer())
+        builder.store(next_seg, curr_segment_alloca)
+        builder.branch(scan_segment)
 
         # Move to next thread
         builder.position_at_end(next_thread)
-        next_ptr = builder.gep(curr_thread, [
+        next_thread_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
         ], inbounds=True)
-        next_thread_i8 = builder.load(next_ptr)
-        next_thread_typed = builder.bitcast(
-            next_thread_i8, self.thread_entry_type.as_pointer())
+        next_thread_i8 = builder.load(next_thread_ptr)
+        next_thread_typed = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
         builder.store(next_thread_typed, curr_thread_alloca)
         builder.branch(thread_loop)
 
@@ -3338,189 +3414,108 @@ class GarbageCollector:
         # Cast to i64*
         return builder.bitcast(slots_alloca, self.i64_ptr)
 
-    def push_frame_inline(self, builder: ir.IRBuilder, num_roots: int, handle_slots: ir.Value) -> ir.Value:
-        """Push a GC frame using stack allocation (avoids malloc fragmentation).
+    def push_frame_inline(self, builder: ir.IRBuilder, num_roots: int) -> ir.Value:
+        """Push a GC frame using segmented shadow stack.
 
-        Phase 3: Takes i64* handle_slots instead of i8** roots.
-        Allocates the frame structure on the stack instead of heap.
-        Returns pointer to the stack-allocated frame for later pop.
-        Uses pthread TLS via ThreadEntry for proper multi-thread support.
+        Phase 5: Uses segment-based shadow stack instead of frame-linked-list.
+        Reserves num_roots slots in the segment chain.
+        Returns the starting slot index (i64) for use in set_root and pop_frame.
         """
-        # Allocate frame struct on stack (parent: i8*, num_roots: i64, handle_slots: i64*)
-        frame_alloca = builder.alloca(self.gc_frame_type, name="gc_frame")
+        # Call gc_segment_push to reserve slots in the segment chain
+        # Returns the starting slot index (i64)
+        num_roots_val = ir.Constant(self.i64, num_roots)
+        start_slot = builder.call(self.gc_segment_push, [num_roots_val])
 
-        # Get ThreadEntry via pthread TLS (once at the start)
+        # Also update ThreadEntry.slot_index for GC visibility
+        # This is the watermark that GC uses to know how many slots to scan
         tls_key = builder.load(self.tls_thread_entry_key)
         thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
         thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         entry_int = builder.ptrtoint(thread_entry, self.i64)
         is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
 
-        # Store thread_entry for use in later blocks
-        thread_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="thread_entry_storage")
-        builder.store(thread_entry, thread_entry_alloca)
-
-        # Create blocks for registered vs not registered cases
         func = builder.function
-        registered_block = func.append_basic_block("push_registered")
-        not_registered_block = func.append_basic_block("push_not_registered")
-        merge_block = func.append_basic_block("push_merge")
+        update_te = func.append_basic_block("push_update_te")
+        push_done = func.append_basic_block("push_done")
 
-        # Allocate storage for old_top to merge results
-        old_top_alloca = builder.alloca(self.i8_ptr, name="old_top_storage")
+        builder.cbranch(is_registered, update_te, push_done)
 
-        builder.cbranch(is_registered, registered_block, not_registered_block)
-
-        # Registered path: get old_top from ThreadEntry.shadow_stack_head
-        builder.position_at_end(registered_block)
-        te_reg = builder.load(thread_entry_alloca)
-        head_ptr = builder.gep(te_reg, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        # Update ThreadEntry.slot_index to current slot position
+        builder.position_at_end(update_te)
+        current_slot_idx = builder.load(self.tls_slot_index)
+        slot_idx_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)  # slot_index field
         ], inbounds=True)
-        old_top_registered = builder.load(head_ptr)
-        builder.store(old_top_registered, old_top_alloca)
-        builder.branch(merge_block)
+        builder.store(current_slot_idx, slot_idx_ptr)
 
-        # Not registered path: use global (fallback for early init)
-        builder.position_at_end(not_registered_block)
-        old_top_global = builder.load(self.tls_frame_top)
-        builder.store(old_top_global, old_top_alloca)
-        builder.branch(merge_block)
-
-        # Merge and continue
-        builder.position_at_end(merge_block)
-        old_top = builder.load(old_top_alloca)
-
-        # Set parent = old_top
-        parent_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(old_top, parent_ptr)
-
-        # Set num_roots
-        num_roots_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(ir.Constant(self.i64, num_roots), num_roots_ptr)
-
-        # Set handle_slots pointer (Phase 3: i64* instead of i8**)
-        slots_ptr_ptr = builder.gep(frame_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        builder.store(handle_slots, slots_ptr_ptr)
-
-        # Update frame_top to point to this frame
-        raw_frame = builder.bitcast(frame_alloca, self.i8_ptr)
-
-        # Store in ThreadEntry.shadow_stack_head if registered, else global
-        te_final = builder.load(thread_entry_alloca)
-        te_final_int = builder.ptrtoint(te_final, self.i64)
-        is_registered_final = builder.icmp_unsigned('!=', te_final_int, ir.Constant(self.i64, 0))
-
-        store_registered = func.append_basic_block("store_registered")
-        store_global = func.append_basic_block("store_global")
-        store_done = func.append_basic_block("store_done")
-
-        builder.cbranch(is_registered_final, store_registered, store_global)
-
-        builder.position_at_end(store_registered)
-        te_store = builder.load(thread_entry_alloca)
-        head_ptr2 = builder.gep(te_store, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        # Also update segment_current pointer in ThreadEntry
+        current_segment = builder.load(self.tls_segment_current)
+        current_segment_i8 = builder.bitcast(current_segment, self.i8_ptr)
+        seg_curr_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 13)  # segment_current field
         ], inbounds=True)
-        builder.store(raw_frame, head_ptr2)
-        # Also update stack_depth in ThreadEntry
-        depth_ptr = builder.gep(te_store, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        old_depth = builder.load(depth_ptr)
-        new_depth = builder.add(old_depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth, depth_ptr)
-        builder.branch(store_done)
+        builder.store(current_segment_i8, seg_curr_ptr)
+        builder.branch(push_done)
 
-        builder.position_at_end(store_global)
-        builder.store(raw_frame, self.tls_frame_top)
-        # Update global depth counter
-        depth = builder.load(self.tls_frame_depth)
-        new_depth_global = builder.add(depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth_global, self.tls_frame_depth)
-        builder.branch(store_done)
+        builder.position_at_end(push_done)
+        return start_slot
 
-        builder.position_at_end(store_done)
-        return raw_frame
+    def pop_frame_inline(self, builder: ir.IRBuilder, start_slot: ir.Value):
+        """Pop a GC frame using segmented shadow stack.
 
-    def pop_frame_inline(self, builder: ir.IRBuilder, frame: ir.Value):
-        """Pop a GC frame (stack-allocated version - no free needed).
-
-        Uses pthread TLS via ThreadEntry for proper multi-thread support.
+        Phase 5: Uses segment-based shadow stack.
+        Restores the slot index to start_slot value.
+        Segment chain stays intact (Segment Stability Invariant).
         """
-        frame_typed = builder.bitcast(frame, self.gc_frame_type.as_pointer())
+        # Call gc_segment_pop to restore slot index
+        builder.call(self.gc_segment_pop, [start_slot])
 
-        # Get parent pointer
-        parent_ptr = builder.gep(frame_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        parent = builder.load(parent_ptr)
-
-        # Get ThreadEntry via pthread TLS (once at the start)
+        # Also update ThreadEntry.slot_index for GC visibility
         tls_key = builder.load(self.tls_thread_entry_key)
         thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
         thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         entry_int = builder.ptrtoint(thread_entry, self.i64)
         is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
 
-        # Store thread_entry for use in later blocks
-        thread_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="pop_thread_entry_storage")
-        builder.store(thread_entry, thread_entry_alloca)
-
         func = builder.function
-        pop_registered = func.append_basic_block("pop_registered")
-        pop_global = func.append_basic_block("pop_global")
+        update_te = func.append_basic_block("pop_update_te")
         pop_done = func.append_basic_block("pop_done")
 
-        builder.cbranch(is_registered, pop_registered, pop_global)
+        builder.cbranch(is_registered, update_te, pop_done)
 
-        # Registered path: update ThreadEntry.shadow_stack_head
-        builder.position_at_end(pop_registered)
-        te_pop = builder.load(thread_entry_alloca)
-        head_ptr = builder.gep(te_pop, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        # Update ThreadEntry.slot_index to restored position
+        builder.position_at_end(update_te)
+        slot_idx_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)  # slot_index field
         ], inbounds=True)
-        builder.store(parent, head_ptr)
-        # Decrement stack_depth in ThreadEntry
-        depth_ptr = builder.gep(te_pop, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        old_depth = builder.load(depth_ptr)
-        new_depth = builder.sub(old_depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth, depth_ptr)
-        builder.branch(pop_done)
-
-        # Not registered path: use global (fallback for early init)
-        builder.position_at_end(pop_global)
-        builder.store(parent, self.tls_frame_top)
-        depth = builder.load(self.tls_frame_depth)
-        new_depth_global = builder.sub(depth, ir.Constant(self.i64, 1))
-        builder.store(new_depth_global, self.tls_frame_depth)
+        builder.store(start_slot, slot_idx_ptr)
         builder.branch(pop_done)
 
         builder.position_at_end(pop_done)
 
-    def push_frame(self, builder: ir.IRBuilder, num_roots: int, handle_slots: ir.Value) -> ir.Value:
-        """Push a GC frame. Returns frame pointer for later pop.
+    def push_frame(self, builder: ir.IRBuilder, num_roots: int) -> ir.Value:
+        """Push a GC frame. Returns start_slot index for later pop.
 
-        Phase 3: Takes i64* handle_slots instead of i8** roots.
-        Uses stack-allocated frames to avoid malloc fragmentation from
-        millions of small allocations.
+        Phase 5: Uses segmented shadow stack.
+        Reserves num_roots slots and returns the starting slot index.
         """
-        return self.push_frame_inline(builder, num_roots, handle_slots)
+        return self.push_frame_inline(builder, num_roots)
 
-    def pop_frame(self, builder: ir.IRBuilder, frame: ir.Value):
+    def pop_frame(self, builder: ir.IRBuilder, start_slot: ir.Value):
         """Pop a GC frame.
 
-        Uses stack-allocated frames - no free needed.
+        Phase 5: Uses segmented shadow stack.
+        Restores slot index to start_slot value.
         """
-        self.pop_frame_inline(builder, frame)
+        self.pop_frame_inline(builder, start_slot)
 
-    def set_root(self, builder: ir.IRBuilder, handle_slots: ir.Value, index: int, value: ir.Value):
+    def set_root(self, builder: ir.IRBuilder, start_slot: ir.Value, index: int, value: ir.Value):
         """Set a root slot to a handle value.
 
-        Phase 4 fix: Takes i64* handle_slots and stores i64 handles.
+        Phase 5: Uses segmented shadow stack.
+        Computes absolute slot = start_slot + index, then stores handle.
         When given a pointer, we call gc_ptr_to_handle to recover the actual
-        handle index from the object's header. This ensures gc_scan_roots can
-        use gc_handle_deref to properly dereference handles during collection.
+        handle index from the object's header.
         """
         index_val = ir.Constant(self.i64, index)
         # Convert value to i64 handle
@@ -3542,7 +3537,10 @@ class GarbageCollector:
                 # Fallback: convert to pointer then get handle
                 ptr_as_i8 = builder.bitcast(value, self.i8_ptr)
                 handle = builder.call(self.gc_ptr_to_handle, [ptr_as_i8])
-        builder.call(self.gc_set_root, [handle_slots, index_val, handle])
+
+        # Compute absolute slot index and store handle via gc_segment_set_root
+        absolute_slot = builder.add(start_slot, index_val)
+        builder.call(self.gc_segment_set_root, [absolute_slot, handle])
 
     def alloc_with_deref(self, builder: ir.IRBuilder, size: ir.Value, type_id: ir.Value) -> ir.Value:
         """Allocate memory and return the pointer (backward compatibility helper).
@@ -4343,13 +4341,15 @@ class GarbageCollector:
         """Store handle at absolute slot index.
 
         Finds the correct segment and slot within it.
+        Uses absolute slot indexing across the segment chain.
         """
         func = self.gc_segment_set_root
         func.args[0].name = "slot"
         func.args[1].name = "handle"
 
         entry = func.append_basic_block("entry")
-        find_segment = func.append_basic_block("find_segment")
+        loop_check = func.append_basic_block("loop_check")
+        loop_body = func.append_basic_block("loop_body")
         found = func.append_basic_block("found")
 
         builder = ir.IRBuilder(entry)
@@ -4370,21 +4370,41 @@ class GarbageCollector:
         base_segment = builder.load(self.tls_segment_base)
         builder.store(base_segment, curr_segment_alloca)
         builder.store(segment_index, remaining_alloca)
-        builder.branch(find_segment)
+        builder.branch(loop_check)
 
-        # Find correct segment
-        builder.position_at_end(find_segment)
+        # Loop check: if remaining == 0, we found the right segment
+        builder.position_at_end(loop_check)
         remaining = builder.load(remaining_alloca)
         is_zero = builder.icmp_unsigned("==", remaining, ir.Constant(self.i64, 0))
-        builder.cbranch(is_zero, found, find_segment)
+        builder.cbranch(is_zero, found, loop_body)
 
-        # The loop body - but we need to avoid infinite loop
-        # Actually, let me restructure this...
+        # Loop body: advance to next segment and decrement remaining
+        builder.position_at_end(loop_body)
+        curr_segment_in_loop = builder.load(curr_segment_alloca)
 
+        # Get next segment pointer: curr_segment->next (field 1)
+        next_ptr = builder.gep(curr_segment_in_loop, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)  # next field
+        ], inbounds=True)
+        next_seg_i8ptr = builder.load(next_ptr)
+        next_segment = builder.bitcast(next_seg_i8ptr, self.stack_segment_type.as_pointer())
+
+        # Update curr_segment to next
+        builder.store(next_segment, curr_segment_alloca)
+
+        # Decrement remaining
+        remaining_in_loop = builder.load(remaining_alloca)
+        new_remaining = builder.sub(remaining_in_loop, ir.Constant(self.i64, 1))
+        builder.store(new_remaining, remaining_alloca)
+
+        builder.branch(loop_check)
+
+        # Found the correct segment - store the handle
         builder.position_at_end(found)
         curr_segment = builder.load(curr_segment_alloca)
 
-        # Get slots array
+        # Get slots array: curr_segment->slots[0] (field 3)
         slots_ptr = builder.gep(curr_segment, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 3),  # slots array
@@ -5466,13 +5486,20 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_dump_heap(self):
-        """Implement function to print all objects in the heap"""
+        """Implement function to print all objects in the heap.
+
+        Iterates through per-thread allocation lists (ThreadEntry.alloc_list)
+        since allocations are tracked per-thread, not in a global list.
+        """
         func = self.gc_dump_heap
 
         entry = func.append_basic_block("entry")
-        loop = func.append_basic_block("loop")
+        check_thread = func.append_basic_block("check_thread")
+        process_thread = func.append_basic_block("process_thread")
+        check_node = func.append_basic_block("check_node")
         print_obj = func.append_basic_block("print_obj")
-        next_obj = func.append_basic_block("next_obj")
+        next_node = func.append_basic_block("next_node")
+        next_thread = func.append_basic_block("next_thread")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -5512,30 +5539,67 @@ class GarbageCollector:
                                                 bytearray(count_fmt.encode('utf-8')) + bytearray([0]))
         count_ptr_fmt = builder.bitcast(count_global, self.i8_ptr)
 
-        # Allocate counter
+        # Allocate counter and iteration variables
         count_alloca = builder.alloca(self.i64, name="count")
         builder.store(ir.Constant(self.i64, 0), count_alloca)
 
-        # Get head of allocation list
-        head = builder.load(self.gc_alloc_list)
-        curr_alloca = builder.alloca(self.i8_ptr, name="curr")
-        builder.store(head, curr_alloca)
-        builder.branch(loop)
+        thread_ptr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
+        curr_node_alloca = builder.alloca(self.i8_ptr, name="curr_node")
 
-        # Loop through allocation list
-        builder.position_at_end(loop)
-        curr = builder.load(curr_alloca)
-        is_null = builder.icmp_unsigned("==", curr, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, print_obj)
+        # Lock registry mutex to prevent thread registry changes during iteration
+        registry_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [registry_mutex])
+
+        # Get first thread from registry
+        registry_head = builder.load(self.gc_thread_registry)
+        builder.store(registry_head, thread_ptr_alloca)
+        builder.branch(check_thread)
+
+        # Check if there's a thread to process
+        builder.position_at_end(check_thread)
+        curr_thread = builder.load(thread_ptr_alloca)
+        thread_int = builder.ptrtoint(curr_thread, self.i64)
+        is_null_thread = builder.icmp_unsigned("==", thread_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_thread, done, process_thread)
+
+        # Process this thread's allocation list
+        builder.position_at_end(process_thread)
+        # Get thread's alloc_list head (field 9)
+        alloc_list_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        list_head = builder.load(alloc_list_ptr)
+        builder.store(list_head, curr_node_alloca)
+        builder.branch(check_node)
+
+        # Check if there's a node to process
+        builder.position_at_end(check_node)
+        curr_node = builder.load(curr_node_alloca)
+        node_int = builder.ptrtoint(curr_node, self.i64)
+        is_null_node = builder.icmp_unsigned("==", node_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_node, next_thread, print_obj)
 
         # Print object info
         builder.position_at_end(print_obj)
-        node = builder.bitcast(curr, self.alloc_node_type.as_pointer())
+        node = builder.bitcast(curr_node, self.alloc_node_type.as_pointer())
 
-        # Phase 7: Get handle and dereference to get data pointer
+        # Get handle and dereference to get data pointer
         handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         obj_handle = builder.load(handle_ptr)
-        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
+
+        # Skip null handles (freed objects)
+        is_null_handle = builder.icmp_unsigned("==", obj_handle, ir.Constant(self.i64, 0))
+        # We need a block to handle null handles
+        print_obj_valid = func.append_basic_block("print_obj_valid")
+        builder.cbranch(is_null_handle, next_node, print_obj_valid)
+
+        builder.position_at_end(print_obj_valid)
+        # Re-load values after branch
+        node2 = builder.bitcast(curr_node, self.alloc_node_type.as_pointer())
+        handle_ptr2 = builder.gep(node2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle2 = builder.load(handle_ptr2)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle2])
 
         # Get header
         data_int = builder.ptrtoint(data_ptr, self.i64)
@@ -5545,13 +5609,12 @@ class GarbageCollector:
         # Load header fields
         size_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         size = builder.load(size_ptr)
-        # Phase 1: type_id and flags are now i64
         type_id_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         type_id = builder.load(type_id_ptr)
         flags_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         flags = builder.load(flags_ptr)
 
-        # Extract mark bit (Phase 1: flags is i64)
+        # Extract mark bit
         marked = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
 
         builder.call(printf, [obj_ptr, data_ptr, type_id, size, marked])
@@ -5561,17 +5624,33 @@ class GarbageCollector:
         new_count = builder.add(count_val, ir.Constant(self.i64, 1))
         builder.store(new_count, count_alloca)
 
-        builder.branch(next_obj)
+        builder.branch(next_node)
 
-        # Get next object
-        builder.position_at_end(next_obj)
-        next_ptr_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        # Get next node in this thread's list
+        builder.position_at_end(next_node)
+        curr_node_reload = builder.load(curr_node_alloca)
+        node3 = builder.bitcast(curr_node_reload, self.alloc_node_type.as_pointer())
+        next_ptr_ptr = builder.gep(node3, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         next_ptr = builder.load(next_ptr_ptr)
-        builder.store(next_ptr, curr_alloca)
-        builder.branch(loop)
+        builder.store(next_ptr, curr_node_alloca)
+        builder.branch(check_node)
 
-        # Done
+        # Move to next thread
+        builder.position_at_end(next_thread)
+        curr_thread2 = builder.load(thread_ptr_alloca)
+        # Get thread's next pointer (field 11 = offset 88)
+        next_thread_ptr = builder.gep(curr_thread2, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_thread_ptr)
+        next_thread_val = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_val, thread_ptr_alloca)
+        builder.branch(check_thread)
+
+        # Done - unlock mutex and print count
         builder.position_at_end(done)
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
         final_count = builder.load(count_alloca)
         builder.call(printf, [count_ptr_fmt, final_count])
         builder.ret_void()

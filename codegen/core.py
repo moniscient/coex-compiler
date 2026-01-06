@@ -1416,7 +1416,7 @@ class CodeGenerator:
             # Register as GC root if this is a heap type
             if stmt.name in self.gc_root_indices and self.gc is not None:
                 root_idx = self.gc_root_indices[stmt.name]
-                self.gc.set_root(self.builder, self.gc_roots, root_idx, init_value)
+                self.gc.set_root(self.builder, self.gc_frame, root_idx, init_value)
 
             # Try to infer tuple info from initializer
             tuple_info = self._infer_tuple_info(stmt.initializer)
@@ -1538,7 +1538,7 @@ class CodeGenerator:
         # Register as GC root if this is a heap type
         if stmt.name in self.gc_root_indices and self.gc is not None:
             root_idx = self.gc_root_indices[stmt.name]
-            self.gc.set_root(self.builder, self.gc_roots, root_idx, init_value)
+            self.gc.set_root(self.builder, self.gc_frame, root_idx, init_value)
 
         # Mark source as moved AFTER we've read its value
         if move_source_name:
@@ -1595,7 +1595,7 @@ class CodeGenerator:
         # Update GC root if needed
         if stmt.name in self.gc_root_indices and self.gc is not None:
             root_idx = self.gc_root_indices[stmt.name]
-            self.gc.set_root(self.builder, self.gc_roots, root_idx, value)
+            self.gc.set_root(self.builder, self.gc_frame, root_idx, value)
 
         # Mark source as moved
         if move_source_name:
@@ -1656,7 +1656,7 @@ class CodeGenerator:
                     # Register as GC root if this is a heap type
                     if name in self.gc_root_indices and self.gc is not None:
                         root_idx = self.gc_root_indices[name]
-                        self.gc.set_root(self.builder, self.gc_roots, root_idx, elem_val)
+                        self.gc.set_root(self.builder, self.gc_frame, root_idx, elem_val)
         else:
             # Not a tuple - error case, but for robustness create dummy vars
             for name in stmt.names:
@@ -1975,7 +1975,7 @@ class CodeGenerator:
                 target_name = stmt.target.name
                 if target_name in self.gc_root_indices and self.gc is not None:
                     root_idx = self.gc_root_indices[target_name]
-                    self.gc.set_root(self.builder, self.gc_roots, root_idx, value)
+                    self.gc.set_root(self.builder, self.gc_frame, root_idx, value)
 
         # Mark source as moved AFTER we've read its value
         if move_source_name:
@@ -2103,7 +2103,7 @@ class CodeGenerator:
                 # Update GC root if this is a tracked heap variable
                 if var_name in self.gc_root_indices and self.gc is not None:
                     root_idx = self.gc_root_indices[var_name]
-                    self.gc.set_root(self.builder, self.gc_roots, root_idx, new_struct)
+                    self.gc.set_root(self.builder, self.gc_frame, root_idx, new_struct)
         elif isinstance(target.object, MemberExpr):
             # Nested field assignment: a.b.x = value
             # Recursively create new structs up the chain
@@ -2172,7 +2172,7 @@ class CodeGenerator:
                 # Update GC root if this is a tracked heap variable
                 if var_name in self.gc_root_indices and self.gc is not None:
                     root_idx = self.gc_root_indices[var_name]
-                    self.gc.set_root(self.builder, self.gc_roots, root_idx, new_collection)
+                    self.gc.set_root(self.builder, self.gc_frame, root_idx, new_collection)
 
     def _get_lvalue(self, expr: Expr) -> Optional[ir.Value]:
         """Get pointer to an lvalue expression"""

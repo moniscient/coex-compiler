@@ -195,7 +195,7 @@ class StatementGenerator:
 
             if stmt.name in cg.gc_root_indices and cg.gc is not None:
                 root_idx = cg.gc_root_indices[stmt.name]
-                cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, init_value)
+                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, init_value)
 
             tuple_info = cg._infer_tuple_info(stmt.initializer)
             if tuple_info:
@@ -297,7 +297,7 @@ class StatementGenerator:
 
         if stmt.name in cg.gc_root_indices and cg.gc is not None:
             root_idx = cg.gc_root_indices[stmt.name]
-            cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, init_value)
+            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, init_value)
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
@@ -379,7 +379,7 @@ class StatementGenerator:
 
         if stmt.name in cg.gc_root_indices and cg.gc is not None:
             root_idx = cg.gc_root_indices[stmt.name]
-            cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, value)
+            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, value)
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
@@ -410,7 +410,7 @@ class StatementGenerator:
 
                     if name in cg.gc_root_indices and cg.gc is not None:
                         root_idx = cg.gc_root_indices[name]
-                        cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, elem_val)
+                        cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, elem_val)
         else:
             for name in stmt.names:
                 if name in cg.locals:
@@ -514,7 +514,7 @@ class StatementGenerator:
 
                 if name in cg.gc_root_indices and cg.gc is not None:
                     root_idx = cg.gc_root_indices[name]
-                    cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, value)
+                    cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, value)
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)

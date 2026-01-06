@@ -450,12 +450,11 @@ class TaskGenerator:
         builder.call(self.task_set_current, [closure_ptr])
 
         # 2. Push GC frame (count params as roots)
+        # Phase 5: frame_ptr is now start_slot index (i64), gc_roots is no longer needed
         num_params = len(task_func.params)
         frame_ptr = None
-        gc_roots = None
         if cg.gc is not None and num_params > 0:
-            gc_roots = cg.gc.create_frame_roots(builder, num_params)
-            frame_ptr = cg.gc.push_frame(builder, num_params, gc_roots)
+            frame_ptr = cg.gc.push_frame(builder, num_params)
 
         # 3. Extract parameters from closure->params
         params_ptr_field = builder.gep(
@@ -488,11 +487,11 @@ class TaskGenerator:
                 call_args.append(param_val)
 
                 # Register handle parameters as GC roots
-                if cg.gc is not None and gc_roots is not None:
+                if cg.gc is not None and frame_ptr is not None:
                     # Check if this is a handle type (heap-allocated)
                     param_type = param_llvm_types[i]
                     if param_type == i64:  # Handles are i64
-                        cg.gc.set_root(builder, gc_roots, i, param_val)
+                        cg.gc.set_root(builder, frame_ptr, i, param_val)
 
         # 4. Call the actual task body
         result = builder.call(task_llvm_func, call_args, name="task_result")

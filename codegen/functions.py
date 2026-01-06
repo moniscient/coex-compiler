@@ -212,6 +212,9 @@ class FunctionGenerator:
         # Initialize GC before building args array (which uses GC allocations)
         if cg.gc is not None:
             builder.call(cg.gc.gc_init, [])
+            # Register main thread with GC (so it has a ThreadEntry for per-thread alloc_list)
+            if cg.gc.gc_register_thread is not None:
+                builder.call(cg.gc.gc_register_thread, [])
 
         call_args = []
 
@@ -403,14 +406,13 @@ class FunctionGenerator:
         heap_var_names.extend(body_heap_vars)
 
         # Create shadow stack frame if we have heap variables and GC is enabled
+        # Phase 5: gc_frame is now the start_slot index (i64), gc_roots is no longer needed
         cg.gc_frame = None
-        cg.gc_roots = None
         cg.gc_root_indices = {}
 
         if heap_var_names and cg.gc is not None:
             num_roots = len(heap_var_names)
-            cg.gc_roots = cg.gc.create_frame_roots(cg.builder, num_roots)
-            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots, cg.gc_roots)
+            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
 
             # Store mapping of var_name -> root_index
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
@@ -453,7 +455,7 @@ class FunctionGenerator:
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:
                 root_idx = cg.gc_root_indices[param.name]
-                cg.gc.set_root(cg.builder, cg.gc_roots, root_idx, param_value)
+                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, param_value)
 
         # Generate body
         for stmt in func.body:
@@ -478,7 +480,6 @@ class FunctionGenerator:
 
         # Clear GC state for this function
         cg.gc_frame = None
-        cg.gc_roots = None
         cg.gc_root_indices = {}
         cg.current_function = None
 
@@ -551,12 +552,11 @@ class FunctionGenerator:
             cg._task.reset_for_function()
 
         # Save and initialize GC state for this monomorphized function
+        # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
         old_gc_frame = getattr(cg, 'gc_frame', None)
-        old_gc_roots = getattr(cg, 'gc_roots', None)
         old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
 
         cg.gc_frame = None
-        cg.gc_roots = None
         cg.gc_root_indices = {}
 
         # Collect heap variables for GC root tracking
@@ -575,8 +575,7 @@ class FunctionGenerator:
         # Create shadow stack frame if we have heap variables
         if heap_var_names and cg.gc is not None:
             num_roots = len(heap_var_names)
-            cg.gc_roots = cg.gc.create_frame_roots(cg.builder, num_roots)
-            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots, cg.gc_roots)
+            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
 
         # Allocate parameters with value semantics (deep copy heap-allocated types)
@@ -599,7 +598,7 @@ class FunctionGenerator:
 
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:
-                cg.gc.set_root(cg.builder, cg.gc_roots, cg.gc_root_indices[param.name], param_value)
+                cg.gc.set_root(cg.builder, cg.gc_frame, cg.gc_root_indices[param.name], param_value)
 
         # Generate body
         for stmt in func_decl.body:
@@ -624,7 +623,6 @@ class FunctionGenerator:
         cg.current_function = old_current_function
         cg.type_substitutions = old_subs
         cg.gc_frame = old_gc_frame
-        cg.gc_roots = old_gc_roots
         cg.gc_root_indices = old_gc_root_indices
 
         return mangled_name
@@ -894,7 +892,6 @@ class FunctionGenerator:
         old_current_function = cg.current_function
         old_current_type = cg.current_type
         old_gc_frame = getattr(cg, 'gc_frame', None)
-        old_gc_roots = getattr(cg, 'gc_roots', None)
         old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
 
         entry = llvm_func.append_basic_block(name="entry")
@@ -910,8 +907,8 @@ class FunctionGenerator:
             cg._task.reset_for_function()
 
         # Initialize GC state for this method
+        # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
         cg.gc_frame = None
-        cg.gc_roots = None
         cg.gc_root_indices = {}
 
         # Collect heap variables for GC root tracking
@@ -929,8 +926,7 @@ class FunctionGenerator:
         # Create shadow stack frame if we have heap variables
         if heap_var_names and cg.gc is not None:
             num_roots = len(heap_var_names)
-            cg.gc_roots = cg.gc.create_frame_roots(cg.builder, num_roots)
-            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots, cg.gc_roots)
+            cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
 
         # GC Safe-point check: trigger GC if allocation threshold exceeded
@@ -953,7 +949,7 @@ class FunctionGenerator:
 
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:
-                cg.gc.set_root(cg.builder, cg.gc_roots, cg.gc_root_indices[param.name], llvm_param)
+                cg.gc.set_root(cg.builder, cg.gc_frame, cg.gc_root_indices[param.name], llvm_param)
 
         # Generate body
         for stmt in method.body:
@@ -978,7 +974,6 @@ class FunctionGenerator:
         cg.current_function = old_current_function
         cg.current_type = old_current_type
         cg.gc_frame = old_gc_frame
-        cg.gc_roots = old_gc_roots
         cg.gc_root_indices = old_gc_root_indices
 
     # ========================================================================
