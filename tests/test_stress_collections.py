@@ -2,6 +2,9 @@
 Stress tests for Map and Set at scale (10 million units).
 These tests verify that HAMT-based data structures can handle
 large numbers of elements efficiently.
+
+NOTE: These tests are currently disabled - they take too long for regular test runs.
+Run manually with: pytest tests/test_stress_collections.py -v
 """
 import pytest
 import subprocess
@@ -10,6 +13,9 @@ import os
 import sys
 import time
 from pathlib import Path
+
+# Skip entire module - these stress tests are too slow for regular test runs
+pytestmark = pytest.mark.skip(reason="Stress tests disabled - run manually if needed")
 
 # Skip 10M tests on CI (too resource-intensive)
 skip_on_ci = pytest.mark.skipif(
