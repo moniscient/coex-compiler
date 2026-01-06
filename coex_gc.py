@@ -3420,44 +3420,17 @@ class GarbageCollector:
         Phase 5: Uses segment-based shadow stack instead of frame-linked-list.
         Reserves num_roots slots in the segment chain.
         Returns the starting slot index (i64) for use in set_root and pop_frame.
+
+        NOTE: gc_segment_push already updates ThreadEntry.slot_index and
+        ThreadEntry.segment_current via pthread_getspecific, so we don't
+        need to sync them again here. LLVM thread_local is broken in llvmlite
+        so we must NOT read from tls_slot_index or tls_segment_current.
         """
         # Call gc_segment_push to reserve slots in the segment chain
         # Returns the starting slot index (i64)
+        # gc_segment_push handles updating ThreadEntry fields via pthread TLS
         num_roots_val = ir.Constant(self.i64, num_roots)
         start_slot = builder.call(self.gc_segment_push, [num_roots_val])
-
-        # Also update ThreadEntry.slot_index for GC visibility
-        # This is the watermark that GC uses to know how many slots to scan
-        tls_key = builder.load(self.tls_thread_entry_key)
-        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
-        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
-        entry_int = builder.ptrtoint(thread_entry, self.i64)
-        is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
-
-        func = builder.function
-        update_te = func.append_basic_block("push_update_te")
-        push_done = func.append_basic_block("push_done")
-
-        builder.cbranch(is_registered, update_te, push_done)
-
-        # Update ThreadEntry.slot_index to current slot position
-        builder.position_at_end(update_te)
-        current_slot_idx = builder.load(self.tls_slot_index)
-        slot_idx_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)  # slot_index field
-        ], inbounds=True)
-        builder.store(current_slot_idx, slot_idx_ptr)
-
-        # Also update segment_current pointer in ThreadEntry
-        current_segment = builder.load(self.tls_segment_current)
-        current_segment_i8 = builder.bitcast(current_segment, self.i8_ptr)
-        seg_curr_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 13)  # segment_current field
-        ], inbounds=True)
-        builder.store(current_segment_i8, seg_curr_ptr)
-        builder.branch(push_done)
-
-        builder.position_at_end(push_done)
         return start_slot
 
     def pop_frame_inline(self, builder: ir.IRBuilder, start_slot: ir.Value):
@@ -3466,32 +3439,13 @@ class GarbageCollector:
         Phase 5: Uses segment-based shadow stack.
         Restores the slot index to start_slot value.
         Segment chain stays intact (Segment Stability Invariant).
+
+        NOTE: gc_segment_pop already updates ThreadEntry.slot_index via
+        pthread_getspecific, so we don't need to sync it again here.
         """
         # Call gc_segment_pop to restore slot index
+        # gc_segment_pop handles updating ThreadEntry.slot_index via pthread TLS
         builder.call(self.gc_segment_pop, [start_slot])
-
-        # Also update ThreadEntry.slot_index for GC visibility
-        tls_key = builder.load(self.tls_thread_entry_key)
-        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
-        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
-        entry_int = builder.ptrtoint(thread_entry, self.i64)
-        is_registered = builder.icmp_unsigned('!=', entry_int, ir.Constant(self.i64, 0))
-
-        func = builder.function
-        update_te = func.append_basic_block("pop_update_te")
-        pop_done = func.append_basic_block("pop_done")
-
-        builder.cbranch(is_registered, update_te, pop_done)
-
-        # Update ThreadEntry.slot_index to restored position
-        builder.position_at_end(update_te)
-        slot_idx_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)  # slot_index field
-        ], inbounds=True)
-        builder.store(start_slot, slot_idx_ptr)
-        builder.branch(pop_done)
-
-        builder.position_at_end(pop_done)
 
     def push_frame(self, builder: ir.IRBuilder, num_roots: int) -> ir.Value:
         """Push a GC frame. Returns start_slot index for later pop.
@@ -4248,6 +4202,9 @@ class GarbageCollector:
 
         If current segment is full, allocates a new one.
         Returns the absolute slot index where roots should be stored.
+
+        IMPORTANT: Uses ThreadEntry fields (via pthread TLS) instead of LLVM
+        thread_local globals, which don't work in llvmlite.
         """
         func = self.gc_segment_push
         func.args[0].name = "num_roots"
@@ -4260,14 +4217,36 @@ class GarbageCollector:
         builder = ir.IRBuilder(entry)
         num_roots = func.args[0]
 
-        # Get current slot index
-        start_slot = builder.load(self.tls_slot_index)
+        # Get ThreadEntry via pthread TLS (this actually works, unlike LLVM thread_local)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+
+        # Read slot_index from ThreadEntry field 14
+        slot_idx_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 14)
+        ], inbounds=True)
+        start_slot = builder.load(slot_idx_ptr)
+
+        # Read segment_current from ThreadEntry field 13
+        seg_curr_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 13)
+        ], inbounds=True)
+        segment_i8 = builder.load(seg_curr_ptr)
+        segment = builder.bitcast(segment_i8, self.stack_segment_type.as_pointer())
+
+        # Store segment in alloca for phi-like access across blocks
+        segment_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="seg_alloca")
+        builder.store(segment, segment_alloca)
+
         builder.branch(check_space)
 
         # Check if we have space in current segment
         builder.position_at_end(check_space)
-        segment = builder.load(self.tls_segment_current)
-        count_ptr = builder.gep(segment, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        seg_for_check = builder.load(segment_alloca)
+        count_ptr = builder.gep(seg_for_check, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         current_count = builder.load(count_ptr)
 
         # Calculate remaining space
@@ -4278,37 +4257,76 @@ class GarbageCollector:
 
         # Allocate new segment
         builder.position_at_end(allocate_new)
+        old_segment = builder.load(segment_alloca)
         new_segment = builder.call(self.gc_segment_alloc, [])
 
         # Link new segment to current
         # new_segment.prev = current_segment
         new_prev_ptr = builder.gep(new_segment, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        current_as_i8ptr = builder.bitcast(segment, self.i8_ptr)
-        builder.store(current_as_i8ptr, new_prev_ptr)
+        old_as_i8ptr = builder.bitcast(old_segment, self.i8_ptr)
+        builder.store(old_as_i8ptr, new_prev_ptr)
 
         # current_segment.next = new_segment
-        curr_next_ptr = builder.gep(segment, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        curr_next_ptr = builder.gep(old_segment, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         new_as_i8ptr = builder.bitcast(new_segment, self.i8_ptr)
         builder.store(new_as_i8ptr, curr_next_ptr)
 
-        # Update TLS to point to new segment
-        builder.store(new_segment, self.tls_segment_current)
+        # Update ThreadEntry.segment_current (field 13)
+        builder.store(new_as_i8ptr, seg_curr_ptr)
+
+        # Update local alloca for have_space block
+        builder.store(new_segment, segment_alloca)
         builder.branch(have_space)
 
         # Have space - update slot count and return start index
         builder.position_at_end(have_space)
-        # Reload segment (may have changed)
-        segment2 = builder.load(self.tls_segment_current)
+        # Reload segment from alloca (may have changed)
+        segment2 = builder.load(segment_alloca)
         count_ptr2 = builder.gep(segment2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         current_count2 = builder.load(count_ptr2)
 
-        # Update count
+        # CRITICAL: Zero the slots BEFORE updating watermark to prevent race condition
+        # If GC scans before set_root is called, it must find zeros (null handles)
+        # Get pointer to slots array in current segment
+        slots_base = builder.gep(segment2, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 3),  # slots array
+            ir.Constant(self.i32, 0)   # first element
+        ], inbounds=True)
+
+        # Zero each slot we're reserving (starting from current_count2)
+        # This is a simple loop - for small num_roots this is fine
+        zero_loop = func.append_basic_block("zero_loop")
+        zero_body = func.append_basic_block("zero_body")
+        zero_done = func.append_basic_block("zero_done")
+
+        zero_idx = builder.alloca(self.i64, name="zero_idx")
+        builder.store(ir.Constant(self.i64, 0), zero_idx)
+        builder.branch(zero_loop)
+
+        builder.position_at_end(zero_loop)
+        zi = builder.load(zero_idx)
+        done_zeroing = builder.icmp_unsigned(">=", zi, num_roots)
+        builder.cbranch(done_zeroing, zero_done, zero_body)
+
+        builder.position_at_end(zero_body)
+        # Calculate absolute slot index: current_count2 + zi
+        abs_slot = builder.add(current_count2, zi)
+        slot_ptr = builder.gep(slots_base, [abs_slot], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), slot_ptr)  # Zero the slot
+        next_zi = builder.add(zi, ir.Constant(self.i64, 1))
+        builder.store(next_zi, zero_idx)
+        builder.branch(zero_loop)
+
+        builder.position_at_end(zero_done)
+
+        # Update segment slot count
         new_count2 = builder.add(current_count2, num_roots)
         builder.store(new_count2, count_ptr2)
 
-        # Update global slot index
+        # Update ThreadEntry.slot_index (field 14)
         new_slot_idx = builder.add(start_slot, num_roots)
-        builder.store(new_slot_idx, self.tls_slot_index)
+        builder.store(new_slot_idx, slot_idx_ptr)
 
         # Return starting slot index
         builder.ret(start_slot)
@@ -4317,23 +4335,30 @@ class GarbageCollector:
         """Restore slot index to start_slot value.
 
         May go back to previous segment if needed.
+
+        IMPORTANT: Uses ThreadEntry fields (via pthread TLS) instead of LLVM
+        thread_local globals, which don't work in llvmlite.
         """
         func = self.gc_segment_pop
         func.args[0].name = "start_slot"
 
         entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
 
+        builder = ir.IRBuilder(entry)
         start_slot = func.args[0]
 
-        # Simply restore the slot index
-        # The segment chain remains intact for potential reuse
-        builder.store(start_slot, self.tls_slot_index)
+        # Get ThreadEntry via pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
 
-        # Update the current segment's slot count based on new index
-        # For simplicity, we track slots globally and recompute segment-local counts
-        # when scanning. This is an approximation - full implementation would track
-        # per-segment counts more precisely.
+        # Update ThreadEntry.slot_index (field 14) directly
+        # The segment chain remains intact for potential reuse
+        slot_idx_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 14)  # slot_index field
+        ], inbounds=True)
+        builder.store(start_slot, slot_idx_ptr)
 
         builder.ret_void()
 
@@ -4342,6 +4367,9 @@ class GarbageCollector:
 
         Finds the correct segment and slot within it.
         Uses absolute slot indexing across the segment chain.
+
+        IMPORTANT: Uses ThreadEntry fields (via pthread TLS) instead of LLVM
+        thread_local globals, which don't work in llvmlite.
         """
         func = self.gc_segment_set_root
         func.args[0].name = "slot"
@@ -4356,6 +4384,19 @@ class GarbageCollector:
         slot = func.args[0]
         handle = func.args[1]
 
+        # Get ThreadEntry via pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+
+        # Get segment_base from ThreadEntry field 12
+        seg_base_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 12)  # segment_base field
+        ], inbounds=True)
+        segment_base_i8 = builder.load(seg_base_ptr)
+        base_segment = builder.bitcast(segment_base_i8, self.stack_segment_type.as_pointer())
+
         # Calculate which segment and which slot within it
         # slot_in_segment = slot % SEGMENT_SLOTS
         # segment_index = slot / SEGMENT_SLOTS
@@ -4367,7 +4408,6 @@ class GarbageCollector:
         curr_segment_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="curr")
         remaining_alloca = builder.alloca(self.i64, name="remaining")
 
-        base_segment = builder.load(self.tls_segment_base)
         builder.store(base_segment, curr_segment_alloca)
         builder.store(segment_index, remaining_alloca)
         builder.branch(loop_check)

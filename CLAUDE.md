@@ -104,6 +104,35 @@ func main() -> int
 ~
 ```
 
+### llvmlite Thread-Local Storage Bug
+
+**CRITICAL WARNING**: llvmlite's `thread_local = 'localdynamic'` attribute is silently ignored. The generated LLVM IR shows plain `global` instead of `thread_local global`. This means:
+
+- **DO NOT** rely on `variable.thread_local = 'localdynamic'` for per-thread state
+- All threads will share the same global variable, causing race conditions
+- This affects TLS globals like `tls_slot_index`, `tls_segment_current`, etc.
+
+**Workaround**: Use pthread TLS instead via `pthread_key_create`/`pthread_setspecific`/`pthread_getspecific`:
+1. Store per-thread data in the ThreadEntry struct (fields 12-14)
+2. ThreadEntry is stored in pthread TLS via `pthread_setspecific`
+3. Access ThreadEntry from any function via `pthread_getspecific`
+
+Example pattern in `coex_gc.py`:
+```python
+# Get ThreadEntry via pthread TLS (this works, unlike LLVM thread_local)
+tls_key = builder.load(self.tls_thread_entry_key)
+thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+
+# Read slot_index from ThreadEntry field 14
+slot_idx_ptr = builder.gep(thread_entry, [
+    ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)
+], inbounds=True)
+slot_index = builder.load(slot_idx_ptr)
+```
+
+The segment functions (`gc_segment_push`, `gc_segment_pop`, `gc_segment_set_root`) use this pattern exclusively.
+
 ## Language Syntax
 
 ### Inviolable requirements. Be certain that changes and update planning adheres to the immutability principles below.
