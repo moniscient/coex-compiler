@@ -471,6 +471,12 @@ class FunctionGenerator:
             cg.builder.store(param_value, alloca)
             cg.locals[param.name] = alloca
 
+            # Mark collection parameters as aliased for in-place optimization safety.
+            # Collection parameters share their wrapper with the caller's variable,
+            # so in-place mutation would violate value semantics for the caller.
+            if cg._is_collection_coex_type(param.type_annotation):
+                cg.aliased_vars.add(param.name)
+
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:
                 root_idx = cg.gc_root_indices[param.name]
@@ -620,6 +626,10 @@ class FunctionGenerator:
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.builder.store(param_value, alloca)
             cg.locals[param.name] = alloca
+
+            # Mark collection parameters as aliased for in-place optimization safety
+            if cg._is_collection_coex_type(param_type):
+                cg.aliased_vars.add(param.name)
 
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:
@@ -838,6 +848,10 @@ class FunctionGenerator:
                     alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.builder.store(llvm_param, alloca)
                     cg.locals[param.name] = alloca
+
+                    # Mark collection parameters as aliased for in-place optimization safety
+                    if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
+                        cg.aliased_vars.add(param.name)
             else:
                 # Instance method - has self as first parameter
                 # Store self pointer
@@ -856,6 +870,10 @@ class FunctionGenerator:
                     alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.builder.store(llvm_param, alloca)
                     cg.locals[param.name] = alloca
+
+                    # Mark collection parameters as aliased for in-place optimization safety
+                    if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
+                        cg.aliased_vars.add(param.name)
 
             # Generate body
             for stmt in method.body:
@@ -975,6 +993,10 @@ class FunctionGenerator:
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.builder.store(llvm_param, alloca)
             cg.locals[param.name] = alloca
+
+            # Mark collection parameters as aliased for in-place optimization safety
+            if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
+                cg.aliased_vars.add(param.name)
 
             # Register parameter as GC root if it's a heap type
             if param.name in cg.gc_root_indices and cg.gc is not None:

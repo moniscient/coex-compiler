@@ -8,9 +8,10 @@ This module handles:
 - Print and debug statements
 - Return statements
 - Tuple destructuring
+- In-place mutation optimization for update patterns
 """
 from llvmlite import ir
-from typing import TYPE_CHECKING, Optional, Dict
+from typing import TYPE_CHECKING, Optional, Dict, Tuple
 from typing import List as PyList
 
 from ast_nodes import (
@@ -24,6 +25,9 @@ from ast_nodes import (
     OptionalType, PrimitiveType, NamedType
 )
 
+# Import uniqueness analysis for in-place mutation optimization
+from analysis.uniqueness import can_optimize_statement, get_update_pattern
+
 if TYPE_CHECKING:
     from codegen.core import CodeGenerator
 
@@ -34,6 +38,166 @@ class StatementGenerator:
     def __init__(self, cg: 'CodeGenerator'):
         """Initialize with reference to parent CodeGenerator instance."""
         self.cg = cg
+
+    # ========================================================================
+    # In-Place Mutation Optimization
+    # ========================================================================
+
+    def try_generate_inplace_update(self, stmt: VarDecl) -> bool:
+        """
+        Try to generate in-place mutation for an update pattern.
+
+        Detects patterns like: x = x.add(y) where x is a Set/Map/List
+        and generates the in-place variant instead of allocating a new wrapper.
+
+        IMPORTANT: Only safe when the variable's value has NOT been aliased
+        (copied to another variable). If aliased, we must create a new wrapper
+        to preserve value semantics.
+
+        Returns True if in-place optimization was applied, False otherwise.
+        """
+        cg = self.cg
+
+        # Check if this is an update pattern
+        if not can_optimize_statement(stmt):
+            return False
+
+        pattern = get_update_pattern(stmt)
+        if pattern is None:
+            return False
+
+        var_name, method_name, args = pattern
+
+        # Make sure the variable exists (must be reassignment, not first declaration)
+        if var_name not in cg.locals:
+            return False
+
+        # CRITICAL: Check if the variable's value has been aliased
+        # If another variable was assigned from this one, we cannot mutate in-place
+        # because that would violate value semantics for the other variable.
+        if hasattr(cg, 'aliased_vars') and var_name in cg.aliased_vars:
+            return False
+
+        # Get the variable's type to determine which in-place function to use
+        coex_type = cg.var_coex_types.get(var_name)
+        if coex_type is None:
+            # Try to infer from LLVM type
+            alloca = cg.locals[var_name]
+            pointee = alloca.type.pointee
+            if not hasattr(pointee, 'name'):
+                return False
+            struct_name = pointee.name
+            if struct_name == "struct.Set":
+                coex_type = SetType(PrimitiveType("int"))  # Default assumption
+            elif struct_name == "struct.Map":
+                coex_type = MapType(PrimitiveType("int"), PrimitiveType("int"))
+            elif struct_name == "struct.List":
+                coex_type = ListType(PrimitiveType("int"))
+            else:
+                return False
+
+        # Get the in-place function
+        inplace_func = self._get_inplace_function(coex_type, method_name)
+        if inplace_func is None:
+            return False
+
+        # Generate the in-place call
+        return self._generate_inplace_call(var_name, method_name, args, coex_type, inplace_func)
+
+    def _get_inplace_function(self, coex_type, method_name: str):
+        """Get the in-place function for a given type and method."""
+        cg = self.cg
+
+        # Check if inplace_variants mapping exists
+        if not hasattr(cg, 'inplace_variants') or not cg.inplace_variants:
+            return None
+
+        # Determine the normal function name based on type
+        if isinstance(coex_type, SetType):
+            if method_name == "add":
+                # Check if element type is supported
+                elem_type = coex_type.element_type
+                if isinstance(elem_type, PrimitiveType):
+                    if elem_type.name == "string":
+                        normal_func = "coex_set_add_string"
+                    else:
+                        normal_func = "coex_set_add"
+                else:
+                    # Skip in-place for non-primitive element types
+                    return None
+            elif method_name == "remove":
+                # Only support remove for primitive element types
+                elem_type = coex_type.element_type
+                if not isinstance(elem_type, PrimitiveType):
+                    return None
+                normal_func = "coex_set_remove"
+            else:
+                return None
+        elif isinstance(coex_type, MapType):
+            if method_name in ("put", "set"):
+                # Only support in-place for primitive value types (not heap types like List)
+                # because our in-place functions expect i64 values
+                value_type = coex_type.value_type
+                if not isinstance(value_type, PrimitiveType):
+                    return None  # Skip in-place for complex value types
+
+                # Check if key type is string
+                key_type = coex_type.key_type
+                if isinstance(key_type, PrimitiveType) and key_type.name == "string":
+                    normal_func = "coex_map_put_string"
+                else:
+                    normal_func = "coex_map_put"
+            elif method_name == "remove":
+                normal_func = "coex_map_remove"
+            else:
+                return None
+        elif isinstance(coex_type, ListType):
+            if method_name == "append":
+                normal_func = "coex_pv_append"
+            else:
+                return None
+        else:
+            return None
+
+        # Look up the in-place variant
+        inplace_name = cg.inplace_variants.get(normal_func)
+        if inplace_name is None:
+            return None
+
+        return cg.functions.get(inplace_name)
+
+    def _generate_inplace_call(self, var_name: str, method_name: str, args: list,
+                               coex_type, inplace_func) -> bool:
+        """Generate the actual in-place function call."""
+        cg = self.cg
+
+        # Load the wrapper pointer
+        alloca = cg.locals[var_name]
+        wrapper_ptr = cg.builder.load(alloca)
+
+        # Generate arguments
+        llvm_args = [wrapper_ptr]
+
+        for arg in args:
+            arg_val = cg._generate_expression(arg)
+            llvm_args.append(arg_val)
+
+        # Call the in-place function (returns void)
+        cg.builder.call(inplace_func, llvm_args)
+
+        # No need to store result - wrapper was mutated in place
+        # The handle in the variable slot is still valid
+
+        # Update GC root if needed (handle unchanged, but for consistency)
+        if var_name in cg.gc_root_indices and cg.gc is not None:
+            root_idx = cg.gc_root_indices[var_name]
+            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, wrapper_ptr)
+
+        return True
+
+    # ========================================================================
+    # Statement Generation
+    # ========================================================================
 
     def generate_statement(self, stmt: Stmt):
         """Generate code for a statement"""
@@ -103,6 +267,16 @@ class StatementGenerator:
                         f"Cannot reassign const binding '{stmt.name}'. "
                         f"Remove 'const' from the declaration to make it rebindable."
                     )
+
+                # Try in-place mutation optimization for update patterns
+                # Pattern: x = x.add(y) where x is a Set/Map/List
+                if self.try_generate_inplace_update(stmt):
+                    # Successfully generated in-place update
+                    # Clear moved_vars if this var was moved
+                    if stmt.name in cg.moved_vars:
+                        cg.moved_vars.discard(stmt.name)
+                    return
+
                 self.generate_var_reassignment(stmt)
                 return
 
@@ -164,28 +338,52 @@ class StatementGenerator:
             # Value semantics: deep copy collections
             inferred_coex_type = self._infer_coex_type_from_initializer(stmt)
 
+            # Track aliasing for in-place optimization safety:
+            # When copying a collection from another variable (e.g., s2 = s1),
+            # mark the source as aliased so in-place mutation is disabled.
+            source_var_name = None
+            if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+                source_var_name = stmt.initializer.name
+
             if inferred_coex_type and cg._is_collection_coex_type(inferred_coex_type):
                 if stmt.is_move:
                     init_value = cg._generate_move_or_eager_copy(init_value, inferred_coex_type)
                 else:
                     init_value = cg._generate_deep_copy(init_value, inferred_coex_type)
+                    # Mark BOTH source and target as aliased because copy functions
+                    # return the same pointer (COW semantics). Both variables now
+                    # share the same wrapper, so neither can be mutated in-place.
+                    if source_var_name:
+                        cg.aliased_vars.add(source_var_name)
+                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
                 cg.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(init_value.type, ir.PointerType):
                 pointee = init_value.type.pointee
                 if hasattr(pointee, 'name'):
                     if pointee.name == "struct.List":
                         init_value = cg.builder.call(cg.list_copy, [init_value])
+                        if source_var_name:
+                            cg.aliased_vars.add(source_var_name)
+                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
                     elif pointee.name == "struct.Set":
                         init_value = cg.builder.call(cg.set_copy, [init_value])
+                        if source_var_name:
+                            cg.aliased_vars.add(source_var_name)
+                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
                     elif pointee.name == "struct.Map":
                         init_value = cg.builder.call(cg.map_copy, [init_value])
+                        if source_var_name:
+                            cg.aliased_vars.add(source_var_name)
+                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
                     elif pointee.name == "struct.String":
                         init_value = cg.builder.call(cg.string_copy, [init_value])
+                        # Note: Strings are immutable, so aliasing doesn't affect in-place ops
                     elif pointee.name == "struct.Array":
                         if stmt.is_move:
                             init_value = cg._generate_move_or_eager_copy(init_value, ArrayType(PrimitiveType("int")))
                         else:
                             init_value = cg.builder.call(cg.array_copy, [init_value])
+                            # Note: Arrays are immutable in Coex, no in-place ops
 
             cg.builder.store(init_value, alloca)
             cg.locals[stmt.name] = alloca
@@ -274,18 +472,31 @@ class StatementGenerator:
 
         init_value = cg._cast_value(init_value, llvm_type)
 
+        # Track aliasing for in-place optimization safety (type-annotated path)
+        typed_source_var_name = None
+        if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+            typed_source_var_name = stmt.initializer.name
+
         # Value semantics for typed collections
         if cg._is_collection_coex_type(stmt.type_annotation):
             if stmt.is_move:
                 init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
             else:
                 init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
+                # Mark BOTH source and target as aliased (COW semantics)
+                if typed_source_var_name:
+                    cg.aliased_vars.add(typed_source_var_name)
+                    cg.aliased_vars.add(stmt.name)  # Target is also aliased
         elif isinstance(init_value.type, ir.PointerType):
             if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in cg.type_fields:
                 if stmt.is_move:
                     init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
                 else:
                     init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
+                    # User-defined types with fields: mark both as aliased
+                    if typed_source_var_name:
+                        cg.aliased_vars.add(typed_source_var_name)
+                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
 
         cg.builder.store(init_value, alloca)
         cg.locals[stmt.name] = alloca
@@ -351,6 +562,11 @@ class StatementGenerator:
         if stmt.is_move and isinstance(stmt.initializer, Identifier):
             move_source_name = stmt.initializer.name
 
+        # Track aliasing for in-place optimization safety
+        reassign_source_var_name = None
+        if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+            reassign_source_var_name = stmt.initializer.name
+
         value = cg._generate_expression(stmt.initializer)
         expected_type = alloca.type.pointee
         value = cg._cast_value(value, expected_type)
@@ -361,19 +577,34 @@ class StatementGenerator:
                 value = cg._generate_move_or_eager_copy(value, coex_type)
             else:
                 value = cg._generate_deep_copy(value, coex_type)
+                # Mark BOTH source and target as aliased (COW semantics)
+                if reassign_source_var_name:
+                    cg.aliased_vars.add(reassign_source_var_name)
+                    cg.aliased_vars.add(stmt.name)  # Target is also aliased
         elif isinstance(value.type, ir.PointerType):
             pointee = value.type.pointee
             if hasattr(pointee, 'name'):
                 if pointee.name == "struct.List" and not stmt.is_move:
                     value = cg.builder.call(cg.list_copy, [value])
+                    if reassign_source_var_name:
+                        cg.aliased_vars.add(reassign_source_var_name)
+                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
                 elif pointee.name == "struct.Set" and not stmt.is_move:
                     value = cg.builder.call(cg.set_copy, [value])
+                    if reassign_source_var_name:
+                        cg.aliased_vars.add(reassign_source_var_name)
+                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
                 elif pointee.name == "struct.Map" and not stmt.is_move:
                     value = cg.builder.call(cg.map_copy, [value])
+                    if reassign_source_var_name:
+                        cg.aliased_vars.add(reassign_source_var_name)
+                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
                 elif pointee.name == "struct.String" and not stmt.is_move:
                     value = cg.builder.call(cg.string_copy, [value])
+                    # Note: Strings are immutable, no in-place ops
                 elif pointee.name == "struct.Array" and not stmt.is_move:
                     value = cg.builder.call(cg.array_copy, [value])
+                    # Note: Arrays are immutable in Coex, no in-place ops
 
         cg.builder.store(value, alloca)
 

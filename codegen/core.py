@@ -39,6 +39,9 @@ from codegen.atomic import AtomicGenerator
 # Import Result generator module
 from codegen.result import ResultGenerator
 
+# Import in-place mutation operations for uniqueness optimization
+from codegen.inplace_ops import create_inplace_operations
+
 # Import Matrix/CA generator module
 from codegen.matrix import MatrixGenerator
 
@@ -190,6 +193,12 @@ class CodeGenerator:
 
         # Const binding tracking for reassignment checking
         self.const_bindings: set = set()  # Set of const variable names
+
+        # Aliasing tracking for in-place mutation optimization
+        # When a collection variable is copied (e.g., s2 = s1), the source (s1)
+        # is marked as aliased. In-place mutation cannot be applied to aliased
+        # variables because it would violate value semantics for the copy.
+        self.aliased_vars: set = set()  # Set of variable names whose values have been copied
 
         # Placeholder variable tracking for loop pre-allocation
         self.placeholder_vars: set = set()  # Set of pre-allocated placeholder variable names
@@ -354,6 +363,11 @@ class CodeGenerator:
         self._hamt = HamtGenerator(self)
         self._hamt.create_map_type()
         self._hamt.create_set_type()
+
+        # Create in-place mutation operations (for uniqueness optimization)
+        # These are variants that mutate wrapper objects in place when binding is unique
+        self.inplace_variants = {}  # Will be populated by create_inplace_operations
+        create_inplace_operations(self)
 
         # Create JSON type and helpers
         self._json = JsonGenerator(self)
