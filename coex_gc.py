@@ -4148,12 +4148,19 @@ class GarbageCollector:
         builder = ir.IRBuilder(entry)
 
         # mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
-        # On macOS: MAP_ANON = 0x1000, MAP_PRIVATE = 0x0002
-        # Combined: 0x1002
+        # Platform-specific mmap flags:
+        #   macOS: MAP_ANON = 0x1000, MAP_PRIVATE = 0x0002 → 0x1002
+        #   Linux: MAP_ANON = 0x0020, MAP_PRIVATE = 0x0002 → 0x0022
+        import sys
+        if sys.platform == 'darwin':
+            mmap_flags = 0x1002  # MAP_PRIVATE | MAP_ANON (macOS)
+        else:
+            mmap_flags = 0x0022  # MAP_PRIVATE | MAP_ANONYMOUS (Linux)
+
         null_ptr = ir.Constant(self.i8_ptr, None)
         size = ir.Constant(self.i64, self.SEGMENT_SIZE)
         prot = ir.Constant(self.i32, 3)  # PROT_READ | PROT_WRITE
-        flags = ir.Constant(self.i32, 0x1002)  # MAP_PRIVATE | MAP_ANON (macOS)
+        flags = ir.Constant(self.i32, mmap_flags)
         fd = ir.Constant(self.i32, -1)
         offset = ir.Constant(self.i64, 0)
 

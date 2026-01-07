@@ -66,6 +66,11 @@ class FunctionGenerator:
         else:
             return_type = ir.VoidType()
 
+        # main() must return i32 for C ABI compliance, not Coex's i64 int
+        # The return value will be truncated from i64 to i32 in generate_return
+        if func.name == "main":
+            return_type = ir.IntType(32)
+
         # Create function
         func_type = ir.FunctionType(return_type, param_types)
         llvm_func = ir.Function(cg.module, func_type, name=func.name)
