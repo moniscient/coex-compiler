@@ -99,11 +99,11 @@ parameterList
     ;
 
 parameter
-    : UNDERSCORE? IDENTIFIER COLON typeExpr
+    : (UNIQUE | BORROW)? UNDERSCORE? IDENTIFIER COLON typeExpr
     ;
 
 returnType
-    : ARROW typeExpr
+    : ARROW UNIQUE? typeExpr
     ;
 
 // ----------------------------------------------------------------------------
@@ -264,8 +264,8 @@ llvmTypeHint
     ;
 
 varDeclStmt
-    : CONST? IDENTIFIER COLON typeExpr (ASSIGN | MOVE_ASSIGN) expression
-    | CONST? IDENTIFIER (ASSIGN | MOVE_ASSIGN) expression
+    : (CONST | UNIQUE)? IDENTIFIER COLON typeExpr (ASSIGN | COPY_ASSIGN) expression
+    | (CONST | UNIQUE)? IDENTIFIER (ASSIGN | COPY_ASSIGN) expression
     ;
 
 // Tuple destructuring: (a, b) = expr
@@ -275,7 +275,7 @@ tupleDestructureStmt
 
 assignOp
     : ASSIGN
-    | MOVE_ASSIGN
+    | COPY_ASSIGN
     | PLUS_ASSIGN
     | MINUS_ASSIGN
     | STAR_ASSIGN
@@ -720,6 +720,8 @@ TIMEOUT     : 'timeout' ;
 // Variable declaration
 VAR         : 'var' ;
 CONST       : 'const' ;
+UNIQUE      : 'unique' ;
+BORROW      : 'borrow' ;
 
 // Async
 AWAIT       : 'await' ;
@@ -807,7 +809,7 @@ SLASH       : '/' ;
 PERCENT     : '%' ;
 LT          : '<' ;
 GT          : '>' ;
-MOVE_ASSIGN : ':=' ;  // Move/eager assign (must come before ASSIGN)
+COPY_ASSIGN : ':=' ;  // Copy assign - creates deep copy (must come before ASSIGN)
 ASSIGN      : '=' ;
 QUESTION    : '?' ;
 SEMI        : ';' ;

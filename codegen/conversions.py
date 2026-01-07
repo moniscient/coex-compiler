@@ -580,20 +580,17 @@ class ConversionGenerator:
         return value
 
     def generate_deep_copy(self, value: ir.Value, coex_type: Type) -> ir.Value:
-        """Generate code to 'deep-copy' a value based on its Coex type.
+        """Generate code to deep-copy a value based on its Coex type.
 
-        With immutable heap semantics, heap-allocated values don't need copying.
-        Sharing references is semantically equivalent to copying because no
-        binding can observe mutations through another binding:
-        - Collections: mutation operations return new objects
-        - Strings: immutable
-        - UDTs: field assignment creates new struct (copy-on-write)
-
-        This function returns value unchanged for all types.
+        This creates a truly independent copy for Array and String types,
+        which is needed for the := (copy) operator to support unique ownership.
+        For other types, returns the value unchanged (immutable heap semantics).
         """
-        # All types: return value unchanged
-        # - Primitives are stack-allocated value types
-        # - Heap types are immutable - sharing is equivalent to copying
+        if isinstance(coex_type, ArrayType):
+            return self.generate_array_deep_copy(value, coex_type.element_type)
+        elif isinstance(coex_type, PrimitiveType) and coex_type.name == "string":
+            return self.generate_string_deep_copy(value)
+        # Other types: return unchanged (immutable semantics)
         return value
 
     def generate_list_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
@@ -621,12 +618,22 @@ class ConversionGenerator:
         return src
 
     def generate_array_deep_copy(self, src: ir.Value, elem_type: Type) -> ir.Value:
-        """Deep copy an array (identity function with immutable heap semantics).
+        """Deep copy an array to create an independent copy with its own data buffer.
 
-        With immutable heap semantics, deep copy is unnecessary.
-        Sharing the reference is semantically equivalent.
+        This is used by the := (copy) operator to ensure the copy is truly independent,
+        which is important for unique ownership semantics where the source should
+        remain valid and unique after a copy.
         """
-        return src
+        return self.cg.builder.call(self.cg.array_deep_copy, [src])
+
+    def generate_string_deep_copy(self, src: ir.Value) -> ir.Value:
+        """Deep copy a string to create an independent copy with its own data buffer.
+
+        This is used by the := (copy) operator to ensure the copy is truly independent,
+        which is important for unique ownership semantics where the source should
+        remain valid and unique after a copy.
+        """
+        return self.cg.builder.call(self.cg.string_deep_copy, [src])
 
     def generate_type_deep_copy(self, src: ir.Value, coex_type: NamedType) -> ir.Value:
         """Deep copy a user-defined type (identity function with immutable heap semantics).

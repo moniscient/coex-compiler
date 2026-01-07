@@ -197,6 +197,21 @@ def compile_coex(source_path: str, output_path: str = None,
         print_ast(program)
         return
 
+    # Run ownership analysis for unique bindings
+    from analysis.ownership import check_program_ownership
+    ownership_errors, ownership_warnings = check_program_ownership(program.functions)
+
+    # Display ownership warnings
+    for warning in ownership_warnings:
+        print(f"  {source_path}: {warning.format()}", file=sys.stderr)
+
+    # Fail on ownership errors
+    if ownership_errors:
+        for error in ownership_errors:
+            print(f"  {source_path}: {error.format()}", file=sys.stderr)
+        print(f"Compilation failed: {len(ownership_errors)} ownership error(s)", file=sys.stderr)
+        sys.exit(1)
+
     # Generate code
     print("Generating LLVM IR...")
     codegen = CodeGenerator()

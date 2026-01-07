@@ -51,7 +51,7 @@ class UnaryOp(Enum):
 
 class AssignOp(Enum):
     ASSIGN = "="
-    MOVE_ASSIGN = ":="
+    COPY_ASSIGN = ":="
     PLUS_ASSIGN = "+="
     MINUS_ASSIGN = "-="
     STAR_ASSIGN = "*="
@@ -501,7 +501,8 @@ class VarDecl(Stmt):
     type_annotation: Optional[Type]
     initializer: Expr
     is_const: bool = False  # True if declared with 'const'
-    is_move: bool = False  # True if := was used
+    is_copy: bool = False  # True if := was used (explicit copy)
+    is_unique: bool = False  # True if declared with 'unique'
 
 
 @dataclass
@@ -529,7 +530,7 @@ class SliceAssignment(Stmt):
     start: Optional[Expr]  # None means 0
     end: Optional[Expr]    # None means len
     value: Expr            # Source collection
-    op: AssignOp           # Should be ASSIGN or MOVE_ASSIGN
+    op: AssignOp           # Should be ASSIGN or COPY_ASSIGN
 
 
 @dataclass
@@ -740,6 +741,8 @@ class Parameter:
     type_annotation: Type
     positional: bool = False  # True if prefixed with _
     default_value: Optional[Expr] = None
+    is_unique: bool = False  # True if 'unique' modifier present
+    is_borrow: bool = False  # True if 'borrow' modifier present
 
 
 @dataclass
@@ -758,6 +761,7 @@ class FunctionDecl:
     return_type: Optional[Type] = None
     body: List[Stmt] = field(default_factory=list)
     annotations: List[Annotation] = field(default_factory=list)
+    return_unique: bool = False  # True if return type has 'unique' modifier
 
 
 @dataclass

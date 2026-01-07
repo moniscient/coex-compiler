@@ -190,8 +190,8 @@ func main() -> int
         expect_output('''
 func main() -> int
     raw = [3, 1, 2, 1, 3, 2].toArray()
-    unique = raw.toSet()
-    result = unique.toArray()
+    deduped = raw.toSet()
+    result = deduped.toArray()
     print(result.len())
     return 0
 ~

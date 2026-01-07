@@ -141,11 +141,13 @@ class ASTBuilder:
 
             # Get return type
             return_type = None
+            return_unique = False
             if ctx.returnType():
                 return_type = self.visit_type_expr(ctx.returnType().typeExpr())
+                return_unique = ctx.returnType().UNIQUE() is not None
 
             # Extern functions have no body
-            return FunctionDecl(FunctionKind.EXTERN, name, [], params, return_type, [], [])
+            return FunctionDecl(FunctionKind.EXTERN, name, [], params, return_type, [], [], return_unique)
 
         # Regular function declaration
         # Get annotations
@@ -180,8 +182,10 @@ class ASTBuilder:
 
         # Get return type
         return_type = None
+        return_unique = False
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
+            return_unique = ctx.returnType().UNIQUE() is not None
 
         # Get body - extern functions have no body
         if kind == FunctionKind.EXTERN:
@@ -189,7 +193,7 @@ class ASTBuilder:
         else:
             body = self.visit_block(ctx.block())
 
-        return FunctionDecl(kind, name, type_params, params, return_type, body, annotations)
+        return FunctionDecl(kind, name, type_params, params, return_type, body, annotations, return_unique)
 
     def visit_annotation(self, ctx) -> Annotation:
         """Visit an annotation: @name or @name("argument")"""
@@ -228,9 +232,11 @@ class ASTBuilder:
     def visit_param(self, ctx: CoexParser.ParameterContext) -> Parameter:
         """Visit a single parameter"""
         positional = ctx.UNDERSCORE() is not None
+        is_unique = ctx.UNIQUE() is not None
+        is_borrow = ctx.BORROW() is not None
         name = ctx.IDENTIFIER().getText()
         type_ann = self.visit_type_expr(ctx.typeExpr())
-        return Parameter(name, type_ann, positional)
+        return Parameter(name, type_ann, positional, is_unique=is_unique, is_borrow=is_borrow)
     
     def visit_type_decl(self, ctx: CoexParser.TypeDeclContext) -> TypeDecl:
         """Visit a type declaration"""
@@ -301,13 +307,15 @@ class ASTBuilder:
         
         # Get return type
         return_type = None
+        return_unique = False
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-        
+            return_unique = ctx.returnType().UNIQUE() is not None
+
         # Get body
         body = self.visit_block(ctx.block())
-        
-        return FunctionDecl(kind, name, type_params, params, return_type, body)
+
+        return FunctionDecl(kind, name, type_params, params, return_type, body, [], return_unique)
     
     def visit_trait_decl(self, ctx: CoexParser.TraitDeclContext) -> TraitDecl:
         """Visit a trait declaration"""
@@ -336,13 +344,15 @@ class ASTBuilder:
             params = self.visit_param_list(ctx.parameterList())
         
         return_type = None
+        return_unique = False
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-        
+            return_unique = ctx.returnType().UNIQUE() is not None
+
         # Trait methods are abstract - no body
         body = []
-        
-        return FunctionDecl(kind, name, [], params, return_type, body)
+
+        return FunctionDecl(kind, name, [], params, return_type, body, [], return_unique)
     
     def visit_matrix_decl(self, ctx: CoexParser.MatrixDeclContext) -> MatrixDecl:
         """Visit a matrix declaration"""
@@ -378,12 +388,14 @@ class ASTBuilder:
             params = self.visit_param_list(ctx.parameterList())
         
         return_type = None
+        return_unique = False
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-        
+            return_unique = ctx.returnType().UNIQUE() is not None
+
         body = self.visit_block(ctx.block())
-        
-        return FunctionDecl(FunctionKind.FORMULA, name, [], params, return_type, body)
+
+        return FunctionDecl(FunctionKind.FORMULA, name, [], params, return_type, body, [], return_unique)
     
     # ========================================================================
     # Types
@@ -605,17 +617,18 @@ class ASTBuilder:
         return '\n'.join(lines).strip()
 
     def visit_var_decl_stmt(self, ctx: CoexParser.VarDeclStmtContext) -> VarDecl:
-        """Visit a variable declaration statement: [const] name [: type] = expr"""
-        # Check for const keyword
+        """Visit a variable declaration statement: [const|unique] name [: type] = expr"""
+        # Check for const or unique keyword
         is_const = ctx.CONST() is not None
+        is_unique = ctx.UNIQUE() is not None
 
         name = ctx.IDENTIFIER().getText()
         # Type annotation is optional
         type_ann = self.visit_type_expr(ctx.typeExpr()) if ctx.typeExpr() else None
         init = self.visit_expression(ctx.expression())
-        # Check if this is a move assignment
-        is_move = ctx.MOVE_ASSIGN() is not None
-        return VarDecl(name, type_ann, init, is_const=is_const, is_move=is_move)
+        # Check if this is a copy assignment (:=)
+        is_copy = ctx.COPY_ASSIGN() is not None
+        return VarDecl(name, type_ann, init, is_const=is_const, is_copy=is_copy, is_unique=is_unique)
     
     def visit_simple_stmt(self, ctx: CoexParser.SimpleStmtContext) -> Stmt:
         """Visit a simple statement (expression or assignment)"""
@@ -656,7 +669,7 @@ class ASTBuilder:
         text = ctx.getText()
         op_map = {
             "=": AssignOp.ASSIGN,
-            ":=": AssignOp.MOVE_ASSIGN,
+            ":=": AssignOp.COPY_ASSIGN,
             "+=": AssignOp.PLUS_ASSIGN,
             "-=": AssignOp.MINUS_ASSIGN,
             "*=": AssignOp.STAR_ASSIGN,

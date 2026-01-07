@@ -224,7 +224,7 @@ class MoveAnalyzer(CommentaryAnalyzer):
         stmt_list = list(self._walk_statements(func.body))
 
         for i, stmt in enumerate(stmt_list):
-            if isinstance(stmt, VarDecl) and not stmt.is_move:
+            if isinstance(stmt, VarDecl) and not stmt.is_copy:
                 # Check if the source is a variable that's not used afterward
                 if isinstance(stmt.initializer, Identifier):
                     source_var = stmt.initializer.name

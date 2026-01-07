@@ -194,10 +194,15 @@ class CodeGenerator:
         # Const binding tracking for reassignment checking
         self.const_bindings: set = set()  # Set of const variable names
 
+        # Unique bindings tracking for ownership system
+        # Unique bindings have sole ownership and are never aliased
+        self.unique_bindings: set = set()  # Set of variable names declared as unique
+
         # Aliasing tracking for in-place mutation optimization
         # When a collection variable is copied (e.g., s2 = s1), the source (s1)
         # is marked as aliased. In-place mutation cannot be applied to aliased
         # variables because it would violate value semantics for the copy.
+        # Note: Unique bindings are never aliased (they have sole ownership).
         self.aliased_vars: set = set()  # Set of variable names whose values have been copied
 
         # Placeholder variable tracking for loop pre-allocation
@@ -1290,9 +1295,12 @@ class CodeGenerator:
             return
 
         # Track if we need to mark source as moved AFTER reading
+        # For unique bindings: = moves (source invalidated), := copies (source preserved)
+        # For non-unique bindings: both = and := preserve source
+        # NOTE: Full move tracking requires ownership analysis (Phase 2) to know
+        # which bindings are unique. For now, disable automatic move tracking.
         move_source_name = None
-        if stmt.is_move and isinstance(stmt.initializer, Identifier):
-            move_source_name = stmt.initializer.name
+        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         if stmt.type_annotation:
             llvm_type = self._get_llvm_type(stmt.type_annotation)
@@ -1394,15 +1402,15 @@ class CodeGenerator:
                             self.var_coex_types[stmt.name] = inferred_coex_type
 
             if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
-                # Use move semantics for := operator, deep copy for =
-                if stmt.is_move:
-                    init_value = self._generate_move_or_eager_copy(init_value, inferred_coex_type)
-                else:
+                # := operator creates independent deep copy, = shares pointer
+                if stmt.is_copy:
                     init_value = self._generate_deep_copy(init_value, inferred_coex_type)
+                else:
+                    init_value = self._generate_move_or_eager_copy(init_value, inferred_coex_type)
                 # Track the inferred type for this variable too
                 self.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(init_value.type, ir.PointerType):
-                # Fallback to shallow copy for unknown collection types
+                # Fallback for unknown collection types
                 pointee = init_value.type.pointee
                 if hasattr(pointee, 'name'):
                     if pointee.name == "struct.List":
@@ -1412,11 +1420,13 @@ class CodeGenerator:
                     elif pointee.name == "struct.Map":
                         init_value = self.builder.call(self.map_copy, [init_value])
                     elif pointee.name == "struct.String":
-                        init_value = self.builder.call(self.string_copy, [init_value])
+                        if stmt.is_copy:
+                            init_value = self.builder.call(self.string_deep_copy, [init_value])
+                        else:
+                            init_value = self.builder.call(self.string_copy, [init_value])
                     elif pointee.name == "struct.Array":
-                        # Use move semantics for := on Array
-                        if stmt.is_move:
-                            init_value = self._generate_move_or_eager_copy(init_value, ArrayType(PrimitiveType("int")))
+                        if stmt.is_copy:
+                            init_value = self.builder.call(self.array_deep_copy, [init_value])
                         else:
                             init_value = self.builder.call(self.array_copy, [init_value])
 
@@ -1523,21 +1533,23 @@ class CodeGenerator:
         # Cast if needed
         init_value = self._cast_value(init_value, llvm_type)
 
-        # Value semantics: deep copy or move collections on assignment to prevent aliasing
-        # We have the Coex type annotation, so use it for proper copy
+        # Value semantics: deep copy or move collections on assignment
+        # := (is_copy=True) creates independent deep copy
+        # = (is_copy=False) shares pointer (move semantics for unique bindings)
         if self._is_collection_coex_type(stmt.type_annotation):
-            # Use move semantics for := operator, deep copy for =
-            if stmt.is_move:
-                init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
-            else:
+            if stmt.is_copy:
+                # := operator: create truly independent deep copy
                 init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+            else:
+                # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
         elif isinstance(init_value.type, ir.PointerType):
             # User-defined types may need deep copy too
             if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in self.type_fields:
-                if stmt.is_move:
-                    init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
-                else:
+                if stmt.is_copy:
                     init_value = self._generate_deep_copy(init_value, stmt.type_annotation)
+                else:
+                    init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
 
         self.builder.store(init_value, alloca)
         self.locals[stmt.name] = alloca
@@ -1564,9 +1576,9 @@ class CodeGenerator:
         alloca = self.locals[stmt.name]
 
         # Track if we need to mark source as moved
+        # NOTE: Full move tracking requires ownership analysis (Phase 2)
         move_source_name = None
-        if stmt.is_move and isinstance(stmt.initializer, Identifier):
-            move_source_name = stmt.initializer.name
+        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         # Generate the value
         value = self._generate_expression(stmt.initializer)
@@ -1578,30 +1590,35 @@ class CodeGenerator:
         value = self._cast_value(value, expected_type)
 
         # Handle value semantics for collections
+        # := (is_copy=True) creates independent deep copy
+        # = (is_copy=False) shares pointer (move semantics)
         coex_type = self.var_coex_types.get(stmt.name)
         if coex_type and self._is_collection_coex_type(coex_type):
-            if stmt.is_move:
-                value = self._generate_move_or_eager_copy(value, coex_type)
-            else:
+            if stmt.is_copy:
+                # := operator: create truly independent deep copy
                 value = self._generate_deep_copy(value, coex_type)
+            else:
+                # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                value = self._generate_move_or_eager_copy(value, coex_type)
         elif isinstance(value.type, ir.PointerType):
+            # Fallback for struct types without Coex type info
             pointee = value.type.pointee
             if hasattr(pointee, 'name'):
                 if pointee.name == "struct.List":
-                    if not stmt.is_move:
-                        value = self.builder.call(self.list_copy, [value])
+                    if stmt.is_copy:
+                        value = self.builder.call(self.list_copy, [value])  # shallow copy for now
                 elif pointee.name == "struct.Set":
-                    if not stmt.is_move:
+                    if stmt.is_copy:
                         value = self.builder.call(self.set_copy, [value])
                 elif pointee.name == "struct.Map":
-                    if not stmt.is_move:
+                    if stmt.is_copy:
                         value = self.builder.call(self.map_copy, [value])
                 elif pointee.name == "struct.String":
-                    if not stmt.is_move:
-                        value = self.builder.call(self.string_copy, [value])
+                    if stmt.is_copy:
+                        value = self.builder.call(self.string_deep_copy, [value])
                 elif pointee.name == "struct.Array":
-                    if not stmt.is_move:
-                        value = self.builder.call(self.array_copy, [value])
+                    if stmt.is_copy:
+                        value = self.builder.call(self.array_deep_copy, [value])
 
         # Store the value
         self.builder.store(value, alloca)
@@ -1755,7 +1772,7 @@ class CodeGenerator:
         """Generate an assignment"""
         # Track if we need to mark source as moved AFTER reading
         move_source_name = None
-        if stmt.op == AssignOp.MOVE_ASSIGN and isinstance(stmt.value, Identifier):
+        if stmt.op == AssignOp.COPY_ASSIGN and isinstance(stmt.value, Identifier):
             move_source_name = stmt.value.name
 
         # Clear moved status when target is reassigned (allows reuse after move)
@@ -1853,8 +1870,8 @@ class CodeGenerator:
                     self.builder.call(func, args)
                     return
 
-        # Handle compound assignment (not for MOVE_ASSIGN or ASSIGN)
-        if stmt.op not in (AssignOp.ASSIGN, AssignOp.MOVE_ASSIGN):
+        # Handle compound assignment (not for COPY_ASSIGN or ASSIGN)
+        if stmt.op not in (AssignOp.ASSIGN, AssignOp.COPY_ASSIGN):
             old_value = self._generate_expression(stmt.target)
             if stmt.op == AssignOp.PLUS_ASSIGN:
                 if isinstance(value.type, ir.DoubleType):
@@ -1949,37 +1966,39 @@ class CodeGenerator:
                         if isinstance(stmt.target, Identifier):
                             self.var_coex_types[stmt.target.name] = coex_type
 
-        # Determine whether to use move or copy semantics
-        is_move = stmt.op == AssignOp.MOVE_ASSIGN
+        # Determine whether to use explicit copy (:=) or standard assignment (=)
+        # := (is_copy=True) creates independent deep copy
+        # = (is_copy=False) shares pointer (move semantics for unique, aliased for non-unique)
+        is_copy = stmt.op == AssignOp.COPY_ASSIGN
 
         if coex_type and self._is_collection_coex_type(coex_type):
-            if is_move:
-                value = self._generate_move_or_eager_copy(value, coex_type)
-            else:
+            if is_copy:
+                # := operator: create truly independent deep copy
                 value = self._generate_deep_copy(value, coex_type)
+            else:
+                # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                value = self._generate_move_or_eager_copy(value, coex_type)
         elif coex_type and isinstance(coex_type, NamedType) and coex_type.name in self.type_fields:
             # User-defined types need deep copy to handle collection fields
-            if is_move:
-                value = self._generate_move_or_eager_copy(value, coex_type)
-            else:
+            if is_copy:
                 value = self._generate_deep_copy(value, coex_type)
+            else:
+                value = self._generate_move_or_eager_copy(value, coex_type)
         elif isinstance(value.type, ir.PointerType):
-            # Fallback to shallow copy for unknown collection types
+            # Fallback for struct types without Coex type info
+            # For := create deep copy, for = just share pointer (no copy)
             pointee = value.type.pointee
-            if hasattr(pointee, 'name'):
+            if hasattr(pointee, 'name') and is_copy:
                 if pointee.name == "struct.List":
-                    value = self.builder.call(self.list_copy, [value])
+                    value = self.builder.call(self.list_copy, [value])  # shallow copy for now
                 elif pointee.name == "struct.Set":
                     value = self.builder.call(self.set_copy, [value])
                 elif pointee.name == "struct.Map":
                     value = self.builder.call(self.map_copy, [value])
                 elif pointee.name == "struct.String":
-                    value = self.builder.call(self.string_copy, [value])
+                    value = self.builder.call(self.string_deep_copy, [value])
                 elif pointee.name == "struct.Array":
-                    if is_move:
-                        value = self._generate_move_or_eager_copy(value, ArrayType(PrimitiveType("int")))
-                    else:
-                        value = self.builder.call(self.array_copy, [value])
+                    value = self.builder.call(self.array_deep_copy, [value])
 
         if ptr:
             self.builder.store(value, ptr)
@@ -2046,7 +2065,7 @@ class CodeGenerator:
         struct_type = self.type_registry[type_name]
 
         # Handle compound assignment (+=, -=, etc.)
-        if op not in (AssignOp.ASSIGN, AssignOp.MOVE_ASSIGN):
+        if op not in (AssignOp.ASSIGN, AssignOp.COPY_ASSIGN):
             old_field_ptr = self.builder.gep(old_struct, [ir.Constant(i32, 0), ir.Constant(i32, field_idx)], inbounds=True)
             old_field_val = self.builder.load(old_field_ptr)
 

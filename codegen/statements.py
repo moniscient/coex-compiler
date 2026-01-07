@@ -75,7 +75,10 @@ class StatementGenerator:
         # CRITICAL: Check if the variable's value has been aliased
         # If another variable was assigned from this one, we cannot mutate in-place
         # because that would violate value semantics for the other variable.
-        if hasattr(cg, 'aliased_vars') and var_name in cg.aliased_vars:
+        # EXCEPTION: Unique bindings always allow in-place optimization because
+        # they have sole ownership and are guaranteed to never be aliased.
+        is_unique = hasattr(cg, 'unique_bindings') and var_name in cg.unique_bindings
+        if not is_unique and hasattr(cg, 'aliased_vars') and var_name in cg.aliased_vars:
             return False
 
         # Get the variable's type to determine which in-place function to use
@@ -319,6 +322,11 @@ class StatementGenerator:
         if stmt.is_const:
             cg.const_bindings.add(stmt.name)
 
+        # Track unique bindings for ownership system
+        # Unique bindings have sole ownership and are never aliased
+        if getattr(stmt, 'is_unique', False):
+            cg.unique_bindings.add(stmt.name)
+
         # Check if this is a cycle variable - write to write buffer
         ctx = cg._get_cycle_context()
         if ctx and stmt.name in ctx['cycle_vars']:
@@ -331,9 +339,9 @@ class StatementGenerator:
             return
 
         # Track if we need to mark source as moved AFTER reading
+        # NOTE: Full move tracking requires ownership analysis (Phase 2)
         move_source_name = None
-        if stmt.is_move and isinstance(stmt.initializer, Identifier):
-            move_source_name = stmt.initializer.name
+        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         if stmt.type_annotation:
             llvm_type = cg._get_llvm_type(stmt.type_annotation)
@@ -377,48 +385,65 @@ class StatementGenerator:
             # When copying a collection from another variable (e.g., s2 = s1),
             # mark the source as aliased so in-place mutation is disabled.
             source_var_name = None
-            if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+            if isinstance(stmt.initializer, Identifier) and not stmt.is_copy:
                 source_var_name = stmt.initializer.name
 
             if inferred_coex_type and cg._is_collection_coex_type(inferred_coex_type):
-                if stmt.is_move:
-                    init_value = cg._generate_move_or_eager_copy(init_value, inferred_coex_type)
-                else:
+                if stmt.is_copy:
+                    # := operator: create truly independent deep copy
                     init_value = cg._generate_deep_copy(init_value, inferred_coex_type)
-                    # Mark BOTH source and target as aliased because copy functions
-                    # return the same pointer (COW semantics). Both variables now
-                    # share the same wrapper, so neither can be mutated in-place.
-                    if source_var_name:
+                    # No aliasing since we have independent copy
+                else:
+                    # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                    init_value = cg._generate_move_or_eager_copy(init_value, inferred_coex_type)
+                    # Mark BOTH source and target as aliased because they share storage
+                    # EXCEPT: unique bindings are never aliased (they have sole ownership)
+                    is_unique_target = stmt.name in cg.unique_bindings
+                    is_unique_source = source_var_name and source_var_name in cg.unique_bindings
+                    if source_var_name and not is_unique_target and not is_unique_source:
                         cg.aliased_vars.add(source_var_name)
                         cg.aliased_vars.add(stmt.name)  # Target is also aliased
                 cg.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(init_value.type, ir.PointerType):
+                # Fallback for struct types without Coex type info
+                # := (is_copy=True) creates deep copy, = (is_copy=False) shares pointer
                 pointee = init_value.type.pointee
+                # Check for unique bindings - they are never aliased
+                is_unique_target = stmt.name in cg.unique_bindings
+                is_unique_source = source_var_name and source_var_name in cg.unique_bindings
+                should_mark_aliased = source_var_name and not is_unique_target and not is_unique_source
                 if hasattr(pointee, 'name'):
                     if pointee.name == "struct.List":
-                        init_value = cg.builder.call(cg.list_copy, [init_value])
-                        if source_var_name:
+                        if stmt.is_copy:
+                            init_value = cg.builder.call(cg.list_copy, [init_value])  # shallow for now
+                        elif should_mark_aliased:
+                            # = operator: share pointer, mark aliased (unless unique)
                             cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
+                            cg.aliased_vars.add(stmt.name)
                     elif pointee.name == "struct.Set":
-                        init_value = cg.builder.call(cg.set_copy, [init_value])
-                        if source_var_name:
+                        if stmt.is_copy:
+                            init_value = cg.builder.call(cg.set_copy, [init_value])
+                        elif should_mark_aliased:
                             cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
+                            cg.aliased_vars.add(stmt.name)
                     elif pointee.name == "struct.Map":
-                        init_value = cg.builder.call(cg.map_copy, [init_value])
-                        if source_var_name:
+                        if stmt.is_copy:
+                            init_value = cg.builder.call(cg.map_copy, [init_value])
+                        elif should_mark_aliased:
                             cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)  # Target is also aliased
+                            cg.aliased_vars.add(stmt.name)
                     elif pointee.name == "struct.String":
-                        init_value = cg.builder.call(cg.string_copy, [init_value])
+                        if stmt.is_copy:
+                            init_value = cg.builder.call(cg.string_deep_copy, [init_value])
                         # Note: Strings are immutable, so aliasing doesn't affect in-place ops
                     elif pointee.name == "struct.Array":
-                        if stmt.is_move:
-                            init_value = cg._generate_move_or_eager_copy(init_value, ArrayType(PrimitiveType("int")))
-                        else:
-                            init_value = cg.builder.call(cg.array_copy, [init_value])
-                            # Note: Arrays are immutable in Coex, no in-place ops
+                        if stmt.is_copy:
+                            # := operator: create truly independent deep copy
+                            init_value = cg.builder.call(cg.array_deep_copy, [init_value])
+                        elif should_mark_aliased:
+                            # = operator: share pointer (aliased unless unique)
+                            cg.aliased_vars.add(source_var_name)
+                            cg.aliased_vars.add(stmt.name)
 
             cg.builder.store(init_value, alloca)
             cg.locals[stmt.name] = alloca
@@ -509,27 +534,38 @@ class StatementGenerator:
 
         # Track aliasing for in-place optimization safety (type-annotated path)
         typed_source_var_name = None
-        if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+        if isinstance(stmt.initializer, Identifier) and not stmt.is_copy:
             typed_source_var_name = stmt.initializer.name
+
+        # Check for unique bindings - they are never aliased
+        typed_is_unique_target = stmt.name in cg.unique_bindings
+        typed_is_unique_source = typed_source_var_name and typed_source_var_name in cg.unique_bindings
+        typed_should_mark_aliased = typed_source_var_name and not typed_is_unique_target and not typed_is_unique_source
 
         # Value semantics for typed collections
         if cg._is_collection_coex_type(stmt.type_annotation):
-            if stmt.is_move:
-                init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
-            else:
+            if stmt.is_copy:
+                # := operator: create truly independent deep copy
                 init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
-                # Mark BOTH source and target as aliased (COW semantics)
-                if typed_source_var_name:
+                # No aliasing since we have independent copy
+            else:
+                # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
+                # Mark BOTH source and target as aliased (unless unique)
+                if typed_should_mark_aliased:
                     cg.aliased_vars.add(typed_source_var_name)
                     cg.aliased_vars.add(stmt.name)  # Target is also aliased
         elif isinstance(init_value.type, ir.PointerType):
             if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in cg.type_fields:
-                if stmt.is_move:
-                    init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
-                else:
+                if stmt.is_copy:
+                    # := operator: create truly independent deep copy
                     init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
-                    # User-defined types with fields: mark both as aliased
-                    if typed_source_var_name:
+                    # No aliasing since we have independent copy
+                else:
+                    # = operator: share pointer
+                    init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
+                    # User-defined types with fields: mark both as aliased (unless unique)
+                    if typed_should_mark_aliased:
                         cg.aliased_vars.add(typed_source_var_name)
                         cg.aliased_vars.add(stmt.name)  # Target is also aliased
 
@@ -593,53 +629,75 @@ class StatementGenerator:
         cg = self.cg
         alloca = cg.locals[stmt.name]
 
+        # Track if we need to mark source as moved
+        # NOTE: Full move tracking requires ownership analysis (Phase 2)
         move_source_name = None
-        if stmt.is_move and isinstance(stmt.initializer, Identifier):
-            move_source_name = stmt.initializer.name
+        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         # Track aliasing for in-place optimization safety
+        # = operator shares pointer (both source and target may alias)
+        # := operator creates deep copy (no aliasing)
         reassign_source_var_name = None
-        if isinstance(stmt.initializer, Identifier) and not stmt.is_move:
+        if isinstance(stmt.initializer, Identifier) and not stmt.is_copy:
             reassign_source_var_name = stmt.initializer.name
 
         value = cg._generate_expression(stmt.initializer)
         expected_type = alloca.type.pointee
         value = cg._cast_value(value, expected_type)
 
+        # Check for unique bindings - they are never aliased
+        reassign_is_unique_target = stmt.name in cg.unique_bindings
+        reassign_is_unique_source = reassign_source_var_name and reassign_source_var_name in cg.unique_bindings
+        reassign_should_mark_aliased = reassign_source_var_name and not reassign_is_unique_target and not reassign_is_unique_source
+
         coex_type = cg.var_coex_types.get(stmt.name)
         if coex_type and cg._is_collection_coex_type(coex_type):
-            if stmt.is_move:
-                value = cg._generate_move_or_eager_copy(value, coex_type)
-            else:
+            if stmt.is_copy:
+                # := operator: create truly independent deep copy
                 value = cg._generate_deep_copy(value, coex_type)
-                # Mark BOTH source and target as aliased (COW semantics)
-                if reassign_source_var_name:
+                # No aliasing since we have independent copy
+            else:
+                # = operator: share pointer (move semantics for unique, aliased for non-unique)
+                value = cg._generate_move_or_eager_copy(value, coex_type)
+                # Mark BOTH source and target as aliased (unless unique)
+                if reassign_should_mark_aliased:
                     cg.aliased_vars.add(reassign_source_var_name)
                     cg.aliased_vars.add(stmt.name)  # Target is also aliased
         elif isinstance(value.type, ir.PointerType):
+            # Fallback for struct types without Coex type info
+            # := (is_copy=True) creates deep copy, = (is_copy=False) shares pointer
             pointee = value.type.pointee
             if hasattr(pointee, 'name'):
-                if pointee.name == "struct.List" and not stmt.is_move:
-                    value = cg.builder.call(cg.list_copy, [value])
-                    if reassign_source_var_name:
+                if pointee.name == "struct.List":
+                    if stmt.is_copy:
+                        value = cg.builder.call(cg.list_copy, [value])  # shallow for now
+                    elif reassign_should_mark_aliased:
+                        # = operator: share pointer, mark aliased (unless unique)
                         cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
-                elif pointee.name == "struct.Set" and not stmt.is_move:
-                    value = cg.builder.call(cg.set_copy, [value])
-                    if reassign_source_var_name:
+                        cg.aliased_vars.add(stmt.name)
+                elif pointee.name == "struct.Set":
+                    if stmt.is_copy:
+                        value = cg.builder.call(cg.set_copy, [value])
+                    elif reassign_should_mark_aliased:
                         cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
-                elif pointee.name == "struct.Map" and not stmt.is_move:
-                    value = cg.builder.call(cg.map_copy, [value])
-                    if reassign_source_var_name:
+                        cg.aliased_vars.add(stmt.name)
+                elif pointee.name == "struct.Map":
+                    if stmt.is_copy:
+                        value = cg.builder.call(cg.map_copy, [value])
+                    elif reassign_should_mark_aliased:
                         cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
-                elif pointee.name == "struct.String" and not stmt.is_move:
-                    value = cg.builder.call(cg.string_copy, [value])
-                    # Note: Strings are immutable, no in-place ops
-                elif pointee.name == "struct.Array" and not stmt.is_move:
-                    value = cg.builder.call(cg.array_copy, [value])
-                    # Note: Arrays are immutable in Coex, no in-place ops
+                        cg.aliased_vars.add(stmt.name)
+                elif pointee.name == "struct.String":
+                    if stmt.is_copy:
+                        value = cg.builder.call(cg.string_deep_copy, [value])
+                    # = operator: share pointer (strings are immutable)
+                elif pointee.name == "struct.Array":
+                    if stmt.is_copy:
+                        value = cg.builder.call(cg.array_deep_copy, [value])
+                    elif reassign_should_mark_aliased:
+                        # = operator: share pointer, mark aliased (unless unique)
+                        cg.aliased_vars.add(reassign_source_var_name)
+                        cg.aliased_vars.add(stmt.name)
 
         cg.builder.store(value, alloca)
 
@@ -692,7 +750,7 @@ class StatementGenerator:
         cg = self.cg
 
         move_source_name = None
-        if stmt.op == AssignOp.MOVE_ASSIGN and isinstance(stmt.value, Identifier):
+        if stmt.op == AssignOp.COPY_ASSIGN and isinstance(stmt.value, Identifier):
             move_source_name = stmt.value.name
 
         if isinstance(stmt.target, Identifier):
@@ -714,7 +772,7 @@ class StatementGenerator:
                 name = stmt.target.name
                 value = cg._generate_expression(stmt.value)
 
-                if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.MOVE_ASSIGN:
+                if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
                     old_val = cg.builder.load(ctx['read_buffers'][name])
                     value = self._apply_compound_op(stmt.op, old_val, value)
 
@@ -748,7 +806,7 @@ class StatementGenerator:
             if name in cg.locals:
                 alloca = cg.locals[name]
 
-                if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.MOVE_ASSIGN:
+                if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
                     old_val = cg.builder.load(alloca)
                     value = self._apply_compound_op(stmt.op, old_val, value)
 
@@ -758,22 +816,22 @@ class StatementGenerator:
                 # Value semantics for collections
                 coex_type = cg.var_coex_types.get(name)
                 if coex_type and cg._is_collection_coex_type(coex_type):
-                    if stmt.op == AssignOp.MOVE_ASSIGN:
+                    if stmt.op == AssignOp.COPY_ASSIGN:
                         value = cg._generate_move_or_eager_copy(value, coex_type)
                     else:
                         value = cg._generate_deep_copy(value, coex_type)
                 elif isinstance(value.type, ir.PointerType):
                     pointee = value.type.pointee
                     if hasattr(pointee, 'name'):
-                        if pointee.name == "struct.List" and stmt.op != AssignOp.MOVE_ASSIGN:
+                        if pointee.name == "struct.List" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.list_copy, [value])
-                        elif pointee.name == "struct.Set" and stmt.op != AssignOp.MOVE_ASSIGN:
+                        elif pointee.name == "struct.Set" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.set_copy, [value])
-                        elif pointee.name == "struct.Map" and stmt.op != AssignOp.MOVE_ASSIGN:
+                        elif pointee.name == "struct.Map" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.map_copy, [value])
-                        elif pointee.name == "struct.String" and stmt.op != AssignOp.MOVE_ASSIGN:
+                        elif pointee.name == "struct.String" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.string_copy, [value])
-                        elif pointee.name == "struct.Array" and stmt.op != AssignOp.MOVE_ASSIGN:
+                        elif pointee.name == "struct.Array" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.array_copy, [value])
 
                 cg.builder.store(value, alloca)
