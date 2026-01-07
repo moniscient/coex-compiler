@@ -313,7 +313,7 @@ class HamtGenerator:
         # Allocate HAMTNode struct (16 bytes with padding)
         node_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_HAMT_NODE if hasattr(cg.gc, 'TYPE_HAMT_NODE') else 0)
-        raw_ptr = cg.gc.alloc_with_deref(builder, node_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, node_size, type_id)
         node_ptr = builder.bitcast(raw_ptr, cg.hamt_node_struct.as_pointer())
 
         # Store bitmap
@@ -332,7 +332,7 @@ class HamtGenerator:
                 null_ptr = ir.Constant(i64_ptr, None)
                 builder.store(null_ptr, children_field)
             with otherwise:
-                children_raw = cg.gc.alloc_with_deref(builder, children_size, ir.Constant(i32, 0))
+                children_raw = cg.gc.alloc_arena_or_gc(builder, children_size, ir.Constant(i32, 0))
                 children_ptr = builder.bitcast(children_raw, i64_ptr)
                 children_field2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
                 builder.store(children_ptr, children_field2)
@@ -359,7 +359,7 @@ class HamtGenerator:
         # Allocate HAMTLeaf struct (24 bytes)
         leaf_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF if hasattr(cg.gc, 'TYPE_HAMT_LEAF') else 0)
-        raw_ptr = cg.gc.alloc_with_deref(builder, leaf_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, leaf_size, type_id)
         leaf_ptr = builder.bitcast(raw_ptr, cg.hamt_leaf_struct.as_pointer())
 
         # Store fields
@@ -1980,7 +1980,7 @@ class HamtGenerator:
         # Fields: root (i64), len (i64), flags (i64)
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_MAP)
-        raw_ptr = cg.gc.alloc_with_deref(builder, map_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         map_ptr = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
         # Store root = 0 (null as i64) (field 0)
@@ -2044,7 +2044,7 @@ class HamtGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_MAP)
-        raw_ptr = cg.gc.alloc_with_deref(builder, map_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -2168,7 +2168,7 @@ class HamtGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_MAP)
-        raw_ptr = cg.gc.alloc_with_deref(builder, map_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -2293,7 +2293,7 @@ class HamtGenerator:
         # Create new Map struct
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_MAP)
-        raw_ptr = cg.gc.alloc_with_deref(builder, map_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, map_ptr_type)
 
         # Store new root (convert pointer to i64)
@@ -2412,7 +2412,7 @@ class HamtGenerator:
         # Create new Map with new root
         map_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_MAP)
-        raw_ptr = cg.gc.alloc_with_deref(builder, map_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -2653,7 +2653,7 @@ class HamtGenerator:
         # All fields are i64 for consistent cross-platform layout
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_SET)
-        raw_ptr = cg.gc.alloc_with_deref(builder, set_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         set_ptr = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
         # Store root = 0 (null pointer as i64)
@@ -2744,7 +2744,7 @@ class HamtGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_SET)
-        raw_ptr = cg.gc.alloc_with_deref(builder, set_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -2837,7 +2837,7 @@ class HamtGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_SET)
-        raw_ptr = cg.gc.alloc_with_deref(builder, set_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)
@@ -3042,7 +3042,7 @@ class HamtGenerator:
         # Allocate new Set struct (24 bytes)
         set_size = ir.Constant(i64, 24)
         type_id = ir.Constant(i32, cg.gc.TYPE_SET)
-        raw_ptr = cg.gc.alloc_with_deref(builder, set_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
         # Store new root (convert pointer to i64)

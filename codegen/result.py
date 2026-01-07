@@ -90,7 +90,7 @@ class ResultGenerator:
         # Allocate Result struct (24 bytes = 3 * 8) via GC
         struct_size = ir.Constant(i64, 24)
         type_id = ir.Constant(ir.IntType(32), cg.gc.get_type_id("Result"))
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         result = builder.bitcast(raw_ptr, result_ptr)
 
         # Set tag = 0 (Ok)
@@ -137,7 +137,7 @@ class ResultGenerator:
         # Allocate Result struct (24 bytes = 3 * 8) via GC
         struct_size = ir.Constant(i64, 24)
         type_id = ir.Constant(ir.IntType(32), cg.gc.get_type_id("Result"))
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         result = builder.bitcast(raw_ptr, result_ptr)
 
         # Set tag = 1 (Err)

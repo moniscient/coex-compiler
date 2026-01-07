@@ -191,7 +191,7 @@ class PosixGenerator:
         # Allocate posix struct (4 bytes for fd only)
         posix_size = ir.Constant(i64, 4)
         posix_type_id = ir.Constant(i32, cg.gc.get_type_id("posix"))
-        posix_raw = cg.gc.alloc_with_deref(builder, posix_size, posix_type_id)
+        posix_raw = cg.gc.alloc_arena_or_gc(builder, posix_size, posix_type_id)
         posix_ptr_val = builder.bitcast(posix_raw, posix_ptr)
 
         # Set fd field
@@ -251,7 +251,7 @@ class PosixGenerator:
         # Allocate buffer for file content
         buf_size = builder.add(file_size, ir.Constant(i64, 1))  # +1 for null terminator
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        buffer = cg.gc.alloc_with_deref(builder, buf_size, string_data_type_id)
+        buffer = cg.gc.alloc_arena_or_gc(builder, buf_size, string_data_type_id)
 
         # Read entire file
         bytes_read = builder.call(cg.posix_read_syscall, [fd, buffer, file_size])

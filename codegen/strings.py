@@ -272,12 +272,12 @@ class StringGenerator:
         # Allocate String struct (32 bytes) via GC
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
-        string_raw = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        string_raw = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(string_raw, cg.string_struct.as_pointer())
 
         # Allocate data buffer via GC
         data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        data_raw = cg.gc.alloc_with_deref(builder, byte_len, data_type_id)
+        data_raw = cg.gc.alloc_arena_or_gc(builder, byte_len, data_type_id)
 
         # Copy data to new buffer
         builder.call(cg.memcpy, [data_raw, data, byte_len])
@@ -357,12 +357,12 @@ class StringGenerator:
         # Allocate 32 bytes for String struct via GC
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         # Allocate data buffer and copy literal data
         string_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING_DATA)
-        data_buf = cg.gc.alloc_with_deref(builder, final_byte_len, string_data_type_id)
+        data_buf = cg.gc.alloc_arena_or_gc(builder, final_byte_len, string_data_type_id)
         builder.call(cg.memcpy, [data_buf, cstr, final_byte_len])
 
         i64 = ir.IntType(64)
@@ -550,7 +550,7 @@ class StringGenerator:
 
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -601,11 +601,11 @@ class StringGenerator:
 
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        dest_data = cg.gc.alloc_with_deref(builder, total_size, string_data_type_id)
+        dest_data = cg.gc.alloc_arena_or_gc(builder, total_size, string_data_type_id)
 
         a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         a_owner_handle = builder.load(a_owner_handle_ptr)
@@ -731,11 +731,11 @@ class StringGenerator:
 
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         result_str = builder.bitcast(raw_ptr, string_ptr_ty)
 
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        dest_data = cg.gc.alloc_with_deref(builder, total_size, string_data_type_id)
+        dest_data = cg.gc.alloc_arena_or_gc(builder, total_size, string_data_type_id)
 
         owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.ptrtoint(dest_data, i64)
@@ -1078,13 +1078,13 @@ class StringGenerator:
         src_data = builder.gep(src_owner, [src_offset])
 
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        new_data = cg.gc.alloc_with_deref(builder, src_size, type_id)
+        new_data = cg.gc.alloc_arena_or_gc(builder, src_size, type_id)
 
         builder.call(cg.memcpy, [new_data, src_data, src_size])
 
         struct_size = ir.Constant(i64, 32)
         string_type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, string_type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, string_type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -1227,7 +1227,7 @@ class StringGenerator:
         new_size = builder.add(new_size, suffix_len)
 
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        new_data = cg.gc.alloc_with_deref(builder, new_size, type_id)
+        new_data = cg.gc.alloc_arena_or_gc(builder, new_size, type_id)
 
         builder.call(cg.memcpy, [new_data, orig_data, start_clamped])
 
@@ -1466,7 +1466,7 @@ class StringGenerator:
 
         buf_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        buf = cg.gc.alloc_with_deref(builder, buf_size, type_id)
+        buf = cg.gc.alloc_arena_or_gc(builder, buf_size, type_id)
 
         fmt_ptr = builder.bitcast(cg._int_conv_fmt, i8_ptr)
         len_result = builder.call(cg.snprintf, [buf, buf_size, fmt_ptr, n])
@@ -1493,7 +1493,7 @@ class StringGenerator:
 
         buf_size = ir.Constant(i64, 64)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        buf = cg.gc.alloc_with_deref(builder, buf_size, type_id)
+        buf = cg.gc.alloc_arena_or_gc(builder, buf_size, type_id)
 
         fmt_ptr = builder.bitcast(cg._float_conv_fmt, i8_ptr)
         len_result = builder.call(cg.snprintf, [buf, buf_size, fmt_ptr, f])
@@ -1554,7 +1554,7 @@ class StringGenerator:
 
         buf_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        buf = cg.gc.alloc_with_deref(builder, buf_size, type_id)
+        buf = cg.gc.alloc_arena_or_gc(builder, buf_size, type_id)
 
         fmt_ptr = builder.bitcast(cg._hex_conv_fmt, i8_ptr)
         len_result = builder.call(cg.snprintf, [buf, buf_size, fmt_ptr, n])
@@ -1596,7 +1596,7 @@ class StringGenerator:
         builder.position_at_end(copy_loop)
 
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        data_buf = cg.gc.alloc_with_deref(builder, byte_len, type_id)
+        data_buf = cg.gc.alloc_arena_or_gc(builder, byte_len, type_id)
 
         idx_ptr = builder.alloca(i64, name="idx")
         codepoint_count_ptr = builder.alloca(i64, name="codepoint_count")
@@ -1643,7 +1643,7 @@ class StringGenerator:
         builder.ret(result)
 
         builder.position_at_end(done)
-        empty_buf = cg.gc.alloc_with_deref(builder, ir.Constant(i64, 1), type_id)
+        empty_buf = cg.gc.alloc_arena_or_gc(builder, ir.Constant(i64, 1), type_id)
         builder.store(ir.Constant(i8, 0), empty_buf)
         empty_str = builder.call(cg.string_new, [empty_buf, ir.Constant(i64, 0), ir.Constant(i64, 0)])
         builder.ret(empty_str)

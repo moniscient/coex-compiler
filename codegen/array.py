@@ -115,13 +115,13 @@ class ArrayGenerator:
         # Allocate Array struct (40 bytes: 5 x 8-byte fields)
         array_size_const = ir.Constant(ir.IntType(64), 40)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
-        raw_ptr = cg.gc.alloc_with_deref(builder, array_size_const, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
         # Allocate data buffer first: cap * elem_size
         data_size = builder.mul(cap, elem_size)
         array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA)
-        data_ptr = cg.gc.alloc_with_deref(builder, data_size, array_data_type_id)
+        data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
         # Initialize fields
         # owner_handle (field 0) - Phase 4: store as i64 handle
@@ -424,7 +424,7 @@ class ArrayGenerator:
 
         # Allocate new data buffer
         type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY_DATA)
-        new_data = cg.gc.alloc_with_deref(builder, data_size, type_id)
+        new_data = cg.gc.alloc_arena_or_gc(builder, data_size, type_id)
 
         # Copy data from source to new buffer
         builder.call(cg.memcpy, [new_data, src_data, data_size])
@@ -432,7 +432,7 @@ class ArrayGenerator:
         # Allocate new Array descriptor (40 bytes)
         struct_size = ir.Constant(i64, 40)
         array_type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, array_type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, array_type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
         # Store owner = new_data (Phase 4: owner is i64 handle)
@@ -519,7 +519,7 @@ class ArrayGenerator:
         # Allocate new Array descriptor (40 bytes) - NO data copy!
         struct_size = ir.Constant(i64, 40)
         type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
         # Store owner handle (shared with source - this is the slice view!)

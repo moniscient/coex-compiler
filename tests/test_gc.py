@@ -438,3 +438,221 @@ func main() -> int
     return 0
 ~
 ''', "6\n")
+
+
+class TestScopeArena:
+    """Tests for scope arena allocation (Phase 6).
+
+    Scope arenas provide fast bump allocation for formulas. Temporary
+    allocations in formulas are bulk-freed when the function returns.
+    """
+
+    def test_formula_with_temp_list(self, expect_output):
+        """Test formula with temporary list that is NOT returned.
+
+        The list should be arena-allocated and bulk-freed on return.
+        """
+        expect_output('''
+formula sum_temp_list() -> int
+    const temp = [1, 2, 3, 4, 5]
+    const total = temp.len()
+    return total
+~
+
+func main() -> int
+    const result = sum_temp_list()
+    print(result)
+    return 0
+~
+''', "5\n")
+
+    def test_formula_many_temp_allocations(self, expect_output):
+        """Test formula with many temporary allocations.
+
+        This stress tests arena allocation - all temps should be
+        arena-allocated and bulk-freed.
+        """
+        expect_output('''
+formula compute_sum(n: int) -> int
+    const sum = 0
+    const result = sum + n
+    return result
+~
+
+func main() -> int
+    const total = 0
+    for i in 0..100
+        const val = compute_sum(i)
+    ~
+    print(42)
+    return 0
+~
+''', "42\n")
+
+    def test_nested_formula_calls(self, expect_output):
+        """Test nested formula calls each with their own arena scope.
+
+        Each formula should have its own arena that is popped on return.
+        """
+        expect_output('''
+formula inner(x: int) -> int
+    const temp = x * 2
+    return temp
+~
+
+formula outer(y: int) -> int
+    const a = inner(y)
+    const b = inner(y + 1)
+    return a + b
+~
+
+func main() -> int
+    const result = outer(5)
+    print(result)
+    return 0
+~
+''', "22\n")
+
+    def test_formula_stress_no_oom(self, expect_output):
+        """Stress test: Many formula calls should not cause OOM.
+
+        Each formula call creates a temporary, but the arena is freed
+        on return, so memory usage should stay bounded.
+        """
+        expect_output('''
+formula create_temp(n: int) -> int
+    const x = n * 2
+    return x
+~
+
+func main() -> int
+    const total = 0
+    for i in 0..10000
+        const val = create_temp(i)
+    ~
+    print(1)
+    return 0
+~
+''', "1\n")
+
+
+class TestArenaEscapePromotion:
+    """Tests for arena escape promotion.
+
+    When a formula returns a heap-allocated value (like a list, string, map),
+    the value is automatically promoted from the arena to the GC heap before
+    the arena is freed. This ensures the returned value survives.
+    """
+
+    def test_formula_returns_list(self, expect_output):
+        """Test formula returning a list - list must be promoted to heap."""
+        expect_output('''
+formula make_list() -> List<int>
+    const result = [1, 2, 3, 4, 5]
+    return result
+~
+
+func main() -> int
+    const items = make_list()
+    print(items.len())
+    print(items.get(0))
+    print(items.get(4))
+    return 0
+~
+''', "5\n1\n5\n")
+
+    def test_formula_returns_string(self, expect_output):
+        """Test formula returning a string - string must be promoted to heap."""
+        expect_output('''
+formula make_greeting(name: string) -> string
+    const greeting = "Hello, " + name + "!"
+    return greeting
+~
+
+func main() -> int
+    const msg = make_greeting("World")
+    print(msg.len())
+    return 0
+~
+''', "13\n")
+
+    def test_formula_returns_map(self, expect_output):
+        """Test formula returning a map - map must be promoted to heap."""
+        expect_output('''
+formula make_map() -> Map<int, int>
+    const m = {1: 10, 2: 20, 3: 30}
+    return m
+~
+
+func main() -> int
+    const data = make_map()
+    print(data.len())
+    print(data.get(1))
+    print(data.get(3))
+    return 0
+~
+''', "3\n10\n30\n")
+
+    def test_nested_formula_returns_collection(self, expect_output):
+        """Test nested formulas returning collections - all must be promoted."""
+        expect_output('''
+formula inner_list(n: int) -> List<int>
+    const result = [n, n * 2, n * 3]
+    return result
+~
+
+formula outer_wrapper(n: int) -> List<int>
+    const inner = inner_list(n)
+    return inner
+~
+
+func main() -> int
+    const items = outer_wrapper(5)
+    print(items.len())
+    print(items.get(0))
+    print(items.get(2))
+    return 0
+~
+''', "3\n5\n15\n")
+
+    def test_formula_gc_after_return(self, expect_output):
+        """Test that promoted values survive GC after formula return."""
+        expect_output('''
+formula make_data() -> List<int>
+    const data = [100, 200, 300]
+    return data
+~
+
+func main() -> int
+    const items = make_data()
+    gc()
+    print(items.len())
+    print(items.get(1))
+    return 0
+~
+''', "3\n200\n")
+
+    def test_formula_stress_returning_lists(self, expect_output):
+        """Stress test: Many formula calls returning lists.
+
+        Tests that promotion works correctly under load and doesn't
+        cause memory leaks or corruption.
+        """
+        expect_output('''
+formula make_list_n(n: int) -> List<int>
+    const result = [n, n + 1, n + 2]
+    return result
+~
+
+func main() -> int
+    const last_len = 0
+    for i in 0..100
+        const items = make_list_n(i)
+        const last_len = items.len()
+    ~
+    print(last_len)
+    gc()
+    print(1)
+    return 0
+~
+''', "3\n1\n")

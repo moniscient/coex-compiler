@@ -100,7 +100,7 @@ class AtomicGenerator:
         # Allocate AtomicRef struct (8 bytes) via GC
         ref_size = ir.Constant(ir.IntType(64), 8)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_UNKNOWN)
-        raw_ptr = cg.gc.alloc_with_deref(builder, ref_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, ref_size, type_id)
         ref_ptr = builder.bitcast(raw_ptr, cg.atomic_ref_struct.as_pointer())
 
         # Get pointer to the value field

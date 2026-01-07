@@ -2062,7 +2062,7 @@ class CodeGenerator:
         # Allocate new struct via GC
         struct_size = ir.Constant(i64, struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
         type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
-        raw_ptr = self.gc.alloc_with_deref(self.builder, struct_size, type_id)
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, struct_size, type_id)
         new_struct = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Copy all fields from old struct to new struct
@@ -2628,7 +2628,7 @@ class CodeGenerator:
 
         # Allocate via GC with registered type ID
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
-        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Initialize fields
@@ -2714,7 +2714,7 @@ class CodeGenerator:
         size_val = ir.Constant(ir.IntType(64), size)
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
 
-        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Zero-initialize all fields
@@ -2758,7 +2758,7 @@ class CodeGenerator:
         size_val = ir.Constant(ir.IntType(64), size)
 
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(enum_name))
-        raw_ptr = self.gc.alloc_with_deref(self.builder, size_val, type_id)
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Store tag
@@ -4281,7 +4281,7 @@ class CodeGenerator:
         # Allocate struct via GC
         struct_size = ir.Constant(i64, len(self.type_fields[type_name]) * 8)
         type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
-        raw_ptr = self.gc.alloc_with_deref(self.builder, struct_size, type_id)
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, struct_size, type_id)
         struct_ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Extract each field

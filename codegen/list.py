@@ -126,7 +126,7 @@ class ListGenerator:
         # Size: 6 * 8 = 48 bytes (all i64 fields)
         list_size = ir.Constant(i64, 48)
         type_id = ir.Constant(i32, cg.gc.TYPE_LIST)
-        raw_ptr = cg.gc.alloc_with_deref(builder, list_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, list_size, type_id)
         list_ptr = builder.bitcast(raw_ptr, cg.list_struct.as_pointer())
 
         # Initialize fields for empty list
@@ -147,7 +147,7 @@ class ListGenerator:
         tail_capacity = ir.Constant(i64, 32)
         tail_size = builder.mul(tail_capacity, func.args[0])
         tail_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
-        tail_ptr = cg.gc.alloc_with_deref(builder, tail_size, tail_type_id)
+        tail_ptr = cg.gc.alloc_arena_or_gc(builder, tail_size, tail_type_id)
         # Phase 4: Store as i64 handle
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.ptrtoint(tail_ptr, i64)
@@ -283,7 +283,7 @@ class ListGenerator:
 
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
-        leaf_data = cg.gc.alloc_with_deref(builder, leaf_size, leaf_type_id)
+        leaf_data = cg.gc.alloc_arena_or_gc(builder, leaf_size, leaf_type_id)
         builder.call(cg.memcpy, [leaf_data, old_tail, leaf_size])
 
         # Calculate how many leaves are currently in the tree
@@ -302,7 +302,7 @@ class ListGenerator:
         builder.position_at_end(create_root_block)
 
         # Create new root node (no refcount - GC handles memory)
-        new_root_raw_create = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_root_raw_create = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root_create = builder.bitcast(new_root_raw_create, cg.pv_node_struct.as_pointer())
 
         # Store leaf_data pointer in children[0] (field 0 is now children)
@@ -338,7 +338,7 @@ class ListGenerator:
         builder.position_at_end(depth_increase_block)
 
         # Create new root node (no refcount - GC handles memory)
-        new_uber_root_raw = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_uber_root_raw = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_uber_root = builder.bitcast(new_uber_root_raw, cg.pv_node_struct.as_pointer())
 
         # Zero out children array (field 0)
@@ -390,7 +390,7 @@ class ListGenerator:
         builder.store(working_root, current_alloca)
 
         # Copy the root node first (we always need a new root, no refcount - GC handles it)
-        new_root_raw_add = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_root_raw_add = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root_add = builder.bitcast(new_root_raw_add, cg.pv_node_struct.as_pointer())
 
         # Copy root's children (field 0 is children)
@@ -467,7 +467,7 @@ class ListGenerator:
 
         # Create new child node (no refcount - GC handles it)
         builder.position_at_end(create_child_block)
-        new_child_raw_create = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_child_raw_create = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_child_create = builder.bitcast(new_child_raw_create, cg.pv_node_struct.as_pointer())
         # Zero out children (field 0 is children)
         create_child_children = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -478,7 +478,7 @@ class ListGenerator:
         # Copy existing child node (no refcount - GC handles it)
         builder.position_at_end(copy_child_block)
         old_child_node = builder.bitcast(old_child_i8, cg.pv_node_struct.as_pointer())
-        new_child_raw_copy = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_child_raw_copy = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_child_copy = builder.bitcast(new_child_raw_copy, cg.pv_node_struct.as_pointer())
         # Copy children from old node (field 0 is children)
         old_child_children = builder.gep(old_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -866,7 +866,7 @@ class ListGenerator:
         builder.position_at_end(root_exists)
 
         # Copy the root node (no refcount - GC handles memory)
-        new_root_raw = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_root_raw = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root = builder.bitcast(new_root_raw, cg.pv_node_struct.as_pointer())
 
         # Copy children pointers from old root (field 0 is children)
@@ -909,7 +909,7 @@ class ListGenerator:
 
         # Create new leaf (copy of old leaf)
         leaf_size_d1 = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_d1 = cg.gc.alloc_with_deref(builder, leaf_size_d1, leaf_type_id)
+        new_leaf_d1 = cg.gc.alloc_arena_or_gc(builder, leaf_size_d1, leaf_type_id)
         builder.call(cg.memcpy, [new_leaf_d1, old_leaf_d1, leaf_size_d1])
 
         # Modify element in new leaf at position index & 0x1F - Phase 4: i64
@@ -971,7 +971,7 @@ class ListGenerator:
         old_child = builder.bitcast(old_child_raw, cg.pv_node_struct.as_pointer())
 
         # Create new child node (no refcount - GC handles memory)
-        new_child_raw = cg.gc.alloc_with_deref(builder, pv_node_size, pv_node_type_id)
+        new_child_raw = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_child = builder.bitcast(new_child_raw, cg.pv_node_struct.as_pointer())
 
         # Copy children array from old child (field 0 is children)
@@ -1010,7 +1010,7 @@ class ListGenerator:
 
         # Create new leaf
         leaf_size_m = builder.mul(ir.Constant(i64, 32), stored_elem_size)
-        new_leaf_m = cg.gc.alloc_with_deref(builder, leaf_size_m, leaf_type_id)
+        new_leaf_m = cg.gc.alloc_arena_or_gc(builder, leaf_size_m, leaf_type_id)
         builder.call(cg.memcpy, [new_leaf_m, old_leaf_m, leaf_size_m])
 
         # Modify element in new leaf - Phase 4: i64

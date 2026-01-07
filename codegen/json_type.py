@@ -265,7 +265,7 @@ class JsonGenerator:
         # Allocate Json struct (9 bytes, but align to 16)
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_NULL (0)
@@ -293,7 +293,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_BOOL (1)
@@ -322,7 +322,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_INT (2)
@@ -350,7 +350,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_FLOAT (3)
@@ -379,7 +379,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_STRING (4)
@@ -408,7 +408,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_ARRAY (5)
@@ -437,7 +437,7 @@ class JsonGenerator:
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
         type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
-        raw_ptr = cg.gc.alloc_with_deref(builder, json_size, type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_OBJECT (6)

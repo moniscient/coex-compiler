@@ -112,7 +112,7 @@ class MatrixGenerator:
         # Allocate matrix struct via GC
         struct_size = ir.Constant(ir.IntType(64), 32)  # 4 * 8 bytes
         matrix_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_UNKNOWN)
-        raw_ptr = cg.gc.alloc_with_deref(builder, struct_size, matrix_type_id)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, matrix_type_id)
         matrix_ptr = builder.bitcast(raw_ptr, matrix_ptr_type)
 
         # Store width and height
@@ -135,7 +135,7 @@ class MatrixGenerator:
 
         # Allocate read buffer via GC
         buffer_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA)
-        read_raw = cg.gc.alloc_with_deref(builder, buffer_size, buffer_type_id)
+        read_raw = cg.gc.alloc_arena_or_gc(builder, buffer_size, buffer_type_id)
         read_buffer = builder.bitcast(read_raw, elem_type.as_pointer())
         read_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),
@@ -144,7 +144,7 @@ class MatrixGenerator:
         builder.store(read_buffer, read_field)
 
         # Allocate write buffer via GC
-        write_raw = cg.gc.alloc_with_deref(builder, buffer_size, buffer_type_id)
+        write_raw = cg.gc.alloc_arena_or_gc(builder, buffer_size, buffer_type_id)
         write_buffer = builder.bitcast(write_raw, elem_type.as_pointer())
         write_field = builder.gep(matrix_ptr, [
             ir.Constant(ir.IntType(32), 0),
