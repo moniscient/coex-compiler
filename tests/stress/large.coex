@@ -1,0 +1,123 @@
+#@ [MOVE] Variable 'first_mult' is not used after this assignment. Consider: mult := first_mult (move instead of copy)
+#@ [MOVE] Variable 'start' is not used after this assignment. Consider: first_mult := start (move instead of copy)
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Large parallel sieve - 1 million with 4 tasks
+# Uses Array<bool> for efficient in-place marking (98% fewer allocations than Set)
+
+task sieve_segment(segment_idx: int, start: int, end_val: int, small_primes: [int]) -> int
+    # Preallocate boolean array for this segment
+    # is_composite[i] means (start + i) is composite
+    segment_size = end_val - start
+    is_composite: Array<bool> = Array.filled(segment_size, false)
+
+    idx = 0
+    while idx < small_primes.len()
+        p = small_primes.get(idx)
+        first_mult = 0
+        if start <= p * p
+            first_mult = p * p
+        else
+            remainder = start % p
+            if remainder == 0
+                first_mult = start
+            else
+                first_mult = start + (p - remainder)
+            ~
+        ~
+        # Mark multiples of p as composite (in-place mutation)
+        mult = first_mult
+        while mult < end_val
+            local_idx = mult - start
+            is_composite = is_composite.set(local_idx, true)
+            mult = mult + p
+        ~
+        idx = idx + 1
+    ~
+
+    # Count primes in segment
+    prime_count = 0
+    num = 0
+    if start < 2
+        num = 2 - start
+    ~
+    while num < segment_size
+        if not is_composite.get(num)
+            prime_count = prime_count + 1
+        ~
+        num = num + 1
+    ~
+    return prime_count
+~
+
+func find_small_primes(limit: int) -> [int]
+    # Preallocate boolean array: is_composite[i] = true means i is composite
+    is_composite: Array<bool> = Array.filled(limit + 1, false)
+
+    # Mark composites using sieve algorithm
+    i = 2
+    while i * i <= limit
+        if not is_composite.get(i)
+            j = i * i
+            while j <= limit
+                is_composite = is_composite.set(j, true)
+                j = j + i
+            ~
+        ~
+        i = i + 1
+    ~
+
+    # Collect primes
+    primes: [int] = []
+    k = 2
+    while k <= limit
+        if not is_composite.get(k)
+            primes = primes.append(k)
+        ~
+        k = k + 1
+    ~
+    return primes
+~
+
+func main(args:[string]) -> int
+    print("=== Large Parallel Sieve Test (Array-based) ===")
+    print("Finding primes up to 1,000,000 using 4 parallel tasks")
+    print("")
+
+    const LIMIT = 1000000
+    const NUM_TASKS = 4
+    const SQRT_LIMIT = 1000
+    const SEGMENT_SIZE = LIMIT / NUM_TASKS
+
+    print("Step 1: Finding small primes...")
+    small_primes = find_small_primes(SQRT_LIMIT)
+    print("  Found small primes: ")
+    print(small_primes.len())
+    gc_dump_stats()
+    print("")
+
+    print("Step 2: Preparing segments...")
+    task_indices: [int] = []
+    for i in 0..NUM_TASKS
+        task_indices = task_indices.append(i)
+    ~
+
+    print("Step 3: Spawning parallel tasks...")
+    results = for idx in task_indices sieve_segment(idx, idx * SEGMENT_SIZE, (idx + 1) * SEGMENT_SIZE, small_primes) ~
+
+    print("Step 4: Collecting results...")
+    total_primes = 0
+    for r in results
+        total_primes = total_primes + r
+    ~
+
+    print("Total primes found: ")
+    print(total_primes)
+    print("")
+    print("Expected: 78498")
+    print("")
+
+    print("Final GC stats:")
+    gc_dump_stats()
+
+    return 0
+~

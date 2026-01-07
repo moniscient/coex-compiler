@@ -455,6 +455,8 @@ class InplaceOpsGenerator:
             "coex_map_remove": "coex_map_remove_inplace",
             "coex_map_set_string": "coex_map_put_string_inplace",
             "coex_map_put_string": "coex_map_put_string_inplace",
+            # Array in-place ops
+            "coex_array_set": "coex_array_set_inplace",
             # List in-place ops skipped for Phase 1
             # "coex_list_append": "coex_list_append_inplace",
         }

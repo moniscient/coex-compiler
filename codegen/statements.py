@@ -156,6 +156,11 @@ class StatementGenerator:
                 normal_func = "coex_pv_append"
             else:
                 return None
+        elif isinstance(coex_type, ArrayType):
+            if method_name == "set":
+                normal_func = "coex_array_set"
+            else:
+                return None
         else:
             return None
 
@@ -175,12 +180,42 @@ class StatementGenerator:
         alloca = cg.locals[var_name]
         wrapper_ptr = cg.builder.load(alloca)
 
-        # Generate arguments
+        # Generate arguments - Array.set needs special handling
         llvm_args = [wrapper_ptr]
 
-        for arg in args:
-            arg_val = cg._generate_expression(arg)
-            llvm_args.append(arg_val)
+        if isinstance(coex_type, ArrayType) and method_name == "set":
+            # Array.set(index, value) -> array_set_inplace(arr, index, value_ptr, elem_size)
+            index = cg._generate_expression(args[0])
+            elem_val = cg._generate_expression(args[1])
+            elem_type = elem_val.type
+
+            # Compute elem_size
+            if isinstance(elem_type, ir.IntType):
+                size = max(1, elem_type.width // 8)
+            elif isinstance(elem_type, ir.DoubleType):
+                size = 8
+            elif isinstance(elem_type, ir.PointerType):
+                size = 8
+            else:
+                size = 8
+
+            elem_size = ir.Constant(ir.IntType(64), size)
+
+            # Store value in alloca and get pointer
+            with cg.builder.goto_entry_block():
+                temp = cg.builder.alloca(elem_type, name="array_set_inplace_elem")
+            cg.builder.store(elem_val, temp)
+            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+
+            if index.type != ir.IntType(64):
+                index = cg.builder.sext(index, ir.IntType(64))
+
+            llvm_args = [wrapper_ptr, index, temp_ptr, elem_size]
+        else:
+            # Standard argument generation for Set/Map
+            for arg in args:
+                arg_val = cg._generate_expression(arg)
+                llvm_args.append(arg_val)
 
         # Call the in-place function (returns void)
         cg.builder.call(inplace_func, llvm_args)

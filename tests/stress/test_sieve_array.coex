@@ -1,0 +1,65 @@
+# Array-based Sieve of Eratosthenes
+# Uses a preallocated boolean array instead of Set<int>
+# Goal: Zero allocations in the marking loop due to in-place optimization
+
+func find_primes_array(limit: int) -> [int]
+    # Preallocate boolean array: is_composite[i] = true means i is composite
+    # Use Array<bool> type annotation (not [bool] which is ListType)
+    is_composite: Array<bool> = Array.filled(limit + 1, false)
+
+    # Mark composites using sieve algorithm
+    i = 2
+    while i * i <= limit
+        if not is_composite.get(i)
+            j = i * i
+            while j <= limit
+                # In-place optimization should apply here:
+                # is_composite is unique (not aliased), so arr.set mutates in place
+                is_composite = is_composite.set(j, true)
+                j = j + i
+            ~
+        ~
+        i = i + 1
+    ~
+
+    # Collect primes (numbers not marked as composite)
+    primes: [int] = []
+    k = 2
+    while k <= limit
+        if not is_composite.get(k)
+            primes = primes.append(k)
+        ~
+        k = k + 1
+    ~
+
+    return primes
+~
+
+func main() -> int
+    print("=== Array-based Sieve (Preallocated Boolean Array) ===")
+    print("")
+
+    print("Before sieve:")
+    gc_dump_stats()
+    print("")
+
+    const LIMIT = 10000
+
+    print("Finding primes up to 10,000...")
+    primes = find_primes_array(LIMIT)
+    print("Found primes: ")
+    print(primes.len())
+    print("")
+
+    print("After sieve (before GC):")
+    gc_dump_stats()
+    print("")
+
+    gc()
+
+    print("After GC:")
+    gc_dump_stats()
+    print("")
+
+    return 0
+~

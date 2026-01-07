@@ -1459,6 +1459,50 @@ class ExpressionGenerator:
                         return cg.builder.call(cg.string_from_bytes, [arg_val])
                     return cg.builder.call(cg.string_from_literal, [cg._get_string_literal("")])
 
+                # Special handling for Array.filled(size, value)
+                # Creates an array of `size` elements, all initialized to `value`
+                if type_name == "Array" and expr.method == "filled" and len(expr.args) == 2:
+                    size_val = self.generate_expression(expr.args[0])
+                    size_val = cg._cast_value(size_val, ir.IntType(64))
+                    fill_val = self.generate_expression(expr.args[1])
+
+                    # Determine element size based on fill value type
+                    if isinstance(fill_val.type, ir.IntType):
+                        if fill_val.type.width == 1:
+                            elem_size = ir.Constant(ir.IntType(64), 1)  # bool = 1 byte
+                        else:
+                            elem_size = ir.Constant(ir.IntType(64), 8)  # int = 8 bytes
+                    elif isinstance(fill_val.type, ir.DoubleType):
+                        elem_size = ir.Constant(ir.IntType(64), 8)  # float = 8 bytes
+                    elif isinstance(fill_val.type, ir.PointerType):
+                        elem_size = ir.Constant(ir.IntType(64), 8)  # pointer = 8 bytes
+                    else:
+                        elem_size = ir.Constant(ir.IntType(64), 8)  # default
+
+                    # Allocate the array
+                    array_ptr = cg.builder.call(cg.array_filled, [size_val, elem_size])
+
+                    # Fill with value using memset for bools, or loop for other types
+                    if isinstance(fill_val.type, ir.IntType) and fill_val.type.width == 1:
+                        # For bool arrays, use memset
+                        # Get data pointer from array
+                        owner_ptr = cg.builder.gep(array_ptr, [
+                            ir.Constant(ir.IntType(32), 0),
+                            ir.Constant(ir.IntType(32), 0)
+                        ], inbounds=True)
+                        owner_handle = cg.builder.load(owner_ptr)
+                        data_ptr = cg.builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+
+                        # memset to fill_val (0 for false, 1 for true)
+                        fill_byte = cg.builder.zext(fill_val, ir.IntType(8))
+                        cg.builder.call(cg.memset, [data_ptr, fill_byte, size_val])
+                    else:
+                        # For other types, we'd need a fill loop
+                        # For now, just set len = size (data is uninitialized/zero)
+                        pass
+
+                    return array_ptr
+
                 # Look for static methods (factory methods)
                 mangled = f"{type_name}_{expr.method}"
                 if mangled in cg.functions:

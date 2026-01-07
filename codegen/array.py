@@ -82,8 +82,20 @@ class ArrayGenerator:
         array_getrange_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i64])
         cg.array_getrange = ir.Function(cg.module, array_getrange_ty, name="coex_array_getrange")
 
+        # array_filled(size: i64, elem_size: i64) -> Array*
+        # Creates a new array with len=size, cap=size (data initialized to zero by GC)
+        array_filled_ty = ir.FunctionType(array_ptr, [i64, i64])
+        cg.array_filled = ir.Function(cg.module, array_filled_ty, name="coex_array_filled")
+
+        # array_set_inplace(arr: Array*, index: i64, value: i8*, elem_size: i64) -> void
+        # Mutates the array in place (only safe when array is unique/unaliased)
+        array_set_inplace_ty = ir.FunctionType(ir.VoidType(), [array_ptr, i64, i8_ptr, i64])
+        cg.array_set_inplace = ir.Function(cg.module, array_set_inplace_ty, name="coex_array_set_inplace")
+
         # Implement all functions
         self._implement_array_new()
+        self._implement_array_filled()
+        self._implement_array_set_inplace()
         self._implement_array_get()
         self._implement_array_set()
         self._implement_array_append()
@@ -146,6 +158,106 @@ class ArrayGenerator:
         builder.store(elem_size, elem_size_ptr)
 
         builder.ret(array_ptr)
+
+    def _implement_array_filled(self):
+        """Implement array_filled: allocate a new array with given size, all elements initialized.
+
+        Unlike array_new which sets len=0, this sets len=size.
+        Data is zeroed by the GC allocator; caller can fill with memset.
+
+        Struct layout: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size }
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
+        """
+        cg = self.cg
+
+        func = cg.array_filled
+        func.args[0].name = "size"
+        func.args[1].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        size = func.args[0]
+        elem_size = func.args[1]
+
+        # Allocate Array struct (40 bytes: 5 x 8-byte fields)
+        array_size_const = ir.Constant(ir.IntType(64), 40)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
+        array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
+
+        # Allocate data buffer: size * elem_size
+        data_size = builder.mul(size, elem_size)
+        array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA)
+        data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
+
+        # Initialize fields
+        # owner_handle (field 0) - store as i64 handle
+        owner_field_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.ptrtoint(data_ptr, ir.IntType(64))
+        builder.store(owner_handle, owner_field_ptr)
+
+        # offset = 0 (field 1)
+        offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), offset_ptr)
+
+        # len = size (field 2) - KEY DIFFERENCE from array_new
+        len_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+        builder.store(size, len_ptr)
+
+        # cap = size (field 3)
+        cap_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
+        builder.store(size, cap_ptr)
+
+        # elem_size (field 4)
+        elem_size_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+        builder.store(elem_size, elem_size_ptr)
+
+        builder.ret(array_ptr)
+
+    def _implement_array_set_inplace(self):
+        """Implement array_set_inplace: mutate element at index IN PLACE.
+
+        This is the unsafe/optimized version that modifies the array directly.
+        Only safe when the array is provably unique (not aliased).
+
+        Unlike array_set which creates a new array, this modifies in place
+        and returns void.
+
+        Field indices: owner=0, offset=1, len=2, cap=3, elem_size=4
+        """
+        cg = self.cg
+
+        func = cg.array_set_inplace
+        func.args[0].name = "arr"
+        func.args[1].name = "index"
+        func.args[2].name = "value"
+        func.args[3].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        array_ptr = func.args[0]
+        index = func.args[1]
+        value_ptr = func.args[2]
+        elem_size = func.args[3]
+
+        # Compute data pointer: owner + offset
+        owner_handle_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        owner = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        offset_ptr = builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        base_offset = builder.load(offset_ptr)
+        data = builder.gep(owner, [base_offset])
+
+        # Calculate element offset: index * elem_size
+        elem_offset = builder.mul(index, elem_size)
+        dest = builder.gep(data, [elem_offset])
+
+        # Copy value to destination
+        builder.call(cg.memcpy, [dest, value_ptr, elem_size])
+
+        builder.ret_void()
 
     def _implement_array_get(self):
         """Implement array_get: return pointer to element at index.
@@ -567,3 +679,5 @@ class ArrayGenerator:
         cg.functions["coex_array_size"] = cg.array_size
         cg.functions["coex_array_copy"] = cg.array_copy
         cg.functions["coex_array_getrange"] = cg.array_getrange
+        cg.functions["coex_array_filled"] = cg.array_filled
+        cg.functions["coex_array_set_inplace"] = cg.array_set_inplace
