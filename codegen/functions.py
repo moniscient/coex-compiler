@@ -471,10 +471,14 @@ class FunctionGenerator:
             cg.builder.store(param_value, alloca)
             cg.locals[param.name] = alloca
 
-            # Mark collection parameters as aliased for in-place optimization safety.
+            # Handle unique parameters - add to unique_bindings for in-place optimization
+            if getattr(param, 'is_unique', False):
+                cg.unique_bindings.add(param.name)
+            # Mark non-unique collection parameters as aliased for in-place optimization safety.
             # Collection parameters share their wrapper with the caller's variable,
             # so in-place mutation would violate value semantics for the caller.
-            if cg._is_collection_coex_type(param.type_annotation):
+            # Unique parameters are NOT aliased - they have sole ownership.
+            elif cg._is_collection_coex_type(param.type_annotation):
                 cg.aliased_vars.add(param.name)
 
             # Register parameter as GC root if it's a heap type

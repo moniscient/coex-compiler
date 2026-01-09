@@ -21,7 +21,7 @@ from .cfg import CFG, BasicBlock, build_cfg, collect_expr_uses, collect_stmt_use
 from ast_nodes import (
     FunctionDecl, Stmt, VarDecl, Assignment, Identifier, Expr, AssignOp,
     ReturnStmt, IfStmt, WhileStmt, ForStmt, MatchStmt, CallExpr, MethodCallExpr,
-    Type, ArrayType, PrimitiveType, Parameter
+    Type, ArrayType, PrimitiveType, Parameter, ExprStmt
 )
 
 
@@ -306,6 +306,15 @@ class OwnershipAnalyzer:
             self._analyze_call_expr(stmt, _get_source_location(stmt))
         elif isinstance(stmt, MethodCallExpr):
             self._analyze_method_call(stmt, _get_source_location(stmt))
+        elif isinstance(stmt, ExprStmt):
+            # ExprStmt wraps expressions used as statements (e.g., function calls)
+            location = _get_source_location(stmt)
+            if isinstance(stmt.expr, CallExpr):
+                self._analyze_call_expr(stmt.expr, location)
+            elif isinstance(stmt.expr, MethodCallExpr):
+                self._analyze_method_call(stmt.expr, location)
+            else:
+                self._check_expr_uses(stmt.expr, location)
         else:
             # For other statements, check for uses of moved variables
             self._check_expr_uses(getattr(stmt, 'value', None), _get_source_location(stmt))
@@ -316,6 +325,18 @@ class OwnershipAnalyzer:
         location = _get_source_location(stmt)
         is_unique = getattr(stmt, 'is_unique', False)
         is_copy = getattr(stmt, 'is_copy', False)
+
+        # Check if we're rebinding a borrowed parameter (mutation is not allowed)
+        existing_binding = self.context.get_binding(stmt.name)
+        if existing_binding and existing_binding.is_borrowed():
+            self.errors.append(OwnershipError(
+                kind="mutate_borrowed",
+                message=f"cannot mutate borrowed binding '{stmt.name}'",
+                location=location,
+                binding_name=stmt.name,
+                declared_at=existing_binding.declared_at
+            ))
+            return  # Don't process further
 
         # Check if unique is applied to unsupported type
         if is_unique and stmt.type_annotation:
@@ -605,18 +626,31 @@ class OwnershipAnalyzer:
         for arg in expr.args:
             self._check_expr_uses(arg, location)
 
-            # Warn if passing unique to non-unique parameter
+            # When passing a unique binding to a function, ownership transfers
+            # (unless the parameter is `borrow`, which we'll handle when we have
+            # access to the callee's parameter info)
             if isinstance(arg, Identifier):
                 binding = self.context.get_binding(arg.name)
                 if binding and binding.is_unique:
-                    # TODO: Check if callee parameter is unique
-                    # For now, just warn
-                    self.warnings.append(OwnershipWarning(
-                        kind="unique_to_non_unique",
-                        message=f"unique binding '{arg.name}' passed to function; uniqueness may be lost",
-                        location=location,
-                        binding_name=arg.name
-                    ))
+                    # Check for move inside loop
+                    if self.loop_depth > 0:
+                        self.errors.append(OwnershipError(
+                            kind="move_in_loop",
+                            message=f"cannot move unique binding '{arg.name}' inside a loop",
+                            location=location,
+                            binding_name=arg.name,
+                            declared_at=binding.declared_at
+                        ))
+                    else:
+                        # Mark as moved - ownership transfers to callee
+                        self.context.mark_moved(arg.name, location)
+                        # Also emit a warning about potential uniqueness loss
+                        self.warnings.append(OwnershipWarning(
+                            kind="unique_to_non_unique",
+                            message=f"unique binding '{arg.name}' passed to function; uniqueness may be lost",
+                            location=location,
+                            binding_name=arg.name
+                        ))
 
     def _analyze_method_call(self, expr: MethodCallExpr, location: SourceLocation):
         """Analyze a method call for ownership issues."""

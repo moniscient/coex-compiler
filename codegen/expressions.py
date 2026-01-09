@@ -1690,7 +1690,7 @@ class ExpressionGenerator:
 
             return ir.Constant(ir.IntType(64), 0)
 
-        if method == "set":
+        if method == "set" or method == "set_at":
             if len(expr.args) >= 2 and isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
 
