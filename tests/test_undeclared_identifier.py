@@ -47,7 +47,6 @@ func main() -> int
 class TestCompoundAssignmentErrors:
     """Tests for compound assignment on undeclared variables."""
 
-    @pytest.mark.xfail(reason="Compound assignment on undeclared var not raising error")
     def test_plus_assign_undeclared(self, expect_compile_error):
         """Test error on += with undeclared variable"""
         expect_compile_error('''
@@ -57,7 +56,6 @@ func main() -> int
 ~
 ''', "Undeclared identifier 'total'")
 
-    @pytest.mark.xfail(reason="Compound assignment on undeclared var not raising error")
     def test_minus_assign_undeclared(self, expect_compile_error):
         """Test error on -= with undeclared variable"""
         expect_compile_error('''
@@ -67,7 +65,6 @@ func main() -> int
 ~
 ''', "Undeclared identifier 'counter'")
 
-    @pytest.mark.xfail(reason="Compound assignment on undeclared var not raising error")
     def test_times_assign_undeclared(self, expect_compile_error):
         """Test error on *= with undeclared variable"""
         expect_compile_error('''

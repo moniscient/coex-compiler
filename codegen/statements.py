@@ -839,6 +839,12 @@ class StatementGenerator:
                 if name in cg.gc_root_indices and cg.gc is not None:
                     root_idx = cg.gc_root_indices[name]
                     cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, value)
+            else:
+                # Variable doesn't exist - compound assignment is an error
+                if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
+                    raise RuntimeError(
+                        f"Undeclared identifier '{name}': cannot use compound assignment on undeclared variable"
+                    )
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
@@ -1139,7 +1145,7 @@ class StatementGenerator:
         elif isinstance(value.type, ir.PointerType):
             pointee = value.type.pointee
             if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                cg.builder.call(cg.string_dprint, [stderr_fd, value])
+                cg.builder.call(cg.string_debug, [value])
             else:
                 fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
                 cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value])

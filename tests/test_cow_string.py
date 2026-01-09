@@ -132,7 +132,6 @@ func main() -> int
 ~
 ''', "1024\n1024\n")
 
-    @pytest.mark.xfail(reason="String iteration has pre-existing output order bug")
     def test_string_iteration_no_cow(self, expect_output):
         """Iterating over string (read-only) should not trigger copy."""
         expect_output('''

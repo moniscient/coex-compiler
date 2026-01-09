@@ -320,6 +320,9 @@ class LoopGenerator:
                 if hasattr(pointee, 'name') and pointee.name == "struct.Set":
                     self.generate_set_for(stmt, iterable)
                     return
+                if hasattr(pointee, 'name') and pointee.name == "struct.String":
+                    self.generate_string_for(stmt, iterable)
+                    return
 
         # For other iterables, we need iterator protocol
         # For now, just execute body once as fallback
@@ -962,6 +965,90 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
+        if cg._task is not None:
+            cg._task.inject_safepoint(cg.builder, exit_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
+        cg.builder.branch(cond_block)
+
+        # Exit
+        cg.builder.position_at_end(exit_block)
+
+        # Restore loop blocks
+        cg.loop_exit_block = old_exit
+        cg.loop_continue_block = old_continue
+
+    def generate_string_for(self, stmt: ForStmt, string_ptr: ir.Value):
+        """Generate for char in string - iterates over characters (bytes)"""
+        cg = self.cg
+        func = cg.builder.function
+
+        # Get string length
+        string_len = cg.builder.call(cg.string_len, [string_ptr])
+
+        # PRE-ALLOCATE all local variables used in the loop body
+        local_vars = cg._collect_local_variables(stmt.body)
+        for lv_name in local_vars:
+            if lv_name not in cg.locals:
+                lv_alloca = cg.builder.alloca(ir.IntType(64), name=lv_name)
+                cg.locals[lv_name] = lv_alloca
+                cg.placeholder_vars.add(lv_name)
+
+        # Allocate index variable
+        index_var = cg.builder.alloca(ir.IntType(64), name="str_idx")
+        cg.builder.store(ir.Constant(ir.IntType(64), 0), index_var)
+
+        # Create blocks
+        cond_block = func.append_basic_block("str_for_cond")
+        body_block = func.append_basic_block("str_for_body")
+        inc_block = func.append_basic_block("str_for_inc")
+        exit_block = func.append_basic_block("str_for_exit")
+
+        # Save loop blocks
+        old_exit = cg.loop_exit_block
+        old_continue = cg.loop_continue_block
+        cg.loop_exit_block = exit_block
+        cg.loop_continue_block = inc_block
+
+        # Jump to condition
+        cg.builder.branch(cond_block)
+
+        # Condition: index < len
+        cg.builder.position_at_end(cond_block)
+        current_idx = cg.builder.load(index_var)
+        cond = cg.builder.icmp_signed("<", current_idx, string_len)
+        cg.builder.cbranch(cond, body_block, exit_block)
+
+        # Body
+        cg.builder.position_at_end(body_block)
+
+        # Get character at index: string_get(string_ptr, index) -> i64 (byte value)
+        current_idx = cg.builder.load(index_var)
+        char_val = cg.builder.call(cg.string_get, [string_ptr, current_idx])
+
+        # Get variable name from pattern
+        var_name = stmt.var_name if stmt.var_name else "__loop_char"
+
+        # Allocate and store character variable
+        if var_name not in cg.locals:
+            char_alloca = cg.builder.alloca(ir.IntType(64), name=var_name)
+            cg.locals[var_name] = char_alloca
+        cg.builder.store(char_val, cg.locals[var_name])
+
+        # Generate body statements
+        for s in stmt.body:
+            cg._generate_statement(s)
+            if cg.builder.block.is_terminated:
+                break
+        if not cg.builder.block.is_terminated:
+            cg.builder.branch(inc_block)
+
+        # Increment index
+        cg.builder.position_at_end(inc_block)
+        current_idx = cg.builder.load(index_var)
+        next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
+        cg.builder.store(next_idx, index_var)
+        # Inject safepoint at loop back-edge for GC watermark acknowledgment
         if cg._task is not None:
             cg._task.inject_safepoint(cg.builder, exit_block)
         else:

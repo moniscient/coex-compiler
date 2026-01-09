@@ -28,7 +28,6 @@ func main() -> int
 ~
 ''', "42\n")
 
-    @pytest.mark.xfail(reason="debug() stderr output not working with directive")
     def test_debug_enabled_with_directive(self, compile_coex):
         """Test that debug() outputs to stderr when debugging directive is present"""
         result = compile_coex('''
@@ -42,7 +41,6 @@ func main() -> int
         assert result.run_success
         assert "debug message" in result.stderr
 
-    @pytest.mark.xfail(reason="debug() stderr output not working with explicit on")
     def test_debug_on_explicit(self, compile_coex):
         """Test debugging on directive"""
         result = compile_coex('''
@@ -97,7 +95,6 @@ func main() -> int
 class TestCombinedDirectives:
     """Tests for combining printing and debugging directives."""
 
-    @pytest.mark.xfail(reason="debug() stderr output not working")
     def test_both_enabled(self, compile_coex):
         """Test both print and debug enabled"""
         result = compile_coex('''
@@ -127,7 +124,6 @@ func main() -> int
         assert "visible" in result.stdout
         assert result.stderr == "" or "should not appear" not in result.stderr
 
-    @pytest.mark.xfail(reason="debug() stderr output not working")
     def test_debug_only(self, compile_coex):
         """Test debug enabled, print disabled"""
         result = compile_coex('''
@@ -187,7 +183,6 @@ func main() -> int
         assert result.run_success
         assert "false" in result.stderr
 
-    @pytest.mark.xfail(reason="debug() stderr output not working")
     def test_debug_string(self, compile_coex):
         """Test debug() with string"""
         result = compile_coex('''
