@@ -122,6 +122,10 @@ class GarbageCollector:
         self.gc_handle_retire = None      # Add handle to retired list (MI-6 deferred reclamation)
         self.gc_promote_retired_handles = None  # Move retired handles to free list
 
+        # Per-thread handle pool functions (lock-free handle allocation)
+        self.gc_handle_pool_alloc = None   # Fast path: allocate from thread-local pool
+        self.gc_handle_pool_refill = None  # Slow path: refill pool under mutex
+
         # Dual-heap async GC functions
         self.gc_async = None
         self.gc_capture_snapshot = None
@@ -294,6 +298,9 @@ class GarbageCollector:
         # MI-6: Deferred reclamation functions
         self._implement_gc_handle_retire()
         self._implement_gc_promote_retired_handles()
+        # Per-thread handle pool functions (lock-free allocation)
+        self._implement_gc_handle_pool_alloc()
+        self._implement_gc_handle_pool_refill()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -438,11 +445,19 @@ class GarbageCollector:
             self.i8_ptr,  # 120: arena_cursor - current arena allocation position
             self.i8_ptr,  # 128: arena_start - start of current arena (for bulk free)
             self.i8_ptr,  # 136: arena_parent_start - parent arena's start (for nesting)
+            # Per-thread handle pool fields (Phase 7) - lock-free handle allocation
+            self.i64,     # 144: handle_pool_start - first handle index in pool
+            self.i64,     # 152: handle_pool_next - next available handle in pool
+            self.i64,     # 160: handle_pool_end - one past last handle in pool
         ])
-        # Total: 144 bytes
+        # Total: 168 bytes
 
         # TLAB configuration
         self.TLAB_SIZE = 256 * 1024  # 256KB per TLAB
+
+        # Handle pool configuration
+        # 4K page / 8 bytes per handle slot = 512 handles per batch
+        self.HANDLE_POOL_SIZE = 512
 
 
     def _create_globals(self):
@@ -1259,6 +1274,22 @@ class GarbageCollector:
         gc_promote_retired_ty = ir.FunctionType(self.void, [])
         self.gc_promote_retired_handles = ir.Function(self.module, gc_promote_retired_ty, name="coex_gc_promote_retired_handles")
 
+        # ============================================================
+        # Per-Thread Handle Pool Functions (Lock-Free Handle Allocation)
+        # ============================================================
+
+        # gc_handle_pool_alloc() -> i64
+        # Fast path: allocate handle from thread-local pool (no locking)
+        # Returns handle index, or 0 if pool is empty (caller must call refill)
+        gc_handle_pool_alloc_ty = ir.FunctionType(self.i64, [])
+        self.gc_handle_pool_alloc = ir.Function(self.module, gc_handle_pool_alloc_ty, name="coex_gc_handle_pool_alloc")
+
+        # gc_handle_pool_refill() -> void
+        # Slow path: acquire mutex and refill thread-local handle pool
+        # Allocates HANDLE_POOL_SIZE (512) handles in a batch
+        gc_handle_pool_refill_ty = ir.FunctionType(self.void, [])
+        self.gc_handle_pool_refill = ir.Function(self.module, gc_handle_pool_refill_ty, name="coex_gc_handle_pool_refill")
+
     def _register_builtin_types(self):
         """Register built-in heap-allocated types"""
         self.type_info[self.TYPE_UNKNOWN] = {'size': 0, 'ref_offsets': []}
@@ -1588,8 +1619,8 @@ class GarbageCollector:
         # Do registration
         builder.position_at_end(do_register)
 
-        # Allocate ThreadEntry (144 bytes = 18 fields × 8 bytes)
-        entry_size = ir.Constant(self.i64, 144)
+        # Allocate ThreadEntry (168 bytes = 21 fields × 8 bytes)
+        entry_size = ir.Constant(self.i64, 168)
         raw_entry = builder.call(self.codegen.malloc, [entry_size])
         new_entry = builder.bitcast(raw_entry, self.thread_entry_type.as_pointer())
 
@@ -1693,6 +1724,28 @@ class GarbageCollector:
                 ir.Constant(self.i32, 0), ir.Constant(self.i32, i)
             ], inbounds=True)
             builder.store(ir.Constant(self.i8_ptr, None), arena_ptr)
+
+        # ============================================================
+        # Per-Thread Handle Pool Initialization (Phase 7)
+        # ============================================================
+        # Fields 18-20: handle pool indices = 0 (empty pool, will refill on first alloc)
+        # Field 18: handle_pool_start = 0
+        pool_start_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 18)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), pool_start_ptr)
+
+        # Field 19: handle_pool_next = 0
+        pool_next_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 19)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), pool_next_ptr)
+
+        # Field 20: handle_pool_end = 0 (pool_next >= pool_end means empty)
+        pool_end_ptr = builder.gep(new_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 20)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), pool_end_ptr)
 
         # Also update TLS globals for fast access from frame functions
         builder.store(first_segment, self.tls_segment_base)
@@ -1888,6 +1941,60 @@ class GarbageCollector:
         builder.branch(seg_loop)
 
         builder.position_at_end(seg_done)
+
+        # ============================================================
+        # Return unused handles from pool to free list (Phase 7)
+        # ============================================================
+        # If pool_next < pool_end, there are unused handles we should return
+        return_handles = func.append_basic_block("return_handles")
+        return_loop = func.append_basic_block("return_loop")
+        return_done = func.append_basic_block("return_done")
+
+        pool_next_ptr = builder.gep(my_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 19)
+        ], inbounds=True)
+        pool_end_ptr = builder.gep(my_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 20)
+        ], inbounds=True)
+        pool_next_val = builder.load(pool_next_ptr)
+        pool_end_val = builder.load(pool_end_ptr)
+
+        has_unused = builder.icmp_unsigned("<", pool_next_val, pool_end_val)
+        builder.cbranch(has_unused, return_handles, return_done)
+
+        # Lock gc_mutex to safely modify free list
+        builder.position_at_end(return_handles)
+        gc_mutex = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [gc_mutex])
+
+        # Allocate loop variable
+        ret_idx_alloca = builder.alloca(self.i64, name="ret_idx")
+        builder.store(pool_next_val, ret_idx_alloca)
+        builder.branch(return_loop)
+
+        # Return each unused handle to free list
+        builder.position_at_end(return_loop)
+        ret_idx = builder.load(ret_idx_alloca)
+        done_returning = builder.icmp_unsigned(">=", ret_idx, pool_end_val)
+
+        return_one = func.append_basic_block("return_one")
+        unlock_and_done = func.append_basic_block("unlock_and_done")
+
+        builder.cbranch(done_returning, unlock_and_done, return_one)
+
+        # Return one handle to free list
+        builder.position_at_end(return_one)
+        builder.call(self.gc_handle_free, [ret_idx])
+        next_idx = builder.add(ret_idx, ir.Constant(self.i64, 1))
+        builder.store(next_idx, ret_idx_alloca)
+        builder.branch(return_loop)
+
+        # Done returning - unlock mutex
+        builder.position_at_end(unlock_and_done)
+        builder.call(self.pthread_mutex_unlock, [gc_mutex])
+        builder.branch(return_done)
+
+        builder.position_at_end(return_done)
 
         # Free ThreadEntry
         my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
@@ -2092,6 +2199,11 @@ class GarbageCollector:
         have_block_malloc = func.append_basic_block("have_block_malloc")
         init_header = func.append_basic_block("init_header")
         alloc_handle = func.append_basic_block("alloc_handle")
+        # Per-thread handle pool allocation (Phase 7)
+        try_handle_pool = func.append_basic_block("try_handle_pool")
+        handle_pool_refill = func.append_basic_block("handle_pool_refill")
+        have_handle = func.append_basic_block("have_handle")
+        add_to_list = func.append_basic_block("add_to_list")
         finish = func.append_basic_block("finish")
 
         builder = ir.IRBuilder(entry)
@@ -2206,7 +2318,7 @@ class GarbageCollector:
         builder.branch(alloc_handle)
 
         # ============================================================
-        # Allocate handle (mutex-protected for thread safety)
+        # Allocate handle from per-thread pool (lock-free fast path)
         # ============================================================
         builder.position_at_end(alloc_handle)
 
@@ -2216,21 +2328,54 @@ class GarbageCollector:
         user_ptr_int = builder.add(block_int, header_size)
         user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
 
-        # Lock mutex for handle allocation (shared resource)
-        mutex_ptr2 = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex_ptr2])
+        # Allocate stack slot to store handle across blocks
+        handle_alloca = builder.alloca(self.i64, name="handle")
 
-        # Allocate handle and store pointer
-        handle = builder.call(self.gc_handle_alloc, [])
+        builder.branch(try_handle_pool)
+
+        # ============================================================
+        # Try per-thread handle pool (fast path - no locking)
+        # ============================================================
+        builder.position_at_end(try_handle_pool)
+        pool_handle = builder.call(self.gc_handle_pool_alloc, [])
+        pool_success = builder.icmp_unsigned("!=", pool_handle, ir.Constant(self.i64, 0))
+        builder.store(pool_handle, handle_alloca)
+        builder.cbranch(pool_success, have_handle, handle_pool_refill)
+
+        # ============================================================
+        # Refill handle pool (slow path - acquires mutex internally)
+        # ============================================================
+        builder.position_at_end(handle_pool_refill)
+        builder.call(self.gc_handle_pool_refill, [])
+        # Retry allocation - should succeed now
+        retry_handle = builder.call(self.gc_handle_pool_alloc, [])
+        builder.store(retry_handle, handle_alloca)
+        builder.branch(have_handle)
+
+        # ============================================================
+        # Have handle - store pointer and update header
+        # ============================================================
+        builder.position_at_end(have_handle)
+        handle = builder.load(handle_alloca)
+
+        # Store pointer in handle table (no lock needed - this thread owns the handle)
         builder.call(self.gc_handle_store, [handle, user_ptr])
 
         # Store handle in header's forward field for ptr->handle lookup
         builder.store(handle, forward_ptr)
 
+        builder.branch(add_to_list)
+
         # ============================================================
-        # Add to per-thread allocation list (protected by gc_mutex)
-        # Keep mutex held to prevent race with gc_sweep_thread_lists
+        # Add to per-thread allocation list (mutex-protected)
+        # Only this section needs the mutex to coordinate with sweep
         # ============================================================
+        builder.position_at_end(add_to_list)
+
+        # Lock mutex only for allocation list update
+        mutex_ptr2 = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr2])
+
         # Allocate allocation node (ALWAYS use malloc for nodes, not TLAB)
         # This ensures sweep can safely free nodes without tracking TLAB status
         node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
@@ -2244,18 +2389,19 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i8_ptr, None), next_ptr)
 
         # node->handle = handle
+        handle_for_node = builder.load(handle_alloca)
         handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        builder.store(handle, handle_ptr)
+        builder.store(handle_for_node, handle_ptr)
 
         # node->size = aligned_size
         node_size_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         aligned_size_reload = builder.load(size_ptr)  # Reload from header
         builder.store(aligned_size_reload, node_size_ptr)
 
-        # Add to per-thread allocation list (still holding gc_mutex)
+        # Add to per-thread allocation list
         builder.call(self.gc_alloc_to_thread_list, [raw_node])
 
-        # Now safe to unlock gc_mutex after alloc_list is updated
+        # Unlock mutex
         builder.call(self.pthread_mutex_unlock, [mutex_ptr2])
 
         builder.branch(finish)
@@ -7394,6 +7540,188 @@ class GarbageCollector:
 
         # Clear retired list
         builder.store(ir.Constant(self.i64, 0), self.gc_handle_retired_list)
+
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_handle_pool_alloc(self):
+        """Fast-path handle allocation from thread-local pool.
+
+        Allocates a handle from the current thread's pre-allocated pool.
+        No locking required - purely thread-local operation.
+
+        Returns:
+            i64 handle index if pool has available handles
+            0 if pool is empty (caller must call gc_handle_pool_refill)
+
+        ThreadEntry fields used:
+            - handle_pool_start (field 18): first handle index in pool
+            - handle_pool_next (field 19): next available handle in pool
+            - handle_pool_end (field 20): one past last handle in pool
+        """
+        func = self.gc_handle_pool_alloc
+
+        entry = func.append_basic_block("entry")
+        have_entry = func.append_basic_block("have_entry")
+        check_pool = func.append_basic_block("check_pool")
+        alloc_from_pool = func.append_basic_block("alloc_from_pool")
+        pool_empty = func.append_basic_block("pool_empty")
+
+        builder = ir.IRBuilder(entry)
+
+        # Get current thread entry via pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+        thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
+
+        # Check if we have a thread entry
+        is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_entry, pool_empty, have_entry)
+
+        builder.position_at_end(have_entry)
+
+        # Load handle_pool_next (field 19)
+        pool_next_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 19)
+        ], inbounds=True)
+        pool_next = builder.load(pool_next_ptr)
+
+        # Load handle_pool_end (field 20)
+        pool_end_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 20)
+        ], inbounds=True)
+        pool_end = builder.load(pool_end_ptr)
+
+        builder.branch(check_pool)
+
+        # Check if pool has available handles
+        builder.position_at_end(check_pool)
+        has_handle = builder.icmp_unsigned("<", pool_next, pool_end)
+        builder.cbranch(has_handle, alloc_from_pool, pool_empty)
+
+        # Allocate handle from pool (fast path)
+        builder.position_at_end(alloc_from_pool)
+        # The handle index is pool_next
+        handle = pool_next
+
+        # Increment pool_next
+        new_next = builder.add(pool_next, ir.Constant(self.i64, 1))
+        builder.store(new_next, pool_next_ptr)
+
+        # Return the allocated handle
+        builder.ret(handle)
+
+        # Pool is empty - return 0 to signal caller to refill
+        builder.position_at_end(pool_empty)
+        builder.ret(ir.Constant(self.i64, 0))
+
+    def _implement_gc_handle_pool_refill(self):
+        """Slow-path handle pool refill.
+
+        Called when gc_handle_pool_alloc returns 0 (pool empty).
+        Acquires mutex and allocates HANDLE_POOL_SIZE (512) handles in batch.
+
+        This is the only place that touches the global handle table for
+        allocation - all other allocations go through the thread-local pool.
+
+        ThreadEntry fields updated:
+            - handle_pool_start (field 18): set to first handle in new batch
+            - handle_pool_next (field 19): set to first handle in new batch
+            - handle_pool_end (field 20): set to first handle + HANDLE_POOL_SIZE
+        """
+        func = self.gc_handle_pool_refill
+
+        entry = func.append_basic_block("entry")
+        have_entry = func.append_basic_block("have_entry")
+        use_bump = func.append_basic_block("use_bump")
+        need_grow = func.append_basic_block("need_grow")
+        do_bump = func.append_basic_block("do_bump")
+        finish = func.append_basic_block("finish")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Get current thread entry via pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+        thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
+
+        # Check if we have a thread entry
+        is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_entry, done, have_entry)
+
+        builder.position_at_end(have_entry)
+
+        # Lock mutex for handle allocation
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+
+        builder.branch(use_bump)
+
+        # ============================================================
+        # Bump allocate a contiguous batch of HANDLE_POOL_SIZE handles
+        # ============================================================
+        builder.position_at_end(use_bump)
+        next_handle_val = builder.load(self.gc_next_handle)
+        table_size = builder.load(self.gc_handle_table_size)
+
+        # Calculate end of batch
+        pool_size = ir.Constant(self.i64, self.HANDLE_POOL_SIZE)
+        batch_end = builder.add(next_handle_val, pool_size)
+
+        # Check if we need to grow the table
+        need_grow_cond = builder.icmp_unsigned(">", batch_end, table_size)
+        builder.cbranch(need_grow_cond, need_grow, do_bump)
+
+        # Grow table and retry
+        builder.position_at_end(need_grow)
+        builder.call(self.gc_handle_table_grow, [])
+        builder.branch(use_bump)
+
+        # Do bump allocation
+        builder.position_at_end(do_bump)
+        start_handle = builder.load(self.gc_next_handle)
+        end_handle = builder.add(start_handle, pool_size)
+
+        # Update gc_next_handle
+        builder.store(end_handle, self.gc_next_handle)
+
+        builder.branch(finish)
+
+        # ============================================================
+        # Update ThreadEntry with new pool
+        # ============================================================
+        builder.position_at_end(finish)
+
+        # Update handle_pool_start (field 18)
+        pool_start_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 18)
+        ], inbounds=True)
+        builder.store(start_handle, pool_start_ptr)
+
+        # Update handle_pool_next (field 19)
+        pool_next_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 19)
+        ], inbounds=True)
+        builder.store(start_handle, pool_next_ptr)
+
+        # Update handle_pool_end (field 20)
+        pool_end_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 20)
+        ], inbounds=True)
+        builder.store(end_handle, pool_end_ptr)
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
 
         builder.branch(done)
 
