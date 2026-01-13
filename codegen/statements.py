@@ -22,7 +22,7 @@ from ast_nodes import (
     Identifier, MemberExpr, IndexExpr, CallExpr, MethodCallExpr,
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
     AssignOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
-    OptionalType, PrimitiveType, NamedType
+    OptionalType, PrimitiveType, NamedType, AtomicType
 )
 
 # Import uniqueness analysis for in-place mutation optimization
@@ -530,7 +530,37 @@ class StatementGenerator:
                 cg._emit_warning("PERF", warning_msg)
                 init_value = converted_value
 
-        init_value = cg._cast_value(init_value, llvm_type)
+        # Special handling for atomic type initialization
+        # Atomic types store values as i64, so we need to convert appropriately
+        # This MUST happen BEFORE _cast_value to avoid wrong float->int conversion
+        if isinstance(stmt.type_annotation, AtomicType):
+            inner_type = stmt.type_annotation.inner
+            if inner_type == "float":
+                # Bitcast double to i64 (preserves bit representation)
+                if isinstance(init_value.type, ir.DoubleType):
+                    init_value = cg.builder.bitcast(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.IntType):
+                    # If it's an int literal used as float, convert first
+                    float_val = cg.builder.sitofp(init_value, ir.DoubleType())
+                    init_value = cg.builder.bitcast(float_val, ir.IntType(64))
+            elif inner_type == "bool":
+                # Extend bool to i64
+                if isinstance(init_value.type, ir.IntType) and init_value.type.width == 1:
+                    init_value = cg.builder.zext(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.IntType):
+                    # Non-zero is true
+                    bool_val = cg.builder.icmp_unsigned('!=', init_value, ir.Constant(init_value.type, 0))
+                    init_value = cg.builder.zext(bool_val, ir.IntType(64))
+            elif inner_type == "int":
+                # Ensure i64
+                if isinstance(init_value.type, ir.IntType) and init_value.type.width != 64:
+                    init_value = cg.builder.sext(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.DoubleType):
+                    init_value = cg.builder.fptosi(init_value, ir.IntType(64))
+            # Skip normal cast for atomic types
+        else:
+            # Cast if needed (non-atomic types)
+            init_value = cg._cast_value(init_value, llvm_type)
 
         # Track aliasing for in-place optimization safety (type-annotated path)
         typed_source_var_name = None

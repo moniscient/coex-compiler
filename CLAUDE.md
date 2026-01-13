@@ -42,7 +42,7 @@ source.coex â†’ ANTLR4 Parser â†’ Parse Tree â†’ AST Builder â�
 
 ## Garbage Collector Architecture
 
-The GC uses a **handle-based** design where all heap references are i64 indices into a global handle table, rather than raw pointers. This enables future concurrent collection without stop-the-world pointer fixup.
+The GC uses a **handle-based** design where all heap references are i64 indices into a global handle table, rather than raw pointers. This enables concurrent collection without stop-the-world pointer fixup.
 
 ### Core Concepts
 
@@ -289,9 +289,9 @@ func main() -> int
 ```
 
 ### Function Kinds
-- `formula` - Pure functions (no side effects)
+- `formula` - Pure functions (no side effects). Currently an alias of `task`.
 - `func` - Regular imperative functions
-- `task` - Concurrent tasks (currently runs sequentially)
+- `task` - Concurrent tasks (implemented as C pthreads)
 
 ### Reserved Words
 `end`, `init`, `self`, `cell`, `true`, `false`, `nil`, `and`, `or`, `not`, `const`, `var`
@@ -374,11 +374,6 @@ func main(stdin: posix, stdout: posix, stderr: posix) -> int
 - `posix.urandom(count: int) -> [byte]` - Random bytes from /dev/urandom
 
 **Note:** This module only works on Unix-like systems (macOS, Linux).
-
-### Known Issues
-| Issue | Description |
-|-------|-------------|
-| Concurrency | All concurrent features run sequentially (stubs) |
 
 ## Codegen Patterns
 

@@ -36,6 +36,9 @@ from codegen.array import ArrayGenerator
 # Import Atomic Ref generator module
 from codegen.atomic import AtomicGenerator
 
+# Import Atomic Primitives generator module (atomic_int, atomic_float, atomic_bool)
+from codegen.atomic_primitives import AtomicPrimitiveGenerator
+
 # Import Result generator module
 from codegen.result import ResultGenerator
 
@@ -402,6 +405,9 @@ class CodeGenerator:
         self._atomic = AtomicGenerator(self)
         self._atomic.create_atomic_ref_type()
 
+        # Atomic primitives (atomic_int, atomic_float, atomic_bool)
+        self._atomic_primitives = AtomicPrimitiveGenerator(self)
+
         # Create Result type struct (helpers moved to codegen/result.py)
         # struct.Result { i64 tag, i64 ok_value, i64 err_value }
         # tag: 0 = Ok, 1 = Err
@@ -621,13 +627,10 @@ class CodeGenerator:
             return type_map.get(coex_type.name, ir.IntType(64))
         
         elif isinstance(coex_type, AtomicType):
-            # Atomics are just regular types for now (sequential execution)
-            type_map = {
-                "int": ir.IntType(64),
-                "float": ir.DoubleType(),
-                "bool": ir.IntType(1),
-            }
-            return type_map.get(coex_type.inner, ir.IntType(64))
+            # Atomic primitives always use i64 storage for proper alignment.
+            # Float and bool values are bitcast to/from i64 during atomic operations.
+            # This ensures atomic instructions work correctly on all platforms.
+            return ir.IntType(64)
         
         elif isinstance(coex_type, OptionalType):
             # Optional is a struct { i1 has_value, T value }
@@ -1530,8 +1533,37 @@ class CodeGenerator:
                 self._emit_warning("PERF", warning_msg)
                 init_value = converted_value
 
-        # Cast if needed
-        init_value = self._cast_value(init_value, llvm_type)
+        # Special handling for atomic type initialization
+        # Atomic types store values as i64, so we need to convert appropriately
+        # This MUST happen BEFORE _cast_value to avoid wrong float->int conversion
+        if isinstance(stmt.type_annotation, AtomicType):
+            inner_type = stmt.type_annotation.inner
+            if inner_type == "float":
+                # Bitcast double to i64 (preserves bit representation)
+                if isinstance(init_value.type, ir.DoubleType):
+                    init_value = self.builder.bitcast(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.IntType):
+                    # If it's an int literal used as float, convert first
+                    float_val = self.builder.sitofp(init_value, ir.DoubleType())
+                    init_value = self.builder.bitcast(float_val, ir.IntType(64))
+            elif inner_type == "bool":
+                # Extend bool to i64
+                if isinstance(init_value.type, ir.IntType) and init_value.type.width == 1:
+                    init_value = self.builder.zext(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.IntType):
+                    # Non-zero is true
+                    bool_val = self.builder.icmp_unsigned('!=', init_value, ir.Constant(init_value.type, 0))
+                    init_value = self.builder.zext(bool_val, ir.IntType(64))
+            elif inner_type == "int":
+                # Ensure i64
+                if isinstance(init_value.type, ir.IntType) and init_value.type.width != 64:
+                    init_value = self.builder.sext(init_value, ir.IntType(64))
+                elif isinstance(init_value.type, ir.DoubleType):
+                    init_value = self.builder.fptosi(init_value, ir.IntType(64))
+            # Skip normal cast for atomic types
+        else:
+            # Cast if needed (non-atomic types)
+            init_value = self._cast_value(init_value, llvm_type)
 
         # Value semantics: deep copy or move collections on assignment
         # := (is_copy=True) creates independent deep copy
@@ -3162,22 +3194,87 @@ class CodeGenerator:
 
             return ir.Constant(ir.IntType(64), 0)
 
+        # Handle atomic primitive methods (atomic_int, atomic_float, atomic_bool)
+        # Check if the object is an atomic type variable
+        atomic_inner_type = None
+        atomic_ptr = None
+        if isinstance(expr.object, Identifier):
+            var_name = expr.object.name
+            if var_name in self.var_coex_types:
+                coex_type = self.var_coex_types[var_name]
+                if isinstance(coex_type, AtomicType):
+                    atomic_inner_type = coex_type.inner
+                    # Get the pointer to the atomic variable (not the loaded value)
+                    if var_name in self.locals:
+                        atomic_ptr = self.locals[var_name]
+
+        if atomic_ptr is not None and atomic_inner_type is not None:
+            # Atomic primitive method dispatch
+            if method == "load":
+                return self._atomic_primitives.generate_atomic_load(
+                    self.builder, atomic_ptr, atomic_inner_type)
+
+            elif method == "store":
+                if expr.args:
+                    value = self._generate_expression(expr.args[0])
+                    return self._atomic_primitives.generate_atomic_store(
+                        self.builder, atomic_ptr, value, atomic_inner_type)
+                return ir.Constant(ir.IntType(64), 0)
+
+            elif method == "exchange":
+                if expr.args:
+                    new_value = self._generate_expression(expr.args[0])
+                    return self._atomic_primitives.generate_atomic_exchange(
+                        self.builder, atomic_ptr, new_value, atomic_inner_type)
+                return ir.Constant(ir.IntType(64), 0)
+
+            elif method == "compare_and_swap" or method == "cas":
+                if len(expr.args) >= 2:
+                    expected = self._generate_expression(expr.args[0])
+                    new_value = self._generate_expression(expr.args[1])
+                    return self._atomic_primitives.generate_atomic_cas(
+                        self.builder, atomic_ptr, expected, new_value, atomic_inner_type)
+                return ir.Constant(ir.IntType(1), 0)
+
+            elif method == "fetch_add" and atomic_inner_type == "int":
+                if expr.args:
+                    delta = self._generate_expression(expr.args[0])
+                    return self._atomic_primitives.generate_fetch_add(
+                        self.builder, atomic_ptr, delta)
+                return ir.Constant(ir.IntType(64), 0)
+
+            elif method == "fetch_sub" and atomic_inner_type == "int":
+                if expr.args:
+                    delta = self._generate_expression(expr.args[0])
+                    return self._atomic_primitives.generate_fetch_sub(
+                        self.builder, atomic_ptr, delta)
+                return ir.Constant(ir.IntType(64), 0)
+
+            elif method == "increment" and atomic_inner_type == "int":
+                return self._atomic_primitives.generate_increment(
+                    self.builder, atomic_ptr)
+
+            elif method == "decrement" and atomic_inner_type == "int":
+                return self._atomic_primitives.generate_decrement(
+                    self.builder, atomic_ptr)
+
+            elif method == "test_and_set" and atomic_inner_type == "bool":
+                return self._atomic_primitives.generate_test_and_set(
+                    self.builder, atomic_ptr)
+
+        # Legacy stubs for non-atomic types (should not normally be reached)
         if method == "load":
-            # atomic.load() - just return value
             return obj
-        
+
         if method == "store":
-            # atomic.store(value) - store value
             return ir.Constant(ir.IntType(64), 0)
-        
+
         if method == "increment":
-            # atomic_int.increment() - add 1 and return old value
             if isinstance(obj.type, ir.IntType):
                 return obj
             return ir.Constant(ir.IntType(64), 0)
-        
+
         if method == "fetch_add":
-            # atomic.fetch_add(delta)
             return obj
 
         if method == "packed" or method == "toArray":

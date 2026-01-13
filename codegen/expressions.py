@@ -24,7 +24,8 @@ from ast_nodes import (
     ListExpr, MapExpr, SetExpr, TupleExpr, RangeExpr, LambdaExpr,
     SelfExpr, CellExpr, CellIndexExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
-    IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind
+    IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
+    AtomicType
 )
 
 if TYPE_CHECKING:
@@ -1515,6 +1516,74 @@ class ExpressionGenerator:
                             arg_val = cg._cast_value(arg_val, expected)
                         args.append(arg_val)
                     return cg.builder.call(func, args)
+
+        # Handle atomic primitive methods (atomic_int, atomic_float, atomic_bool)
+        # Check BEFORE generating expression, because we need the pointer, not the loaded value
+        if isinstance(expr.object, Identifier):
+            var_name = expr.object.name
+            if var_name in cg.var_coex_types:
+                coex_type = cg.var_coex_types[var_name]
+                if isinstance(coex_type, AtomicType):
+                    atomic_inner_type = coex_type.inner
+                    if var_name in cg.locals:
+                        atomic_ptr = cg.locals[var_name]
+                        method = expr.method
+
+                        # Atomic primitive method dispatch
+                        if method == "load":
+                            return cg._atomic_primitives.generate_atomic_load(
+                                cg.builder, atomic_ptr, atomic_inner_type)
+
+                        elif method == "store":
+                            if expr.args:
+                                value = self.generate_expression(expr.args[0])
+                                return cg._atomic_primitives.generate_atomic_store(
+                                    cg.builder, atomic_ptr, value, atomic_inner_type)
+                            return ir.Constant(ir.IntType(64), 0)
+
+                        elif method == "exchange":
+                            if expr.args:
+                                new_value = self.generate_expression(expr.args[0])
+                                return cg._atomic_primitives.generate_atomic_exchange(
+                                    cg.builder, atomic_ptr, new_value, atomic_inner_type)
+                            return ir.Constant(ir.IntType(64), 0)
+
+                        elif method == "compare_and_swap" or method == "cas":
+                            if len(expr.args) >= 2:
+                                expected = self.generate_expression(expr.args[0])
+                                new_value = self.generate_expression(expr.args[1])
+                                return cg._atomic_primitives.generate_atomic_cas(
+                                    cg.builder, atomic_ptr, expected, new_value, atomic_inner_type)
+                            return ir.Constant(ir.IntType(1), 0)
+
+                        elif method == "fetch_add" and atomic_inner_type == "int":
+                            if expr.args:
+                                delta = self.generate_expression(expr.args[0])
+                                return cg._atomic_primitives.generate_fetch_add(
+                                    cg.builder, atomic_ptr, delta)
+                            return ir.Constant(ir.IntType(64), 0)
+
+                        elif method == "fetch_sub" and atomic_inner_type == "int":
+                            if expr.args:
+                                delta = self.generate_expression(expr.args[0])
+                                return cg._atomic_primitives.generate_fetch_sub(
+                                    cg.builder, atomic_ptr, delta)
+                            return ir.Constant(ir.IntType(64), 0)
+
+                        elif method == "increment" and atomic_inner_type == "int":
+                            return cg._atomic_primitives.generate_increment(
+                                cg.builder, atomic_ptr)
+
+                        elif method == "decrement" and atomic_inner_type == "int":
+                            return cg._atomic_primitives.generate_decrement(
+                                cg.builder, atomic_ptr)
+
+                        elif method == "test_and_set" and atomic_inner_type == "bool":
+                            return cg._atomic_primitives.generate_test_and_set(
+                                cg.builder, atomic_ptr)
+
+                        else:
+                            raise RuntimeError(f"Undefined method '{method}' on atomic_{atomic_inner_type}")
 
         # Instance method call: obj.method()
         obj = self.generate_expression(expr.object)
