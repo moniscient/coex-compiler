@@ -449,12 +449,20 @@ class TaskGenerator:
         # 1b. Set current task closure for safepoint checks (TLS)
         builder.call(self.task_set_current, [closure_ptr])
 
-        # 2. Push GC frame (count params as roots)
-        # Phase 5: frame_ptr is now start_slot index (i64), gc_roots is no longer needed
-        num_params = len(task_func.params)
+        # 2. Push GC frame for HEAP-TYPE parameters only
+        # CRITICAL: Only allocate slots for heap types (list, map, string, etc.)
+        # Primitive types (int, float, bool) must NOT be rooted - their values would
+        # be misinterpreted as handle indices during GC root scanning!
+        num_heap_params = 0
+        heap_param_indices = []  # Map heap param slot -> original param index
+        for i, param in enumerate(task_func.params):
+            if param.type_annotation and cg._is_heap_type(param.type_annotation):
+                heap_param_indices.append(i)
+                num_heap_params += 1
+
         frame_ptr = None
-        if cg.gc is not None and num_params > 0:
-            frame_ptr = cg.gc.push_frame(builder, num_params)
+        if cg.gc is not None and num_heap_params > 0:
+            frame_ptr = cg.gc.push_frame(builder, num_heap_params)
 
         # 3. Extract parameters from closure->params
         params_ptr_field = builder.gep(
@@ -467,6 +475,7 @@ class TaskGenerator:
 
         # Build list of extracted parameter values
         call_args = []
+        heap_slot = 0  # Track slot index for heap params
         if task_func.params:
             # Get param struct type
             param_llvm_types = [arg.type for arg in task_llvm_func.args]
@@ -486,12 +495,11 @@ class TaskGenerator:
                 param_val = builder.load(param_ptr, name=f"param_{param.name}")
                 call_args.append(param_val)
 
-                # Register handle parameters as GC roots
+                # Register heap-type parameters as GC roots
                 if cg.gc is not None and frame_ptr is not None:
-                    # Check if this is a handle type (heap-allocated)
-                    param_type = param_llvm_types[i]
-                    if param_type == i64:  # Handles are i64
-                        cg.gc.set_root(builder, frame_ptr, i, param_val)
+                    if param.type_annotation and cg._is_heap_type(param.type_annotation):
+                        cg.gc.set_root(builder, frame_ptr, heap_slot, param_val)
+                        heap_slot += 1
 
         # 4. Call the actual task body
         result = builder.call(task_llvm_func, call_args, name="task_result")
@@ -515,7 +523,7 @@ class TaskGenerator:
         builder.store(result_ptr, result_field)
 
         # 6. Pop GC frame
-        if cg.gc is not None and num_params > 0:
+        if cg.gc is not None and num_heap_params > 0:
             cg.gc.pop_frame(builder, frame_ptr)
 
         # 7. Clear current task closure TLS before signaling completion

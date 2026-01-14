@@ -5843,52 +5843,67 @@ class GarbageCollector:
         prepend_done_block = func.append_basic_block("prepend_done")
 
         # =====================================================================
-        # KNOWN ISSUE: Survivors prepend is DISABLED.
-        #
-        # Background: After sweeping each thread's allocation list, surviving
-        # allocation nodes should be prepended back to allow future sweeps to
-        # find those objects. Without prepending, the allocation nodes become
-        # orphaned (leaked) but the objects themselves remain correctly tracked
-        # via the handle table and are NOT collected prematurely.
-        #
-        # The Issue: When parallel for comprehensions (task spawning) are used
-        # with loop variables passed to tasks, the survivors prepend causes
-        # crashes on subsequent rounds. This appears to be an interaction
-        # between:
-        # 1. How parallel for creates allocations for task closures/params
-        # 2. How those nodes end up in the survivors list
-        # 3. How prepending them back affects subsequent allocations
-        #
-        # The crash pattern:
-        # - Single tasks work fine
-        # - Multiple tasks work fine if loop variable is NOT passed
-        # - Crashes on round 2+ when loop variable IS passed to tasks
-        #
-        # Impact of this workaround:
-        # - Memory leak: ~24 bytes per surviving allocation node per GC cycle
-        # - Objects are still correctly managed (not freed prematurely)
-        # - Programs work correctly, just with slightly higher memory usage
-        #
-        # TODO: Investigate root cause. Possible areas:
-        # 1. Task parameter struct allocation tracking
-        # 2. Parallel for spawn loop alloca placement
-        # 3. Interaction between closure allocation and GC sweep timing
+        # Survivors prepend using "Link Before Publish" CAS pattern
         # =====================================================================
-        builder.branch(next_thread)
+        # Branch based on whether we have survivors
+        builder.cbranch(has_survivors_final, do_prepend_block, next_thread)
 
-        # Keep blocks for LLVM structure (unreachable)
+        # --- Do prepend: set up for CAS loop ---
         builder.position_at_end(do_prepend_block)
-        builder.branch(prepend_done_block)
 
+        # Load the alloc_list_ptr we stored earlier
+        alloc_ptr_for_prepend = builder.load(alloc_list_ptr_alloca)
+
+        # Store alloc_list_ptr for use in CAS loop
+        builder.store(alloc_ptr_for_prepend, alloc_ptr_prepend_alloca)
+
+        # Get survivors_tail->next pointer for linking
+        surv_tail_typed = builder.bitcast(surv_tail_final, self.alloc_node_type.as_pointer())
+        surv_tail_next_ptr = builder.gep(surv_tail_typed, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)  # next field
+        ], inbounds=True)
+        builder.store(surv_tail_next_ptr, surv_tail_next_prepend_alloca)
+
+        # Load initial old_head for CAS
+        old_head_init = builder.load(alloc_ptr_for_prepend, align=8)
+        builder.store(old_head_init, expected_prepend_alloca)
+
+        builder.branch(prepend_cas_loop)
+
+        # --- CAS loop: link tail and try atomic swap ---
         builder.position_at_end(prepend_cas_loop)
-        builder.branch(prepend_done_block)
 
+        # Load expected old_head
+        expected_head = builder.load(expected_prepend_alloca)
+
+        # Load stored pointers
+        alloc_ptr_reload = builder.load(alloc_ptr_prepend_alloca)
+        tail_next_reload = builder.load(surv_tail_next_prepend_alloca)
+
+        # Step 1: Link survivors_tail->next = old_head (LINK BEFORE PUBLISH!)
+        builder.store(expected_head, tail_next_reload)
+
+        # Step 2: CAS(alloc_list, expected=old_head, desired=survivors_head)
+        cmpxchg_prepend = builder.cmpxchg(
+            alloc_ptr_reload, expected_head, surv_head_final,
+            'acq_rel', 'acquire'
+        )
+        cas_old = builder.extract_value(cmpxchg_prepend, 0)
+        cas_success = builder.extract_value(cmpxchg_prepend, 1)
+
+        builder.cbranch(cas_success, prepend_cas_success, prepend_cas_retry)
+
+        # --- CAS success: continue to next thread ---
         builder.position_at_end(prepend_cas_success)
         builder.branch(prepend_done_block)
 
+        # --- CAS retry: update expected and loop ---
         builder.position_at_end(prepend_cas_retry)
-        builder.branch(prepend_done_block)
+        builder.store(cas_old, expected_prepend_alloca)
+        builder.branch(prepend_cas_loop)
 
+        # --- Prepend done: continue to next thread ---
         builder.position_at_end(prepend_done_block)
         builder.branch(next_thread)
 
