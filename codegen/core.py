@@ -4534,6 +4534,10 @@ class CodeGenerator:
         """Generate code for map comprehension - delegated to ComprehensionGenerator"""
         return self._comprehensions.generate_map_comprehension(expr)
 
+    def _generate_lambda(self, expr: 'LambdaExpr') -> ir.Value:
+        """Generate code for lambda expression - delegated to FunctionGenerator"""
+        return self._functions.generate_lambda(expr)
+
     def _bind_pattern(self, pattern, value):
         """Bind pattern variables to a value."""
         if isinstance(pattern, str):
