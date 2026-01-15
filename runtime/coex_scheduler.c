@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
+#include <sys/time.h>
 
 /* External GC functions (defined in coex_gc runtime) */
 extern void coex_gc_register_thread(void);
@@ -181,13 +183,16 @@ static void wake_all_workers(void) {
 }
 
 static void park_worker(int worker_id) {
+    (void)worker_id;  /* Unused parameter */
     pthread_mutex_lock(&parking_mutex);
     atomic_fetch_add(&parked_workers, 1);
 
     /* Wait with timeout to allow periodic stealing attempts */
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 1000000;  /* 1ms timeout */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ts.tv_sec = tv.tv_sec;
+    ts.tv_nsec = tv.tv_usec * 1000 + 1000000;  /* Add 1ms timeout */
     if (ts.tv_nsec >= 1000000000) {
         ts.tv_sec += 1;
         ts.tv_nsec -= 1000000000;
