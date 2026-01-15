@@ -99,12 +99,12 @@ typedef struct FirstContext {
  * Collects all results from spawned tasks.
  */
 typedef struct MostContext {
-    pthread_mutex_t mutex;        /* Protects result arrays */
+    pthread_mutex_t mutex;        /* Protects condition variable */
     pthread_cond_t cond;          /* Signal main when all done */
     int64_t task_count;           /* Number of spawned tasks */
     atomic_int_fast64_t remaining; /* Tasks still running */
     int64_t* results;             /* Array of results */
-    int64_t result_count;         /* Number of collected results */
+    atomic_int_fast64_t result_count; /* Number of collected results (lock-free) */
     int64_t capacity;             /* Capacity of results array */
 } MostContext;
 

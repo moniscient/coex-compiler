@@ -385,12 +385,11 @@ static void handle_first_completion(SchedulerTask* task, int64_t value) {
 static void handle_most_completion(SchedulerTask* task, int64_t value) {
     MostContext* ctx = (MostContext*)task->completion_context;
 
-    /* Add result to list */
-    pthread_mutex_lock(&ctx->mutex);
-    if (ctx->result_count < ctx->capacity) {
-        ctx->results[ctx->result_count++] = value;
+    /* Add result using lock-free atomic increment */
+    int64_t idx = atomic_fetch_add(&ctx->result_count, 1);
+    if (idx < ctx->capacity) {
+        ctx->results[idx] = value;
     }
-    pthread_mutex_unlock(&ctx->mutex);
 
     /* Check if we're the last one */
     int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
@@ -413,10 +412,10 @@ void coex_scheduler_ensure_init(void) {
 
     pthread_mutex_lock(&scheduler_init_mutex);
     if (!atomic_load(&scheduler_initialized)) {
-        /* Determine worker count: 2x physical cores */
+        /* Determine worker count: match physical cores */
         int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (cores < 1) cores = 1;
-        worker_count = cores * 2;
+        worker_count = cores;
         if (worker_count > SCHEDULER_MAX_WORKERS) {
             worker_count = SCHEDULER_MAX_WORKERS;
         }
@@ -589,15 +588,16 @@ void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index,
     /* Store in context for cancellation */
     ctx->tasks[index] = task;
 
-    /* Submit to global queue */
+    /* Submit to global queue (don't wake yet - batch wake in first_wait) */
     pthread_mutex_lock(&global_queue_mutex);
     deque_push_bottom(&global_queue, task);
     pthread_mutex_unlock(&global_queue_mutex);
-
-    wake_one_worker();
 }
 
 int64_t coex_scheduler_first_wait(FirstContext* ctx) {
+    /* Wake all workers once after batch spawning */
+    wake_all_workers();
+
     pthread_mutex_lock(&ctx->mutex);
     while (!atomic_load(&ctx->has_winner)) {
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
@@ -616,7 +616,7 @@ MostContext* coex_scheduler_most_context_create(int64_t count) {
     ctx->task_count = count;
     atomic_store(&ctx->remaining, count);
     ctx->results = calloc(count, sizeof(int64_t));
-    ctx->result_count = 0;
+    atomic_store(&ctx->result_count, 0);
     ctx->capacity = count;
 
     return ctx;
@@ -647,22 +647,23 @@ void coex_scheduler_most_spawn_task(MostContext* ctx,
     task->completion_type = COMPLETION_MOST;
     task->completion_index = 0;  /* Not used for most */
 
-    /* Submit to global queue */
+    /* Submit to global queue (don't wake yet - batch wake in most_wait) */
     pthread_mutex_lock(&global_queue_mutex);
     deque_push_bottom(&global_queue, task);
     pthread_mutex_unlock(&global_queue_mutex);
-
-    wake_one_worker();
 }
 
 void coex_scheduler_most_wait(MostContext* ctx,
                                int64_t** out_results, int64_t* out_count) {
+    /* Wake all workers once after batch spawning */
+    wake_all_workers();
+
     pthread_mutex_lock(&ctx->mutex);
     while (atomic_load(&ctx->remaining) > 0) {
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
     }
     *out_results = ctx->results;
-    *out_count = ctx->result_count;
+    *out_count = atomic_load(&ctx->result_count);
     pthread_mutex_unlock(&ctx->mutex);
 }
 
