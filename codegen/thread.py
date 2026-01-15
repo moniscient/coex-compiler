@@ -1,14 +1,14 @@
 """
-Task concurrency implementation for Coex.
+Thread concurrency implementation for Coex.
 
-This module provides structured concurrency through the `task` function kind.
-Tasks spawn OS threads via pthreads, with explicit parameter passing,
+This module provides structured concurrency through the `thread` function kind.
+Threads spawn OS threads via pthreads, with explicit parameter passing,
 cooperative cancellation, and three collection strategies (for, first, most).
 
 Key concepts:
-- TaskClosure: Per-task execution context with params, result, cancellation
-- Nursery: Per-function tracking of spawned tasks for join-at-exit
-- Trampoline: Compiler-generated entry point for each task function
+- TaskClosure: Per-thread execution context with params, result, cancellation
+- Nursery: Per-function tracking of spawned threads for join-at-exit
+- Trampoline: Compiler-generated entry point for each thread function
 
 The C runtime (runtime/coex_task.c) handles pthread operations.
 """
@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from ast_nodes import FunctionDecl, Type
 
 
-class TaskGenerator:
-    """Generates task concurrency infrastructure for the Coex compiler."""
+class ThreadGenerator:
+    """Generates thread concurrency infrastructure for the Coex compiler."""
 
     def __init__(self, codegen: 'CodeGenerator'):
         """Initialize with reference to parent CodeGenerator instance."""

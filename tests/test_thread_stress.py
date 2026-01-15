@@ -1,14 +1,14 @@
 """
-Stress tests for task-based concurrency.
+Stress tests for thread-based concurrency.
 
 These tests verify that:
-1. Multiple parallel tasks execute correctly
+1. Multiple parallel threads execute correctly
 2. Results are correctly collected and ordered
-3. Tasks handle large data correctly
+3. Threads handle large data correctly
 4. GC works correctly under concurrent load
 
 NOTE: These tests are currently disabled - they take too long for regular test runs.
-Run manually with: pytest tests/test_task_stress.py -v
+Run manually with: pytest tests/test_thread_stress.py -v
 """
 import pytest
 import subprocess
@@ -28,13 +28,13 @@ skip_on_ci = pytest.mark.skipif(
 )
 
 
-class TestParallel24Tasks:
-    """Tests specifically for 24 parallel tasks - the original stress test target."""
+class TestParallel24Threads:
+    """Tests specifically for 24 parallel threads - the original stress test target."""
 
     def test_24_tasks_sum_ranges(self, expect_output):
-        """24 parallel tasks computing partial sums - verifies 24-way parallelism works."""
+        """24 parallel threads computing partial sums - verifies 24-way thread parallelism works."""
         expect_output('''
-task compute_sum(start: int, count: int) -> int
+thread compute_sum(start: int, count: int) -> int
     total = 0
     i = 0
     while i < count
@@ -45,15 +45,15 @@ task compute_sum(start: int, count: int) -> int
 ~
 
 func main() -> int
-    # Compute sum of 0..2400000 using 24 tasks
-    task_indices: [int] = []
+    # Compute sum of 0..2400000 using 24 threads
+    thread_indices: [int] = []
     for i in 0..24
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
     segment_size = 100000
 
-    sums = for idx in task_indices compute_sum(idx * segment_size, segment_size) ~
+    sums = for idx in thread_indices compute_sum(idx * segment_size, segment_size) ~
 
     total = 0
     for s in sums
@@ -67,9 +67,9 @@ func main() -> int
 ''', "2879998800000\n")
 
     def test_24_tasks_with_list_iteration(self, expect_output):
-        """24 parallel tasks iterating over shared list data."""
+        """24 parallel threads iterating over shared list data."""
         expect_output('''
-task process_list(idx: int, data: [int], multiplier: int) -> int
+thread process_list(idx: int, data: [int], multiplier: int) -> int
     total = 0
     for item in data
         total = total + (item * multiplier) + idx
@@ -84,12 +84,12 @@ func main() -> int
         data = data.append(i)
     ~
 
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..24
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
-    results = for idx in task_indices process_list(idx, data, idx + 1) ~
+    results = for idx in thread_indices process_list(idx, data, idx + 1) ~
 
     total = 0
     for r in results
@@ -103,12 +103,12 @@ func main() -> int
 
 
 class TestParallelTaskBasics:
-    """Basic parallel task tests."""
+    """Basic parallel thread tests."""
 
     def test_parallel_sum_8_tasks(self, expect_output):
-        """Test 8 parallel tasks computing partial sums."""
+        """Test 8 parallel threads computing partial sums."""
         expect_output('''
-task compute_partial_sum(start: int, count: int) -> int
+thread compute_partial_sum(start: int, count: int) -> int
     total = 0
     for i in 0..count
         total = total + (start + i)
@@ -117,13 +117,13 @@ task compute_partial_sum(start: int, count: int) -> int
 ~
 
 func main() -> int
-    # Compute sum of 0..1000 using 8 parallel tasks
-    task_indices: [int] = []
+    # Compute sum of 0..1000 using 8 parallel threads
+    thread_indices: [int] = []
     for i in 0..8
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
-    partial_sums = for idx in task_indices compute_partial_sum(idx * 125, 125) ~
+    partial_sums = for idx in thread_indices compute_partial_sum(idx * 125, 125) ~
 
     total = 0
     for s in partial_sums
@@ -137,19 +137,19 @@ func main() -> int
 ''', "499500\n")
 
     def test_parallel_24_tasks_simple(self, expect_output):
-        """Test 24 parallel tasks with simple computation."""
+        """Test 24 parallel threads with simple computation."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
 func main() -> int
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..24
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
-    results = for idx in task_indices double(idx) ~
+    results = for idx in thread_indices double(idx) ~
 
     total = 0
     for r in results
@@ -163,9 +163,9 @@ func main() -> int
 ''', "552\n")
 
     def test_parallel_tasks_with_list_params(self, expect_output):
-        """Test passing lists to parallel tasks."""
+        """Test passing lists to parallel threads."""
         expect_output('''
-task sum_list(items: [int]) -> int
+thread sum_list(items: [int]) -> int
     total = 0
     for item in items
         total = total + item
@@ -198,14 +198,14 @@ class TestParallelSieveSmall:
     """Small-scale parallel sieve tests.
 
     NOTE: These tests are marked xfail due to a non-deterministic race condition
-    in the GC when parallel tasks perform Set allocations. The crash pattern is
+    in the GC when parallel threads perform Set allocations. The crash pattern is
     inconsistent - the same code can pass or fail depending on timing.
     """
 
     def test_parallel_sieve_100_2_tasks(self, expect_output):
         """Test parallel sieve to 100 with 2 tasks."""
         expect_output('''
-task sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     composites: Set<int> = {}
     idx = 0
     while idx < small_primes.len()
@@ -261,11 +261,11 @@ func find_small_primes(limit: int) -> [int]
 
 func main() -> int
     small_primes = find_small_primes(10)
-    task_indices: [int] = []
-    task_indices = task_indices.append(0)
-    task_indices = task_indices.append(1)
+    thread_indices: [int] = []
+    thread_indices = thread_indices.append(0)
+    thread_indices = thread_indices.append(1)
     segment_size = 50
-    counts = for idx in task_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
+    counts = for idx in thread_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
     total = 0
     for c in counts
         total = total + c
@@ -282,14 +282,14 @@ class TestParallelSieve:
     """Parallel sieve of Eratosthenes tests.
 
     These tests are marked xfail due to a race condition in the GC when
-    multiple parallel tasks perform heavy Set allocations. The issue appears
+    multiple parallel threads perform heavy Set allocations. The issue appears
     when segment sizes exceed ~60-75 elements with Set operations.
     """
 
     def test_parallel_sieve_1000(self, expect_output):
         """Test parallel sieve to 1000 with 4 tasks."""
         expect_output('''
-task sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -348,14 +348,14 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(32)  # sqrt(1000) ~ 32
 
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..4
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
     segment_size = 250  # 1000 / 4
 
-    counts = for idx in task_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
+    counts = for idx in thread_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
 
     total = 0
     for c in counts
@@ -371,7 +371,7 @@ func main() -> int
     def test_parallel_sieve_10000_8_tasks(self, expect_output):
         """Test parallel sieve to 10000 with 8 tasks."""
         expect_output('''
-task sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -430,14 +430,14 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(100)  # sqrt(10000) = 100
 
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..8
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
     segment_size = 1250  # 10000 / 8
 
-    counts = for idx in task_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
+    counts = for idx in thread_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
 
     total = 0
     for c in counts
@@ -456,13 +456,13 @@ class TestParallelSieveStress:
     """Stress tests for parallel sieve at scale.
 
     These tests are marked xfail due to a race condition in the GC when
-    multiple parallel tasks perform heavy Set allocations.
+    multiple parallel threads perform heavy Set allocations.
     """
 
     def test_parallel_sieve_100k_24_tasks(self, compiler_root):
         """Test parallel sieve to 100K with 24 tasks."""
         source = '''
-task sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -521,15 +521,15 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(317)  # sqrt(100000) ~ 317
 
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..24
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
     const LIMIT = 100000
     segment_size = LIMIT / 24
 
-    counts = for idx in task_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
+    counts = for idx in thread_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
 
     total = 0
     for c in counts
@@ -565,13 +565,13 @@ func main() -> int
             output = run_result.stdout.strip()
             assert output == "9592", f"Expected 9592 primes, got {output}"
 
-            print(f"\n  24-task parallel sieve to 100K completed in {elapsed:.2f}s")
+            print(f"\n  24-thread parallel sieve to 100K completed in {elapsed:.2f}s")
 
     @skip_on_ci
     def test_parallel_sieve_1m_24_tasks(self, compiler_root):
         """Test parallel sieve to 1M with 24 tasks."""
         source = '''
-task sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -630,15 +630,15 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(1000)  # sqrt(1000000) = 1000
 
-    task_indices: [int] = []
+    thread_indices: [int] = []
     for i in 0..24
-        task_indices = task_indices.append(i)
+        thread_indices = thread_indices.append(i)
     ~
 
     const LIMIT = 1000000
     segment_size = LIMIT / 24
 
-    counts = for idx in task_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
+    counts = for idx in thread_indices sieve_segment(idx * segment_size, (idx + 1) * segment_size, small_primes) ~
 
     total = 0
     for c in counts
@@ -674,7 +674,7 @@ func main() -> int
             output = run_result.stdout.strip()
             assert output == "78498", f"Expected 78498 primes, got {output}"
 
-            print(f"\n  24-task parallel sieve to 1M completed in {elapsed:.2f}s")
+            print(f"\n  24-thread parallel sieve to 1M completed in {elapsed:.2f}s")
 
 
 @skip_on_ci
@@ -683,7 +683,7 @@ class TestParallelSieve100M:
     """100 million element stress test.
 
     NOTE: This test is marked xfail due to a race condition in the GC when
-    parallel tasks perform heavy Set allocations.
+    parallel threads perform heavy Set allocations.
     """
 
     def test_parallel_sieve_100m_full(self, compiler_root):
@@ -720,4 +720,4 @@ class TestParallelSieve100M:
             assert "SUCCESS" in run_result.stdout, f"Test failed: {run_result.stdout}"
             assert "5761455" in run_result.stdout, f"Wrong prime count: {run_result.stdout}"
 
-            print(f"\n  24-task parallel sieve to 100M completed in {elapsed:.2f}s")
+            print(f"\n  24-thread parallel sieve to 100M completed in {elapsed:.2f}s")

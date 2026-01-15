@@ -1255,9 +1255,9 @@ class ExpressionGenerator:
             if name in cg.functions:
                 func = cg.functions[name]
 
-                # Check if this is a task function call
-                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.TASK:
-                    return self._generate_task_call(name, func, expr.args)
+                # Check if this is a thread function call
+                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.THREAD:
+                    return self._generate_thread_call(name, func, expr.args)
 
                 args = []
                 for i, arg in enumerate(expr.args):
@@ -1349,19 +1349,19 @@ class ExpressionGenerator:
         return ir.Constant(ir.IntType(64), 0)
 
     # ========================================================================
-    # Task Call
+    # Thread Call
     # ========================================================================
 
-    def _generate_task_call(self, name: str, func: ir.Function,
-                            args: PyList) -> ir.Value:
-        """Generate code for a task function call.
+    def _generate_thread_call(self, name: str, func: ir.Function,
+                              args: PyList) -> ir.Value:
+        """Generate code for a thread function call.
 
         Currently executes synchronously (spawn, join immediately, return result).
         This matches the "single assignment" semantics where result is used.
 
         Args:
-            name: Task function name
-            func: LLVM function for the task
+            name: Thread function name
+            func: LLVM function for the thread
             args: List of argument expressions
 
         Returns:
@@ -1392,7 +1392,7 @@ class ExpressionGenerator:
             arg_values.append(arg_val)
 
         # Spawn the task using TaskGenerator
-        thread_handle, closure_ptr = cg._task.spawn_task(
+        thread_handle, closure_ptr = cg._thread.spawn_task(
             cg.builder,
             task_decl,
             func,
@@ -1401,7 +1401,7 @@ class ExpressionGenerator:
         )
 
         # Join immediately (synchronous execution for now)
-        cg.builder.call(cg._task.task_join, [thread_handle])
+        cg.builder.call(cg._thread.task_join, [thread_handle])
 
         # Extract result from closure
         result_field = cg.builder.gep(
@@ -1416,7 +1416,7 @@ class ExpressionGenerator:
         result = cg.builder.ptrtoint(result_ptr, i64, name="result")
 
         # Free the closure
-        cg.builder.call(cg._task.closure_free, [closure_ptr])
+        cg.builder.call(cg._thread.closure_free, [closure_ptr])
 
         return result
 

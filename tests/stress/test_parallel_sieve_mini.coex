@@ -1,18 +1,17 @@
+#@ [MOVE] Variable 'start' is not used after this assignment. Consider: num := start (move instead of copy)
 #@ [MOVE] Variable 'first_mult' is not used after this assignment. Consider: mult := first_mult (move instead of copy)
-#@ [MOVE] Variable 'start' is not used after this assignment. Consider: first_mult := start (move instead of copy)
 #@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
-# Large parallel sieve - 1 million with 4 tasks
-# Uses Array<bool> for efficient in-place marking (98% fewer allocations than Set)
+# Mini parallel sieve - smaller scale to test the algorithm pattern
 
 thread sieve_segment(segment_idx: int, start: int, end_val: int, small_primes: [int]) -> int
-    # Preallocate boolean array for this segment
-    # is_composite[i] means (start + i) is composite
-    segment_size = end_val - start
-    is_composite: Array<bool> = Array.filled(segment_size, false)
+    # Mark composites in this segment
+    composites: Set<int> = {}
 
     idx = 0
     while idx < small_primes.len()
         p = small_primes.get(idx)
+
+        # Find first multiple of p >= start
         first_mult = 0
         if start <= p * p
             first_mult = p * p
@@ -24,74 +23,77 @@ thread sieve_segment(segment_idx: int, start: int, end_val: int, small_primes: [
                 first_mult = start + (p - remainder)
             ~
         ~
-        # Mark multiples of p as composite (in-place mutation)
+
+        # Mark all multiples of p in this segment
         mult = first_mult
         while mult < end_val
-            local_idx = mult - start
-            is_composite = is_composite.set(local_idx, true)
+            composites = composites.add(mult)
             mult = mult + p
         ~
+
         idx = idx + 1
     ~
 
-    # Count primes in segment
+    # Count primes in this segment
     prime_count = 0
-    num = 0
-    if start < 2
-        num = 2 - start
+    num = start
+    if num < 2
+        num = 2
     ~
-    while num < segment_size
-        if not is_composite.get(num)
+    while num < end_val
+        if not composites.has(num)
             prime_count = prime_count + 1
         ~
         num = num + 1
     ~
+
     return prime_count
 ~
 
 func find_small_primes(limit: int) -> [int]
-    # Preallocate boolean array: is_composite[i] = true means i is composite
-    is_composite: Array<bool> = Array.filled(limit + 1, false)
+    composites: Set<int> = {}
 
-    # Mark composites using sieve algorithm
     i = 2
     while i * i <= limit
-        if not is_composite.get(i)
+        if not composites.has(i)
             j = i * i
             while j <= limit
-                is_composite = is_composite.set(j, true)
+                composites = composites.add(j)
                 j = j + i
             ~
         ~
         i = i + 1
     ~
 
-    # Collect primes
     primes: [int] = []
     k = 2
     while k <= limit
-        if not is_composite.get(k)
+        if not composites.has(k)
             primes = primes.append(k)
         ~
         k = k + 1
     ~
+
     return primes
 ~
 
-func main(args:[string]) -> int
-    print("=== Large Parallel Sieve Test (Array-based) ===")
-    print("Finding primes up to 100,000,000 using 8 parallel tasks")
+func main() -> int
+    print("=== Mini Parallel Sieve Test ===")
+    print("Finding primes up to 100,000 using 4 parallel tasks")
     print("")
 
-    const LIMIT = 100000000
-    const NUM_TASKS = 8
-    const SQRT_LIMIT = 1000
+    const LIMIT = 100000
+    const NUM_TASKS = 4
+    const SQRT_LIMIT = 316
     const SEGMENT_SIZE = LIMIT / NUM_TASKS
 
     print("Step 1: Finding small primes...")
     small_primes = find_small_primes(SQRT_LIMIT)
     print("  Found small primes: ")
     print(small_primes.len())
+
+    print("")
+    print("Initial GC stats:")
     gc_dump_stats()
     print("")
 
@@ -113,7 +115,7 @@ func main(args:[string]) -> int
     print("Total primes found: ")
     print(total_primes)
     print("")
-    print("Expected: 78498")
+    print("Expected: 9592")
     print("")
 
     print("Final GC stats:")

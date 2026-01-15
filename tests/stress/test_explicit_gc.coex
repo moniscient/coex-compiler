@@ -1,0 +1,58 @@
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Test explicit GC to verify it works
+
+thread create_garbage(n: int) -> int
+    count = 0
+    i = 0
+    while i < n
+        garbage: Set<int> = {}
+        j = 0
+        while j < 10
+            garbage = garbage.add(j)
+            j = j + 1
+        ~
+        count = count + 1
+        i = i + 1
+    ~
+    return count
+~
+
+func main() -> int
+    print("=== Explicit GC Test ===")
+    print("")
+
+    print("Before any work:")
+    gc_dump_stats()
+    print("")
+
+    print("Creating task indices...")
+    task_indices: [int] = []
+    for i in 0..4
+        task_indices = task_indices.append(i)
+    ~
+
+    print("Spawning 4 parallel tasks...")
+    results = for idx in task_indices create_garbage(1000) ~
+
+    print("All tasks completed!")
+    print("")
+
+    print("After tasks (before GC):")
+    gc_dump_stats()
+    print("")
+
+    print("Running explicit GC...")
+    gc()
+
+    print("After first GC:")
+    gc_dump_stats()
+    print("")
+
+    print("Running second GC (for retired handles)...")
+    gc()
+
+    print("After second GC:")
+    gc_dump_stats()
+
+    return 0
+~

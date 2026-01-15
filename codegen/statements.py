@@ -1051,8 +1051,8 @@ class StatementGenerator:
             ret_val = cg._cast_value(ret_val, ret_type)
 
             # Join nursery tasks before return (structured concurrency guarantee)
-            if cg._task is not None and cg._task.has_active_nursery():
-                cg._task.join_nursery(cg.builder)
+            if cg._thread is not None and cg._thread.has_active_nursery():
+                cg._thread.join_nursery(cg.builder)
 
             # Promote escaping values before arena pop (Phase 6)
             # If returning a pointer and we have an arena, the value might be arena-allocated
@@ -1073,8 +1073,8 @@ class StatementGenerator:
             cg.builder.ret(ret_val)
         else:
             # Join nursery tasks before return (structured concurrency guarantee)
-            if cg._task is not None and cg._task.has_active_nursery():
-                cg._task.join_nursery(cg.builder)
+            if cg._thread is not None and cg._thread.has_active_nursery():
+                cg._thread.join_nursery(cg.builder)
 
             # Pop arena before GC frame (Phase 6)
             if getattr(cg, 'arena_start', None) is not None and cg.gc is not None:

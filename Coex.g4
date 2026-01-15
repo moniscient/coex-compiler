@@ -6,7 +6,7 @@
  * Version: 1.0
  * 
  * This grammar implements the complete Coex language including:
- * - Three function kinds: formula, task, func
+ * - Four function kinds: formula, thread, func, extern
  * - Structured concurrency with channels and atomics
  * - Cellular automata (matrices) with parallel cell updates
  * - Static polymorphism through traits
@@ -73,7 +73,7 @@ functionDecl
 
 functionKind
     : FORMULA
-    | TASK
+    | THREAD
     | FUNC
     | EXTERN
     ;
@@ -678,8 +678,9 @@ typeList
 
 // Function kinds
 FORMULA     : 'formula' ;
-TASK        : 'task' ;
+THREAD      : 'thread' ;
 FUNC        : 'func' ;
+TASK        : 'task' ;    // Reserved for future coroutine system
 
 // Type definitions
 TYPE        : 'type' ;

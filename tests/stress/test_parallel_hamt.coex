@@ -1,0 +1,50 @@
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Small parallel HAMT test to diagnose parallel GC issues
+
+thread build_set(n: int) -> int
+    s: Set<int> = {}
+    i = 0
+    while i < n
+        s = s.add(i)
+        i = i + 1
+    ~
+    return s.len()
+~
+
+func main() -> int
+    print("=== Parallel HAMT Test ===")
+    print("")
+
+    print("Before parallel tasks:")
+    gc_dump_stats()
+    print("")
+
+    # Create 4 tasks that each build a set of 100 elements
+    print("Spawning 4 parallel tasks (each builds a Set with 100 elements)...")
+    task_indices: [int] = []
+    for i in 0..4
+        task_indices = task_indices.append(i)
+    ~
+
+    results = for idx in task_indices build_set(100) ~
+
+    print("Tasks completed!")
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    print("Total elements: ")
+    print(total)
+    print("")
+
+    print("After parallel tasks:")
+    gc_dump_stats()
+
+    gc()
+
+    print("")
+    print("After explicit GC:")
+    gc_dump_stats()
+
+    return 0
+~

@@ -443,8 +443,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -579,8 +579,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -694,8 +694,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -779,8 +779,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -872,8 +872,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -965,8 +965,8 @@ class LoopGenerator:
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
         # Task's inject_safepoint also calls gc_safepoint, so we only need
         # to call it directly if not in a task context
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -1049,8 +1049,8 @@ class LoopGenerator:
         next_idx = cg.builder.add(current_idx, ir.Constant(ir.IntType(64), 1))
         cg.builder.store(next_idx, index_var)
         # Inject safepoint at loop back-edge for GC watermark acknowledgment
-        if cg._task is not None:
-            cg._task.inject_safepoint(cg.builder, exit_block)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, exit_block)
         else:
             cg.builder.call(cg.gc.gc_safepoint, [])
         cg.builder.branch(cond_block)
@@ -1068,14 +1068,14 @@ class LoopGenerator:
         When the body expression is a task call, this generates parallel
         execution: spawn all tasks, join all, collect results in order.
 
-        For non-task expressions, generates sequential map operation.
+        For non-thread expressions, generates sequential map operation.
         """
         cg = self.cg
 
-        # Check if body is a task call
-        is_task_call = self._is_task_call(stmt.body_expr)
+        # Check if body is a thread call
+        is_thread_call = self._is_thread_call(stmt.body_expr)
 
-        if is_task_call and cg._task is not None:
+        if is_thread_call and cg._thread is not None:
             result = self._generate_parallel_for_assign(stmt)
         else:
             result = self._generate_sequential_for_assign(stmt)
@@ -1088,14 +1088,14 @@ class LoopGenerator:
             cg.locals[stmt.target] = var_ptr
             cg.builder.store(result, var_ptr)
 
-    def _is_task_call(self, expr: Expr) -> bool:
-        """Check if expression is a call to a task function."""
+    def _is_thread_call(self, expr: Expr) -> bool:
+        """Check if expression is a call to a thread function."""
         cg = self.cg
         if isinstance(expr, CallExpr):
             if isinstance(expr.callee, Identifier):
                 name = expr.callee.name
                 if name in cg.func_decls:
-                    return cg.func_decls[name].kind == FunctionKind.TASK
+                    return cg.func_decls[name].kind == FunctionKind.THREAD
         return False
 
     def _generate_sequential_for_assign(self, stmt: ForAssignStmt) -> ir.Value:
@@ -1192,7 +1192,7 @@ class LoopGenerator:
         7. Return result list
         """
         cg = self.cg
-        task_gen = cg._task
+        task_gen = cg._thread
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
@@ -1427,13 +1427,13 @@ class LoopGenerator:
         6. Free all closures
         """
         cg = self.cg
-        task_gen = cg._task
+        task_gen = cg._thread
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
         # Verify body is a task call
-        if not self._is_task_call(stmt.body_expr):
+        if not self._is_thread_call(stmt.body_expr):
             cg._emit_warning(
                 "WARN",
                 "'first' requires a task call in body, falling back to sequential"
@@ -1752,7 +1752,7 @@ class LoopGenerator:
 
         # Check if body is a task call first
         call_expr = stmt.body_expr
-        if not self._is_task_call(call_expr):
+        if not self._is_thread_call(call_expr):
             # Fallback to sequential for non-task calls - use for-collection
             for_assign = ForAssignStmt(
                 target="_most_temp",
@@ -1783,7 +1783,7 @@ class LoopGenerator:
             return
 
         # Get task_gen now that we know it's a task call
-        task_gen = cg._task
+        task_gen = cg._thread
 
         # Extract task info
         task_name = call_expr.callee.name

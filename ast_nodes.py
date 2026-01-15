@@ -16,9 +16,10 @@ from enum import Enum, auto
 
 class FunctionKind(Enum):
     FORMULA = auto()
-    TASK = auto()
+    THREAD = auto()  # OS-level concurrency (pthreads)
     FUNC = auto()
     EXTERN = auto()  # FFI to C functions
+    # TASK is reserved for future coroutine system
 
 
 class BinaryOp(Enum):

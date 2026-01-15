@@ -108,15 +108,15 @@ func main() -> int
 ''', "16\n")
 
 
-class TestTaskKind:
-    """Tests for task (concurrent) functions.
+class TestThreadKind:
+    """Tests for thread (concurrent) functions.
     
     Note: Tasks currently execute sequentially, but syntax should work.
     """
     
     def test_simple_task(self, expect_output):
         expect_output('''
-task work(n: int) -> int
+thread work(n: int) -> int
     sum: int = 0
     for i in range(0, n)
         sum += i
@@ -132,7 +132,7 @@ func main() -> int
     
     def test_task_with_func(self, expect_output):
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -278,7 +278,7 @@ formula compute(x: int) -> int
     return x * x
 ~
 
-task worker(n: int) -> int
+thread worker(n: int) -> int
     sum: int = 0
     for i in range(1, n)
         sum += compute(i)
@@ -343,7 +343,7 @@ func main() -> int
     def test_var_in_task_allowed(self, expect_output):
         """declarations should be allowed in task."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     total: int = 0
     total = x * 2
     return total

@@ -160,8 +160,8 @@ class ASTBuilder:
         kind_text = kind_ctx.getText()
         if kind_text == "formula":
             kind = FunctionKind.FORMULA
-        elif kind_text == "task":
-            kind = FunctionKind.TASK
+        elif kind_text == "thread":
+            kind = FunctionKind.THREAD
         elif kind_text == "extern":
             kind = FunctionKind.EXTERN
         else:
@@ -287,8 +287,8 @@ class ASTBuilder:
         kind_text = kind_ctx.getText()
         if kind_text == "formula":
             kind = FunctionKind.FORMULA
-        elif kind_text == "task":
-            kind = FunctionKind.TASK
+        elif kind_text == "thread":
+            kind = FunctionKind.THREAD
         else:
             kind = FunctionKind.FUNC
         
@@ -336,7 +336,7 @@ class ASTBuilder:
         """Visit a trait method signature"""
         kind_ctx = ctx.functionKind()
         kind_text = kind_ctx.getText() if kind_ctx else "func"
-        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK}.get(kind_text, FunctionKind.FUNC)
+        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
         
         name = ctx.IDENTIFIER().getText()
         params = []
@@ -475,7 +475,7 @@ class ASTBuilder:
     def visit_function_type(self, ctx: CoexParser.FunctionTypeContext) -> FunctionType:
         """Visit a function type: formula(int, int) -> int"""
         kind_text = ctx.functionKind().getText() if ctx.functionKind() else "func"
-        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK}.get(kind_text, FunctionKind.FUNC)
+        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
         
         param_types = []
         if ctx.typeList():
@@ -1323,7 +1323,7 @@ class ASTBuilder:
     def visit_lambda_expr(self, ctx: CoexParser.LambdaExprContext) -> LambdaExpr:
         """Visit a lambda expression"""
         kind_text = ctx.functionKind().getText() if ctx.functionKind() else "formula"
-        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK}.get(kind_text, FunctionKind.FORMULA)
+        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FORMULA)
         
         params = []
         if ctx.parameterList():

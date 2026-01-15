@@ -1,0 +1,45 @@
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Simple task test to verify GC watermark protocol
+# Tests with fewer tasks to isolate the issue
+
+thread compute_sum(n: int) -> int
+    sum = 0
+    i = 0
+    while i < n
+        sum = sum + i
+        i = i + 1
+    ~
+    return sum
+~
+
+func main() -> int
+    print("=== Simple Task GC Test ===")
+    print("")
+
+    print("Creating task indices...")
+    task_indices: [int] = []
+    for i in 0..4
+        task_indices = task_indices.append(i)
+    ~
+
+    print("Spawning 4 parallel tasks (each computes sum 0..10000)...")
+    results = for idx in task_indices compute_sum(10000) ~
+
+    print("All tasks completed!")
+    print("Results count: ")
+    print(results.len())
+
+    total = 0
+    for r in results
+        total = total + r
+    ~
+
+    print("Total sum: ")
+    print(total)
+
+    print("")
+    print("=== GC Statistics ===")
+    gc_dump_stats()
+
+    return 0
+~

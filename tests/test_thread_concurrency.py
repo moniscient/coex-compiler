@@ -1,22 +1,22 @@
 """
-Tests for task concurrency.
+Tests for thread concurrency.
 
 These tests verify that:
-1. Tasks execute on actual OS threads
-2. Tasks can run concurrently
-3. Task results are correctly returned
-4. Multiple tasks work correctly
+1. Threads execute on actual OS threads
+2. Threads can run concurrently
+3. Thread results are correctly returned
+4. Multiple threads work correctly
 """
 import pytest
 
 
-class TestTaskConcurrency:
-    """Tests for task concurrent execution."""
+class TestThreadConcurrency:
+    """Tests for thread concurrent execution."""
 
     def test_simple_task_returns_result(self, expect_output):
-        """Test that a simple task returns its result."""
+        """Test that a simple thread returns its result."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -27,10 +27,10 @@ func main() -> int
 ~
 ''', "42\n")
 
-    def test_task_with_multiple_params(self, expect_output):
-        """Test task with multiple parameters."""
+    def test_thread_with_multiple_params(self, expect_output):
+        """Test thread with multiple parameters."""
         expect_output('''
-task add(a: int, b: int) -> int
+thread add(a: int, b: int) -> int
     return a + b
 ~
 
@@ -41,14 +41,14 @@ func main() -> int
 ~
 ''', "42\n")
 
-    def test_task_calling_func(self, expect_output):
-        """Test task that calls a regular function."""
+    def test_thread_calling_func(self, expect_output):
+        """Test thread that calls a regular function."""
         expect_output('''
 func helper(x: int) -> int
     return x + 10
 ~
 
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return helper(x)
 ~
 
@@ -62,7 +62,7 @@ func main() -> int
     def test_multiple_task_calls(self, expect_output):
         """Test calling multiple tasks sequentially."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -75,10 +75,10 @@ func main() -> int
 ~
 ''', "36\n")
 
-    def test_task_with_loop(self, expect_output):
-        """Test task with internal loop."""
+    def test_thread_with_loop(self, expect_output):
+        """Test thread with internal loop."""
         expect_output('''
-task sum_to(n: int) -> int
+thread sum_to(n: int) -> int
     total = 0
     i = 1
     while i <= n
@@ -95,10 +95,10 @@ func main() -> int
 ~
 ''', "55\n")
 
-    def test_task_no_params(self, expect_output):
-        """Test task with no parameters."""
+    def test_thread_no_params(self, expect_output):
+        """Test thread with no parameters."""
         expect_output('''
-task get_answer() -> int
+thread get_answer() -> int
     return 42
 ~
 
@@ -110,13 +110,13 @@ func main() -> int
 ''', "42\n")
 
     def test_nested_task_calls(self, expect_output):
-        """Test task calling another task."""
+        """Test thread calling another task."""
         expect_output('''
-task inner(x: int) -> int
+thread inner(x: int) -> int
     return x + 1
 ~
 
-task outer(x: int) -> int
+thread outer(x: int) -> int
     return inner(x) * 2
 ~
 
@@ -127,10 +127,10 @@ func main() -> int
 ~
 ''', "42\n")
 
-    def test_task_with_conditional(self, expect_output):
-        """Test task with conditional logic."""
+    def test_thread_with_conditional(self, expect_output):
+        """Test thread with conditional logic."""
         expect_output('''
-task abs_val(x: int) -> int
+thread abs_val(x: int) -> int
     if x < 0
         return 0 - x
     else
@@ -147,10 +147,10 @@ func main() -> int
 ~
 ''', "42\n42\n")
 
-    def test_task_result_in_expression(self, expect_output):
-        """Test using task result directly in expression."""
+    def test_thread_result_in_expression(self, expect_output):
+        """Test using thread result directly in expression."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -166,9 +166,9 @@ class TestTaskWarnings:
     """Tests for task-related compiler warnings."""
 
     def test_single_task_assignment_warning(self, compile_coex):
-        """Test that single task assignment emits a warning."""
+        """Test that single thread assignment emits a warning."""
         result = compile_coex('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -181,14 +181,14 @@ func main() -> int
         # Verify compilation succeeded and output is correct
         assert result.compile_success
         assert result.run_output == "42\n"
-        # Verify warning is emitted for single task assignment
+        # Verify warning is emitted for single thread assignment
         assert "WARN" in result.compile_output
         assert "executes sequentially" in result.compile_output
 
     def test_multiple_task_calls_multiple_warnings(self, compile_coex):
-        """Test that each task call emits its own warning."""
+        """Test that each thread call emits its own warning."""
         result = compile_coex('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -201,7 +201,7 @@ func main() -> int
 ''')
         assert result.compile_success
         assert result.run_output == "30\n"
-        # Should have multiple warnings (one per task call)
+        # Should have multiple warnings (one per thread call)
         warn_count = result.compile_output.count("WARN")
         assert warn_count >= 2, f"Expected at least 2 warnings, got {warn_count}"
 
@@ -212,7 +212,7 @@ class TestForCollectionBlock:
     def test_parallel_map_simple(self, expect_output):
         """Test basic parallel map: results = for x in items compute(x) ~"""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -231,7 +231,7 @@ func main() -> int
     def test_parallel_map_order_preserved(self, expect_output):
         """Test that results maintain iteration order."""
         expect_output('''
-task identity(x: int) -> int
+thread identity(x: int) -> int
     return x
 ~
 
@@ -248,7 +248,7 @@ func main() -> int
     def test_parallel_map_with_computation(self, expect_output):
         """Test parallel map with actual computation in task."""
         expect_output('''
-task compute(n: int) -> int
+thread compute(n: int) -> int
     sum = 0
     i = 1
     while i <= n
@@ -274,7 +274,7 @@ func main() -> int
     def test_parallel_map_empty_list(self, expect_output):
         """Test parallel map with empty input list."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -289,7 +289,7 @@ func main() -> int
     def test_parallel_map_single_element(self, expect_output):
         """Test parallel map with single element."""
         expect_output('''
-task triple(x: int) -> int
+thread triple(x: int) -> int
     return x * 3
 ~
 
@@ -304,7 +304,7 @@ func main() -> int
     def test_parallel_map_no_warning(self, compile_coex):
         """Test that for-collection does not emit sequential warning."""
         result = compile_coex('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -327,7 +327,7 @@ class TestFirstCollectionSyntax:
     def test_first_syntax_parses(self, expect_output):
         """Test that first syntax parses and executes."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -342,7 +342,7 @@ func main() -> int
     def test_first_single_item(self, expect_output):
         """Test first with single item."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -357,7 +357,7 @@ func main() -> int
     def test_first_larger_collection(self, expect_output):
         """Test first with larger collection - first result wins."""
         expect_output('''
-task identity(x: int) -> int
+thread identity(x: int) -> int
     return x
 ~
 
@@ -372,7 +372,7 @@ func main() -> int
     def test_first_no_sequential_warning(self, compile_coex):
         """Test that first collection does not emit sequential warning."""
         result = compile_coex('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -390,7 +390,7 @@ func main() -> int
     def test_first_empty_list_returns_zero(self, expect_output):
         """Test first with empty list returns 0 (no tasks to race)."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -409,7 +409,7 @@ class TestMostCollectionSyntax:
     def test_most_syntax_parses(self, expect_output):
         """Test that most syntax parses and executes."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -425,7 +425,7 @@ func main() -> int
     def test_most_empty_list(self, expect_output):
         """Test most with empty input."""
         expect_output('''
-task compute(x: int) -> int
+thread compute(x: int) -> int
     return x * 2
 ~
 
@@ -441,7 +441,7 @@ func main() -> int
     def test_most_larger_collection(self, expect_output):
         """Test most with larger collection - all succeed."""
         expect_output('''
-task double(x: int) -> int
+thread double(x: int) -> int
     return x * 2
 ~
 
@@ -461,7 +461,7 @@ func main() -> int
     def test_most_single_item(self, expect_output):
         """Test most with single item."""
         expect_output('''
-task triple(x: int) -> int
+thread triple(x: int) -> int
     return x * 3
 ~
 
@@ -479,7 +479,7 @@ class TestCancellationSafepoints:
     """Tests for cancellation safepoint behavior (Phase 9).
 
     Safepoints are injected at loop back-edges to allow tasks to respond
-    to cancellation requests. When a task is cancelled (e.g., by losing
+    to cancellation requests. When a thread is cancelled (e.g., by losing
     a 'first' race), it should exit promptly at the next safepoint rather
     than running to completion.
     """
@@ -487,12 +487,12 @@ class TestCancellationSafepoints:
     def test_first_with_loop_tasks(self, compile_coex):
         """Test that first works correctly when tasks have loops.
 
-        This implicitly tests safepoints - the winning task completes,
+        This implicitly tests safepoints - the winning thread completes,
         losing tasks get cancelled, and they exit at their loop safepoints.
         The result is one of the valid outcomes (race-dependent).
         """
         result = compile_coex('''
-task compute_sum(n: int) -> int
+thread compute_sum(n: int) -> int
     total = 0
     i = 0
     while i < n
@@ -515,10 +515,10 @@ func main() -> int
         valid_results = ["10\n", "3\n", "45\n"]
         assert result.run_output in valid_results, f"Got {result.run_output!r}, expected one of {valid_results}"
 
-    def test_task_with_while_loop(self, expect_output):
-        """Test task with while loop has safepoints injected."""
+    def test_thread_with_while_loop(self, expect_output):
+        """Test thread with while loop has safepoints injected."""
         expect_output('''
-task count_to(n: int) -> int
+thread count_to(n: int) -> int
     count = 0
     while count < n
         count = count + 1
@@ -533,10 +533,10 @@ func main() -> int
 ~
 ''', "100\n")
 
-    def test_task_with_for_loop(self, expect_output):
-        """Test task with for loop has safepoints injected."""
+    def test_thread_with_for_loop(self, expect_output):
+        """Test thread with for loop has safepoints injected."""
         expect_output('''
-task sum_range(n: int) -> int
+thread sum_range(n: int) -> int
     total = 0
     for i in range(n)
         total = total + i
@@ -551,10 +551,10 @@ func main() -> int
 ~
 ''', "45\n")
 
-    def test_task_with_list_iteration(self, expect_output):
-        """Test task iterating over list has safepoints."""
+    def test_thread_with_list_iteration(self, expect_output):
+        """Test thread iterating over list has safepoints."""
         expect_output('''
-task sum_list(items: [int]) -> int
+thread sum_list(items: [int]) -> int
     total = 0
     for item in items
         total = total + item

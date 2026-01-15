@@ -129,9 +129,9 @@ class FunctionGenerator:
                     f"'{cg.current_function.name}'. Extern functions can only "
                     f"be called from func."
                 )
-            elif caller_kind == FunctionKind.TASK:
+            elif caller_kind == FunctionKind.THREAD:
                 raise RuntimeError(
-                    f"Cannot call extern function '{name}' from task "
+                    f"Cannot call extern function '{name}' from thread "
                     f"'{cg.current_function.name}'. Extern functions can only "
                     f"be called from func."
                 )
@@ -392,8 +392,8 @@ class FunctionGenerator:
         cg.current_function = func
 
         # Reset task nursery state for new function
-        if cg._task is not None:
-            cg._task.reset_for_function()
+        if cg._thread is not None:
+            cg._thread.reset_for_function()
 
         # ====================================================================
         # GC Shadow Stack Integration
@@ -442,8 +442,8 @@ class FunctionGenerator:
         # ====================================================================
         # Initialize nursery for bare task calls if this function might spawn tasks
         # The nursery tracks thread handles and closures for join-at-exit
-        if cg._task is not None:
-            cg._task.init_nursery(cg.builder, max_tasks=64)
+        if cg._thread is not None:
+            cg._thread.init_nursery(cg.builder, max_tasks=64)
         # ====================================================================
 
         # GC Safe-point check: trigger GC if allocation threshold exceeded
@@ -495,8 +495,8 @@ class FunctionGenerator:
         # Add implicit return if needed
         if not cg.builder.block.is_terminated:
             # Join nursery tasks before return (structured concurrency guarantee)
-            if cg._task is not None and cg._task.has_active_nursery():
-                cg._task.join_nursery(cg.builder)
+            if cg._thread is not None and cg._thread.has_active_nursery():
+                cg._thread.join_nursery(cg.builder)
 
             # Pop arena before GC frame (Phase 6)
             if cg.arena_start is not None and cg.gc is not None:
@@ -583,8 +583,8 @@ class FunctionGenerator:
         cg.current_function = func_decl
 
         # Reset task nursery state for new function
-        if cg._task is not None:
-            cg._task.reset_for_function()
+        if cg._thread is not None:
+            cg._thread.reset_for_function()
 
         # Save and initialize GC state for this monomorphized function
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
@@ -954,8 +954,8 @@ class FunctionGenerator:
         cg.current_type = type_name
 
         # Reset task nursery state for new method
-        if cg._task is not None:
-            cg._task.reset_for_function()
+        if cg._thread is not None:
+            cg._thread.reset_for_function()
 
         # Initialize GC state for this method
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed

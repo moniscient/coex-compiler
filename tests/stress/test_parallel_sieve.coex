@@ -1,0 +1,186 @@
+#@ [MOVE] Variable 'LIMIT' is not used after this assignment. Consider: end_val := LIMIT (move instead of copy)
+#@ [MOVE] Variable 'start' is not used after this assignment. Consider: num := start (move instead of copy)
+#@ [MOVE] Variable 'first_mult' is not used after this assignment. Consider: mult := first_mult (move instead of copy)
+#@ [MOVE] Variable 'total_limit' is not used after this assignment. Consider: end_val := total_limit (move instead of copy)
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Parallel Sieve of Eratosthenes Stress Test
+# Uses 24 parallel tasks to find primes up to 100 million
+#
+# Strategy:
+# 1. Sequentially find small primes up to sqrt(100_000_000) ~ 10,000
+# 2. Partition the range [2, 100_000_000] into 24 segments
+# 3. Each task sieves one segment using the small primes
+# 4. Combine results
+#
+# This tests:
+# - Spawning 24 concurrent OS threads
+# - Passing large lists to tasks (small primes list)
+# - Returning large lists from tasks (primes in each segment)
+# - Memory pressure from parallel allocations
+# - GC behavior under concurrent load
+
+# Sequential sieve for small primes (up to sqrt(LIMIT))
+# These primes are used by all parallel tasks
+func find_small_primes(limit: int) -> [int]
+    # Use Set to track composites (more efficient than boolean array)
+    composites: Set<int> = {}
+
+    i = 2
+    while i * i <= limit
+        if not composites.has(i)
+            # i is prime, mark multiples as composite
+            j = i * i
+            while j <= limit
+                composites = composites.add(j)
+                j = j + i
+            ~
+        ~
+        i = i + 1
+    ~
+
+    # Collect primes
+    primes: [int] = []
+    k = 2
+    while k <= limit
+        if not composites.has(k)
+            primes = primes.append(k)
+        ~
+        k = k + 1
+    ~
+
+    return primes
+~
+
+# Task that sieves a segment [start, end) using provided small primes
+# Returns count of primes found in this segment (to avoid huge return lists)
+thread sieve_segment(segment_idx: int, segment_size: int, total_limit: int, small_primes: [int]) -> int
+    start = segment_idx * segment_size
+    end_val = start + segment_size
+    if end_val > total_limit
+        end_val = total_limit
+    ~
+
+    # For this segment, check each number against small primes
+    # Use Set to track composites in this segment
+    composites: Set<int> = {}
+
+    # Mark composites using each small prime
+    idx = 0
+    while idx < small_primes.len()
+        p = small_primes.get(idx)
+
+        # Find first multiple of p >= start
+        first_mult = ((start + p - 1) / p) * p
+        if first_mult < p * 2
+            first_mult = p * 2
+        ~
+        if first_mult < start
+            first_mult = first_mult + p
+        ~
+
+        # Mark all multiples of p in this segment
+        mult = first_mult
+        while mult < end_val
+            composites = composites.add(mult)
+            mult = mult + p
+        ~
+
+        idx = idx + 1
+    ~
+
+    # Count primes in this segment
+    prime_count = 0
+    num = start
+    if num < 2
+        num = 2
+    ~
+    while num < end_val
+        if not composites.has(num)
+            prime_count = prime_count + 1
+        ~
+        num = num + 1
+    ~
+
+    return prime_count
+~
+
+func main() -> int
+    print("=== Parallel Sieve of Eratosthenes Stress Test ===")
+    print("Finding primes up to 100,000,000 using 24 parallel tasks")
+    print("")
+
+    const LIMIT = 100000000
+    const NUM_TASKS = 24
+    const SQRT_LIMIT = 10000
+    const SEGMENT_SIZE = LIMIT / NUM_TASKS
+
+    # Step 1: Find small primes sequentially
+    print("Step 1: Finding small primes up to 10,000...")
+    small_primes = find_small_primes(SQRT_LIMIT)
+    print("  Found small primes: ")
+    print(small_primes.len())
+    print("")
+
+    # Step 2: Create task indices
+    print("Step 2: Preparing 24 parallel segments...")
+    task_indices: [int] = []
+    for i in 0..NUM_TASKS
+        task_indices = task_indices.append(i)
+    ~
+
+    # Show segment info
+    for i in 0..NUM_TASKS
+        start = i * SEGMENT_SIZE
+        end_val = start + SEGMENT_SIZE
+        if end_val > LIMIT
+            end_val = LIMIT
+        ~
+        print("  Segment ")
+        print(i)
+        print(": [")
+        print(start)
+        print(", ")
+        print(end_val)
+        print(")")
+    ~
+    print("")
+
+    # Step 3: Spawn 24 parallel tasks using for collection
+    print("Step 3: Spawning 24 parallel sieve tasks...")
+
+    segment_counts = for idx in task_indices sieve_segment(idx, SEGMENT_SIZE, LIMIT, small_primes) ~
+
+    print("  All tasks completed!")
+    print("")
+
+    # Step 4: Sum up results
+    print("Step 4: Analyzing results...")
+    total_count = 0
+    for count in segment_counts
+        total_count = total_count + count
+    ~
+
+    print("  Total primes found: ")
+    print(total_count)
+    print("")
+
+    # Verification: There are exactly 5,761,455 primes below 100,000,000
+    # (This is the prime counting function pi(10^8))
+    const EXPECTED_COUNT = 5761455
+
+    if total_count == EXPECTED_COUNT
+        print("SUCCESS: Prime count matches expected value!")
+    else
+        print("MISMATCH: Expected ")
+        print(EXPECTED_COUNT)
+        print(" but found ")
+        print(total_count)
+    ~
+
+    # Memory stats
+    print("")
+    print("=== GC Statistics ===")
+    gc_dump_stats()
+
+    return 0
+~

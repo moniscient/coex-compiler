@@ -1,0 +1,56 @@
+#@ [PERF] Loop modifies 'task_indices' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Task test that forces GC to trigger within tasks
+
+thread create_garbage(n: int) -> int
+    # Create lots of garbage to trigger GC
+    count = 0
+    i = 0
+    while i < n
+        # Create a set that becomes garbage immediately
+        garbage: Set<int> = {}
+        j = 0
+        while j < 10
+            garbage = garbage.add(j)
+            j = j + 1
+        ~
+        count = count + 1
+        i = i + 1
+    ~
+    return count
+~
+
+func main() -> int
+    print("=== Task GC Trigger Test ===")
+    print("")
+
+    print("Initial GC stats:")
+    gc_dump_stats()
+    print("")
+
+    print("Creating task indices...")
+    task_indices: [int] = []
+    for i in 0..4
+        task_indices = task_indices.append(i)
+    ~
+
+    print("Spawning 4 parallel tasks (each creates 1000 garbage sets)...")
+    results = for idx in task_indices create_garbage(1000) ~
+
+    print("All tasks completed!")
+    print("Results count: ")
+    print(results.len())
+
+    total = 0
+    for r in results
+        total = total + r
+    ~
+
+    print("Total garbage sets created: ")
+    print(total)
+
+    print("")
+    print("=== Final GC Statistics ===")
+    gc_dump_stats()
+
+    return 0
+~
