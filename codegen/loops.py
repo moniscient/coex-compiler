@@ -18,7 +18,8 @@ from ast_nodes import (
     MethodCallExpr, BinaryExpr, UnaryExpr, TernaryExpr, IndexExpr,
     SliceExpr, ListExpr, TupleExpr, RangeExpr, LambdaExpr, MapExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, Type, ListType,
-    PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral, FunctionKind
+    PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral, FunctionKind,
+    FunctionDecl, Parameter
 )
 
 if TYPE_CHECKING:
@@ -31,6 +32,8 @@ class LoopGenerator:
     def __init__(self, cg: 'CodeGenerator'):
         """Initialize with reference to parent CodeGenerator instance."""
         self.cg = cg
+        # Counter for generating unique synthetic thread names
+        self._synthetic_thread_counter = 0
 
     # ========================================================================
     # Loop Nursery Support
@@ -1134,6 +1137,222 @@ class LoopGenerator:
                 return stmt
         return None
 
+    # ========================================================================
+    # Synthetic Thread Generation for Complex Bodies
+    # ========================================================================
+
+    def _generate_synthetic_task_for_body(
+        self,
+        body: PyList[Stmt],
+        pattern,
+        iterable: Expr,
+        prefix: str = "first"
+    ) -> CallExpr:
+        """Generate a synthetic task function for a complex first/most body.
+
+        When a first/most body contains multiple statements or control flow
+        (if/else, etc.), we can't directly extract a single task call. Instead,
+        we generate a synthetic task function that wraps the body and call it.
+
+        This generates TASK functions (lightweight coroutines) rather than
+        THREAD functions (pthreads), enabling massive parallelism.
+
+        Args:
+            body: The list of statements in the body
+            pattern: The loop variable pattern (str or IdentifierPattern)
+            iterable: The iterable expression (to infer element type)
+            prefix: Prefix for function name ("first" or "most")
+
+        Returns:
+            A CallExpr that calls the synthetic task with the loop variable
+        """
+        cg = self.cg
+
+        # Generate unique name
+        self._synthetic_thread_counter += 1
+        func_name = f"__{prefix}_body_{self._synthetic_thread_counter}"
+
+        # Get the loop variable name
+        if isinstance(pattern, str):
+            var_name = pattern
+        elif isinstance(pattern, IdentifierPattern):
+            var_name = pattern.name
+        else:
+            var_name = "_item"
+
+        # Infer element type from iterable
+        elem_coex_type = self._infer_element_type_from_iterable(iterable)
+
+        # Infer return type from body
+        return_type = self._infer_return_type_from_body(body)
+
+        # Transform body: ensure last expression is returned
+        transformed_body = self._transform_body_for_return(body)
+
+        # Create the FunctionDecl AST node - use TASK for lightweight coroutines
+        func_decl = FunctionDecl(
+            kind=FunctionKind.TASK,
+            name=func_name,
+            type_params=[],
+            params=[Parameter(name=var_name, type_annotation=elem_coex_type)],
+            return_type=return_type,
+            body=transformed_body,
+            annotations=[]
+        )
+
+        # Store the declaration for later reference
+        cg.func_decls[func_name] = func_decl
+
+        # Declare the function (creates LLVM signature)
+        cg._functions.declare_function(func_decl)
+
+        # Generate the function body
+        # Save current function context
+        saved_function = cg.current_function
+        saved_locals = cg.locals.copy()
+        saved_builder = cg.builder
+
+        # Generate the synthetic function
+        cg._functions.generate_function(func_decl)
+
+        # Restore context
+        cg.current_function = saved_function
+        cg.locals = saved_locals
+        cg.builder = saved_builder
+
+        # Create a CallExpr to the synthetic function
+        call_expr = CallExpr(
+            callee=Identifier(name=func_name),
+            args=[Identifier(name=var_name)]
+        )
+
+        return call_expr
+
+    def _infer_element_type_from_iterable(self, iterable: Expr) -> Type:
+        """Infer the Coex element type from an iterable expression."""
+        cg = self.cg
+
+        # Handle list literals
+        if isinstance(iterable, ListExpr):
+            if iterable.elements:
+                # Infer from first element
+                first_elem = iterable.elements[0]
+                return cg._infer_type_from_expr(first_elem)
+            return PrimitiveType("int")
+
+        # Handle identifiers (variable references)
+        if isinstance(iterable, Identifier):
+            var_name = iterable.name
+            if var_name in cg.var_coex_types:
+                coex_type = cg.var_coex_types[var_name]
+                if isinstance(coex_type, ListType):
+                    return coex_type.element_type
+
+        # Handle range expressions
+        if isinstance(iterable, RangeExpr):
+            return PrimitiveType("int")
+
+        # Default to int
+        return PrimitiveType("int")
+
+    def _infer_return_type_from_body(self, body: PyList[Stmt]) -> Type:
+        """Infer the return type from a body's statements.
+
+        Looks for:
+        1. Explicit return statements
+        2. The final expression (if it's an expression statement)
+        3. Task/thread calls (uses the callee's return type)
+        """
+        cg = self.cg
+
+        # Find all expressions that could produce the return value
+        def find_return_exprs(stmts: PyList[Stmt]) -> PyList[Expr]:
+            exprs = []
+            for stmt in stmts:
+                if isinstance(stmt, ReturnStmt) and stmt.value:
+                    exprs.append(stmt.value)
+                elif isinstance(stmt, ExprStmt):
+                    exprs.append(stmt.expr)
+                elif isinstance(stmt, IfStmt):
+                    # Check both branches
+                    exprs.extend(find_return_exprs(stmt.then_body))
+                    if stmt.else_body:
+                        exprs.extend(find_return_exprs(stmt.else_body))
+            return exprs
+
+        return_exprs = find_return_exprs(body)
+
+        # Try to infer type from the expressions
+        for expr in return_exprs:
+            inferred = self._infer_type_from_expr_deep(expr)
+            if inferred:
+                return inferred
+
+        # Default to int
+        return PrimitiveType("int")
+
+    def _infer_type_from_expr_deep(self, expr: Expr) -> Optional[Type]:
+        """Infer type from an expression, handling calls specially."""
+        cg = self.cg
+
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                func_name = expr.callee.name
+                if func_name in cg.func_decls:
+                    decl = cg.func_decls[func_name]
+                    if decl.return_type:
+                        return decl.return_type
+
+        # Use the standard type inference
+        try:
+            return cg._infer_type_from_expr(expr)
+        except:
+            return None
+
+    def _transform_body_for_return(self, body: PyList[Stmt]) -> PyList[Stmt]:
+        """Transform a body to ensure it returns a value.
+
+        If the last statement is an expression statement, convert it to a return.
+        For if/else, recursively transform both branches.
+        """
+        if not body:
+            return [ReturnStmt(value=IntLiteral(value=0))]
+
+        # Copy body to avoid mutation
+        result = list(body)
+
+        # Transform the last statement
+        last = result[-1]
+
+        if isinstance(last, ExprStmt):
+            # Convert to return statement
+            result[-1] = ReturnStmt(value=last.expr)
+        elif isinstance(last, IfStmt):
+            # Transform both branches
+            new_then = self._transform_body_for_return(last.then_body)
+            # Transform else_if_clauses
+            new_else_if_clauses = []
+            for elif_cond, elif_body in (last.else_if_clauses or []):
+                new_elif_body = self._transform_body_for_return(elif_body)
+                new_else_if_clauses.append((elif_cond, new_elif_body))
+            new_else = self._transform_body_for_return(last.else_body) if last.else_body else None
+            result[-1] = IfStmt(
+                condition=last.condition,
+                then_body=new_then,
+                else_if_clauses=new_else_if_clauses,
+                else_body=new_else
+            )
+        elif isinstance(last, ReturnStmt):
+            # Already returns, no change needed
+            pass
+        elif isinstance(last, Expr):
+            # Direct expression (shouldn't happen normally)
+            result[-1] = ReturnStmt(value=last)
+        # For other statements (VarDecl, etc.), leave as-is
+        # The actual return should be handled elsewhere
+
+        return result
+
     def _generate_sequential_first(self, stmt: FirstAssignStmt, body_expr: Expr):
         """Generate sequential first: iterate until first successful result.
 
@@ -1197,6 +1416,372 @@ class LoopGenerator:
 
         # Done
         cg.builder.position_at_end(done_block)
+
+    def _generate_scheduler_first(self, stmt: FirstAssignStmt, body_expr: Expr):
+        """Generate parallel first using scheduler batch spawn APIs.
+
+        For tasks, spawns all tasks concurrently via the scheduler and returns
+        the first completed result. Uses FirstContext for race semantics.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get task call info
+        call_expr = body_expr
+        task_name = call_expr.callee.name
+
+        # Get task transformer and batch spawn APIs
+        task_xform = cg._task
+
+        # Check if task has a state machine
+        if not task_xform.has_state_machine(task_name):
+            # Fall back to sequential execution for tasks without state machines
+            self._generate_sequential_first(stmt, body_expr)
+            return
+
+        # Get step function and frame info
+        step_fn = task_xform.get_task_step_function(task_name)
+        frame_info = task_xform.get_task_frame_info(task_name)
+
+        if step_fn is None or frame_info is None:
+            self._generate_sequential_first(stmt, body_expr)
+            return
+
+        # Get iterable and its length
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        # Allocate result variable
+        if stmt.target not in cg.locals:
+            var_ptr = cg.builder.alloca(i64, name=stmt.target)
+            cg.locals[stmt.target] = var_ptr
+        result_ptr = cg.locals[stmt.target]
+        cg.builder.store(ir.Constant(i64, 0), result_ptr)  # Default value
+
+        func = cg.builder.block.function
+
+        # Check for empty iterable
+        is_empty = cg.builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        not_empty_block = func.append_basic_block("scheduler_first_not_empty")
+        done_block = func.append_basic_block("scheduler_first_done")
+
+        cg.builder.cbranch(is_empty, done_block, not_empty_block)
+
+        # Not empty: create FirstContext and spawn tasks
+        cg.builder.position_at_end(not_empty_block)
+
+        # Create FirstContext
+        first_ctx = cg.builder.call(
+            task_xform.get_first_context_create(),
+            [list_len],
+            name="first_ctx"
+        )
+
+        # Spawn loop
+        spawn_header = func.append_basic_block("first_spawn_header")
+        spawn_body = func.append_basic_block("first_spawn_body")
+        spawn_done = func.append_basic_block("first_spawn_done")
+
+        idx_alloca = cg.builder.alloca(i64, name="first_spawn_idx")
+        cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        # Spawn loop header
+        cg.builder.position_at_end(spawn_header)
+        idx = cg.builder.load(idx_alloca)
+        cond = cg.builder.icmp_signed("<", idx, list_len)
+        cg.builder.cbranch(cond, spawn_body, spawn_done)
+
+        # Spawn loop body
+        cg.builder.position_at_end(spawn_body)
+
+        # Get element and bind loop variable
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate task arguments
+        arg_values = []
+        for arg in call_expr.args:
+            arg_val = cg._generate_expression(arg)
+            arg_values.append(arg_val)
+
+        # Allocate frame for this task
+        frame_ptr = task_xform.allocate_task_frame(task_name, arg_values, cg.builder)
+
+        # Get step function pointer as i8*
+        step_fn_ptr = cg.builder.bitcast(step_fn, i8_ptr)
+
+        # Spawn task into FirstContext
+        cg.builder.call(
+            task_xform.get_first_spawn_task(),
+            [first_ctx, idx, frame_ptr, step_fn_ptr]
+        )
+
+        # Increment index
+        cg.builder.store(cg.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        # After spawning: wait for first result
+        cg.builder.position_at_end(spawn_done)
+        result = cg.builder.call(
+            task_xform.get_first_wait(),
+            [first_ctx],
+            name="first_result"
+        )
+
+        # Store result
+        cg.builder.store(result, result_ptr)
+
+        # Cleanup FirstContext
+        cg.builder.call(task_xform.get_first_context_destroy(), [first_ctx])
+
+        cg.builder.branch(done_block)
+
+        # Done
+        cg.builder.position_at_end(done_block)
+
+    def _generate_scheduler_most(self, stmt: MostAssignStmt, body_expr: Expr):
+        """Generate parallel most using scheduler batch spawn APIs.
+
+        For tasks, spawns all tasks concurrently via the scheduler and waits
+        for all to complete. Uses MostContext to collect all results.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.IntType(8).as_pointer()
+        elem_size = ir.Constant(i64, 8)
+
+        # Get task call info
+        call_expr = body_expr
+        task_name = call_expr.callee.name
+
+        # Get task transformer and batch spawn APIs
+        task_xform = cg._task
+
+        # Check if task has a state machine
+        if not task_xform.has_state_machine(task_name):
+            # Fall back to parallel for-assign for tasks without state machines
+            self._generate_most_fallback(stmt, body_expr)
+            return
+
+        # Get step function and frame info
+        step_fn = task_xform.get_task_step_function(task_name)
+        frame_info = task_xform.get_task_frame_info(task_name)
+
+        if step_fn is None or frame_info is None:
+            self._generate_most_fallback(stmt, body_expr)
+            return
+
+        # Get iterable and its length
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        # Create result and error lists
+        results_list = cg.builder.call(cg.list_new, [elem_size])
+        errors_list = cg.builder.call(cg.list_new, [elem_size])
+
+        # Allocate result variables
+        if stmt.results_target in cg.locals:
+            cg.builder.store(results_list, cg.locals[stmt.results_target])
+        else:
+            results_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.results_target)
+            cg.locals[stmt.results_target] = results_ptr
+            cg.builder.store(results_list, results_ptr)
+
+        if stmt.errors_target in cg.locals:
+            cg.builder.store(errors_list, cg.locals[stmt.errors_target])
+        else:
+            errors_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.errors_target)
+            cg.locals[stmt.errors_target] = errors_ptr
+            cg.builder.store(errors_list, errors_ptr)
+
+        func = cg.builder.block.function
+
+        # Check for empty iterable
+        is_empty = cg.builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        not_empty_block = func.append_basic_block("scheduler_most_not_empty")
+        done_block = func.append_basic_block("scheduler_most_done")
+
+        cg.builder.cbranch(is_empty, done_block, not_empty_block)
+
+        # Not empty: create MostContext and spawn tasks
+        cg.builder.position_at_end(not_empty_block)
+
+        # Create MostContext
+        most_ctx = cg.builder.call(
+            task_xform.get_most_context_create(),
+            [list_len],
+            name="most_ctx"
+        )
+
+        # Spawn loop
+        spawn_header = func.append_basic_block("most_spawn_header")
+        spawn_body = func.append_basic_block("most_spawn_body")
+        spawn_done = func.append_basic_block("most_spawn_done")
+
+        idx_alloca = cg.builder.alloca(i64, name="most_spawn_idx")
+        cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        # Spawn loop header
+        cg.builder.position_at_end(spawn_header)
+        idx = cg.builder.load(idx_alloca)
+        cond = cg.builder.icmp_signed("<", idx, list_len)
+        cg.builder.cbranch(cond, spawn_body, spawn_done)
+
+        # Spawn loop body
+        cg.builder.position_at_end(spawn_body)
+
+        # Get element and bind loop variable
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Evaluate task arguments
+        arg_values = []
+        for arg in call_expr.args:
+            arg_val = cg._generate_expression(arg)
+            arg_values.append(arg_val)
+
+        # Allocate frame for this task
+        frame_ptr = task_xform.allocate_task_frame(task_name, arg_values, cg.builder)
+
+        # Get step function pointer as i8*
+        step_fn_ptr = cg.builder.bitcast(step_fn, i8_ptr)
+
+        # Spawn task into MostContext
+        cg.builder.call(
+            task_xform.get_most_spawn_task(),
+            [most_ctx, frame_ptr, step_fn_ptr]
+        )
+
+        # Increment index
+        cg.builder.store(cg.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+        cg.builder.branch(spawn_header)
+
+        # After spawning: wait for all results
+        cg.builder.position_at_end(spawn_done)
+
+        # Allocate space for results array and count
+        results_ptr_ptr = cg.builder.alloca(i8_ptr.as_pointer(), name="results_arr_ptr")
+        results_count_ptr = cg.builder.alloca(i64, name="results_count")
+
+        cg.builder.call(
+            task_xform.get_most_wait(),
+            [most_ctx, results_ptr_ptr, results_count_ptr]
+        )
+
+        # Get results array and count
+        results_arr = cg.builder.load(results_ptr_ptr)
+        results_count = cg.builder.load(results_count_ptr)
+
+        # Copy results to list
+        copy_header = func.append_basic_block("most_copy_header")
+        copy_body = func.append_basic_block("most_copy_body")
+        copy_done = func.append_basic_block("most_copy_done")
+
+        copy_idx = cg.builder.alloca(i64, name="copy_idx")
+        cg.builder.store(ir.Constant(i64, 0), copy_idx)
+        cg.builder.branch(copy_header)
+
+        cg.builder.position_at_end(copy_header)
+        ci = cg.builder.load(copy_idx)
+        copy_cond = cg.builder.icmp_signed("<", ci, results_count)
+        cg.builder.cbranch(copy_cond, copy_body, copy_done)
+
+        cg.builder.position_at_end(copy_body)
+        # Get result value from array
+        result_arr_typed = cg.builder.bitcast(results_arr, i64.as_pointer().as_pointer())
+        result_ptr = cg.builder.gep(result_arr_typed, [ci], inbounds=True)
+        result_val = cg.builder.load(result_ptr)
+
+        # Append to results list
+        current_results_list = cg.builder.load(cg.locals[stmt.results_target])
+        new_results_list = cg.builder.call(
+            cg.list_append_i64, [current_results_list, result_val]
+        )
+        cg.builder.store(new_results_list, cg.locals[stmt.results_target])
+
+        # Increment copy index
+        cg.builder.store(cg.builder.add(ci, ir.Constant(i64, 1)), copy_idx)
+        cg.builder.branch(copy_header)
+
+        cg.builder.position_at_end(copy_done)
+
+        # Cleanup MostContext
+        cg.builder.call(task_xform.get_most_context_destroy(), [most_ctx])
+
+        cg.builder.branch(done_block)
+
+        # Done
+        cg.builder.position_at_end(done_block)
+
+    def _generate_most_fallback(self, stmt: MostAssignStmt, body_expr: Expr):
+        """Fallback for most when scheduler isn't available."""
+        cg = self.cg
+        i64 = ir.IntType(64)
+        elem_size = ir.Constant(i64, 8)
+
+        # Use for-collection fallback
+        for_assign = ForAssignStmt(
+            target="_most_temp",
+            pattern=stmt.pattern,
+            iterable=stmt.iterable,
+            body_expr=body_expr
+        )
+        result_list = self._generate_parallel_for_assign(for_assign)
+        errors_list = cg.builder.call(cg.list_new, [elem_size])
+
+        # Store results and errors
+        if stmt.results_target in cg.locals:
+            cg.builder.store(result_list, cg.locals[stmt.results_target])
+        else:
+            results_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.results_target)
+            cg.locals[stmt.results_target] = results_ptr
+            cg.builder.store(result_list, results_ptr)
+
+        if stmt.errors_target in cg.locals:
+            cg.builder.store(errors_list, cg.locals[stmt.errors_target])
+        else:
+            errors_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.errors_target)
+            cg.locals[stmt.errors_target] = errors_ptr
+            cg.builder.store(errors_list, errors_ptr)
 
     def _generate_sequential_for_assign(self, stmt: ForAssignStmt) -> ir.Value:
         """Generate sequential map: iterate and collect results in list."""
@@ -1535,26 +2120,20 @@ class LoopGenerator:
         # Extract body expression from block
         body_expr = self._extract_body_expr(stmt.body)
         if body_expr is None:
-            cg._emit_warning(
-                "WARN",
-                "'first' body must be a single expression, falling back to sequential"
+            # Complex body - generate synthetic thread function
+            body_expr = self._generate_synthetic_task_for_body(
+                stmt.body, stmt.pattern, stmt.iterable, prefix="first"
             )
-            # Create default result (0) to avoid undeclared variable error
-            if stmt.target not in cg.locals:
-                var_ptr = cg.builder.alloca(i64, name=stmt.target)
-                cg.locals[stmt.target] = var_ptr
-            cg.builder.store(ir.Constant(i64, 0), cg.locals[stmt.target])
-            return
 
         # Check if it's a task call (task or thread)
         is_task = self._is_task_call(body_expr)
         is_thread = self._is_thread_call(body_expr)
 
-        # For task calls, use sequential execution (one at a time)
-        # For thread calls, use parallel execution with pthread
+        # For task calls, use scheduler-based parallel execution
+        # For thread calls, use pthread-based parallel execution
         if is_task and not is_thread:
-            # Sequential execution for tasks - execute each and return first result
-            self._generate_sequential_first(stmt, body_expr)
+            # Parallel execution for tasks via scheduler batch spawn
+            self._generate_scheduler_first(stmt, body_expr)
             return
 
         # Verify body is a thread call for parallel execution
@@ -1876,31 +2455,27 @@ class LoopGenerator:
         # Extract body expression from block
         body_expr = self._extract_body_expr(stmt.body)
         if body_expr is None:
-            cg._emit_warning(
-                "WARN",
-                "'most' body must be a single expression, falling back to sequential"
+            # Complex body - generate synthetic thread function
+            body_expr = self._generate_synthetic_task_for_body(
+                stmt.body, stmt.pattern, stmt.iterable, prefix="most"
             )
-            # Create empty results
-            result_list = cg.builder.call(cg.list_new, [elem_size])
-            errors_list = cg.builder.call(cg.list_new, [elem_size])
-            # Store results and errors
-            if stmt.results_target in cg.locals:
-                cg.builder.store(result_list, cg.locals[stmt.results_target])
-            else:
-                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
-                cg.locals[stmt.results_target] = var_ptr
-                cg.builder.store(result_list, var_ptr)
-            if stmt.errors_target in cg.locals:
-                cg.builder.store(errors_list, cg.locals[stmt.errors_target])
-            else:
-                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
-                cg.locals[stmt.errors_target] = var_ptr
-                cg.builder.store(errors_list, var_ptr)
+
+        # Check if body is a task or thread call
+        call_expr = body_expr
+        is_task = self._is_task_call(call_expr)
+        is_thread = self._is_thread_call(call_expr)
+
+        # For task calls, use scheduler-based parallel execution
+        if is_task and not is_thread:
+            # Parallel execution for tasks via scheduler batch spawn
+            self._generate_scheduler_most(stmt, body_expr)
+
+            # Track types
+            cg.var_coex_types[stmt.results_target] = ListType(PrimitiveType("int"))
+            cg.var_coex_types[stmt.errors_target] = ListType(PrimitiveType("int"))
             return
 
-        # Check if body is a task call first
-        call_expr = body_expr
-        if not self._is_thread_call(call_expr):
+        if not is_thread:
             # Fallback to sequential for non-task calls - use for-collection
             for_assign = ForAssignStmt(
                 target="_most_temp",

@@ -58,7 +58,7 @@ thread consumer(ch: Channel<int>) -> int
     return ch.receive()
 ~
 
-task test() -> int
+func test() -> int
     ch: Channel<int> = Channel.new()
     producer(ch)
     return consumer(ch)
@@ -97,7 +97,7 @@ thread helper(ch: Channel<int>) -> void
     ch.send(2)
 ~
 
-task maybe_escape(ch: Channel<int>, escape: bool) -> void
+func maybe_escape(ch: Channel<int>, escape: bool) -> void
     if escape
         helper(ch)
     else
@@ -120,7 +120,7 @@ thread helper(ch: Channel<int>) -> void
     ch.send(2)
 ~
 
-task maybe_escape(ch: Channel<int>, escape: bool) -> void
+func maybe_escape(ch: Channel<int>, escape: bool) -> void
     if escape
         helper(ch)
     else

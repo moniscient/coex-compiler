@@ -41,10 +41,10 @@ func main() -> int
 ~
 ''', "42\n")
 
-    def test_thread_calling_func(self, expect_output):
-        """Test thread that calls a regular function."""
+    def test_thread_calling_formula(self, expect_output):
+        """Test thread that calls a formula function."""
         expect_output('''
-func helper(x: int) -> int
+formula helper(x: int) -> int
     return x + 10
 ~
 

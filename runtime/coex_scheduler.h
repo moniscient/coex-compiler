@@ -25,6 +25,11 @@
 /* Initial deque capacity (power of 2) */
 #define DEQUE_INITIAL_CAPACITY 256
 
+/* Completion type constants */
+#define COMPLETION_NORMAL 0
+#define COMPLETION_FIRST  1
+#define COMPLETION_MOST   2
+
 /* Task result kinds */
 typedef enum {
     TASK_RESULT_DONE = 0,     /* Task completed with result */
@@ -59,6 +64,11 @@ typedef struct SchedulerTask {
     pthread_cond_t* main_cond;
     int64_t* main_result;             /* Where to store result for main */
     atomic_bool* main_done;           /* Signal main thread */
+
+    /* For first/most completion */
+    void* completion_context;         /* FirstContext* or MostContext* */
+    int completion_type;              /* COMPLETION_NORMAL, COMPLETION_FIRST, COMPLETION_MOST */
+    int64_t completion_index;         /* Index for first tasks */
 } SchedulerTask;
 
 /* Chase-Lev work-stealing deque */
@@ -69,6 +79,34 @@ typedef struct {
     int64_t capacity;                 /* Current capacity */
     pthread_mutex_t resize_lock;      /* Lock for buffer resize */
 } Deque;
+
+/**
+ * Context for 'first' structured concurrency.
+ * Tracks multiple spawned tasks, returns first result.
+ */
+typedef struct FirstContext {
+    pthread_mutex_t mutex;        /* Protects result fields */
+    pthread_cond_t cond;          /* Signal main when done */
+    atomic_bool has_winner;       /* True when first task completes */
+    int64_t winner_value;         /* Result from winning task */
+    int64_t task_count;           /* Number of spawned tasks */
+    atomic_int_fast64_t completed; /* Number of tasks done/cancelled */
+    SchedulerTask** tasks;        /* Array of task pointers for cancellation */
+} FirstContext;
+
+/**
+ * Context for 'most' structured concurrency.
+ * Collects all results from spawned tasks.
+ */
+typedef struct MostContext {
+    pthread_mutex_t mutex;        /* Protects result arrays */
+    pthread_cond_t cond;          /* Signal main when all done */
+    int64_t task_count;           /* Number of spawned tasks */
+    atomic_int_fast64_t remaining; /* Tasks still running */
+    int64_t* results;             /* Array of results */
+    int64_t result_count;         /* Number of collected results */
+    int64_t capacity;             /* Capacity of results array */
+} MostContext;
 
 /* ============================================================================
  * Scheduler Lifecycle
@@ -174,6 +212,75 @@ SchedulerTask* deque_pop_bottom(Deque* dq);
  * Returns NULL if empty or contention.
  */
 SchedulerTask* deque_steal(Deque* dq);
+
+/* ============================================================================
+ * Batch Task Spawning (for first/most)
+ * ============================================================================ */
+
+/**
+ * Create a FirstContext for batch spawning with first-wins semantics.
+ *
+ * @param count    Number of tasks to spawn
+ * @return         Initialized FirstContext
+ */
+FirstContext* coex_scheduler_first_context_create(int64_t count);
+
+/**
+ * Destroy a FirstContext and free resources.
+ */
+void coex_scheduler_first_context_destroy(FirstContext* ctx);
+
+/**
+ * Add a task to a FirstContext and start it.
+ *
+ * @param ctx       The FirstContext
+ * @param index     Task index (0 to count-1)
+ * @param frame     Task frame
+ * @param step_fn   Task step function
+ */
+void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index,
+                                      void* frame, StepFunction step_fn);
+
+/**
+ * Wait for first task to complete in FirstContext.
+ *
+ * @param ctx       The FirstContext
+ * @return          Result from first completing task
+ */
+int64_t coex_scheduler_first_wait(FirstContext* ctx);
+
+/**
+ * Create a MostContext for batch spawning with all-results semantics.
+ *
+ * @param count    Number of tasks to spawn
+ * @return         Initialized MostContext
+ */
+MostContext* coex_scheduler_most_context_create(int64_t count);
+
+/**
+ * Destroy a MostContext and free resources.
+ */
+void coex_scheduler_most_context_destroy(MostContext* ctx);
+
+/**
+ * Add a task to a MostContext and start it.
+ *
+ * @param ctx       The MostContext
+ * @param frame     Task frame
+ * @param step_fn   Task step function
+ */
+void coex_scheduler_most_spawn_task(MostContext* ctx,
+                                     void* frame, StepFunction step_fn);
+
+/**
+ * Wait for all tasks to complete in MostContext.
+ *
+ * @param ctx           The MostContext
+ * @param out_results   Pointer to receive results array
+ * @param out_count     Pointer to receive result count
+ */
+void coex_scheduler_most_wait(MostContext* ctx,
+                               int64_t** out_results, int64_t* out_count);
 
 /* ============================================================================
  * Debug/Stats

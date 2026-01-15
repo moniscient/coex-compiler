@@ -56,6 +56,16 @@ class TaskTransformer:
         self._scheduler_init_fn = None
         self._scheduler_spawn_and_wait_fn = None
 
+        # Batch spawn APIs for first/most
+        self._first_context_create_fn = None
+        self._first_context_destroy_fn = None
+        self._first_spawn_task_fn = None
+        self._first_wait_fn = None
+        self._most_context_create_fn = None
+        self._most_context_destroy_fn = None
+        self._most_spawn_task_fn = None
+        self._most_wait_fn = None
+
     def register_task_function(self, name: str):
         """Register a function name as a task function."""
         self._task_function_names.add(name)
@@ -93,6 +103,109 @@ class TaskTransformer:
         """Generate call to ensure scheduler is initialized."""
         self.declare_scheduler_functions()
         builder.call(self._scheduler_init_fn, [])
+
+    def declare_first_most_functions(self):
+        """Declare scheduler batch spawn functions for first/most."""
+        cg = self.cg
+        module = cg.module
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # FirstContext* coex_scheduler_first_context_create(int64_t count)
+        if self._first_context_create_fn is None:
+            fn_type = ir.FunctionType(i8_ptr, [i64])
+            self._first_context_create_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_first_context_create"
+            )
+
+        # void coex_scheduler_first_context_destroy(FirstContext* ctx)
+        if self._first_context_destroy_fn is None:
+            fn_type = ir.FunctionType(ir.VoidType(), [i8_ptr])
+            self._first_context_destroy_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_first_context_destroy"
+            )
+
+        # void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index, void* frame, StepFunction step_fn)
+        if self._first_spawn_task_fn is None:
+            fn_type = ir.FunctionType(ir.VoidType(), [i8_ptr, i64, i8_ptr, i8_ptr])
+            self._first_spawn_task_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_first_spawn_task"
+            )
+
+        # int64_t coex_scheduler_first_wait(FirstContext* ctx)
+        if self._first_wait_fn is None:
+            fn_type = ir.FunctionType(i64, [i8_ptr])
+            self._first_wait_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_first_wait"
+            )
+
+        # MostContext* coex_scheduler_most_context_create(int64_t count)
+        if self._most_context_create_fn is None:
+            fn_type = ir.FunctionType(i8_ptr, [i64])
+            self._most_context_create_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_most_context_create"
+            )
+
+        # void coex_scheduler_most_context_destroy(MostContext* ctx)
+        if self._most_context_destroy_fn is None:
+            fn_type = ir.FunctionType(ir.VoidType(), [i8_ptr])
+            self._most_context_destroy_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_most_context_destroy"
+            )
+
+        # void coex_scheduler_most_spawn_task(MostContext* ctx, void* frame, StepFunction step_fn)
+        if self._most_spawn_task_fn is None:
+            fn_type = ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr, i8_ptr])
+            self._most_spawn_task_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_most_spawn_task"
+            )
+
+        # void coex_scheduler_most_wait(MostContext* ctx, int64_t** out_results, int64_t* out_count)
+        if self._most_wait_fn is None:
+            fn_type = ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr.as_pointer(), i64.as_pointer()])
+            self._most_wait_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_most_wait"
+            )
+
+    def get_first_context_create(self) -> ir.Function:
+        """Get first context create function."""
+        self.declare_first_most_functions()
+        return self._first_context_create_fn
+
+    def get_first_context_destroy(self) -> ir.Function:
+        """Get first context destroy function."""
+        self.declare_first_most_functions()
+        return self._first_context_destroy_fn
+
+    def get_first_spawn_task(self) -> ir.Function:
+        """Get first spawn task function."""
+        self.declare_first_most_functions()
+        return self._first_spawn_task_fn
+
+    def get_first_wait(self) -> ir.Function:
+        """Get first wait function."""
+        self.declare_first_most_functions()
+        return self._first_wait_fn
+
+    def get_most_context_create(self) -> ir.Function:
+        """Get most context create function."""
+        self.declare_first_most_functions()
+        return self._most_context_create_fn
+
+    def get_most_context_destroy(self) -> ir.Function:
+        """Get most context destroy function."""
+        self.declare_first_most_functions()
+        return self._most_context_destroy_fn
+
+    def get_most_spawn_task(self) -> ir.Function:
+        """Get most spawn task function."""
+        self.declare_first_most_functions()
+        return self._most_spawn_task_fn
+
+    def get_most_wait(self) -> ir.Function:
+        """Get most wait function."""
+        self.declare_first_most_functions()
+        return self._most_wait_fn
 
     # ========================================================================
     # Frame Type Generation
@@ -553,6 +666,82 @@ class TaskTransformer:
     def is_task_function(self, name: str) -> bool:
         """Check if a function name refers to a task."""
         return name in self._task_function_names
+
+    # ========================================================================
+    # Batch Task Spawning for first/most
+    # ========================================================================
+
+    def get_task_step_function(self, task_name: str) -> Optional[ir.Function]:
+        """Get the step function for a task, if it has one."""
+        return self.step_functions.get(task_name)
+
+    def get_task_frame_info(self, task_name: str) -> Optional[TaskFrameInfo]:
+        """Get frame info for a task, if it has one."""
+        return self.task_frames.get(task_name)
+
+    def allocate_task_frame(self, task_name: str, arg_values: List[ir.Value],
+                            builder: ir.IRBuilder) -> Optional[ir.Value]:
+        """
+        Allocate and initialize a task frame for batch spawning.
+
+        Returns the frame pointer (as i8*), or None if the task doesn't have a frame.
+        This is used by first/most to spawn tasks without immediately waiting.
+        """
+        cg = self.cg
+
+        # Get frame info
+        frame_info = self.task_frames.get(task_name)
+        if frame_info is None:
+            return None
+
+        # Allocate frame on heap
+        frame_size = ir.Constant(ir.IntType(64), 64)  # Approximate size
+        malloc_fn = self._get_or_declare_malloc()
+        frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
+        frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
+
+        # Initialize state to 0
+        state_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), state_ptr)
+
+        # Initialize resolved to 0
+        resolved_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__resolved'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), resolved_ptr)
+
+        # Initialize waiter to null
+        waiter_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__waiter'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), waiter_ptr)
+
+        # Copy parameters to frame
+        for i, param in enumerate(frame_info.parameters):
+            if i < len(arg_values):
+                param_idx = frame_info.field_indices[param.name]
+                param_ptr = builder.gep(frame_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), param_idx)
+                ], inbounds=True)
+
+                # Cast argument if needed
+                arg_val = arg_values[i]
+                expected_type = frame_info.llvm_frame_type.elements[param_idx]
+                arg_val = cg._cast_value(arg_val, expected_type)
+                builder.store(arg_val, param_ptr)
+
+        # Return frame as i8*
+        return builder.bitcast(frame_ptr, ir.IntType(8).as_pointer())
+
+    def has_state_machine(self, task_name: str) -> bool:
+        """Check if a task has a state machine (step function)."""
+        return task_name in self.step_functions
 
 
 def create_task_transformer(cg: 'CodeGenerator') -> TaskTransformer:

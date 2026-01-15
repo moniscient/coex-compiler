@@ -262,9 +262,28 @@ void* coex_scheduler_worker_loop(void* arg) {
  * Task Execution
  * ============================================================================ */
 
+/* Forward declaration of first/most completion handlers */
+static void handle_first_completion(SchedulerTask* task, int64_t value);
+static void handle_most_completion(SchedulerTask* task, int64_t value);
+
 void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
     /* Check cancellation */
     if (atomic_load(&task->cancelled)) {
+        /* For first/most, still need to track completion */
+        if (task->completion_type == COMPLETION_FIRST) {
+            /* First task - cancelled, track completion but don't store result */
+            FirstContext* ctx = (FirstContext*)task->completion_context;
+            atomic_fetch_add(&ctx->completed, 1);
+        } else if (task->completion_type == COMPLETION_MOST) {
+            /* Most task - cancelled, track completion */
+            MostContext* ctx = (MostContext*)task->completion_context;
+            int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
+            if (remaining == 0) {
+                pthread_mutex_lock(&ctx->mutex);
+                pthread_cond_signal(&ctx->cond);
+                pthread_mutex_unlock(&ctx->mutex);
+            }
+        }
         free(task);
         return;
     }
@@ -275,14 +294,31 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
 
     /* Check cancellation again */
     if (atomic_load(&task->cancelled)) {
+        /* For first/most, still need to track completion */
+        if (task->completion_type == COMPLETION_FIRST) {
+            FirstContext* ctx = (FirstContext*)task->completion_context;
+            atomic_fetch_add(&ctx->completed, 1);
+        } else if (task->completion_type == COMPLETION_MOST) {
+            MostContext* ctx = (MostContext*)task->completion_context;
+            int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
+            if (remaining == 0) {
+                pthread_mutex_lock(&ctx->mutex);
+                pthread_cond_signal(&ctx->cond);
+                pthread_mutex_unlock(&ctx->mutex);
+            }
+        }
         free(task);
         return;
     }
 
     switch (result.kind) {
         case TASK_RESULT_DONE: {
-            /* Task completed */
-            if (task->main_mutex) {
+            /* Task completed - check for first/most handlers */
+            if (task->completion_type == COMPLETION_FIRST) {
+                handle_first_completion(task, result.value);
+            } else if (task->completion_type == COMPLETION_MOST) {
+                handle_most_completion(task, result.value);
+            } else if (task->main_mutex) {
                 /* Waiting main thread */
                 pthread_mutex_lock(task->main_mutex);
                 *task->main_result = result.value;
@@ -307,6 +343,7 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
             child->step_fn = (StepFunction)result.spawn.step_fn;
             child->waiter = task;  /* Child will wake this task */
             atomic_store(&child->cancelled, false);
+            child->completion_type = COMPLETION_NORMAL;
 
             /* Push child to ready queue */
             deque_push_bottom(&worker_deques[worker_id], child);
@@ -314,6 +351,54 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
             /* Parent task stays suspended (not freed) */
             break;
         }
+    }
+}
+
+/* Handle completion of a first-wins task */
+static void handle_first_completion(SchedulerTask* task, int64_t value) {
+    FirstContext* ctx = (FirstContext*)task->completion_context;
+
+    /* Try to claim winner slot */
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&ctx->has_winner, &expected, true)) {
+        /* We won! */
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->winner_value = value;
+
+        /* Cancel siblings */
+        for (int64_t i = 0; i < ctx->task_count; i++) {
+            if (i != task->completion_index && ctx->tasks[i]) {
+                atomic_store(&ctx->tasks[i]->cancelled, true);
+            }
+        }
+
+        /* Signal main thread */
+        pthread_cond_signal(&ctx->cond);
+        pthread_mutex_unlock(&ctx->mutex);
+    }
+
+    /* Track completion */
+    atomic_fetch_add(&ctx->completed, 1);
+}
+
+/* Handle completion of a most task */
+static void handle_most_completion(SchedulerTask* task, int64_t value) {
+    MostContext* ctx = (MostContext*)task->completion_context;
+
+    /* Add result to list */
+    pthread_mutex_lock(&ctx->mutex);
+    if (ctx->result_count < ctx->capacity) {
+        ctx->results[ctx->result_count++] = value;
+    }
+    pthread_mutex_unlock(&ctx->mutex);
+
+    /* Check if we're the last one */
+    int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
+    if (remaining == 0) {
+        /* Wake main thread */
+        pthread_mutex_lock(&ctx->mutex);
+        pthread_cond_signal(&ctx->cond);
+        pthread_mutex_unlock(&ctx->mutex);
     }
 }
 
@@ -455,6 +540,130 @@ void coex_scheduler_ready_task(SchedulerTask* task) {
     deque_push_bottom(&global_queue, task);
     pthread_mutex_unlock(&global_queue_mutex);
     wake_one_worker();
+}
+
+/* ============================================================================
+ * Batch Task Spawning (for first/most)
+ * ============================================================================ */
+
+FirstContext* coex_scheduler_first_context_create(int64_t count) {
+    FirstContext* ctx = malloc(sizeof(FirstContext));
+    if (!ctx) return NULL;
+
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    atomic_store(&ctx->has_winner, false);
+    ctx->winner_value = 0;
+    ctx->task_count = count;
+    atomic_store(&ctx->completed, 0);
+    ctx->tasks = calloc(count, sizeof(SchedulerTask*));
+
+    return ctx;
+}
+
+void coex_scheduler_first_context_destroy(FirstContext* ctx) {
+    if (!ctx) return;
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
+    free(ctx->tasks);
+    free(ctx);
+}
+
+void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index,
+                                      void* frame, StepFunction step_fn) {
+    coex_scheduler_ensure_init();
+
+    /* Create task with first completion type */
+    SchedulerTask* task = malloc(sizeof(SchedulerTask));
+    memset(task, 0, sizeof(SchedulerTask));
+
+    task->frame = frame;
+    task->step_fn = step_fn;
+    task->waiter = NULL;
+    task->resolved_value = 0;
+    atomic_store(&task->cancelled, false);
+    task->completion_context = ctx;
+    task->completion_type = COMPLETION_FIRST;
+    task->completion_index = index;
+
+    /* Store in context for cancellation */
+    ctx->tasks[index] = task;
+
+    /* Submit to global queue */
+    pthread_mutex_lock(&global_queue_mutex);
+    deque_push_bottom(&global_queue, task);
+    pthread_mutex_unlock(&global_queue_mutex);
+
+    wake_one_worker();
+}
+
+int64_t coex_scheduler_first_wait(FirstContext* ctx) {
+    pthread_mutex_lock(&ctx->mutex);
+    while (!atomic_load(&ctx->has_winner)) {
+        pthread_cond_wait(&ctx->cond, &ctx->mutex);
+    }
+    int64_t result = ctx->winner_value;
+    pthread_mutex_unlock(&ctx->mutex);
+    return result;
+}
+
+MostContext* coex_scheduler_most_context_create(int64_t count) {
+    MostContext* ctx = malloc(sizeof(MostContext));
+    if (!ctx) return NULL;
+
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    ctx->task_count = count;
+    atomic_store(&ctx->remaining, count);
+    ctx->results = calloc(count, sizeof(int64_t));
+    ctx->result_count = 0;
+    ctx->capacity = count;
+
+    return ctx;
+}
+
+void coex_scheduler_most_context_destroy(MostContext* ctx) {
+    if (!ctx) return;
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
+    free(ctx->results);
+    free(ctx);
+}
+
+void coex_scheduler_most_spawn_task(MostContext* ctx,
+                                     void* frame, StepFunction step_fn) {
+    coex_scheduler_ensure_init();
+
+    /* Create task with most completion type */
+    SchedulerTask* task = malloc(sizeof(SchedulerTask));
+    memset(task, 0, sizeof(SchedulerTask));
+
+    task->frame = frame;
+    task->step_fn = step_fn;
+    task->waiter = NULL;
+    task->resolved_value = 0;
+    atomic_store(&task->cancelled, false);
+    task->completion_context = ctx;
+    task->completion_type = COMPLETION_MOST;
+    task->completion_index = 0;  /* Not used for most */
+
+    /* Submit to global queue */
+    pthread_mutex_lock(&global_queue_mutex);
+    deque_push_bottom(&global_queue, task);
+    pthread_mutex_unlock(&global_queue_mutex);
+
+    wake_one_worker();
+}
+
+void coex_scheduler_most_wait(MostContext* ctx,
+                               int64_t** out_results, int64_t* out_count) {
+    pthread_mutex_lock(&ctx->mutex);
+    while (atomic_load(&ctx->remaining) > 0) {
+        pthread_cond_wait(&ctx->cond, &ctx->mutex);
+    }
+    *out_results = ctx->results;
+    *out_count = ctx->result_count;
+    pthread_mutex_unlock(&ctx->mutex);
 }
 
 /* ============================================================================
