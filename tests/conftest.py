@@ -180,6 +180,62 @@ class CompiledBinary:
 
 
 @pytest.fixture
+def compile_with_warnings(compiler_root):
+    """
+    Fixture that compiles code and returns both result and warnings.
+
+    Usage:
+        result, warnings = compile_with_warnings(source_code)
+        assert len(warnings) == 1
+        assert warnings[0]['category'] == 'ATOMIC_SPIN'
+    """
+    def _compile(source: str):
+        # Import compiler internals
+        import sys
+        old_path = sys.path.copy()
+        sys.path.insert(0, str(compiler_root))
+
+        try:
+            from antlr4 import InputStream, CommonTokenStream
+            from CoexLexer import CoexLexer
+            from CoexParser import CoexParser
+            from ast_builder import ASTBuilder
+            from commentary_analyzer import run_all_analyzers
+
+            # Parse
+            input_stream = InputStream(source)
+            lexer = CoexLexer(input_stream)
+            token_stream = CommonTokenStream(lexer)
+            parser = CoexParser(token_stream)
+            tree = parser.program()
+
+            # Build AST
+            builder = ASTBuilder()
+            program = builder.build(tree)
+
+            # Run static analyzers (this is what we care about for warning tests)
+            analyzer_comments = run_all_analyzers(program)
+
+            # Convert to dict format for test assertions
+            warnings = []
+            for comment in analyzer_comments:
+                warnings.append({
+                    'category': comment.category.name,
+                    'message': comment.message,
+                    'line': comment.line
+                })
+
+            return True, warnings
+
+        except Exception as e:
+            return False, [{'category': 'ERROR', 'message': str(e), 'line': 0}]
+        finally:
+            sys.path = old_path
+
+    return _compile
+
+
+@pytest.fixture
 def compile_binary(compiler_root):
     """
     Fixture that compiles code and returns a binary that can be run with custom args.

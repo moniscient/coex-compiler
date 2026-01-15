@@ -55,6 +55,10 @@ class FunctionGenerator:
             self.declare_extern_function(func)
             return
 
+        # Register task functions with the TaskTransformer
+        if func.kind == FunctionKind.TASK:
+            cg._task.register_task_function(func.name)
+
         # Build parameter types
         param_types = []
         for param in func.params:
@@ -120,20 +124,21 @@ class FunctionGenerator:
         """
         cg = self.cg
 
-        # Validate calling hierarchy: only func can call extern
+        # Validate calling hierarchy: only func and thread can call extern
+        # task and formula cannot call extern (they must be non-blocking)
         if hasattr(cg, 'current_function') and cg.current_function:
             caller_kind = cg.current_function.kind
             if caller_kind == FunctionKind.FORMULA:
                 raise RuntimeError(
                     f"Cannot call extern function '{name}' from formula "
                     f"'{cg.current_function.name}'. Extern functions can only "
-                    f"be called from func."
+                    f"be called from func or thread."
                 )
-            elif caller_kind == FunctionKind.THREAD:
+            elif caller_kind == FunctionKind.TASK:
                 raise RuntimeError(
-                    f"Cannot call extern function '{name}' from thread "
+                    f"Cannot call extern function '{name}' from task "
                     f"'{cg.current_function.name}'. Extern functions can only "
-                    f"be called from func."
+                    f"be called from func or thread."
                 )
 
         llvm_func = cg.functions[name]

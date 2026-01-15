@@ -73,6 +73,7 @@ functionDecl
 
 functionKind
     : FORMULA
+    | TASK
     | THREAD
     | FUNC
     | EXTERN
@@ -318,16 +319,16 @@ forAssignStmt
     : IDENTIFIER ASSIGN FOR bindingPattern IN expression expression COLON? NEWLINE* block
     ;
 
-// First-assign pattern: result = first i in items expr ~
+// First-assign pattern: result = first i in items body ~
 // Returns the first successful result, cancelling remaining tasks
 firstAssignStmt
-    : IDENTIFIER ASSIGN FIRST bindingPattern IN expression expression COLON? NEWLINE* block
+    : IDENTIFIER ASSIGN FIRST bindingPattern IN expression COLON? NEWLINE* block
     ;
 
-// Most-assign pattern: (results, errors) = most i in items expr ~
+// Most-assign pattern: (results, errors) = most i in items body ~
 // Returns tuple of (successful results, errors) - no cancellation
 mostAssignStmt
-    : LPAREN IDENTIFIER COMMA IDENTIFIER RPAREN ASSIGN MOST bindingPattern IN expression expression COLON? NEWLINE* block
+    : LPAREN IDENTIFIER COMMA IDENTIFIER RPAREN ASSIGN MOST bindingPattern IN expression COLON? NEWLINE* block
     ;
 
 // While loop (standard while condition)

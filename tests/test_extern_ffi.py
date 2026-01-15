@@ -196,7 +196,7 @@ func main() -> int
 extern abs(x: int) -> int
 ~
 
-thread bad_thread(x: int) -> int
+task bad_task(x: int) -> int
     return abs(x)
 ~
 

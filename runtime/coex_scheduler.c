@@ -1,0 +1,467 @@
+/**
+ * Coex Work-Stealing Scheduler Implementation
+ *
+ * Implements Chase-Lev work-stealing deques and a fixed-size worker pool.
+ */
+
+#include "coex_scheduler.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+
+/* External GC functions (defined in coex_gc runtime) */
+extern void coex_gc_register_thread(void);
+extern void coex_gc_unregister_thread(void);
+
+/* ============================================================================
+ * Global Scheduler State
+ * ============================================================================ */
+
+static atomic_bool scheduler_initialized = false;
+static atomic_bool scheduler_shutdown_flag = false;
+static pthread_mutex_t scheduler_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int worker_count = 0;
+static pthread_t workers[SCHEDULER_MAX_WORKERS];
+static Deque worker_deques[SCHEDULER_MAX_WORKERS];
+
+/* Parking: workers sleep here when no work */
+static pthread_mutex_t parking_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t parking_cond = PTHREAD_COND_INITIALIZER;
+static atomic_int parked_workers = 0;
+
+/* Global queue for tasks from main thread */
+static Deque global_queue;
+static pthread_mutex_t global_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Statistics */
+static atomic_uint_fast64_t tasks_executed = 0;
+static atomic_uint_fast64_t tasks_stolen = 0;
+
+/* ============================================================================
+ * Chase-Lev Deque Implementation
+ * ============================================================================ */
+
+/* Circular buffer for deque */
+typedef struct {
+    int64_t capacity;
+    SchedulerTask* tasks[];  /* Flexible array member */
+} DequeBuffer;
+
+static DequeBuffer* deque_buffer_alloc(int64_t capacity) {
+    DequeBuffer* buf = malloc(sizeof(DequeBuffer) + capacity * sizeof(SchedulerTask*));
+    if (buf) {
+        buf->capacity = capacity;
+        memset(buf->tasks, 0, capacity * sizeof(SchedulerTask*));
+    }
+    return buf;
+}
+
+void deque_init(Deque* dq) {
+    atomic_store(&dq->top, 0);
+    atomic_store(&dq->bottom, 0);
+    DequeBuffer* buf = deque_buffer_alloc(DEQUE_INITIAL_CAPACITY);
+    atomic_store(&dq->buffer, (uintptr_t)buf);
+    dq->capacity = DEQUE_INITIAL_CAPACITY;
+    pthread_mutex_init(&dq->resize_lock, NULL);
+}
+
+void deque_destroy(Deque* dq) {
+    DequeBuffer* buf = (DequeBuffer*)atomic_load(&dq->buffer);
+    if (buf) free(buf);
+    pthread_mutex_destroy(&dq->resize_lock);
+}
+
+/* Grow the deque buffer (called under resize_lock) */
+static void deque_grow(Deque* dq) {
+    DequeBuffer* old_buf = (DequeBuffer*)atomic_load(&dq->buffer);
+    int64_t old_cap = old_buf->capacity;
+    int64_t new_cap = old_cap * 2;
+
+    DequeBuffer* new_buf = deque_buffer_alloc(new_cap);
+
+    /* Copy existing elements */
+    int64_t t = atomic_load_explicit(&dq->top, memory_order_relaxed);
+    int64_t b = atomic_load_explicit(&dq->bottom, memory_order_relaxed);
+    for (int64_t i = t; i < b; i++) {
+        new_buf->tasks[i % new_cap] = old_buf->tasks[i % old_cap];
+    }
+
+    atomic_store(&dq->buffer, (uintptr_t)new_buf);
+    dq->capacity = new_cap;
+
+    /* Old buffer will be freed eventually (could use epoch-based reclamation) */
+    /* For simplicity, we leak it here - in practice use hazard pointers */
+}
+
+void deque_push_bottom(Deque* dq, SchedulerTask* task) {
+    int64_t b = atomic_load_explicit(&dq->bottom, memory_order_relaxed);
+    int64_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
+    DequeBuffer* buf = (DequeBuffer*)atomic_load_explicit(&dq->buffer, memory_order_relaxed);
+
+    /* Check if we need to grow */
+    if (b - t >= buf->capacity - 1) {
+        pthread_mutex_lock(&dq->resize_lock);
+        deque_grow(dq);
+        buf = (DequeBuffer*)atomic_load(&dq->buffer);
+        pthread_mutex_unlock(&dq->resize_lock);
+    }
+
+    buf->tasks[b % buf->capacity] = task;
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&dq->bottom, b + 1, memory_order_relaxed);
+}
+
+SchedulerTask* deque_pop_bottom(Deque* dq) {
+    int64_t b = atomic_load_explicit(&dq->bottom, memory_order_relaxed) - 1;
+    DequeBuffer* buf = (DequeBuffer*)atomic_load_explicit(&dq->buffer, memory_order_relaxed);
+    atomic_store_explicit(&dq->bottom, b, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+
+    int64_t t = atomic_load_explicit(&dq->top, memory_order_relaxed);
+
+    if (t <= b) {
+        /* Non-empty */
+        SchedulerTask* task = buf->tasks[b % buf->capacity];
+        if (t == b) {
+            /* Last element - compete with stealers */
+            if (!atomic_compare_exchange_strong_explicit(
+                    &dq->top, &t, t + 1,
+                    memory_order_seq_cst, memory_order_relaxed)) {
+                /* Lost race with stealer */
+                task = NULL;
+            }
+            atomic_store_explicit(&dq->bottom, b + 1, memory_order_relaxed);
+        }
+        return task;
+    } else {
+        /* Empty */
+        atomic_store_explicit(&dq->bottom, b + 1, memory_order_relaxed);
+        return NULL;
+    }
+}
+
+SchedulerTask* deque_steal(Deque* dq) {
+    int64_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
+    atomic_thread_fence(memory_order_seq_cst);
+    int64_t b = atomic_load_explicit(&dq->bottom, memory_order_acquire);
+
+    if (t < b) {
+        /* Non-empty */
+        DequeBuffer* buf = (DequeBuffer*)atomic_load_explicit(&dq->buffer, memory_order_relaxed);
+        SchedulerTask* task = buf->tasks[t % buf->capacity];
+
+        if (!atomic_compare_exchange_strong_explicit(
+                &dq->top, &t, t + 1,
+                memory_order_seq_cst, memory_order_relaxed)) {
+            /* Lost race */
+            return NULL;
+        }
+        return task;
+    }
+    return NULL;
+}
+
+/* ============================================================================
+ * Worker Thread Pool
+ * ============================================================================ */
+
+static void wake_one_worker(void) {
+    pthread_mutex_lock(&parking_mutex);
+    pthread_cond_signal(&parking_cond);
+    pthread_mutex_unlock(&parking_mutex);
+}
+
+static void wake_all_workers(void) {
+    pthread_mutex_lock(&parking_mutex);
+    pthread_cond_broadcast(&parking_cond);
+    pthread_mutex_unlock(&parking_mutex);
+}
+
+static void park_worker(int worker_id) {
+    pthread_mutex_lock(&parking_mutex);
+    atomic_fetch_add(&parked_workers, 1);
+
+    /* Wait with timeout to allow periodic stealing attempts */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 1000000;  /* 1ms timeout */
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
+
+    pthread_cond_timedwait(&parking_cond, &parking_mutex, &ts);
+    atomic_fetch_sub(&parked_workers, 1);
+    pthread_mutex_unlock(&parking_mutex);
+}
+
+/* Try to steal from other workers */
+static SchedulerTask* try_steal(int worker_id) {
+    /* Try global queue first */
+    pthread_mutex_lock(&global_queue_mutex);
+    SchedulerTask* task = deque_steal(&global_queue);
+    pthread_mutex_unlock(&global_queue_mutex);
+    if (task) {
+        atomic_fetch_add(&tasks_stolen, 1);
+        return task;
+    }
+
+    /* Try other workers */
+    for (int i = 0; i < worker_count; i++) {
+        if (i != worker_id) {
+            task = deque_steal(&worker_deques[i]);
+            if (task) {
+                atomic_fetch_add(&tasks_stolen, 1);
+                return task;
+            }
+        }
+    }
+    return NULL;
+}
+
+void* coex_scheduler_worker_loop(void* arg) {
+    int worker_id = (int)(intptr_t)arg;
+
+    /* Register with GC */
+    coex_gc_register_thread();
+
+    while (!atomic_load(&scheduler_shutdown_flag)) {
+        SchedulerTask* task = NULL;
+
+        /* Try own deque first (LIFO for locality) */
+        task = deque_pop_bottom(&worker_deques[worker_id]);
+
+        /* If empty, try stealing */
+        if (!task) {
+            task = try_steal(worker_id);
+        }
+
+        /* If still no work, park */
+        if (!task) {
+            park_worker(worker_id);
+            continue;
+        }
+
+        /* Execute the task */
+        coex_scheduler_run_task(task, worker_id);
+    }
+
+    coex_gc_unregister_thread();
+    return NULL;
+}
+
+/* ============================================================================
+ * Task Execution
+ * ============================================================================ */
+
+void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
+    /* Check cancellation */
+    if (atomic_load(&task->cancelled)) {
+        free(task);
+        return;
+    }
+
+    /* Call step function */
+    TaskResult result = task->step_fn(task->frame, task->resolved_value);
+    atomic_fetch_add(&tasks_executed, 1);
+
+    /* Check cancellation again */
+    if (atomic_load(&task->cancelled)) {
+        free(task);
+        return;
+    }
+
+    switch (result.kind) {
+        case TASK_RESULT_DONE: {
+            /* Task completed */
+            if (task->main_mutex) {
+                /* Waiting main thread */
+                pthread_mutex_lock(task->main_mutex);
+                *task->main_result = result.value;
+                atomic_store(task->main_done, true);
+                pthread_cond_signal(task->main_cond);
+                pthread_mutex_unlock(task->main_mutex);
+            } else if (task->waiter) {
+                /* Wake parent task */
+                task->waiter->resolved_value = result.value;
+                deque_push_bottom(&worker_deques[worker_id], task->waiter);
+                wake_one_worker();
+            }
+            free(task);
+            break;
+        }
+
+        case TASK_RESULT_SPAWN: {
+            /* Spawn child task */
+            SchedulerTask* child = malloc(sizeof(SchedulerTask));
+            memset(child, 0, sizeof(SchedulerTask));
+            child->frame = result.spawn.frame;
+            child->step_fn = (StepFunction)result.spawn.step_fn;
+            child->waiter = task;  /* Child will wake this task */
+            atomic_store(&child->cancelled, false);
+
+            /* Push child to ready queue */
+            deque_push_bottom(&worker_deques[worker_id], child);
+            wake_one_worker();
+            /* Parent task stays suspended (not freed) */
+            break;
+        }
+    }
+}
+
+/* ============================================================================
+ * Scheduler Lifecycle
+ * ============================================================================ */
+
+void coex_scheduler_ensure_init(void) {
+    if (atomic_load(&scheduler_initialized)) {
+        return;
+    }
+
+    pthread_mutex_lock(&scheduler_init_mutex);
+    if (!atomic_load(&scheduler_initialized)) {
+        /* Determine worker count: 2x physical cores */
+        int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (cores < 1) cores = 1;
+        worker_count = cores * 2;
+        if (worker_count > SCHEDULER_MAX_WORKERS) {
+            worker_count = SCHEDULER_MAX_WORKERS;
+        }
+
+        /* Initialize global queue */
+        deque_init(&global_queue);
+
+        /* Initialize worker deques */
+        for (int i = 0; i < worker_count; i++) {
+            deque_init(&worker_deques[i]);
+        }
+
+        /* Spawn worker threads */
+        for (int i = 0; i < worker_count; i++) {
+            int rc = pthread_create(&workers[i], NULL,
+                                    coex_scheduler_worker_loop,
+                                    (void*)(intptr_t)i);
+            if (rc != 0) {
+                fprintf(stderr, "Failed to create worker %d: %s\n", i, strerror(rc));
+            }
+        }
+
+        atomic_store(&scheduler_initialized, true);
+    }
+    pthread_mutex_unlock(&scheduler_init_mutex);
+}
+
+bool coex_scheduler_is_initialized(void) {
+    return atomic_load(&scheduler_initialized);
+}
+
+int coex_scheduler_get_worker_count(void) {
+    return worker_count;
+}
+
+void coex_scheduler_shutdown(void) {
+    if (!atomic_load(&scheduler_initialized)) {
+        return;
+    }
+
+    /* Signal shutdown */
+    atomic_store(&scheduler_shutdown_flag, true);
+    wake_all_workers();
+
+    /* Wait for workers to finish */
+    for (int i = 0; i < worker_count; i++) {
+        pthread_join(workers[i], NULL);
+    }
+
+    /* Cleanup deques */
+    deque_destroy(&global_queue);
+    for (int i = 0; i < worker_count; i++) {
+        deque_destroy(&worker_deques[i]);
+    }
+}
+
+/* ============================================================================
+ * Task Spawning
+ * ============================================================================ */
+
+int64_t coex_scheduler_spawn_and_wait(void* frame, StepFunction step_fn) {
+    /* Ensure scheduler is running */
+    coex_scheduler_ensure_init();
+
+    /* Create task */
+    SchedulerTask* task = malloc(sizeof(SchedulerTask));
+    memset(task, 0, sizeof(SchedulerTask));
+    task->frame = frame;
+    task->step_fn = step_fn;
+    task->waiter = NULL;
+    task->resolved_value = 0;
+    atomic_store(&task->cancelled, false);
+
+    /* Setup main thread waiting */
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    int64_t result = 0;
+    atomic_bool done = false;
+
+    task->main_mutex = &mutex;
+    task->main_cond = &cond;
+    task->main_result = &result;
+    task->main_done = &done;
+
+    /* Submit to global queue */
+    pthread_mutex_lock(&global_queue_mutex);
+    deque_push_bottom(&global_queue, task);
+    pthread_mutex_unlock(&global_queue_mutex);
+
+    /* Wake a worker */
+    wake_one_worker();
+
+    /* Wait for completion */
+    pthread_mutex_lock(&mutex);
+    while (!atomic_load(&done)) {
+        pthread_cond_wait(&cond, &mutex);
+    }
+    pthread_mutex_unlock(&mutex);
+
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&cond);
+
+    return result;
+}
+
+SchedulerTask* coex_scheduler_spawn_child(void* frame, StepFunction step_fn,
+                                           SchedulerTask* parent) {
+    SchedulerTask* task = malloc(sizeof(SchedulerTask));
+    memset(task, 0, sizeof(SchedulerTask));
+    task->frame = frame;
+    task->step_fn = step_fn;
+    task->waiter = parent;
+    task->resolved_value = 0;
+    atomic_store(&task->cancelled, false);
+    return task;
+}
+
+void coex_scheduler_ready_task(SchedulerTask* task) {
+    /* Add task to global queue and wake a worker */
+    pthread_mutex_lock(&global_queue_mutex);
+    deque_push_bottom(&global_queue, task);
+    pthread_mutex_unlock(&global_queue_mutex);
+    wake_one_worker();
+}
+
+/* ============================================================================
+ * Debug/Stats
+ * ============================================================================ */
+
+void coex_scheduler_dump_stats(void) {
+    printf("=== Scheduler Stats ===\n");
+    printf("Initialized: %s\n", atomic_load(&scheduler_initialized) ? "yes" : "no");
+    printf("Worker count: %d\n", worker_count);
+    printf("Tasks executed: %llu\n", (unsigned long long)atomic_load(&tasks_executed));
+    printf("Tasks stolen: %llu\n", (unsigned long long)atomic_load(&tasks_stolen));
+    printf("Parked workers: %d\n", atomic_load(&parked_workers));
+    printf("=======================\n");
+}

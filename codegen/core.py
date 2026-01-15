@@ -30,6 +30,9 @@ from codegen.list import ListGenerator
 # Import HAMT/Map/Set generator module
 from codegen.hamt import HamtGenerator
 
+# Import Channel generator module
+from codegen.channel import ChannelGenerator
+
 # Import Array generator module
 from codegen.array import ArrayGenerator
 
@@ -80,6 +83,9 @@ from codegen.traits import TraitGenerator
 
 # Import Thread generator module (for concurrent thread support)
 from codegen.thread import ThreadGenerator
+
+# Import Task transformer module (for lightweight coroutine tasks)
+from task_transform import TaskTransformer
 
 # Import Enum generator module
 from codegen.enums import EnumGenerator
@@ -375,6 +381,10 @@ class CodeGenerator:
         self._hamt.create_map_type()
         self._hamt.create_set_type()
 
+        # Create Channel type and helpers
+        self._channel = ChannelGenerator(self)
+        self._channel.register_channel_type()
+
         # Create in-place mutation operations (for uniqueness optimization)
         # These are variants that mutate wrapper objects in place when binding is unique
         self.inplace_variants = {}  # Will be populated by create_inplace_operations
@@ -479,6 +489,9 @@ class CodeGenerator:
         # Thread concurrency moved to codegen/thread.py - ThreadGenerator class
         self._thread = ThreadGenerator(self)
         self._thread.create_task_types()
+
+        # Task transformation for lightweight coroutines - task_transform.py
+        self._task = TaskTransformer(self)
 
         # Enum helpers moved to codegen/enums.py - EnumGenerator class
         self._enums = EnumGenerator(self)
@@ -662,6 +675,10 @@ class CodeGenerator:
         elif isinstance(coex_type, ArrayType):
             # Arrays are pointers to Array struct
             return self.array_struct.as_pointer()
+
+        elif isinstance(coex_type, ChannelType):
+            # Channels are pointers to Channel struct
+            return self._channel.get_channel_struct().as_pointer()
 
         elif isinstance(coex_type, TupleType):
             # Tuple is a struct of its elements
@@ -856,6 +873,22 @@ class CodeGenerator:
         and system libraries needed for linking.
         """
         return self.ffi_link_args
+
+    def uses_scheduler(self) -> bool:
+        """Check if the compiled program uses the task scheduler.
+
+        Returns True if any task functions (using 'task' keyword) were defined,
+        which requires linking the scheduler runtime library.
+        """
+        return len(self._task.get_task_function_names()) > 0
+
+    def uses_channels(self) -> bool:
+        """Check if the compiled program uses channels.
+
+        Returns True if Channel type is used, which requires linking
+        the channel runtime library.
+        """
+        return self._channel.uses_channels()
 
     # Trait helpers moved to codegen/traits.py - TraitGenerator class
 
@@ -2651,7 +2684,11 @@ class CodeGenerator:
         if type_name == "Set":
             # Default flags=0 (no heap pointers)
             return self.builder.call(self.set_new, [ir.Constant(i64, 0)])
-        
+
+        if type_name == "Channel":
+            # Create new channel using runtime function
+            return self._channel.generate_channel_new(None, self.builder)
+
         if type_name == "atomic_ref":
             # atomic_ref.new(value) or atomic_ref.new() for nil
             if args:

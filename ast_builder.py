@@ -160,6 +160,8 @@ class ASTBuilder:
         kind_text = kind_ctx.getText()
         if kind_text == "formula":
             kind = FunctionKind.FORMULA
+        elif kind_text == "task":
+            kind = FunctionKind.TASK
         elif kind_text == "thread":
             kind = FunctionKind.THREAD
         elif kind_text == "extern":
@@ -287,6 +289,8 @@ class ASTBuilder:
         kind_text = kind_ctx.getText()
         if kind_text == "formula":
             kind = FunctionKind.FORMULA
+        elif kind_text == "task":
+            kind = FunctionKind.TASK
         elif kind_text == "thread":
             kind = FunctionKind.THREAD
         else:
@@ -336,7 +340,7 @@ class ASTBuilder:
         """Visit a trait method signature"""
         kind_ctx = ctx.functionKind()
         kind_text = kind_ctx.getText() if kind_ctx else "func"
-        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
+        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
         
         name = ctx.IDENTIFIER().getText()
         params = []
@@ -475,7 +479,7 @@ class ASTBuilder:
     def visit_function_type(self, ctx: CoexParser.FunctionTypeContext) -> FunctionType:
         """Visit a function type: formula(int, int) -> int"""
         kind_text = ctx.functionKind().getText() if ctx.functionKind() else "func"
-        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
+        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FUNC)
         
         param_types = []
         if ctx.typeList():
@@ -744,29 +748,29 @@ class ASTBuilder:
         return ForAssignStmt(target, pattern, iterable, body_expr)
 
     def visit_first_assign_stmt(self, ctx: CoexParser.FirstAssignStmtContext) -> FirstAssignStmt:
-        """Visit a first-assign statement: result = first i in items expr ~
+        """Visit a first-assign statement: result = first i in items body ~
 
         Returns the first successful result, cancelling remaining tasks.
         """
         target = ctx.IDENTIFIER().getText()
         pattern = self.visit_binding_pattern(ctx.bindingPattern())
-        iterable = self.visit_expression(ctx.expression(0))
-        body_expr = self.visit_expression(ctx.expression(1))
-        return FirstAssignStmt(target, pattern, iterable, body_expr)
+        iterable = self.visit_expression(ctx.expression())
+        body = self.visit_block(ctx.block())
+        return FirstAssignStmt(target, pattern, iterable, body)
 
     def visit_most_assign_stmt(self, ctx: CoexParser.MostAssignStmtContext) -> MostAssignStmt:
-        """Visit a most-assign statement: (results, errors) = most i in items expr ~
+        """Visit a most-assign statement: (results, errors) = most i in items body ~
 
         Returns tuple of (successful_results, errors) - no cancellation.
         """
-        # Grammar: (IDENTIFIER, IDENTIFIER) = most pattern in expr expr ~
+        # Grammar: (IDENTIFIER, IDENTIFIER) = most pattern in expr body ~
         identifiers = ctx.IDENTIFIER()
         results_target = identifiers[0].getText()
         errors_target = identifiers[1].getText()
         pattern = self.visit_binding_pattern(ctx.bindingPattern())
-        iterable = self.visit_expression(ctx.expression(0))
-        body_expr = self.visit_expression(ctx.expression(1))
-        return MostAssignStmt(results_target, errors_target, pattern, iterable, body_expr)
+        iterable = self.visit_expression(ctx.expression())
+        body = self.visit_block(ctx.block())
+        return MostAssignStmt(results_target, errors_target, pattern, iterable, body)
 
     def visit_binding_pattern(self, ctx) -> Pattern:
         """Visit a binding pattern (for destructuring in for loops and comprehensions)"""
@@ -1323,7 +1327,7 @@ class ASTBuilder:
     def visit_lambda_expr(self, ctx: CoexParser.LambdaExprContext) -> LambdaExpr:
         """Visit a lambda expression"""
         kind_text = ctx.functionKind().getText() if ctx.functionKind() else "formula"
-        kind = {"formula": FunctionKind.FORMULA, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FORMULA)
+        kind = {"formula": FunctionKind.FORMULA, "task": FunctionKind.TASK, "thread": FunctionKind.THREAD}.get(kind_text, FunctionKind.FORMULA)
         
         params = []
         if ctx.parameterList():

@@ -254,6 +254,25 @@ def compile_coex(source_path: str, output_path: str = None,
             print(f"Warning: Task runtime library not found at {task_runtime}")
             print("Build it with: cd runtime && make")
 
+        # Add scheduler runtime library if tasks or channels are used
+        # (channels depend on scheduler for task wakeup)
+        if codegen.uses_scheduler() or codegen.uses_channels():
+            scheduler_runtime = os.path.join(runtime_dir, "libcoex_scheduler.a")
+            if os.path.exists(scheduler_runtime):
+                link_cmd.append(scheduler_runtime)
+            else:
+                print(f"Warning: Scheduler runtime library not found at {scheduler_runtime}")
+                print("Build it with: cd runtime && make")
+
+        # Add channel runtime library when channels are used (task or thread)
+        if codegen.uses_channels():
+            channel_runtime = os.path.join(runtime_dir, "libcoex_channel.a")
+            if os.path.exists(channel_runtime):
+                link_cmd.append(channel_runtime)
+            else:
+                print(f"Warning: Channel runtime library not found at {channel_runtime}")
+                print("Build it with: cd runtime && make")
+
         # Add FFI library link arguments (compiled .o files and system libs)
         ffi_link_args = codegen.get_ffi_link_args()
         if ffi_link_args:

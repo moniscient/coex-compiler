@@ -1255,9 +1255,18 @@ class ExpressionGenerator:
             if name in cg.functions:
                 func = cg.functions[name]
 
+                # Check function kind hierarchy
+                if name in cg.func_decls:
+                    callee_kind = cg.func_decls[name].kind
+                    self._check_function_kind_hierarchy(name, callee_kind)
+
                 # Check if this is a thread function call
                 if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.THREAD:
                     return self._generate_thread_call(name, func, expr.args)
+
+                # Check if this is a task function call
+                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.TASK:
+                    return self._generate_task_call(name, func, expr.args)
 
                 args = []
                 for i, arg in enumerate(expr.args):
@@ -1349,6 +1358,48 @@ class ExpressionGenerator:
         return ir.Constant(ir.IntType(64), 0)
 
     # ========================================================================
+    # Function Kind Hierarchy Check
+    # ========================================================================
+
+    def _check_function_kind_hierarchy(self, callee_name: str, callee_kind: FunctionKind):
+        """Check that the function call respects the kind hierarchy.
+
+        Hierarchy (lighter to heavier):
+            formula -> can only call formula
+            task    -> can call formula, task
+            thread  -> can call formula, task, thread
+            func    -> can call formula, task, thread, func
+
+        Raises RuntimeError if the hierarchy is violated.
+        """
+        cg = self.cg
+
+        if not hasattr(cg, 'current_function') or not cg.current_function:
+            return  # Not in a function context
+
+        caller_kind = cg.current_function.kind
+        caller_name = cg.current_function.name
+
+        # Define what each kind can call
+        # Key = caller kind, Value = set of allowed callee kinds
+        allowed = {
+            FunctionKind.FORMULA: {FunctionKind.FORMULA},
+            FunctionKind.TASK: {FunctionKind.FORMULA, FunctionKind.TASK},
+            FunctionKind.THREAD: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD},
+            FunctionKind.FUNC: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD, FunctionKind.FUNC},
+            FunctionKind.EXTERN: set(),  # extern can't call anything (it's a declaration)
+        }
+
+        if caller_kind in allowed:
+            if callee_kind not in allowed[caller_kind]:
+                raise RuntimeError(
+                    f"Cannot call {callee_kind.name.lower()} '{callee_name}' from "
+                    f"{caller_kind.name.lower()} '{caller_name}'. "
+                    f"{caller_kind.name.lower()} can only call: "
+                    f"{', '.join(k.name.lower() for k in sorted(allowed[caller_kind], key=lambda x: x.value))}."
+                )
+
+    # ========================================================================
     # Thread Call
     # ========================================================================
 
@@ -1419,6 +1470,36 @@ class ExpressionGenerator:
         cg.builder.call(cg._thread.closure_free, [closure_ptr])
 
         return result
+
+    def _generate_task_call(self, name: str, func: ir.Function,
+                            args: PyList) -> ir.Value:
+        """Generate code for a task function call (lightweight coroutine).
+
+        Task calls go through the work-stealing scheduler. For now, this
+        executes synchronously via spawn_and_wait, but the scheduler
+        infrastructure enables future concurrent execution.
+
+        Args:
+            name: Task function name
+            func: LLVM function for the task
+            args: List of argument expressions
+
+        Returns:
+            Result from the task
+        """
+        cg = self.cg
+
+        # Evaluate arguments
+        arg_values = []
+        for i, arg in enumerate(args):
+            arg_val = self.generate_expression(arg)
+            if i < len(func.args):
+                expected = func.args[i].type
+                arg_val = cg._cast_value(arg_val, expected)
+            arg_values.append(arg_val)
+
+        # Use the task transformer to generate the call
+        return cg._task.generate_task_call(name, arg_values, cg.builder)
 
     # ========================================================================
     # Method Call
@@ -1524,6 +1605,14 @@ class ExpressionGenerator:
             if var_name in cg.var_coex_types:
                 coex_type = cg.var_coex_types[var_name]
                 if isinstance(coex_type, AtomicType):
+                    # Formula purity check: formulas cannot use atomic operations
+                    if hasattr(cg, 'current_function') and cg.current_function:
+                        if cg.current_function.kind == FunctionKind.FORMULA:
+                            raise RuntimeError(
+                                f"Cannot use atomic operations in formula '{cg.current_function.name}'. "
+                                f"Formulas must be pure and cannot use mutable atomic state."
+                            )
+
                     atomic_inner_type = coex_type.inner
                     if var_name in cg.locals:
                         atomic_ptr = cg.locals[var_name]
@@ -1631,6 +1720,14 @@ class ExpressionGenerator:
                     return cg.builder.call(cg.set_has_string, [obj, elem_arg])
                 elif method == "add":
                     return cg.builder.call(cg.set_add_string, [obj, elem_arg])
+
+        # Special handling for Channel methods
+        if type_name == "Channel" and method in ("send", "receive"):
+            if method == "send" and expr.args:
+                value = self.generate_expression(expr.args[0])
+                return cg._channel.generate_channel_send(obj, value, cg.builder)
+            elif method == "receive":
+                return cg._channel.generate_channel_receive(obj, cg.builder)
 
         if type_name and type_name in cg.type_methods:
             method_map = cg.type_methods[type_name]

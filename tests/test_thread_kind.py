@@ -128,34 +128,33 @@ func main() -> int
 ''', "42\n")
 
 
-class TestTaskKeywordReserved:
-    """Tests that the `task` keyword is reserved and errors."""
+class TestTaskKeywordFunctionality:
+    """Tests that the `task` keyword works as lightweight coroutines."""
 
-    def test_task_keyword_in_function_errors(self, compile_coex):
-        """Using 'task' as function kind should produce a syntax error."""
-        result = compile_coex('''
-task old_style() -> int
+    def test_task_basic_execution(self, expect_output):
+        """Task function executes and returns value."""
+        expect_output('''
+task compute() -> int
     return 42
 ~
 
 func main() -> int
+    result = compute()
+    print(result)
     return 0
 ~
-''')
-        # Compilation should fail with syntax error mentioning 'task'
-        assert not result.compile_success
-        assert "task" in result.compile_output.lower()
+''', "42\n")
 
-    def test_task_keyword_with_params_errors(self, compile_coex):
-        """Using 'task' with parameters should also produce a syntax error."""
-        result = compile_coex('''
+    def test_task_with_params(self, expect_output):
+        """Task function with parameters works correctly."""
+        expect_output('''
 task compute(x: int) -> int
     return x * 2
 ~
 
 func main() -> int
+    result = compute(21)
+    print(result)
     return 0
 ~
-''')
-        assert not result.compile_success
-        assert "task" in result.compile_output.lower()
+''', "42\n")

@@ -1098,6 +1098,106 @@ class LoopGenerator:
                     return cg.func_decls[name].kind == FunctionKind.THREAD
         return False
 
+    def _is_task_call(self, expr: Expr) -> bool:
+        """Check if expression is a call to a task or thread function."""
+        cg = self.cg
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name
+                if name in cg.func_decls:
+                    kind = cg.func_decls[name].kind
+                    return kind in (FunctionKind.TASK, FunctionKind.THREAD)
+        return False
+
+    def _extract_body_expr(self, body: list) -> Optional[Expr]:
+        """Extract the expression from a block body.
+
+        For first/most, the body should produce a value. This helper
+        extracts the expression from a single-statement body where
+        that statement is an expression (like a task call).
+
+        Returns None if the body can't be reduced to a single expression.
+        """
+        from ast_nodes import ExprStmt, ReturnStmt
+        if not body:
+            return None
+        if len(body) == 1:
+            stmt = body[0]
+            # If it's an expression statement, return the expression
+            if isinstance(stmt, ExprStmt):
+                return stmt.expr
+            # If it's a return statement, return the return value expression
+            if isinstance(stmt, ReturnStmt):
+                return stmt.value
+            # If it's directly an expression (CallExpr, etc.), return it
+            if isinstance(stmt, Expr):
+                return stmt
+        return None
+
+    def _generate_sequential_first(self, stmt: FirstAssignStmt, body_expr: Expr):
+        """Generate sequential first: iterate until first successful result.
+
+        For tasks, executes each task in sequence and returns the first result.
+        This is a sequential fallback when true parallel execution isn't available.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+
+        # Get iterable length and iterator
+        iterable_val = cg._generate_expression(stmt.iterable)
+        list_len = cg.builder.call(cg.list_len, [iterable_val])
+
+        # Allocate result variable
+        if stmt.target not in cg.locals:
+            var_ptr = cg.builder.alloca(i64, name=stmt.target)
+            cg.locals[stmt.target] = var_ptr
+        result_ptr = cg.locals[stmt.target]
+        cg.builder.store(ir.Constant(i64, 0), result_ptr)  # Default value
+
+        # Check for empty iterable
+        is_empty = cg.builder.icmp_signed("==", list_len, ir.Constant(i64, 0))
+        func = cg.builder.block.function
+        not_empty_block = func.append_basic_block("first_not_empty")
+        done_block = func.append_basic_block("first_done")
+
+        cg.builder.cbranch(is_empty, done_block, not_empty_block)
+
+        # If not empty, execute first task and store result
+        cg.builder.position_at_end(not_empty_block)
+
+        # Get first element
+        first_idx = ir.Constant(i64, 0)
+        elem_ptr = cg.builder.call(cg.list_get, [iterable_val, first_idx])
+        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+
+        # Bind loop variable
+        pattern = stmt.pattern
+        if isinstance(pattern, str):
+            if pattern in cg.locals:
+                cg.builder.store(elem_val, cg.locals[pattern])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=pattern)
+                cg.locals[pattern] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+        elif isinstance(pattern, IdentifierPattern):
+            name = pattern.name
+            if name in cg.locals:
+                cg.builder.store(elem_val, cg.locals[name])
+            else:
+                var_ptr = cg.builder.alloca(i64, name=name)
+                cg.locals[name] = var_ptr
+                cg.builder.store(elem_val, var_ptr)
+
+        # Execute body expression (task call)
+        result = cg._generate_expression(body_expr)
+
+        # Store result
+        cg.builder.store(result, result_ptr)
+        cg.builder.branch(done_block)
+
+        # Done
+        cg.builder.position_at_end(done_block)
+
     def _generate_sequential_for_assign(self, stmt: ForAssignStmt) -> ir.Value:
         """Generate sequential map: iterate and collect results in list."""
         cg = self.cg
@@ -1432,24 +1532,46 @@ class LoopGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Verify body is a task call
-        if not self._is_thread_call(stmt.body_expr):
+        # Extract body expression from block
+        body_expr = self._extract_body_expr(stmt.body)
+        if body_expr is None:
+            cg._emit_warning(
+                "WARN",
+                "'first' body must be a single expression, falling back to sequential"
+            )
+            # Create default result (0) to avoid undeclared variable error
+            if stmt.target not in cg.locals:
+                var_ptr = cg.builder.alloca(i64, name=stmt.target)
+                cg.locals[stmt.target] = var_ptr
+            cg.builder.store(ir.Constant(i64, 0), cg.locals[stmt.target])
+            return
+
+        # Check if it's a task call (task or thread)
+        is_task = self._is_task_call(body_expr)
+        is_thread = self._is_thread_call(body_expr)
+
+        # For task calls, use sequential execution (one at a time)
+        # For thread calls, use parallel execution with pthread
+        if is_task and not is_thread:
+            # Sequential execution for tasks - execute each and return first result
+            self._generate_sequential_first(stmt, body_expr)
+            return
+
+        # Verify body is a thread call for parallel execution
+        if not is_thread:
             cg._emit_warning(
                 "WARN",
                 "'first' requires a task call in body, falling back to sequential"
             )
-            # Fallback to sequential - just take first result
-            for_assign = ForAssignStmt(
-                target=stmt.target,
-                pattern=stmt.pattern,
-                iterable=stmt.iterable,
-                body_expr=stmt.body_expr
-            )
-            self.generate_for_assign(for_assign)
+            # Create default result
+            if stmt.target not in cg.locals:
+                var_ptr = cg.builder.alloca(i64, name=stmt.target)
+                cg.locals[stmt.target] = var_ptr
+            cg.builder.store(ir.Constant(i64, 0), cg.locals[stmt.target])
             return
 
         # Extract task call info
-        call_expr = stmt.body_expr
+        call_expr = body_expr
         task_name = call_expr.callee.name
         task_decl = cg.func_decls[task_name]
         task_llvm_func = cg.functions[task_name]
@@ -1749,16 +1871,42 @@ class LoopGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
         elem_size = ir.Constant(i64, 8)
+        list_ptr_type = cg.list_struct.as_pointer()
+
+        # Extract body expression from block
+        body_expr = self._extract_body_expr(stmt.body)
+        if body_expr is None:
+            cg._emit_warning(
+                "WARN",
+                "'most' body must be a single expression, falling back to sequential"
+            )
+            # Create empty results
+            result_list = cg.builder.call(cg.list_new, [elem_size])
+            errors_list = cg.builder.call(cg.list_new, [elem_size])
+            # Store results and errors
+            if stmt.results_target in cg.locals:
+                cg.builder.store(result_list, cg.locals[stmt.results_target])
+            else:
+                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
+                cg.locals[stmt.results_target] = var_ptr
+                cg.builder.store(result_list, var_ptr)
+            if stmt.errors_target in cg.locals:
+                cg.builder.store(errors_list, cg.locals[stmt.errors_target])
+            else:
+                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
+                cg.locals[stmt.errors_target] = var_ptr
+                cg.builder.store(errors_list, var_ptr)
+            return
 
         # Check if body is a task call first
-        call_expr = stmt.body_expr
+        call_expr = body_expr
         if not self._is_thread_call(call_expr):
             # Fallback to sequential for non-task calls - use for-collection
             for_assign = ForAssignStmt(
                 target="_most_temp",
                 pattern=stmt.pattern,
                 iterable=stmt.iterable,
-                body_expr=stmt.body_expr
+                body_expr=body_expr
             )
             result_list = self._generate_parallel_for_assign(for_assign)
             errors_list = cg.builder.call(cg.list_new, [elem_size])
@@ -1767,13 +1915,13 @@ class LoopGenerator:
             if stmt.results_target in cg.locals:
                 cg.builder.store(result_list, cg.locals[stmt.results_target])
             else:
-                var_ptr = cg.builder.alloca(i64, name=stmt.results_target)
+                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
                 cg.locals[stmt.results_target] = var_ptr
                 cg.builder.store(result_list, var_ptr)
             if stmt.errors_target in cg.locals:
                 cg.builder.store(errors_list, cg.locals[stmt.errors_target])
             else:
-                var_ptr = cg.builder.alloca(i64, name=stmt.errors_target)
+                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
                 cg.locals[stmt.errors_target] = var_ptr
                 cg.builder.store(errors_list, var_ptr)
 

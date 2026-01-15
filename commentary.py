@@ -22,6 +22,7 @@ class CommentaryCategory(Enum):
     TYPE = auto()   # Type-related observations
     GC = auto()     # Garbage collection hints
     MOVE = auto()   # Move semantics suggestions
+    ATOMIC_SPIN = auto()  # Atomic spin-wait in task context
 
 
 class CommentaryResponse(Enum):

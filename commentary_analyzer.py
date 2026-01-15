@@ -18,6 +18,9 @@ from ast_nodes import (
     PrintStmt, AssignOp, MemberExpr
 )
 from commentary import CompilerComment, CommentaryCategory
+from ast_nodes import (
+    PrimitiveType, AtomicType, BinaryExpr, UnaryExpr, TernaryExpr
+)
 
 
 class CommentaryAnalyzer(ABC):
@@ -365,12 +368,171 @@ class GCAnalyzer(CommentaryAnalyzer):
         return count
 
 
+class AtomicSpinAnalyzer(CommentaryAnalyzer):
+    """Detects potentially problematic spin-waits on atomics in task context.
+
+    Tasks are cooperatively scheduled, so spinning on an atomic can starve
+    the scheduler and prevent other tasks from making progress.
+    """
+
+    # Atomic method names that read shared state
+    ATOMIC_READ_METHODS = {'load', 'compare_exchange'}
+
+    def analyze(self, program: Program) -> List[CompilerComment]:
+        comments = []
+        for func in program.functions:
+            # Only check TASK functions, not THREAD, FUNC, etc.
+            if func.kind != FunctionKind.TASK:
+                continue
+
+            # Build set of known atomic parameter names
+            atomic_params = self._get_atomic_params(func)
+            comments.extend(self._analyze_function(func, atomic_params))
+        return comments
+
+    def _get_atomic_params(self, func: FunctionDecl) -> set:
+        """Get set of parameter names that are atomic types."""
+        atomic_names = set()
+        for param in func.params:
+            if param.type_annotation:
+                type_name = str(param.type_annotation)
+                if type_name.startswith('atomic_'):
+                    atomic_names.add(param.name)
+        return atomic_names
+
+    def _analyze_function(self, func: FunctionDecl, atomic_params: set) -> List[CompilerComment]:
+        comments = []
+
+        # Track local variables that are assigned from atomics
+        atomic_derived = set()
+
+        for stmt in self._walk_statements(func.body):
+            # Track atomic-derived variables
+            if isinstance(stmt, VarDecl):
+                if self._expr_involves_atomic(stmt.initializer, atomic_params, atomic_derived):
+                    atomic_derived.add(stmt.name)
+            elif isinstance(stmt, Assignment):
+                if isinstance(stmt.target, Identifier):
+                    if self._expr_involves_atomic(stmt.value, atomic_params, atomic_derived):
+                        atomic_derived.add(stmt.target.name)
+
+            # Check while loops for atomic conditions
+            if isinstance(stmt, WhileStmt):
+                # Check if condition involves atomic
+                if self._expr_involves_atomic(stmt.condition, atomic_params, atomic_derived):
+                    comments.append(CompilerComment(
+                        category=CommentaryCategory.ATOMIC_SPIN,
+                        message=(
+                            "Loop condition depends on atomic load; may starve scheduler. "
+                            "Consider using channels or select for task synchronization."
+                        ),
+                        line=getattr(stmt, 'line', 1)
+                    ))
+
+                # Also check for atomic reads inside while body that affect termination
+                for body_stmt in stmt.body:
+                    if isinstance(body_stmt, (VarDecl, Assignment)):
+                        target_name = body_stmt.name if isinstance(body_stmt, VarDecl) else (
+                            body_stmt.target.name if isinstance(body_stmt.target, Identifier) else None
+                        )
+                        if target_name and self._var_used_in_condition(target_name, stmt.condition):
+                            value = body_stmt.initializer if isinstance(body_stmt, VarDecl) else body_stmt.value
+                            if self._expr_involves_atomic(value, atomic_params, atomic_derived):
+                                # Variable controlling loop is updated from atomic
+                                comments.append(CompilerComment(
+                                    category=CommentaryCategory.ATOMIC_SPIN,
+                                    message=(
+                                        f"Variable '{target_name}' updated from atomic in loop; may starve scheduler. "
+                                        "Consider using channels or select for task synchronization."
+                                    ),
+                                    line=getattr(body_stmt, 'line', 1)
+                                ))
+
+        return comments
+
+    def _expr_involves_atomic(self, expr: Expr, atomic_params: set, atomic_derived: set) -> bool:
+        """Check if expression reads from an atomic variable."""
+        if expr is None:
+            return False
+
+        if isinstance(expr, MethodCallExpr):
+            # Check if method is an atomic read
+            if expr.method in self.ATOMIC_READ_METHODS:
+                if isinstance(expr.object, Identifier):
+                    if expr.object.name in atomic_params:
+                        return True
+            # Also check arguments
+            return any(self._expr_involves_atomic(arg, atomic_params, atomic_derived) for arg in expr.args)
+
+        if isinstance(expr, CallExpr):
+            # Check for CallExpr(callee=MemberExpr(...)) pattern which is how
+            # method calls like flag.load() are parsed
+            if isinstance(expr.callee, MemberExpr):
+                method_name = expr.callee.member
+                if method_name in self.ATOMIC_READ_METHODS:
+                    if isinstance(expr.callee.object, Identifier):
+                        if expr.callee.object.name in atomic_params:
+                            return True
+            # Check callee and arguments
+            if self._expr_involves_atomic(expr.callee, atomic_params, atomic_derived):
+                return True
+            return any(self._expr_involves_atomic(arg, atomic_params, atomic_derived) for arg in expr.args)
+
+        if isinstance(expr, Identifier):
+            # Check if it's a variable derived from atomic
+            return expr.name in atomic_derived
+
+        if isinstance(expr, MemberExpr):
+            # Check the object of member access
+            return self._expr_involves_atomic(expr.object, atomic_params, atomic_derived)
+
+        if isinstance(expr, BinaryExpr):
+            return (self._expr_involves_atomic(expr.left, atomic_params, atomic_derived) or
+                    self._expr_involves_atomic(expr.right, atomic_params, atomic_derived))
+
+        if isinstance(expr, UnaryExpr):
+            return self._expr_involves_atomic(expr.operand, atomic_params, atomic_derived)
+
+        if isinstance(expr, TernaryExpr):
+            return (self._expr_involves_atomic(expr.condition, atomic_params, atomic_derived) or
+                    self._expr_involves_atomic(expr.then_expr, atomic_params, atomic_derived) or
+                    self._expr_involves_atomic(expr.else_expr, atomic_params, atomic_derived))
+
+        return False
+
+    def _var_used_in_condition(self, var_name: str, condition: Expr) -> bool:
+        """Check if variable is used in a condition expression."""
+        if condition is None:
+            return False
+
+        if isinstance(condition, Identifier):
+            return condition.name == var_name
+
+        if isinstance(condition, BinaryExpr):
+            return (self._var_used_in_condition(var_name, condition.left) or
+                    self._var_used_in_condition(var_name, condition.right))
+
+        if isinstance(condition, UnaryExpr):
+            return self._var_used_in_condition(var_name, condition.operand)
+
+        if isinstance(condition, MethodCallExpr):
+            if isinstance(condition.object, Identifier) and condition.object.name == var_name:
+                return True
+            return any(self._var_used_in_condition(var_name, arg) for arg in condition.args)
+
+        if isinstance(condition, CallExpr):
+            return any(self._var_used_in_condition(var_name, arg) for arg in condition.args)
+
+        return False
+
+
 # All analyzers to run
 ALL_ANALYZERS = [
     PerformanceAnalyzer(),
     FunctionKindAnalyzer(),
     MoveAnalyzer(),
     GCAnalyzer(),
+    AtomicSpinAnalyzer(),
 ]
 
 

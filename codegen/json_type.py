@@ -1865,3 +1865,717 @@ class JsonGenerator:
         cg.functions["coex_json_pretty"] = cg.json_pretty
         cg.functions["coex_json_stringify"] = cg.json_stringify
 
+    # =========================================================================
+    # JSON Conversion Methods (code generation during expression evaluation)
+    # =========================================================================
+
+    def generate_json_object(self, expr: 'JsonObjectExpr') -> ir.Value:
+        """Generate code for JSON object literal: {name: "Alice", age: 30}
+
+        Creates a Map<String, Json> internally, then wraps it in a Json object.
+        """
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        if not expr.entries:
+            # Empty JSON object: create empty map, wrap in json_new_object
+            flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR  # String keys, Json values
+            empty_map = builder.call(cg.map_new, [ir.Constant(i64, flags)])
+            return builder.call(cg.json_new_object, [empty_map])
+
+        # Create map with string keys and json values
+        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR
+        map_ptr = builder.call(cg.map_new, [ir.Constant(i64, flags)])
+
+        # Add each entry
+        for key_str, value_expr in expr.entries:
+            # Generate the key as a string (it's already a literal string from parsing)
+            key_string = cg._get_string_ptr(key_str)
+
+            # Generate the value expression
+            value = cg._generate_expression(value_expr)
+
+            # Convert value to JSON if it isn't already
+            json_value = self.convert_to_json(value, value_expr)
+
+            # Cast json pointer to i64 for map storage
+            json_i64 = builder.ptrtoint(json_value, i64)
+
+            # Add to map using string-aware set
+            map_ptr = builder.call(cg.map_set_string, [map_ptr, key_string, json_i64])
+
+        # Wrap the map in a Json object
+        return builder.call(cg.json_new_object, [map_ptr])
+
+    def convert_to_json(self, value: ir.Value, expr: 'Expr') -> ir.Value:
+        """Convert a value to a Json* pointer based on its type."""
+        from ast_nodes import NilLiteral
+        cg = self.cg
+        builder = cg.builder
+
+        # Handle NilLiteral first - before type checks since nil generates i64(0)
+        if isinstance(expr, NilLiteral):
+            return builder.call(cg.json_new_null, [])
+
+        # Check value type and call appropriate json_new_* constructor
+        if isinstance(value.type, ir.IntType):
+            if value.type.width == 1:
+                # Boolean
+                return builder.call(cg.json_new_bool, [value])
+            elif value.type.width == 64:
+                # Integer
+                return builder.call(cg.json_new_int, [value])
+            else:
+                # Extend to i64 for JSON
+                extended = builder.zext(value, ir.IntType(64))
+                return builder.call(cg.json_new_int, [extended])
+        elif isinstance(value.type, ir.DoubleType):
+            # Float
+            return builder.call(cg.json_new_float, [value])
+        elif isinstance(value.type, ir.PointerType):
+            if hasattr(value.type.pointee, 'name'):
+                struct_name = value.type.pointee.name
+                if struct_name == "struct.String":
+                    # String
+                    return builder.call(cg.json_new_string, [value])
+                elif struct_name == "struct.Json":
+                    # Already JSON, return as-is
+                    return value
+                elif struct_name == "struct.List":
+                    # List -> JSON array (need to convert elements to JSON)
+                    return self.convert_list_to_json_array(value)
+                elif struct_name == "struct.Map":
+                    # Map -> JSON object
+                    return builder.call(cg.json_new_object, [value])
+                else:
+                    # Check for user-defined types and enums
+                    type_name = struct_name.replace("struct.", "") if struct_name.startswith("struct.") else struct_name
+                    return self.convert_udt_to_json(value, type_name)
+
+        # Default: treat as int (may need extension for other types)
+        if isinstance(value.type, ir.IntType):
+            extended = builder.zext(value, ir.IntType(64)) if value.type.width < 64 else value
+            return builder.call(cg.json_new_int, [extended])
+
+        # Fallback: create null JSON
+        return builder.call(cg.json_new_null, [])
+
+    def convert_list_to_json_array(self, list_ptr: ir.Value) -> ir.Value:
+        """Convert a Coex list to a JSON array by converting each element to JSON.
+
+        This creates a new list where each element is a Json* pointer, then wraps
+        it in a JSON array.
+        """
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get source list length and element size
+        src_len = builder.call(cg.list_len, [list_ptr])
+
+        # Get the element size from the list struct (field 3)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        src_elem_size = builder.load(elem_size_ptr)
+
+        # Create new list with 8-byte elements (for Json* pointers)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
+
+        # Store pointers for loop (allocate OUTSIDE loop to avoid stack overflow)
+        json_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="json_list_ptr")
+        builder.store(json_list, json_list_ptr)
+        idx_ptr = builder.alloca(i64, name="conv_idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+        temp = builder.alloca(i64, name="json_temp")  # Reused each iteration
+
+        # Create loop blocks
+        func = builder.function
+        loop_cond = func.append_basic_block("list_conv_cond")
+        loop_body = func.append_basic_block("list_conv_body")
+        loop_done = func.append_basic_block("list_conv_done")
+
+        builder.branch(loop_cond)
+
+        # Loop condition
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, src_len)
+        builder.cbranch(cmp, loop_body, loop_done)
+
+        # Loop body: get element, convert to JSON, append
+        builder.position_at_end(loop_body)
+        elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
+
+        # Determine conversion based on element size
+        # For now, assume all elements are 8 bytes and could be int or pointer
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+
+        # Convert to JSON (treat as int for now - could be enhanced)
+        json_elem = builder.call(cg.json_new_int, [elem_i64])
+
+        # Append to JSON list (reuse pre-allocated temp)
+        json_i64 = builder.ptrtoint(json_elem, i64)
+        builder.store(json_i64, temp)
+        temp_i8 = builder.bitcast(temp, i8_ptr)
+
+        curr_list = builder.load(json_list_ptr)
+        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        builder.store(new_list, json_list_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        # Done: create JSON array from the converted list
+        builder.position_at_end(loop_done)
+        final_list = builder.load(json_list_ptr)
+        return builder.call(cg.json_new_array, [final_list])
+
+    def convert_udt_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
+        """Convert a user-defined type or enum to JSON with _type metadata."""
+        cg = self.cg
+
+        # Check if it's an enum
+        if type_name in cg.enum_variants:
+            return self.convert_enum_to_json(value, type_name)
+
+        # Check if it's a user-defined struct
+        if type_name in cg.type_fields:
+            return self.convert_struct_to_json(value, type_name)
+
+        # Unknown type - return null JSON
+        return cg.builder.call(cg.json_new_null, [])
+
+    def convert_struct_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
+        """Convert a user-defined struct to JSON object with _type field."""
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Create empty JSON object (starts with empty map)
+        flags = ir.Constant(i64, 0x01)  # String keys
+        map_ptr = builder.call(cg.map_new, [flags])
+
+        # Add _type field
+        type_str = cg._get_string_ptr(type_name)
+        type_json = builder.call(cg.json_new_string, [type_str])
+        type_json_i64 = builder.ptrtoint(type_json, i64)
+        type_key = cg._get_string_ptr("_type")
+        map_ptr = builder.call(cg.map_set_string, [map_ptr, type_key, type_json_i64])
+
+        # Add each field
+        field_info = cg.type_fields[type_name]
+        for idx, (field_name, field_type) in enumerate(field_info):
+            # Extract field value
+            field_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            field_val = builder.load(field_ptr)
+
+            # Convert field value to JSON
+            field_json = self.convert_field_to_json(field_val, field_type)
+
+            # Add to map
+            field_json_i64 = builder.ptrtoint(field_json, i64)
+            field_key = cg._get_string_ptr(field_name)
+            map_ptr = builder.call(cg.map_set_string, [map_ptr, field_key, field_json_i64])
+
+        # Wrap map in JSON object
+        return builder.call(cg.json_new_object, [map_ptr])
+
+    def convert_enum_to_json(self, value: ir.Value, enum_name: str) -> ir.Value:
+        """Convert an enum to JSON object with _type and _variant fields."""
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = builder.function
+
+        # Get tag value (first field of enum struct)
+        tag_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+
+        # Create result alloca for PHI-like behavior
+        result_ptr = builder.alloca(cg.json_struct.as_pointer(), name="enum_json")
+
+        # Build switch for each variant
+        variants = cg.enum_variants[enum_name]
+        done_block = func.append_basic_block(f"enum_json_done")
+
+        # Default block (shouldn't happen but needed for switch)
+        default_block = func.append_basic_block(f"enum_json_default")
+
+        # Create switch instruction
+        switch = builder.switch(tag, default_block)
+
+        for variant_name, (variant_tag, variant_fields) in variants.items():
+            variant_block = func.append_basic_block(f"enum_json_{variant_name}")
+            switch.add_case(ir.Constant(i64, variant_tag), variant_block)
+
+            builder.position_at_end(variant_block)
+
+            # Create JSON object for this variant
+            flags = ir.Constant(i64, 0x01)  # String keys
+            map_ptr = builder.call(cg.map_new, [flags])
+
+            # Add _type field
+            type_str = cg._get_string_ptr(enum_name)
+            type_json = builder.call(cg.json_new_string, [type_str])
+            type_json_i64 = builder.ptrtoint(type_json, i64)
+            type_key = cg._get_string_ptr("_type")
+            map_ptr = builder.call(cg.map_set_string, [map_ptr, type_key, type_json_i64])
+
+            # Add _variant field
+            variant_str = cg._get_string_ptr(variant_name)
+            variant_json = builder.call(cg.json_new_string, [variant_str])
+            variant_json_i64 = builder.ptrtoint(variant_json, i64)
+            variant_key = cg._get_string_ptr("_variant")
+            map_ptr = builder.call(cg.map_set_string, [map_ptr, variant_key, variant_json_i64])
+
+            # Add variant data fields (start at index 1, after tag)
+            for field_idx, (field_name, field_type) in enumerate(variant_fields):
+                field_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, field_idx + 1)], inbounds=True)
+                field_val = builder.load(field_ptr)
+
+                # Convert field value to JSON
+                field_json = self.convert_field_to_json(field_val, field_type)
+
+                # Add to map
+                field_json_i64 = builder.ptrtoint(field_json, i64)
+                field_key = cg._get_string_ptr(field_name)
+                map_ptr = builder.call(cg.map_set_string, [map_ptr, field_key, field_json_i64])
+
+            # Wrap map in JSON object
+            json_obj = builder.call(cg.json_new_object, [map_ptr])
+            builder.store(json_obj, result_ptr)
+            builder.branch(done_block)
+
+        # Default block - create null JSON
+        builder.position_at_end(default_block)
+        null_json = builder.call(cg.json_new_null, [])
+        builder.store(null_json, result_ptr)
+        builder.branch(done_block)
+
+        # Done block - load and return result
+        builder.position_at_end(done_block)
+        return builder.load(result_ptr)
+
+    def convert_field_to_json(self, field_val: ir.Value, field_type: 'Type') -> ir.Value:
+        """Convert a field value to JSON based on its Coex type."""
+        from ast_nodes import PrimitiveType, ListType, MapType, NamedType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        # Handle primitives
+        if isinstance(field_type, PrimitiveType):
+            if field_type.name == "int":
+                if isinstance(field_val.type, ir.IntType) and field_val.type.width < 64:
+                    field_val = builder.zext(field_val, i64)
+                return builder.call(cg.json_new_int, [field_val])
+            elif field_type.name == "float":
+                return builder.call(cg.json_new_float, [field_val])
+            elif field_type.name == "bool":
+                return builder.call(cg.json_new_bool, [field_val])
+            elif field_type.name == "string":
+                # field_val is i64 (pointer as int), convert back to pointer
+                if isinstance(field_val.type, ir.IntType):
+                    str_ptr = builder.inttoptr(field_val, cg.string_struct.as_pointer())
+                else:
+                    str_ptr = field_val
+                return builder.call(cg.json_new_string, [str_ptr])
+
+        # Handle collections
+        if isinstance(field_type, ListType):
+            if isinstance(field_val.type, ir.IntType):
+                list_ptr = builder.inttoptr(field_val, cg.list_struct.as_pointer())
+            else:
+                list_ptr = field_val
+            return builder.call(cg.json_new_array, [list_ptr])
+
+        if isinstance(field_type, MapType):
+            if isinstance(field_val.type, ir.IntType):
+                map_ptr = builder.inttoptr(field_val, cg.map_struct.as_pointer())
+            else:
+                map_ptr = field_val
+            return builder.call(cg.json_new_object, [map_ptr])
+
+        # Handle user-defined types
+        if isinstance(field_type, NamedType):
+            if isinstance(field_val.type, ir.IntType):
+                udt_ptr = builder.inttoptr(field_val, cg.type_registry[field_type.name].as_pointer())
+            else:
+                udt_ptr = field_val
+            return self.convert_udt_to_json(udt_ptr, field_type.name)
+
+        # Fallback - treat as int
+        if isinstance(field_val.type, ir.IntType):
+            if field_val.type.width < 64:
+                field_val = builder.zext(field_val, i64)
+            return builder.call(cg.json_new_int, [field_val])
+
+        return builder.call(cg.json_new_null, [])
+
+    def generate_as_expr(self, expr: 'AsExpr') -> ir.Value:
+        """Generate code for type cast expression: expr as Type or expr as Type?"""
+        from ast_nodes import PrimitiveType, NamedType, ListType, OptionalType
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Generate the source expression
+        source = cg._generate_expression(expr.expr)
+        target_type = expr.target_type
+
+        # Handle OptionalType wrapper - get the inner type
+        if isinstance(target_type, OptionalType):
+            inner_type = target_type.inner_type
+        else:
+            inner_type = target_type
+
+        # If source is not JSON, we need special handling
+        if not (isinstance(source.type, ir.PointerType) and
+                hasattr(source.type.pointee, 'name') and
+                source.type.pointee.name == "struct.Json"):
+            # Source is not JSON - handle other conversions
+            return self.generate_non_json_as_expr(source, expr)
+
+        # JSON → Coex conversion
+        # Get the JSON tag
+        tag_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        value_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = builder.load(value_ptr)
+
+        # Handle JSON → string: extract string if JSON is string type, else serialize
+        if isinstance(inner_type, PrimitiveType) and inner_type.name == "string":
+            # Check if JSON is a string type - if so, extract; otherwise serialize
+            is_str_type = builder.icmp_unsigned("==", tag, ir.Constant(ir.IntType(8), self.JSON_TAG_STRING))
+
+            func = builder.function
+            extract_block = func.append_basic_block("json_extract_str")
+            serialize_block = func.append_basic_block("json_serialize_str")
+            done_block = func.append_basic_block("json_str_done")
+
+            builder.cbranch(is_str_type, extract_block, serialize_block)
+
+            # Extract the string directly
+            builder.position_at_end(extract_block)
+            extracted = builder.inttoptr(value, cg.string_struct.as_pointer())
+            builder.branch(done_block)
+
+            # Serialize to JSON string
+            builder.position_at_end(serialize_block)
+            serialized = builder.call(cg.json_stringify, [source])
+            builder.branch(done_block)
+
+            # Merge results
+            builder.position_at_end(done_block)
+            result = builder.phi(cg.string_struct.as_pointer(), "str_result")
+            result.add_incoming(extracted, extract_block)
+            result.add_incoming(serialized, serialize_block)
+            return result
+
+        # Handle primitive target types (extraction)
+        if isinstance(inner_type, PrimitiveType):
+            return self.generate_json_to_primitive(source, tag, value, inner_type, expr.is_optional)
+
+        # Handle user-defined types
+        if isinstance(inner_type, NamedType):
+            if inner_type.name in cg.type_fields:
+                return self.generate_json_to_struct(source, tag, value, inner_type, expr.is_optional)
+            if inner_type.name in cg.enum_variants:
+                return self.generate_json_to_enum(source, tag, value, inner_type, expr.is_optional)
+
+        # Handle List type
+        if isinstance(inner_type, ListType):
+            return self.generate_json_to_list(source, tag, value, inner_type, expr.is_optional)
+
+        # Fallback - return 0/nil
+        if expr.is_optional:
+            return ir.Constant(i64, 0)
+        return ir.Constant(i64, 0)
+
+    def generate_non_json_as_expr(self, source: ir.Value, expr: 'AsExpr') -> ir.Value:
+        """Handle non-JSON type conversions (e.g., int as string, string as json)."""
+        from ast_nodes import PrimitiveType, OptionalType
+        cg = self.cg
+        builder = cg.builder
+        target_type = expr.target_type
+
+        if isinstance(target_type, OptionalType):
+            inner_type = target_type.inner_type
+        else:
+            inner_type = target_type
+
+        # string → json (parsing)
+        if isinstance(inner_type, PrimitiveType) and inner_type.name == "json":
+            # Check if source is a string
+            if (isinstance(source.type, ir.PointerType) and
+                hasattr(source.type.pointee, 'name') and
+                source.type.pointee.name == "struct.String"):
+                # Parse the string as JSON
+                return builder.call(cg.json_parse, [source])
+            # Other types → json (implicit conversion)
+            return self.convert_to_json(source, expr.expr)
+
+        # For other conversions, just return the value (type checking should catch errors)
+        return source
+
+    def generate_json_to_primitive(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                     target_type: 'PrimitiveType', is_optional: bool) -> ir.Value:
+        """Convert JSON to a primitive type."""
+        cg = self.cg
+        builder = cg.builder
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        func = builder.function
+
+        # Determine expected tag
+        # JSON tags: 0=null, 1=bool, 2=int, 3=float, 4=string, 5=array, 6=object
+        if target_type.name == "bool":
+            expected_tag = 1
+            result_type = i1
+        elif target_type.name == "int":
+            expected_tag = 2
+            result_type = i64
+        elif target_type.name == "float":
+            expected_tag = 3
+            result_type = ir.DoubleType()
+        elif target_type.name == "string":
+            expected_tag = 4
+            result_type = cg.string_struct.as_pointer()
+        else:
+            # Unknown primitive - return 0
+            return ir.Constant(i64, 0)
+
+        # Check tag matches
+        tag_matches = builder.icmp_unsigned("==", tag, ir.Constant(i8, expected_tag))
+
+        # Create blocks
+        match_block = func.append_basic_block("as_match")
+        fail_block = func.append_basic_block("as_fail")
+        done_block = func.append_basic_block("as_done")
+
+        # Allocate result
+        if is_optional:
+            # Optional returns i64 (0 for nil)
+            result_ptr = builder.alloca(i64, name="as_result")
+        else:
+            result_ptr = builder.alloca(result_type, name="as_result")
+
+        builder.cbranch(tag_matches, match_block, fail_block)
+
+        # Match block - extract value
+        builder.position_at_end(match_block)
+        if target_type.name == "bool":
+            extracted = builder.trunc(value, i1)
+            if is_optional:
+                # Store as i64 for optional (1 = Some(false), 2 = Some(true))
+                extended = builder.zext(extracted, i64)
+                # Add 1 so 0 can mean None
+                result = builder.add(extended, ir.Constant(i64, 1))
+                builder.store(result, result_ptr)
+            else:
+                builder.store(extracted, result_ptr)
+        elif target_type.name == "int":
+            if is_optional:
+                # For optional int, we need a sentinel. Use a tagged representation.
+                # Store value + 1, with 0 meaning None
+                # This limits range but works for most cases
+                result = builder.add(value, ir.Constant(i64, 1))
+                builder.store(result, result_ptr)
+            else:
+                builder.store(value, result_ptr)
+        elif target_type.name == "float":
+            # value is i64 - bitcast to double
+            extracted = builder.bitcast(value, ir.DoubleType())
+            if is_optional:
+                # Store as i64
+                builder.store(value, result_ptr)
+            else:
+                builder.store(extracted, result_ptr)
+        elif target_type.name == "string":
+            str_ptr = builder.inttoptr(value, cg.string_struct.as_pointer())
+            if is_optional:
+                builder.store(value, result_ptr)
+            else:
+                # Store the actual String* pointer
+                builder.store(str_ptr, result_ptr)
+        builder.branch(done_block)
+
+        # Fail block
+        builder.position_at_end(fail_block)
+        if is_optional:
+            builder.store(ir.Constant(i64, 0), result_ptr)
+            builder.branch(done_block)
+        else:
+            # Panic - type mismatch
+            # For now, just store 0 and continue
+            if result_type == i1:
+                builder.store(ir.Constant(i1, 0), result_ptr)
+            elif result_type == i64:
+                builder.store(ir.Constant(i64, 0), result_ptr)
+            elif isinstance(result_type, ir.DoubleType):
+                builder.store(ir.Constant(ir.DoubleType(), 0.0), result_ptr)
+            else:
+                # Pointer type
+                null_ptr = builder.inttoptr(ir.Constant(i64, 0), result_type)
+                builder.store(null_ptr, result_ptr)
+            builder.branch(done_block)
+
+        # Done block
+        builder.position_at_end(done_block)
+        return builder.load(result_ptr)
+
+    def generate_json_to_struct(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                  target_type: 'NamedType', is_optional: bool) -> ir.Value:
+        """Convert JSON object to user-defined struct."""
+        cg = self.cg
+        builder = cg.builder
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        func = builder.function
+        type_name = target_type.name
+
+        # Check it's an object (tag == 6)
+        is_object = builder.icmp_unsigned("==", tag, ir.Constant(i8, 6))
+
+        match_block = func.append_basic_block("as_struct_match")
+        fail_block = func.append_basic_block("as_struct_fail")
+        done_block = func.append_basic_block("as_struct_done")
+
+        struct_type = cg.type_registry[type_name]
+        result_ptr = builder.alloca(struct_type.as_pointer(), name="as_struct_result")
+
+        builder.cbranch(is_object, match_block, fail_block)
+
+        # Match block - extract fields
+        builder.position_at_end(match_block)
+
+        # Get the map from the JSON object
+        map_ptr = builder.inttoptr(value, cg.map_struct.as_pointer())
+
+        # Allocate struct via GC
+        struct_size = ir.Constant(i64, len(cg.type_fields[type_name]) * 8)
+        type_id = ir.Constant(i32, cg.gc.get_type_id(type_name))
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
+        struct_ptr = builder.bitcast(raw_ptr, struct_type.as_pointer())
+
+        # Extract each field
+        field_info = cg.type_fields[type_name]
+        for idx, (field_name, field_type) in enumerate(field_info):
+            # Skip _type field
+            if field_name == "_type":
+                continue
+
+            # Get field from map
+            field_key = cg._get_string_ptr(field_name)
+            field_json_i64 = builder.call(cg.map_get_string, [map_ptr, field_key])
+
+            # Convert from JSON
+            field_json = builder.inttoptr(field_json_i64, cg.json_struct.as_pointer())
+            field_val = self.extract_json_value(field_json, field_type)
+
+            # Store in struct
+            field_ptr = builder.gep(struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            builder.store(field_val, field_ptr)
+
+        if is_optional:
+            struct_i64 = builder.ptrtoint(struct_ptr, i64)
+            builder.store(builder.inttoptr(struct_i64, struct_type.as_pointer()), result_ptr)
+        else:
+            builder.store(struct_ptr, result_ptr)
+        builder.branch(done_block)
+
+        # Fail block
+        builder.position_at_end(fail_block)
+        null_ptr = builder.inttoptr(ir.Constant(i64, 0), struct_type.as_pointer())
+        builder.store(null_ptr, result_ptr)
+        builder.branch(done_block)
+
+        # Done block
+        builder.position_at_end(done_block)
+        return builder.load(result_ptr)
+
+    def generate_json_to_enum(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                target_type: 'NamedType', is_optional: bool) -> ir.Value:
+        """Convert JSON object to enum."""
+        # Similar to struct but also checks _variant field
+        i64 = ir.IntType(64)
+
+        # For now, return a simple placeholder
+        # Full enum conversion requires matching variant names
+        if is_optional:
+            return ir.Constant(i64, 0)
+        return ir.Constant(i64, 0)
+
+    def generate_json_to_list(self, json_ptr: ir.Value, tag: ir.Value, value: ir.Value,
+                                target_type: 'ListType', is_optional: bool) -> ir.Value:
+        """Convert JSON array to List."""
+        cg = self.cg
+        builder = cg.builder
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        func = builder.function
+
+        # Check it's an array (tag == 5)
+        is_array = builder.icmp_unsigned("==", tag, ir.Constant(i8, 5))
+
+        match_block = func.append_basic_block("as_list_match")
+        fail_block = func.append_basic_block("as_list_fail")
+        done_block = func.append_basic_block("as_list_done")
+
+        result_ptr = builder.alloca(cg.list_struct.as_pointer(), name="as_list_result")
+
+        builder.cbranch(is_array, match_block, fail_block)
+
+        # Match block - the value is already a List*
+        builder.position_at_end(match_block)
+        list_ptr = builder.inttoptr(value, cg.list_struct.as_pointer())
+        builder.store(list_ptr, result_ptr)
+        builder.branch(done_block)
+
+        # Fail block
+        builder.position_at_end(fail_block)
+        null_ptr = builder.inttoptr(ir.Constant(i64, 0), cg.list_struct.as_pointer())
+        builder.store(null_ptr, result_ptr)
+        builder.branch(done_block)
+
+        # Done block
+        builder.position_at_end(done_block)
+        return builder.load(result_ptr)
+
+    def extract_json_value(self, json_ptr: ir.Value, target_type: 'Type') -> ir.Value:
+        """Extract a value from a JSON pointer, converting to the target type."""
+        from ast_nodes import PrimitiveType
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # Get tag and value
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value = builder.load(value_ptr)
+
+        if isinstance(target_type, PrimitiveType):
+            if target_type.name == "int":
+                return value
+            elif target_type.name == "float":
+                return builder.bitcast(value, ir.DoubleType())
+            elif target_type.name == "bool":
+                return builder.trunc(value, ir.IntType(1))
+            elif target_type.name == "string":
+                return builder.inttoptr(value, cg.string_struct.as_pointer())
+
+        # For complex types, return the raw value as i64
+        return value
+

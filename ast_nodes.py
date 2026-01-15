@@ -16,10 +16,10 @@ from enum import Enum, auto
 
 class FunctionKind(Enum):
     FORMULA = auto()
+    TASK = auto()    # Lightweight coroutine (stackless)
     THREAD = auto()  # OS-level concurrency (pthreads)
     FUNC = auto()
     EXTERN = auto()  # FFI to C functions
-    # TASK is reserved for future coroutine system
 
 
 class BinaryOp(Enum):
@@ -598,7 +598,7 @@ class ForAssignStmt(Stmt):
 
 @dataclass
 class FirstAssignStmt(Stmt):
-    """result = first item in items expr ~
+    """result = first item in items body ~
 
     Spawns all tasks, returns the first successful result.
     Remaining tasks are cancelled once a result is obtained.
@@ -607,7 +607,7 @@ class FirstAssignStmt(Stmt):
     target: str
     pattern: Union[str, Pattern]
     iterable: Expr
-    body_expr: Expr
+    body: List['Stmt']  # Block of statements to execute for each item
 
     @property
     def var_name(self) -> Optional[str]:
@@ -621,7 +621,7 @@ class FirstAssignStmt(Stmt):
 
 @dataclass
 class MostAssignStmt(Stmt):
-    """(results, errors) = most item in items expr ~
+    """(results, errors) = most item in items body ~
 
     Spawns all tasks and waits for all to complete.
     Returns a tuple of (successful_results, errors).
@@ -631,7 +631,7 @@ class MostAssignStmt(Stmt):
     errors_target: str   # Variable for errors list
     pattern: Union[str, Pattern]
     iterable: Expr
-    body_expr: Expr
+    body: List['Stmt']  # Block of statements to execute for each item
 
     @property
     def var_name(self) -> Optional[str]:

@@ -1088,6 +1088,14 @@ class StatementGenerator:
         """Generate print statement"""
         cg = self.cg
 
+        # Formula purity check: formulas cannot perform I/O
+        if hasattr(cg, 'current_function') and cg.current_function:
+            if cg.current_function.kind == FunctionKind.FORMULA:
+                raise RuntimeError(
+                    f"Cannot use print() in formula '{cg.current_function.name}'. "
+                    f"Formulas must be pure and cannot perform I/O."
+                )
+
         if not cg.printing_enabled:
             return
 
