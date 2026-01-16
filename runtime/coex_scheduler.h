@@ -48,8 +48,8 @@ typedef struct {
     };
 } TaskResult;
 
-/* Step function signature: takes frame, returns TaskResult */
-typedef TaskResult (*StepFunction)(void* frame, int64_t resolved_value);
+/* Step function signature: takes frame, writes result to output parameter */
+typedef void (*StepFunction)(void* frame, int64_t resolved_value, TaskResult* out_result);
 
 /* Suspended task waiting in scheduler */
 typedef struct SchedulerTask {

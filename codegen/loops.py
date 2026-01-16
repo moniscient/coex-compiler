@@ -1699,7 +1699,8 @@ class LoopGenerator:
         cg.builder.position_at_end(spawn_done)
 
         # Allocate space for results array and count
-        results_ptr_ptr = cg.builder.alloca(i8_ptr.as_pointer(), name="results_arr_ptr")
+        # Alloca creates a pointer to the type, so alloca(i8*) gives us i8**
+        results_ptr_ptr = cg.builder.alloca(i8_ptr, name="results_arr_ptr")
         results_count_ptr = cg.builder.alloca(i64, name="results_count")
 
         cg.builder.call(
@@ -1726,15 +1727,19 @@ class LoopGenerator:
         cg.builder.cbranch(copy_cond, copy_body, copy_done)
 
         cg.builder.position_at_end(copy_body)
-        # Get result value from array
-        result_arr_typed = cg.builder.bitcast(results_arr, i64.as_pointer().as_pointer())
+        # Get result value from array - results_arr is i64* (array of int64 values)
+        result_arr_typed = cg.builder.bitcast(results_arr, i64.as_pointer())
         result_ptr = cg.builder.gep(result_arr_typed, [ci], inbounds=True)
         result_val = cg.builder.load(result_ptr)
 
-        # Append to results list
+        # Append to results list - list_append takes (list, elem_ptr, elem_size)
         current_results_list = cg.builder.load(cg.locals[stmt.results_target])
+        temp_ptr = cg.builder.alloca(i64, name="result_temp")
+        cg.builder.store(result_val, temp_ptr)
+        temp_i8_ptr = cg.builder.bitcast(temp_ptr, i8_ptr)
+        elem_size = ir.Constant(i64, 8)
         new_results_list = cg.builder.call(
-            cg.list_append_i64, [current_results_list, result_val]
+            cg.list_append, [current_results_list, temp_i8_ptr, elem_size]
         )
         cg.builder.store(new_results_list, cg.locals[stmt.results_target])
 

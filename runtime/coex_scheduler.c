@@ -288,8 +288,9 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
         return;
     }
 
-    /* Call step function */
-    TaskResult result = task->step_fn(task->frame, task->resolved_value);
+    /* Call step function with output parameter */
+    TaskResult result;
+    task->step_fn(task->frame, task->resolved_value, &result);
     atomic_fetch_add(&tasks_executed, 1);
 
     /* Check cancellation again */

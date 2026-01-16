@@ -169,7 +169,7 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
             process_statements(stmt.then_body)
             if stmt.else_body:
                 process_statements(stmt.else_body)
-            for elif_cond, elif_body in stmt.elif_branches:
+            for elif_cond, elif_body in stmt.else_if_clauses:
                 call = find_task_call_in_expr(elif_cond, task_functions)
                 if call:
                     callee_name = get_callee_name(call)
@@ -312,7 +312,7 @@ def find_all_locals(body: List[Stmt]) -> Dict[str, Type]:
             process_statements(stmt.then_body)
             if stmt.else_body:
                 process_statements(stmt.else_body)
-            for _, elif_body in stmt.elif_branches:
+            for _, elif_body in stmt.else_if_clauses:
                 process_statements(elif_body)
 
         elif isinstance(stmt, ForStmt):
@@ -425,7 +425,7 @@ def compute_hoisted_locals(
                 if stmt.else_body:
                     for s in stmt.else_body:
                         find_in_stmt(s)
-                for cond, body in stmt.elif_branches:
+                for cond, body in stmt.else_if_clauses:
                     find_in_expr(cond)
                     for s in body:
                         find_in_stmt(s)

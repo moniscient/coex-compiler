@@ -20,6 +20,7 @@ from ast_nodes import (
     TupleExpr, ListExpr, MapExpr, SetExpr, LambdaExpr, SelectStmt, WithinStmt,
     SelfExpr
 )
+from task_analysis import analyze_task
 
 if TYPE_CHECKING:
     from codegen.core import CodeGenerator
@@ -377,6 +378,29 @@ class FunctionGenerator:
         # Skip extern functions (they have no body, external linkage only)
         if func.kind == FunctionKind.EXTERN:
             return
+
+        # ====================================================================
+        # TASK Function State Machine Generation
+        # ====================================================================
+        # TASK functions with suspension points (calls to other tasks) are
+        # transformed into state machines for scheduler execution.
+        # Tasks without suspension points are generated as regular functions
+        # but still registered for scheduler batch spawning.
+        if func.kind == FunctionKind.TASK and cg._task is not None:
+            # Analyze task for suspension points
+            task_functions = cg._task._task_function_names
+            analysis = analyze_task(func, task_functions)
+
+            # Only generate state machine if task has suspension points
+            if analysis.suspension_points:
+                cg._task.generate_task_with_state_machine(func, analysis)
+                return
+            else:
+                # No suspension points - generate as simple task with step function wrapper
+                # The step function just executes the body and returns DONE
+                cg._task.generate_simple_task_with_step(func)
+                return
+        # ====================================================================
 
         llvm_func = cg.functions[func.name]
 

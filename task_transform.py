@@ -302,6 +302,236 @@ class TaskTransformer:
 
         return llvm_func
 
+    def generate_simple_task_with_step(self, func: FunctionDecl):
+        """
+        Generate a simple task (no suspension points) with step function wrapper.
+
+        For scheduler batch spawning (first/most), we need a step function even
+        for tasks that don't suspend. This generates:
+        1. The actual task function body (impl function)
+        2. A minimal frame type (just parameters)
+        3. A step function that calls the impl and returns DONE
+        4. An entry function that either uses scheduler (for batch) or calls directly
+        """
+        cg = self.cg
+
+        # Create a minimal analysis with no suspension points
+        from task_analysis import TaskAnalysis
+        analysis = TaskAnalysis(
+            function_name=func.name,
+            parameters=func.params,
+            return_type=func.return_type,
+            suspension_points=[],
+            hoisted_locals={},
+            all_locals={}
+        )
+
+        # Create frame type (for parameters)
+        frame_info = self.get_or_create_frame_type(func, analysis)
+
+        # Generate the impl function first
+        impl_fn = self._generate_task_impl(func)
+
+        # Generate step function that calls impl and returns DONE
+        step_fn = self._generate_simple_step_function_with_impl(func, frame_info, impl_fn)
+        self.step_functions[func.name] = step_fn
+
+        # Generate entry function that just calls impl directly (no scheduler for simple calls)
+        self._generate_simple_entry_function(func, impl_fn)
+
+    def _generate_simple_step_function_with_impl(self, func: FunctionDecl,
+                                                   frame_info: TaskFrameInfo,
+                                                   impl_fn: ir.Function) -> ir.Function:
+        """
+        Generate a step function for a simple task (no suspension).
+
+        This step function:
+        1. Loads parameters from frame
+        2. Calls the internal task function
+        3. Returns TASK_RESULT_DONE with the result
+        """
+        cg = self.cg
+
+        # TaskResult struct matches C layout with union:
+        # { i32 kind; i32 padding; union { i64 value; struct { i8* frame; i8* step_fn; } }; }
+        # For DONE: kind=0, padding=0, value=result, step_fn=null
+        task_result_type = ir.LiteralStructType([
+            ir.IntType(32),  # kind (offset 0)
+            ir.IntType(32),  # padding (offset 4)
+            ir.IntType(64),  # value or frame as i64 (offset 8)
+            ir.IntType(8).as_pointer(),  # step_fn (offset 16)
+        ])
+
+        # Step function type: void step(Frame*, i64 resolved, TaskResult* out)
+        # Using output parameter to avoid ABI issues with struct returns
+        step_fn_type = ir.FunctionType(
+            ir.VoidType(),
+            [frame_info.llvm_frame_type.as_pointer(), ir.IntType(64),
+             task_result_type.as_pointer()]
+        )
+
+        step_fn_name = f"__{func.name}_step"
+        step_fn = ir.Function(cg.module, step_fn_type, name=step_fn_name)
+        step_fn.args[0].name = "frame"
+        step_fn.args[1].name = "resolved"
+        step_fn.args[2].name = "out_result"
+
+        # Create entry block
+        entry = step_fn.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        frame_ptr = step_fn.args[0]
+        out_ptr = step_fn.args[2]
+
+        # Load parameters from frame and call impl function
+        args = []
+        for param in func.params:
+            param_idx = frame_info.field_indices[param.name]
+            param_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), param_idx)
+            ], inbounds=True)
+            args.append(builder.load(param_ptr))
+
+        # Call the implementation function
+        result_val = builder.call(impl_fn, args, name="result")
+
+        # Cast result to i64 if needed
+        if result_val.type != ir.IntType(64):
+            if isinstance(result_val.type, ir.IntType):
+                result_val = builder.sext(result_val, ir.IntType(64))
+            else:
+                result_val = builder.ptrtoint(result_val, ir.IntType(64))
+
+        # Store TASK_RESULT_DONE to output parameter
+        # Store kind = 0 (TASK_RESULT_DONE)
+        kind_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), TASK_RESULT_DONE), kind_ptr)
+
+        # Store padding = 0
+        padding_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), 0), padding_ptr)
+
+        # Store value
+        value_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 2)
+        ], inbounds=True)
+        builder.store(result_val, value_ptr)
+
+        # Store step_fn = null
+        stepfn_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), stepfn_ptr)
+
+        builder.ret_void()
+
+        return step_fn
+
+    def _generate_simple_entry_function(self, func: FunctionDecl,
+                                         impl_fn: ir.Function):
+        """
+        Generate a simple entry function that just calls the impl directly.
+
+        For simple tasks called normally (not via first/most), there's no need
+        to go through the scheduler. Just call the implementation directly.
+        """
+        cg = self.cg
+
+        # Reuse existing function declaration
+        if func.name not in cg.functions:
+            raise RuntimeError(f"Function {func.name} not declared")
+
+        entry_fn = cg.functions[func.name]
+
+        # Create entry block
+        entry = entry_fn.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Just call impl with the arguments and return
+        result = builder.call(impl_fn, list(entry_fn.args), name="result")
+        builder.ret(result)
+
+    def _generate_task_impl(self, func: FunctionDecl) -> ir.Function:
+        """Generate the internal implementation function for a simple task."""
+        cg = self.cg
+
+        # Get return type
+        if func.return_type:
+            ret_type = cg._get_llvm_type(func.return_type)
+        else:
+            ret_type = ir.IntType(64)
+
+        # Get parameter types
+        param_types = []
+        for param in func.params:
+            param_types.append(cg._get_llvm_type(param.type_annotation))
+
+        # Create implementation function with mangled name
+        impl_name = f"__{func.name}_impl"
+        fn_type = ir.FunctionType(ret_type, param_types)
+        impl_fn = ir.Function(cg.module, fn_type, name=impl_name)
+
+        # Name parameters
+        for i, param in enumerate(func.params):
+            impl_fn.args[i].name = param.name
+
+        # Create entry block
+        entry = impl_fn.append_basic_block("entry")
+
+        # Save codegen state
+        saved_builder = cg.builder
+        saved_locals = cg.locals.copy() if hasattr(cg, 'locals') and cg.locals else {}
+        saved_function = getattr(cg, 'current_function', None)
+        saved_gc_frame = getattr(cg, 'gc_frame', None)
+        saved_gc_root_indices = cg.gc_root_indices.copy() if hasattr(cg, 'gc_root_indices') and cg.gc_root_indices else {}
+
+        # Set up for body generation
+        cg.builder = ir.IRBuilder(entry)
+        cg.locals = {}
+        cg.current_function = func
+        cg.gc_frame = None
+        cg.gc_root_indices = {}
+
+        # Set up parameter locals
+        for i, param in enumerate(func.params):
+            llvm_param = impl_fn.args[i]
+            alloca = cg.builder.alloca(llvm_param.type, name=param.name)
+            cg.builder.store(llvm_param, alloca)
+            cg.locals[param.name] = alloca
+            if param.type_annotation:
+                cg.var_coex_types[param.name] = param.type_annotation
+
+        # Generate body
+        for stmt in func.body:
+            cg._generate_statement(stmt)
+            if cg.builder.block.is_terminated:
+                break
+
+        # Add implicit return if needed
+        if not cg.builder.block.is_terminated:
+            if isinstance(ret_type, ir.VoidType):
+                cg.builder.ret_void()
+            else:
+                cg.builder.ret(ir.Constant(ret_type, 0))
+
+        # Restore state
+        cg.builder = saved_builder
+        cg.locals = saved_locals
+        cg.current_function = saved_function
+        cg.gc_frame = saved_gc_frame
+        cg.gc_root_indices = saved_gc_root_indices
+
+        return impl_fn
+
     # ========================================================================
     # State Machine Task (With Suspension Points)
     # ========================================================================
@@ -337,35 +567,43 @@ class TaskTransformer:
         Generate the step function that implements the state machine.
 
         The step function:
-        - Takes a frame pointer and returns TaskResult
+        - Takes a frame pointer and output TaskResult*
         - Switches on frame->state to execute current state
-        - Returns TASK_RESULT_DONE(value) or TASK_RESULT_SPAWN(child_frame, child_step)
+        - Writes TASK_RESULT_DONE(value) or TASK_RESULT_SPAWN(child_frame, child_step) to output
         """
         cg = self.cg
 
-        # TaskResult struct: { i32 kind, i64 value, i8* child_frame, i8* child_step }
+        # TaskResult struct matches C layout with union:
+        # { i32 kind; i32 padding; union { i64 value; struct { i8* frame; i8* step_fn; } }; }
+        # For DONE: kind=0, padding=0, value=result, step_fn=null
         task_result_type = ir.LiteralStructType([
-            ir.IntType(32),  # kind
-            ir.IntType(64),  # value (for DONE)
-            ir.IntType(8).as_pointer(),  # child_frame (for SPAWN)
-            ir.IntType(8).as_pointer(),  # child_step (for SPAWN)
+            ir.IntType(32),  # kind (offset 0)
+            ir.IntType(32),  # padding (offset 4)
+            ir.IntType(64),  # value or frame as i64 (offset 8)
+            ir.IntType(8).as_pointer(),  # step_fn (offset 16)
         ])
 
-        # Step function type: TaskResult step(Frame*)
+        # Step function type: void step(Frame*, i64 resolved, TaskResult* out)
+        # Note: this signature uses output parameter to avoid ABI issues
         step_fn_type = ir.FunctionType(
-            task_result_type,
-            [frame_info.llvm_frame_type.as_pointer()]
+            ir.VoidType(),
+            [frame_info.llvm_frame_type.as_pointer(), ir.IntType(64),
+             task_result_type.as_pointer()]
         )
 
         step_fn_name = f"__{func.name}_step"
         step_fn = ir.Function(cg.module, step_fn_type, name=step_fn_name)
         step_fn.args[0].name = "frame"
+        step_fn.args[1].name = "resolved"
+        step_fn.args[2].name = "out_result"
 
         # Create entry block
         entry = step_fn.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
         frame_ptr = step_fn.args[0]
+        resolved_val = step_fn.args[1]
+        out_ptr = step_fn.args[2]
 
         # Load current state
         state_ptr = builder.gep(frame_ptr, [
@@ -389,20 +627,77 @@ class TaskTransformer:
         # Generate code for each state
         self._generate_state_blocks(
             builder, step_fn, frame_ptr, frame_info, func,
-            analysis, state_blocks, task_result_type
+            analysis, state_blocks, task_result_type, out_ptr, resolved_val
         )
 
-        # Default block: return DONE(0) - should never reach here
+        # Default block: write DONE(0) - should never reach here
         builder.position_at_end(default_block)
-        result = ir.Constant(task_result_type, [
-            ir.Constant(ir.IntType(32), TASK_RESULT_DONE),
-            ir.Constant(ir.IntType(64), 0),
-            ir.Constant(ir.IntType(8).as_pointer(), None),
-            ir.Constant(ir.IntType(8).as_pointer(), None),
-        ])
-        builder.ret(result)
+        self._store_task_result_done(builder, out_ptr, ir.Constant(ir.IntType(64), 0))
+        builder.ret_void()
 
         return step_fn
+
+    def _store_task_result_done(self, builder: ir.IRBuilder, out_ptr: ir.Value, value: ir.Value):
+        """Store TASK_RESULT_DONE to output parameter."""
+        # Store kind = 0
+        kind_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), TASK_RESULT_DONE), kind_ptr)
+
+        # Store padding = 0
+        padding_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), 0), padding_ptr)
+
+        # Store value
+        value_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 2)
+        ], inbounds=True)
+        builder.store(value, value_ptr)
+
+        # Store step_fn = null
+        stepfn_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), stepfn_ptr)
+
+    def _store_task_result_spawn(self, builder: ir.IRBuilder, out_ptr: ir.Value,
+                                   frame_ptr: ir.Value, step_fn_ptr: ir.Value):
+        """Store TASK_RESULT_SPAWN to output parameter."""
+        # Store kind = 1
+        kind_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), TASK_RESULT_SPAWN), kind_ptr)
+
+        # Store padding = 0
+        padding_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(32), 0), padding_ptr)
+
+        # Store frame as i64
+        value_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 2)
+        ], inbounds=True)
+        frame_as_i64 = builder.ptrtoint(frame_ptr, ir.IntType(64))
+        builder.store(frame_as_i64, value_ptr)
+
+        # Store step_fn
+        stepfn_ptr = builder.gep(out_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 3)
+        ], inbounds=True)
+        builder.store(step_fn_ptr, stepfn_ptr)
 
     def _generate_state_blocks(self, builder: ir.IRBuilder,
                                 step_fn: ir.Function,
@@ -411,7 +706,9 @@ class TaskTransformer:
                                 func: FunctionDecl,
                                 analysis: TaskAnalysis,
                                 state_blocks: List,
-                                task_result_type):
+                                task_result_type,
+                                out_ptr: ir.Value,
+                                resolved_arg: ir.Value):
         """Generate code for each state in the state machine."""
         cg = self.cg
         suspension_points = analysis.suspension_points
@@ -422,13 +719,8 @@ class TaskTransformer:
         if not suspension_points:
             # No suspension points - run to completion and return DONE
             # This shouldn't happen if we're generating state machine
-            result = ir.Constant(task_result_type, [
-                ir.Constant(ir.IntType(32), TASK_RESULT_DONE),
-                ir.Constant(ir.IntType(64), 0),
-                ir.Constant(ir.IntType(8).as_pointer(), None),
-                ir.Constant(ir.IntType(8).as_pointer(), None),
-            ])
-            builder.ret(result)
+            self._store_task_result_done(builder, out_ptr, ir.Constant(ir.IntType(64), 0))
+            builder.ret_void()
             return
 
         # For state 0: execute code before first suspension, then SPAWN child
@@ -444,28 +736,18 @@ class TaskTransformer:
         # Create child frame and return SPAWN
         # For now, return a placeholder - the actual child frame creation
         # requires generating code for the callee's frame
-        child_frame_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
-        child_step_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
-
-        result = ir.Constant(task_result_type, [
-            ir.Constant(ir.IntType(32), TASK_RESULT_SPAWN),
-            ir.Constant(ir.IntType(64), 0),
-            child_frame_ptr,
-            child_step_ptr,
-        ])
-        builder.ret(result)
+        self._store_task_result_spawn(builder, out_ptr,
+                                       ir.Constant(ir.IntType(8).as_pointer(), None),
+                                       ir.Constant(ir.IntType(8).as_pointer(), None))
+        builder.ret_void()
 
         # Generate remaining states
         for i, sp in enumerate(suspension_points):
             state_idx = i + 1
             builder.position_at_end(state_blocks[state_idx])
 
-            # Load resolved value from previous suspension
-            resolved_ptr = builder.gep(frame_ptr, [
-                ir.Constant(ir.IntType(32), 0),
-                ir.Constant(ir.IntType(32), frame_info.field_indices['__resolved'])
-            ], inbounds=True)
-            resolved_val = builder.load(resolved_ptr, name="resolved")
+            # Use resolved value passed as argument
+            resolved_val = resolved_arg
 
             # Store to variable if this suspension had a target
             if sp.var_name and sp.var_name in frame_info.field_indices:
@@ -485,23 +767,15 @@ class TaskTransformer:
                 ], inbounds=True)
                 builder.store(ir.Constant(ir.IntType(64), next_state), state_ptr)
 
-                result = ir.Constant(task_result_type, [
-                    ir.Constant(ir.IntType(32), TASK_RESULT_SPAWN),
-                    ir.Constant(ir.IntType(64), 0),
-                    ir.Constant(ir.IntType(8).as_pointer(), None),
-                    ir.Constant(ir.IntType(8).as_pointer(), None),
-                ])
-                builder.ret(result)
+                self._store_task_result_spawn(builder, out_ptr,
+                                               ir.Constant(ir.IntType(8).as_pointer(), None),
+                                               ir.Constant(ir.IntType(8).as_pointer(), None))
+                builder.ret_void()
             else:
                 # Last state - return DONE with final value
                 # Load return value (use resolved_val or compute from frame)
-                result = ir.Constant(task_result_type, [
-                    ir.Constant(ir.IntType(32), TASK_RESULT_DONE),
-                    resolved_val,
-                    ir.Constant(ir.IntType(8).as_pointer(), None),
-                    ir.Constant(ir.IntType(8).as_pointer(), None),
-                ])
-                builder.ret(result)
+                self._store_task_result_done(builder, out_ptr, resolved_val)
+                builder.ret_void()
 
     def _generate_entry_function(self, func: FunctionDecl,
                                    frame_info: TaskFrameInfo,
@@ -531,9 +805,12 @@ class TaskTransformer:
         # Create function type
         fn_type = ir.FunctionType(ret_type, param_types)
 
-        # Create entry function
-        entry_fn = ir.Function(cg.module, fn_type, name=func.name)
-        cg.functions[func.name] = entry_fn
+        # Reuse existing function declaration if it exists (from declare_function)
+        if func.name in cg.functions:
+            entry_fn = cg.functions[func.name]
+        else:
+            entry_fn = ir.Function(cg.module, fn_type, name=func.name)
+            cg.functions[func.name] = entry_fn
 
         # Name parameters
         for i, param in enumerate(func.params):
@@ -609,6 +886,11 @@ class TaskTransformer:
         cg = self.cg
         if "malloc" in cg.functions:
             return cg.functions["malloc"]
+        # Check if malloc is already in module
+        for fn in cg.module.functions:
+            if fn.name == "malloc":
+                cg.functions["malloc"] = fn
+                return fn
         fn_type = ir.FunctionType(ir.IntType(8).as_pointer(), [ir.IntType(64)])
         fn = ir.Function(cg.module, fn_type, name="malloc")
         cg.functions["malloc"] = fn
@@ -619,6 +901,11 @@ class TaskTransformer:
         cg = self.cg
         if "free" in cg.functions:
             return cg.functions["free"]
+        # Check if free is already in module
+        for fn in cg.module.functions:
+            if fn.name == "free":
+                cg.functions["free"] = fn
+                return fn
         fn_type = ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()])
         fn = ir.Function(cg.module, fn_type, name="free")
         cg.functions["free"] = fn
