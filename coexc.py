@@ -3,12 +3,14 @@
 Coex Compiler
 
 Usage:
-    python coexc.py <source_file> [-o output] [--emit-ir] [--emit-ast]
+    python coexc.py <source_file> [-o output] [--emit-ir] [--emit-ast] [-O level]
 
 Examples:
-    python coexc.py hello.coex                    # Produces hello (linked executable)
+    python coexc.py hello.coex                    # Produces hello (linked executable with -O3)
     python coexc.py hello.coex -o myapp           # Produces myapp (linked executable)
     python coexc.py hello.coex -o hello.o         # Produces hello.o (object file only)
+    python coexc.py hello.coex -O0                # Compile without optimizations (fast compile)
+    python coexc.py hello.coex -O3                # Compile with aggressive optimizations (default)
     python coexc.py hello.coex --emit-ir          # Print LLVM IR
     python coexc.py hello.coex --emit-ast         # Print AST
     python coexc.py hello.coex --no-commentary    # Compile without updating commentary
@@ -117,7 +119,8 @@ def compile_coex(source_path: str, output_path: str = None,
                  emit_ir: bool = False, emit_ast: bool = False,
                  link: bool = False, no_commentary: bool = False,
                  strip_commentary: bool = False, commentary_only: bool = False,
-                 cli_printing: bool = None, cli_debugging: bool = None):
+                 cli_printing: bool = None, cli_debugging: bool = None,
+                 opt_level: int = 3):
     """
     Compile a Coex source file.
 
@@ -130,6 +133,7 @@ def compile_coex(source_path: str, output_path: str = None,
         no_commentary: Skip commentary generation/update
         strip_commentary: Remove all #@ comments from source
         commentary_only: Only update commentary, don't compile
+        opt_level: LLVM optimization level (0-3, default 3 for -O3)
     """
     # Determine output path
     if output_path is None:
@@ -234,8 +238,9 @@ def compile_coex(source_path: str, output_path: str = None,
 
     # Compile to object file
     obj_path = output_path if output_path.endswith(".o") else output_path + ".o"
-    print(f"Compiling to {obj_path}...")
-    codegen.compile_to_object(obj_path)
+    opt_str = f" (with -O{opt_level} optimizations)" if opt_level > 0 else ""
+    print(f"Compiling to {obj_path}{opt_str}...")
+    codegen.compile_to_object(obj_path, opt_level=opt_level)
 
     # Link if requested
     if link or not output_path.endswith(".o"):
@@ -324,9 +329,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s hello.coex                    Compile and link to hello
+  %(prog)s hello.coex                    Compile and link to hello (with -O3)
   %(prog)s hello.coex -o myapp           Compile and link to myapp
   %(prog)s hello.coex -o hello.o         Compile to hello.o (object only)
+  %(prog)s hello.coex -O0                Compile without optimizations (fast)
+  %(prog)s hello.coex -O3                Compile with aggressive optimizations
   %(prog)s hello.coex --emit-ir          Print LLVM IR
   %(prog)s hello.coex --emit-ast         Print AST
   %(prog)s hello.coex --no-commentary    Compile without updating commentary
@@ -355,6 +362,8 @@ Examples:
                         help="Force enable debug() output")
     parser.add_argument("--no-debugging", action="store_true",
                         help="Force disable debug() output")
+    parser.add_argument("-O", "--opt-level", type=int, default=3, choices=[0, 1, 2, 3],
+                        help="LLVM optimization level (0=none, 1=basic, 2=default, 3=aggressive) [default: 3]")
 
     args = parser.parse_args()
 
@@ -393,7 +402,8 @@ Examples:
             strip_commentary=args.strip_commentary,
             commentary_only=args.commentary_only,
             cli_printing=cli_printing,
-            cli_debugging=cli_debugging
+            cli_debugging=cli_debugging,
+            opt_level=args.opt_level
         )
     except CompileError as e:
         print(f"Compilation failed: {e}", file=sys.stderr)

@@ -3993,8 +3993,13 @@ entry:
 
         return result
 
-    def compile_to_object(self, output_path: str):
-        """Compile module to object file"""
+    def compile_to_object(self, output_path: str, opt_level: int = 3):
+        """Compile module to object file with LLVM optimizations.
+
+        Args:
+            output_path: Path to write the object file
+            opt_level: Optimization level (0-3, default 3 for -O3)
+        """
         llvm_ir = str(self.module)
         llvm_ir = self._inject_inline_ir(llvm_ir)  # Inject inline LLVM IR
         try:
@@ -4003,8 +4008,36 @@ entry:
         except Exception as e:
             raise RuntimeError(f"LLVM IR error (possibly in inline IR): {e}")
 
+        # Apply LLVM optimization passes
+        if opt_level > 0:
+            # Create pass manager builder with optimization level
+            pmb = binding.PassManagerBuilder()
+            pmb.opt_level = opt_level
+
+            # Enable loop vectorization and SLP vectorization at -O2 and above
+            if opt_level >= 2:
+                pmb.loop_vectorize = True
+                pmb.slp_vectorize = True
+
+            # Create and populate module pass manager
+            pm = binding.ModulePassManager()
+            pmb.populate(pm)
+
+            # Run optimization passes
+            pm.run(mod)
+
+        # Create target machine with appropriate optimization settings
         target = binding.Target.from_default_triple()
-        target_machine = target.create_target_machine()
+
+        # Use optimization level for code generation too
+        if opt_level == 0:
+            code_opt = 0
+        elif opt_level == 1:
+            code_opt = 1
+        else:
+            code_opt = 2  # LLVM codegen only supports 0, 1, 2
+
+        target_machine = target.create_target_machine(opt=code_opt)
 
         with open(output_path, "wb") as f:
             f.write(target_machine.emit_object(mod))
