@@ -4010,21 +4010,40 @@ entry:
 
         # Apply LLVM optimization passes
         if opt_level > 0:
-            # Create pass manager builder with optimization level
-            pmb = binding.PassManagerBuilder()
-            pmb.opt_level = opt_level
+            # Check for new pass manager API (llvmlite >= 0.45 with LLVM 20)
+            if hasattr(binding, 'PipelineTuningOptions'):
+                # New API - use PassBuilder with PipelineTuningOptions
+                target = binding.Target.from_default_triple()
+                tm = target.create_target_machine()
 
-            # Enable loop vectorization and SLP vectorization at -O2 and above
-            if opt_level >= 2:
-                pmb.loop_vectorize = True
-                pmb.slp_vectorize = True
+                # Create tuning options with speed optimization
+                pto = binding.PipelineTuningOptions(speed_level=opt_level, size_level=0)
 
-            # Create and populate module pass manager
-            pm = binding.ModulePassManager()
-            pmb.populate(pm)
+                # Create pass builder and get module pass manager
+                pb = binding.PassBuilder(tm, pto)
+                pm = pb.getModulePassManager()
 
-            # Run optimization passes
-            pm.run(mod)
+                # Run optimization passes
+                pm.run(mod, pb)
+            elif hasattr(binding, 'PassManagerBuilder'):
+                # Legacy API (llvmlite < 0.45)
+                pmb = binding.PassManagerBuilder()
+                pmb.opt_level = opt_level
+
+                # Enable loop vectorization and SLP vectorization at -O2 and above
+                if opt_level >= 2:
+                    pmb.loop_vectorize = True
+                    pmb.slp_vectorize = True
+
+                # Create and populate module pass manager
+                pm = binding.ModulePassManager()
+                pmb.populate(pm)
+
+                # Run optimization passes
+                pm.run(mod)
+            else:
+                # Neither API available - skip optimization (should not happen)
+                pass
 
         # Create target machine with appropriate optimization settings
         target = binding.Target.from_default_triple()
