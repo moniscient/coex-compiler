@@ -42,6 +42,14 @@ examples/stress_array_1m
 /hello
 /stress_array_1m
 
+# Compiled stress test binaries
+tests/stress/channel_bench
+tests/stress/large
+tests/stress/large-v1
+tests/stress/simple_bench
+tests/stress/test_*
+tests/stress/token_ring
+
 # LLVM IR dumps (debugging artifacts)
 *.ll
 
