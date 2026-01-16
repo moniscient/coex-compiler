@@ -316,9 +316,9 @@ def find_all_locals(body: List[Stmt]) -> Dict[str, Type]:
                 process_statements(elif_body)
 
         elif isinstance(stmt, ForStmt):
-            # Loop variable
-            if stmt.variable:
-                locals_dict[stmt.variable] = None
+            # Loop variable - use var_name property for backward compat
+            if stmt.var_name:
+                locals_dict[stmt.var_name] = None
             process_statements(stmt.body)
 
         elif isinstance(stmt, WhileStmt):
@@ -366,8 +366,8 @@ def compute_hoisted_locals(
             if isinstance(stmt, VarDecl):
                 defined.add(stmt.name)
             elif isinstance(stmt, ForStmt):
-                if stmt.variable:
-                    defined.add(stmt.variable)
+                if stmt.var_name:
+                    defined.add(stmt.var_name)
         return defined
 
     def find_used_vars(stmts: List[Stmt], from_index: int) -> Set[str]:
