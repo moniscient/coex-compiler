@@ -19,7 +19,7 @@ from typing import List, Dict, Optional, Set, TYPE_CHECKING
 from llvmlite import ir
 
 from ast_nodes import FunctionDecl, FunctionKind, Type, Parameter
-from task_analysis import analyze_task, TaskAnalysis, SuspensionPoint
+from task_analysis import analyze_task, TaskAnalysis, SuspensionPoint, ControlFlowContext
 
 if TYPE_CHECKING:
     from codegen.core import CodeGenerator
@@ -240,6 +240,21 @@ class TaskTransformer:
         field_indices['__waiter'] = idx
         idx += 1
 
+        # Field 3: branch_taken (for if/else control flow)
+        fields.append(ir.IntType(64))
+        field_indices['__branch_taken'] = idx
+        idx += 1
+
+        # Field 4: loop_idx (current loop iteration index)
+        fields.append(ir.IntType(64))
+        field_indices['__loop_idx'] = idx
+        idx += 1
+
+        # Field 5: loop_end (loop end value)
+        fields.append(ir.IntType(64))
+        field_indices['__loop_end'] = idx
+        idx += 1
+
         # Parameters
         for param in func.params:
             llvm_type = cg._get_llvm_type(param.type_annotation)
@@ -250,6 +265,24 @@ class TaskTransformer:
         # Hoisted locals (those that span suspension points)
         for local_name, local_type in analysis.hoisted_locals.items():
             if local_name not in field_indices:  # Avoid duplicates with params
+                llvm_type = cg._get_llvm_type(local_type) if local_type else ir.IntType(64)
+                fields.append(llvm_type)
+                field_indices[local_name] = idx
+                idx += 1
+
+        # Suspension point target variables (receive child task results)
+        for sp in analysis.suspension_points:
+            if sp.var_name and sp.var_name not in field_indices:
+                # Target variable isn't in frame yet - add it
+                # Type will be int64 (task results are always i64)
+                fields.append(ir.IntType(64))
+                field_indices[sp.var_name] = idx
+                idx += 1
+
+        # All other locals from the function body (loop variables, etc.)
+        # This ensures variables defined in loops/conditionals are accessible
+        for local_name, local_type in analysis.all_locals.items():
+            if local_name not in field_indices:
                 llvm_type = cg._get_llvm_type(local_type) if local_type else ir.IntType(64)
                 fields.append(llvm_type)
                 field_indices[local_name] = idx
@@ -597,6 +630,10 @@ class TaskTransformer:
         step_fn.args[1].name = "resolved"
         step_fn.args[2].name = "out_result"
 
+        # Register step function early for recursive calls
+        # This must happen before generating the body so recursive calls can find it
+        self.step_functions[func.name] = step_fn
+
         # Create entry block
         entry = step_fn.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
@@ -624,11 +661,21 @@ class TaskTransformer:
         for i, block in enumerate(state_blocks):
             switch.add_case(ir.Constant(ir.IntType(64), i), block)
 
+        # Save and initialize GC state for step function context
+        old_gc_frame = getattr(cg, 'gc_frame', None)
+        old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
+        cg.gc_frame = None
+        cg.gc_root_indices = {}
+
         # Generate code for each state
         self._generate_state_blocks(
             builder, step_fn, frame_ptr, frame_info, func,
             analysis, state_blocks, task_result_type, out_ptr, resolved_val
         )
+
+        # Restore GC state
+        cg.gc_frame = old_gc_frame
+        cg.gc_root_indices = old_gc_root_indices
 
         # Default block: write DONE(0) - should never reach here
         builder.position_at_end(default_block)
@@ -699,6 +746,17 @@ class TaskTransformer:
         ], inbounds=True)
         builder.store(step_fn_ptr, stepfn_ptr)
 
+    def _get_top_level_stmt_index(self, sp: SuspensionPoint) -> int:
+        """
+        Get the top-level statement index for a suspension point.
+
+        For top-level suspensions, this is sp.stmt_index.
+        For nested suspensions, this is the parent_stmt_index from context.
+        """
+        if sp.context is None:
+            return sp.stmt_index
+        return sp.context.parent_stmt_index
+
     def _generate_state_blocks(self, builder: ir.IRBuilder,
                                 step_fn: ir.Function,
                                 frame_ptr: ir.Value,
@@ -709,47 +767,96 @@ class TaskTransformer:
                                 task_result_type,
                                 out_ptr: ir.Value,
                                 resolved_arg: ir.Value):
-        """Generate code for each state in the state machine."""
+        """
+        Generate code for each state in the state machine.
+
+        Each state executes a segment of the function body:
+        - State 0: statements from start until first suspension
+        - State N: statements from after suspension N-1 until suspension N (or end)
+
+        For nested suspensions (inside if/else/for/while), the code:
+        1. Executes top-level statements up to the control flow statement
+        2. Enters the control flow and executes until the suspension
+        3. On resume, continues within the control flow and then after it
+        """
         cg = self.cg
         suspension_points = analysis.suspension_points
 
-        # State 0: Initial state - execute until first suspension
-        builder.position_at_end(state_blocks[0])
-
         if not suspension_points:
-            # No suspension points - run to completion and return DONE
-            # This shouldn't happen if we're generating state machine
+            # No suspension points - shouldn't happen for state machine
+            builder.position_at_end(state_blocks[0])
             self._store_task_result_done(builder, out_ptr, ir.Constant(ir.IntType(64), 0))
             builder.ret_void()
             return
 
-        # For state 0: execute code before first suspension, then SPAWN child
+        # State 0: Execute statements before first suspension, then spawn child
+        builder.position_at_end(state_blocks[0])
+
+        # Set up context for executing statements with frame-based variables
+        self._setup_frame_locals_context(builder, frame_ptr, frame_info, func)
+
         first_sp = suspension_points[0]
 
-        # Update state to 1 (after first suspension)
-        state_ptr = builder.gep(frame_ptr, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
-        ], inbounds=True)
-        builder.store(ir.Constant(ir.IntType(64), 1), state_ptr)
+        # Check if suspension is inside control flow
+        if first_sp.context is not None and first_sp.context.kind in ("if_then", "if_else"):
+            # Generate branching code for if/else
+            self._generate_conditional_state_0(
+                builder, step_fn, frame_ptr, frame_info, func,
+                first_sp, task_result_type, out_ptr
+            )
+        elif first_sp.context is not None and first_sp.context.kind == "for":
+            # Generate for loop handling
+            self._generate_for_loop_state_0(
+                builder, step_fn, frame_ptr, frame_info, func,
+                first_sp, task_result_type, out_ptr, analysis
+            )
+        else:
+            # Regular execution to suspension
+            self._execute_to_suspension(
+                builder, func.body, first_sp, frame_ptr, frame_info,
+                out_ptr, step_fn
+            )
 
-        # Create child frame and return SPAWN
-        # For now, return a placeholder - the actual child frame creation
-        # requires generating code for the callee's frame
-        self._store_task_result_spawn(builder, out_ptr,
-                                       ir.Constant(ir.IntType(8).as_pointer(), None),
-                                       ir.Constant(ir.IntType(8).as_pointer(), None))
-        builder.ret_void()
+            # Update state to 1
+            state_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+            ], inbounds=True)
+            builder.store(ir.Constant(ir.IntType(64), 1), state_ptr)
+
+            # Create child frame and spawn
+            child_frame, child_step_fn = self._create_child_task_spawn(
+                builder, frame_ptr, frame_info, first_sp
+            )
+            self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
+            builder.ret_void()
 
         # Generate remaining states
         for i, sp in enumerate(suspension_points):
             state_idx = i + 1
             builder.position_at_end(state_blocks[state_idx])
 
-            # Use resolved value passed as argument
-            resolved_val = resolved_arg
+            # Re-setup context for this state
+            self._setup_frame_locals_context(builder, frame_ptr, frame_info, func)
 
-            # Store to variable if this suspension had a target
+            # Check if this suspension is inside a for loop - needs special handling
+            if sp.context is not None and sp.context.kind == "for":
+                # For loop suspension - use special resume handler
+                self._generate_for_loop_resume_state(
+                    builder, step_fn, frame_ptr, frame_info, func,
+                    sp, task_result_type, out_ptr, resolved_arg
+                )
+                continue
+
+            # Store resolved value to __resolved field for use in expression evaluation
+            resolved_val = resolved_arg
+            resolved_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices['__resolved'])
+            ], inbounds=True)
+            builder.store(resolved_val, resolved_ptr)
+
+            # Also store resolved value to target variable if applicable
             if sp.var_name and sp.var_name in frame_info.field_indices:
                 var_ptr = builder.gep(frame_ptr, [
                     ir.Constant(ir.IntType(32), 0),
@@ -757,9 +864,16 @@ class TaskTransformer:
                 ], inbounds=True)
                 builder.store(resolved_val, var_ptr)
 
-            # Check if there's another suspension after this
             if state_idx < len(suspension_points):
-                # More suspensions - advance state and SPAWN next child
+                # More suspensions - execute from after current to next suspension
+                next_sp = suspension_points[state_idx]
+
+                # Execute from after current suspension to next suspension
+                self._execute_from_suspension_to_next(
+                    builder, func.body, sp, next_sp, frame_ptr, frame_info
+                )
+
+                # Update state and spawn next child
                 next_state = state_idx + 1
                 state_ptr = builder.gep(frame_ptr, [
                     ir.Constant(ir.IntType(32), 0),
@@ -767,15 +881,1179 @@ class TaskTransformer:
                 ], inbounds=True)
                 builder.store(ir.Constant(ir.IntType(64), next_state), state_ptr)
 
-                self._store_task_result_spawn(builder, out_ptr,
-                                               ir.Constant(ir.IntType(8).as_pointer(), None),
-                                               ir.Constant(ir.IntType(8).as_pointer(), None))
+                child_frame, child_step_fn = self._create_child_task_spawn(
+                    builder, frame_ptr, frame_info, next_sp
+                )
+                self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
                 builder.ret_void()
             else:
-                # Last state - return DONE with final value
-                # Load return value (use resolved_val or compute from frame)
-                self._store_task_result_done(builder, out_ptr, resolved_val)
+                # Last state - execute remaining statements and return
+                return_val = self._execute_from_suspension_to_end(
+                    builder, func.body, sp, frame_ptr, frame_info
+                )
+
+                self._store_task_result_done(builder, out_ptr, return_val)
                 builder.ret_void()
+
+    def _generate_conditional_state_0(self, builder: ir.IRBuilder,
+                                        step_fn: ir.Function,
+                                        frame_ptr: ir.Value,
+                                        frame_info: TaskFrameInfo,
+                                        func: FunctionDecl,
+                                        first_sp: SuspensionPoint,
+                                        task_result_type,
+                                        out_ptr: ir.Value):
+        """
+        Generate conditional state 0 for suspensions inside if/else.
+
+        This evaluates the condition and branches:
+        - If condition matches suspension branch: execute up to suspension, SPAWN
+        - If condition doesn't match: execute other branch, continue after if, DONE
+        """
+        from ast_nodes import IfStmt, ReturnStmt
+
+        cg = self.cg
+        ctx = first_sp.context
+        parent_idx = ctx.parent_stmt_index
+
+        # Execute statements before the if
+        self._execute_statements_until(
+            builder, func.body, 0, parent_idx, frame_ptr, frame_info
+        )
+
+        # Get the if statement
+        if_stmt = func.body[parent_idx]
+        if not isinstance(if_stmt, IfStmt):
+            # Fallback to regular path
+            self._execute_statements_until(
+                builder, func.body, parent_idx, parent_idx + 1, frame_ptr, frame_info
+            )
+            return
+
+        # Evaluate the condition
+        cond_val = cg._generate_expression(if_stmt.condition)
+
+        # Convert to i1 if needed
+        if cond_val.type != ir.IntType(1):
+            if isinstance(cond_val.type, ir.IntType):
+                cond_val = builder.icmp_signed('!=', cond_val,
+                                                ir.Constant(cond_val.type, 0), name="cond")
+            else:
+                cond_val = ir.Constant(ir.IntType(1), 1)
+
+        # Create basic blocks for then and else paths
+        suspend_block = step_fn.append_basic_block("suspend_path")
+        skip_block = step_fn.append_basic_block("skip_path")
+
+        # Branch based on condition and which branch has the suspension
+        if ctx.kind == "if_then":
+            # Suspension in then branch - if true: suspend, if false: skip
+            builder.cbranch(cond_val, suspend_block, skip_block)
+        else:  # if_else
+            # Suspension in else branch - if true: skip, if false: suspend
+            builder.cbranch(cond_val, skip_block, suspend_block)
+
+        # Generate suspend path (condition leads to suspension)
+        builder.position_at_end(suspend_block)
+
+        # Store branch_taken
+        branch_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__branch_taken'])
+        ], inbounds=True)
+        branch_val = 1 if ctx.kind == "if_then" else 0
+        builder.store(ir.Constant(ir.IntType(64), branch_val), branch_ptr)
+
+        # Execute the suspension branch up to the suspension
+        if ctx.kind == "if_then":
+            self._execute_statements_until(
+                builder, if_stmt.then_body, 0, ctx.nested_stmt_index,
+                frame_ptr, frame_info
+            )
+        else:
+            self._execute_statements_until(
+                builder, if_stmt.else_body, 0, ctx.nested_stmt_index,
+                frame_ptr, frame_info
+            )
+
+        # Update state to 1
+        state_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 1), state_ptr)
+
+        # Create child frame and spawn
+        child_frame, child_step_fn = self._create_child_task_spawn(
+            builder, frame_ptr, frame_info, first_sp
+        )
+        self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
+        builder.ret_void()
+
+        # Generate skip path (condition skips suspension, execute other branch)
+        builder.position_at_end(skip_block)
+
+        # Execute the other branch
+        if ctx.kind == "if_then":
+            # Execute else branch
+            if if_stmt.else_body:
+                for stmt in if_stmt.else_body:
+                    if isinstance(stmt, ReturnStmt):
+                        if stmt.value:
+                            return_val = cg._generate_expression(stmt.value)
+                            if return_val.type != ir.IntType(64):
+                                if isinstance(return_val.type, ir.IntType):
+                                    return_val = builder.sext(return_val, ir.IntType(64))
+                                elif isinstance(return_val.type, ir.PointerType):
+                                    return_val = builder.ptrtoint(return_val, ir.IntType(64))
+                            self._store_task_result_done(builder, out_ptr, return_val)
+                            builder.ret_void()
+                            return
+                        else:
+                            self._store_task_result_done(builder, out_ptr,
+                                                          ir.Constant(ir.IntType(64), 0))
+                            builder.ret_void()
+                            return
+                    else:
+                        cg._generate_statement(stmt)
+                        if cg.builder.block.is_terminated:
+                            return
+        else:
+            # Execute then branch (no suspension in then)
+            for stmt in if_stmt.then_body:
+                if isinstance(stmt, ReturnStmt):
+                    if stmt.value:
+                        return_val = cg._generate_expression(stmt.value)
+                        if return_val.type != ir.IntType(64):
+                            if isinstance(return_val.type, ir.IntType):
+                                return_val = builder.sext(return_val, ir.IntType(64))
+                            elif isinstance(return_val.type, ir.PointerType):
+                                return_val = builder.ptrtoint(return_val, ir.IntType(64))
+                        self._store_task_result_done(builder, out_ptr, return_val)
+                        builder.ret_void()
+                        return
+                    else:
+                        self._store_task_result_done(builder, out_ptr,
+                                                      ir.Constant(ir.IntType(64), 0))
+                        builder.ret_void()
+                        return
+                else:
+                    cg._generate_statement(stmt)
+                    if cg.builder.block.is_terminated:
+                        return
+
+        # Continue after if statement
+        start_idx = parent_idx + 1
+        return_val = self._execute_statements_and_return(
+            builder, func.body, start_idx, len(func.body), frame_ptr, frame_info
+        )
+        self._store_task_result_done(builder, out_ptr, return_val)
+        builder.ret_void()
+
+    def _generate_for_loop_state_0(self, builder: ir.IRBuilder,
+                                    step_fn: ir.Function,
+                                    frame_ptr: ir.Value,
+                                    frame_info: TaskFrameInfo,
+                                    func: FunctionDecl,
+                                    first_sp: SuspensionPoint,
+                                    task_result_type,
+                                    out_ptr: ir.Value,
+                                    analysis):
+        """
+        Generate state 0 for a suspension inside a for loop.
+
+        This initializes the loop, checks the condition, and either:
+        - Spawns the first iteration's child task
+        - Skips the loop if it's empty
+        """
+        from ast_nodes import ForStmt, RangeExpr
+
+        cg = self.cg
+        ctx = first_sp.context
+        parent_idx = ctx.parent_stmt_index
+
+        # Execute statements before the for loop
+        self._execute_statements_until(
+            builder, func.body, 0, parent_idx, frame_ptr, frame_info
+        )
+
+        # Get the for statement
+        for_stmt = func.body[parent_idx]
+        if not isinstance(for_stmt, ForStmt):
+            # Fallback
+            return
+
+        # Initialize loop state
+        # Evaluate the iterable (for now, assuming it's a range)
+        if isinstance(for_stmt.iterable, RangeExpr):
+            start_val = cg._generate_expression(for_stmt.iterable.start)
+            end_val = cg._generate_expression(for_stmt.iterable.end)
+        else:
+            # Default for other iterables - would need more complex handling
+            start_val = ir.Constant(ir.IntType(64), 0)
+            end_val = ir.Constant(ir.IntType(64), 0)
+
+        # Store loop state to frame
+        loop_idx_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__loop_idx'])
+        ], inbounds=True)
+        builder.store(start_val, loop_idx_ptr)
+
+        loop_end_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__loop_end'])
+        ], inbounds=True)
+        builder.store(end_val, loop_end_ptr)
+
+        # Also store the loop variable to frame (so it's accessible)
+        loop_var_name = for_stmt.var_name
+        if loop_var_name in frame_info.field_indices:
+            loop_var_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices[loop_var_name])
+            ], inbounds=True)
+            builder.store(start_val, loop_var_ptr)
+
+        # Check if loop should execute (idx < end)
+        cond = builder.icmp_signed('<', start_val, end_val, name="loop_cond")
+
+        # Create blocks for loop entry and skip
+        loop_entry = step_fn.append_basic_block("loop_entry")
+        loop_skip = step_fn.append_basic_block("loop_skip")
+
+        builder.cbranch(cond, loop_entry, loop_skip)
+
+        # Loop entry: execute body up to suspension, spawn child
+        builder.position_at_end(loop_entry)
+
+        # Execute loop body statements before the suspension
+        self._execute_statements_until(
+            builder, for_stmt.body, 0, ctx.nested_stmt_index,
+            frame_ptr, frame_info
+        )
+
+        # Update state to 1
+        state_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 1), state_ptr)
+
+        # Create child frame and spawn
+        child_frame, child_step_fn = self._create_child_task_spawn(
+            builder, frame_ptr, frame_info, first_sp
+        )
+        self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
+        builder.ret_void()
+
+        # Loop skip: continue after the loop
+        builder.position_at_end(loop_skip)
+
+        # Execute statements after the for loop and return
+        start_idx = parent_idx + 1
+        return_val = self._execute_statements_and_return(
+            builder, func.body, start_idx, len(func.body), frame_ptr, frame_info
+        )
+        self._store_task_result_done(builder, out_ptr, return_val)
+        builder.ret_void()
+
+    def _generate_for_loop_resume_state(self, builder: ir.IRBuilder,
+                                          step_fn: ir.Function,
+                                          frame_ptr: ir.Value,
+                                          frame_info: TaskFrameInfo,
+                                          func: FunctionDecl,
+                                          sp: SuspensionPoint,
+                                          task_result_type,
+                                          out_ptr: ir.Value,
+                                          resolved_arg: ir.Value):
+        """
+        Generate the resume state for a suspension inside a for loop.
+
+        After each iteration:
+        1. Store resolved value to target variable
+        2. Execute remaining loop body
+        3. Increment loop index
+        4. Check if more iterations
+        5. If yes: execute loop body up to suspension, spawn, return SPAWN
+        6. If no: continue after loop, return DONE
+        """
+        from ast_nodes import ForStmt
+
+        cg = self.cg
+        ctx = sp.context
+        parent_idx = ctx.parent_stmt_index
+        for_stmt = func.body[parent_idx]
+
+        # Store resolved value to target variable
+        if sp.var_name and sp.var_name in frame_info.field_indices:
+            var_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices[sp.var_name])
+            ], inbounds=True)
+            builder.store(resolved_arg, var_ptr)
+
+        # Execute remaining loop body statements (after the suspension)
+        remaining_start = ctx.nested_stmt_index + 1
+        self._execute_statements_until(
+            builder, for_stmt.body, remaining_start, len(for_stmt.body),
+            frame_ptr, frame_info
+        )
+
+        # Increment loop index
+        loop_idx_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__loop_idx'])
+        ], inbounds=True)
+        current_idx = builder.load(loop_idx_ptr, name="loop_idx")
+        next_idx = builder.add(current_idx, ir.Constant(ir.IntType(64), 1), name="next_idx")
+        builder.store(next_idx, loop_idx_ptr)
+
+        # Also update the loop variable in frame
+        loop_var_name = for_stmt.var_name
+        if loop_var_name in frame_info.field_indices:
+            loop_var_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices[loop_var_name])
+            ], inbounds=True)
+            builder.store(next_idx, loop_var_ptr)
+
+        # Check if more iterations (idx < end)
+        loop_end_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__loop_end'])
+        ], inbounds=True)
+        loop_end = builder.load(loop_end_ptr, name="loop_end")
+        more_iterations = builder.icmp_signed('<', next_idx, loop_end, name="more_iter")
+
+        # Create blocks for continue and exit
+        loop_continue = step_fn.append_basic_block("loop_continue")
+        loop_exit = step_fn.append_basic_block("loop_exit")
+
+        builder.cbranch(more_iterations, loop_continue, loop_exit)
+
+        # Loop continue: execute body up to suspension, spawn next
+        builder.position_at_end(loop_continue)
+
+        # Execute loop body statements before the suspension
+        self._execute_statements_until(
+            builder, for_stmt.body, 0, ctx.nested_stmt_index,
+            frame_ptr, frame_info
+        )
+
+        # Create child frame and spawn (state stays at current)
+        child_frame, child_step_fn = self._create_child_task_spawn(
+            builder, frame_ptr, frame_info, sp
+        )
+        self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
+        builder.ret_void()
+
+        # Loop exit: continue after the loop
+        builder.position_at_end(loop_exit)
+
+        # Execute statements after the for loop and return
+        start_idx = parent_idx + 1
+        return_val = self._execute_statements_and_return(
+            builder, func.body, start_idx, len(func.body), frame_ptr, frame_info
+        )
+        self._store_task_result_done(builder, out_ptr, return_val)
+        builder.ret_void()
+
+    def _execute_to_suspension(self, builder: ir.IRBuilder, body: list,
+                                sp: SuspensionPoint, frame_ptr: ir.Value,
+                                frame_info: TaskFrameInfo,
+                                out_ptr: ir.Value = None, step_fn: ir.Function = None):
+        """
+        Execute statements from the beginning of body until the suspension point.
+
+        For nested suspensions, this enters the control flow structure.
+        """
+        if sp.context is None:
+            # Top-level suspension - just execute statements until it
+            self._execute_statements_until(
+                builder, body, 0, sp.stmt_index, frame_ptr, frame_info,
+                out_ptr, step_fn
+            )
+        else:
+            # Nested suspension - execute up to parent, then enter parent
+            parent_idx = sp.context.parent_stmt_index
+            self._execute_statements_until(
+                builder, body, 0, parent_idx, frame_ptr, frame_info,
+                out_ptr, step_fn
+            )
+            # Now execute within the parent control flow up to the suspension
+            self._execute_within_control_flow_to_suspension(
+                builder, body[parent_idx], sp, frame_ptr, frame_info
+            )
+
+    def _execute_within_control_flow_to_suspension(self, builder: ir.IRBuilder,
+                                                     parent_stmt, sp: SuspensionPoint,
+                                                     frame_ptr: ir.Value,
+                                                     frame_info: TaskFrameInfo):
+        """
+        Execute within a control flow statement up to the suspension point.
+
+        For if/else, this evaluates the condition and executes the appropriate branch.
+        """
+        from ast_nodes import IfStmt, ForStmt, WhileStmt, MatchStmt
+
+        cg = self.cg
+        ctx = sp.context
+
+        if isinstance(parent_stmt, IfStmt):
+            # Evaluate condition
+            cond_val = cg._generate_expression(parent_stmt.condition)
+
+            # Convert to i1 if needed
+            if cond_val.type != ir.IntType(1):
+                if isinstance(cond_val.type, ir.IntType):
+                    cond_val = builder.icmp_signed('!=', cond_val,
+                                                    ir.Constant(cond_val.type, 0), name="cond")
+                else:
+                    cond_val = ir.Constant(ir.IntType(1), 1)  # Default true
+
+            # Store which branch we're taking in the frame
+            branch_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), frame_info.field_indices['__branch_taken'])
+            ], inbounds=True)
+
+            if ctx.kind == "if_then":
+                # Suspension is in then branch
+                # Store 1 (then) to branch_taken
+                builder.store(ir.Constant(ir.IntType(64), 1), branch_ptr)
+                # Execute then_body up to the nested suspension index
+                self._execute_statements_until(
+                    builder, parent_stmt.then_body, 0, ctx.nested_stmt_index,
+                    frame_ptr, frame_info
+                )
+            elif ctx.kind == "if_else":
+                # Suspension is in else branch
+                # Store 0 (else) to branch_taken
+                builder.store(ir.Constant(ir.IntType(64), 0), branch_ptr)
+                # Execute else_body up to the nested suspension index
+                self._execute_statements_until(
+                    builder, parent_stmt.else_body, 0, ctx.nested_stmt_index,
+                    frame_ptr, frame_info
+                )
+            elif ctx.kind == "if_elif":
+                # Suspension is in an elif branch
+                elif_idx = ctx.branch_index - 2
+                if elif_idx >= 0 and elif_idx < len(parent_stmt.else_if_clauses):
+                    _, elif_body = parent_stmt.else_if_clauses[elif_idx]
+                    # Store branch index
+                    builder.store(ir.Constant(ir.IntType(64), ctx.branch_index), branch_ptr)
+                    self._execute_statements_until(
+                        builder, elif_body, 0, ctx.nested_stmt_index,
+                        frame_ptr, frame_info
+                    )
+
+        elif isinstance(parent_stmt, ForStmt):
+            # For loops with suspensions - execute loop setup
+            # Set up the loop variable from the iteration
+            self._execute_statements_until(
+                builder, parent_stmt.body, 0, ctx.nested_stmt_index,
+                frame_ptr, frame_info
+            )
+
+        elif isinstance(parent_stmt, WhileStmt):
+            # For while loops, evaluate condition first
+            cond_val = cg._generate_expression(parent_stmt.condition)
+            # Execute body up to suspension
+            self._execute_statements_until(
+                builder, parent_stmt.body, 0, ctx.nested_stmt_index,
+                frame_ptr, frame_info
+            )
+
+    def _execute_from_suspension_to_next(self, builder: ir.IRBuilder, body: list,
+                                          current_sp: SuspensionPoint,
+                                          next_sp: SuspensionPoint,
+                                          frame_ptr: ir.Value,
+                                          frame_info: TaskFrameInfo):
+        """
+        Execute from after current suspension to the next suspension point.
+        """
+        # First, complete any remaining code from the current suspension's context
+        if current_sp.context is not None:
+            # Finish the current control flow branch
+            self._complete_control_flow_branch(
+                builder, body, current_sp, frame_ptr, frame_info
+            )
+            # Continue from after the control flow statement
+            current_top_idx = current_sp.context.parent_stmt_index
+            start_idx = current_top_idx + 1
+        else:
+            start_idx = current_sp.stmt_index + 1
+
+        # Now execute to the next suspension
+        if next_sp.context is None:
+            # Next suspension is at top level
+            end_idx = next_sp.stmt_index
+            self._execute_statements_until(
+                builder, body, start_idx, end_idx, frame_ptr, frame_info
+            )
+        else:
+            # Next suspension is nested
+            next_parent_idx = next_sp.context.parent_stmt_index
+            # Execute top-level statements up to the parent
+            self._execute_statements_until(
+                builder, body, start_idx, next_parent_idx, frame_ptr, frame_info
+            )
+            # Enter the parent and execute to the suspension
+            if next_parent_idx < len(body):
+                self._execute_within_control_flow_to_suspension(
+                    builder, body[next_parent_idx], next_sp, frame_ptr, frame_info
+                )
+
+    def _execute_from_suspension_to_end(self, builder: ir.IRBuilder, body: list,
+                                          sp: SuspensionPoint,
+                                          frame_ptr: ir.Value,
+                                          frame_info: TaskFrameInfo) -> ir.Value:
+        """
+        Execute from after the suspension to the end of the function, returning the result.
+        """
+        from ast_nodes import ReturnStmt
+
+        # Special handling for return statement suspensions
+        # The suspension IS the return statement, so we need to evaluate the return
+        # expression with the resolved task call value substituted
+        if sp.var_name == "__return_value" and isinstance(sp.node, ReturnStmt):
+            # The return expression contains a task call that's now resolved
+            # Evaluate the expression using state context (which substitutes task calls)
+            if sp.node.value:
+                return_val = self._evaluate_expr_in_state_context(
+                    builder, sp.node.value, frame_ptr, frame_info
+                )
+                # Cast to i64
+                cg = self.cg
+                if return_val.type != ir.IntType(64):
+                    if isinstance(return_val.type, ir.IntType):
+                        return_val = builder.sext(return_val, ir.IntType(64))
+                    elif isinstance(return_val.type, ir.DoubleType):
+                        return_val = builder.bitcast(return_val, ir.IntType(64))
+                    elif isinstance(return_val.type, ir.PointerType):
+                        return_val = builder.ptrtoint(return_val, ir.IntType(64))
+                return return_val
+            return ir.Constant(ir.IntType(64), 0)
+
+        # First, complete any remaining code from the current suspension's context
+        if sp.context is not None:
+            # Finish the current control flow branch and get return value if any
+            return_val, has_return = self._complete_control_flow_branch_with_return(
+                builder, body, sp, frame_ptr, frame_info
+            )
+            if has_return:
+                return return_val
+            # Continue from after the control flow statement
+            start_idx = sp.context.parent_stmt_index + 1
+        else:
+            start_idx = sp.stmt_index + 1
+
+        # Execute remaining statements and find return
+        return self._execute_statements_and_return(
+            builder, body, start_idx, len(body), frame_ptr, frame_info
+        )
+
+    def _complete_control_flow_branch(self, builder: ir.IRBuilder, body: list,
+                                        sp: SuspensionPoint,
+                                        frame_ptr: ir.Value,
+                                        frame_info: TaskFrameInfo):
+        """
+        Complete execution of the remaining statements in the current control flow branch.
+        """
+        from ast_nodes import IfStmt, ForStmt, WhileStmt
+
+        ctx = sp.context
+        if ctx is None:
+            return
+
+        parent_idx = ctx.parent_stmt_index
+        if parent_idx >= len(body):
+            return
+
+        parent_stmt = body[parent_idx]
+
+        if isinstance(parent_stmt, IfStmt):
+            if ctx.kind == "if_then":
+                # Complete remaining then_body statements after suspension
+                remaining_start = ctx.nested_stmt_index + 1
+                self._execute_statements_until(
+                    builder, parent_stmt.then_body, remaining_start,
+                    len(parent_stmt.then_body), frame_ptr, frame_info
+                )
+            elif ctx.kind == "if_else":
+                # Complete remaining else_body statements
+                remaining_start = ctx.nested_stmt_index + 1
+                self._execute_statements_until(
+                    builder, parent_stmt.else_body, remaining_start,
+                    len(parent_stmt.else_body), frame_ptr, frame_info
+                )
+            elif ctx.kind == "if_elif":
+                # Complete remaining elif body
+                elif_idx = ctx.branch_index - 2
+                if elif_idx >= 0 and elif_idx < len(parent_stmt.else_if_clauses):
+                    _, elif_body = parent_stmt.else_if_clauses[elif_idx]
+                    remaining_start = ctx.nested_stmt_index + 1
+                    self._execute_statements_until(
+                        builder, elif_body, remaining_start,
+                        len(elif_body), frame_ptr, frame_info
+                    )
+
+        elif isinstance(parent_stmt, ForStmt):
+            # Complete remaining loop body statements
+            remaining_start = ctx.nested_stmt_index + 1
+            self._execute_statements_until(
+                builder, parent_stmt.body, remaining_start,
+                len(parent_stmt.body), frame_ptr, frame_info
+            )
+
+        elif isinstance(parent_stmt, WhileStmt):
+            # Complete remaining loop body statements
+            remaining_start = ctx.nested_stmt_index + 1
+            self._execute_statements_until(
+                builder, parent_stmt.body, remaining_start,
+                len(parent_stmt.body), frame_ptr, frame_info
+            )
+
+    def _complete_control_flow_branch_with_return(self, builder: ir.IRBuilder, body: list,
+                                                    sp: SuspensionPoint,
+                                                    frame_ptr: ir.Value,
+                                                    frame_info: TaskFrameInfo) -> tuple:
+        """
+        Complete execution of the remaining statements in the control flow branch,
+        capturing any return value.
+
+        Returns (return_value, has_return) tuple.
+        """
+        from ast_nodes import IfStmt, ForStmt, WhileStmt, ReturnStmt
+
+        cg = self.cg
+        ctx = sp.context
+        if ctx is None:
+            return (ir.Constant(ir.IntType(64), 0), False)
+
+        parent_idx = ctx.parent_stmt_index
+        if parent_idx >= len(body):
+            return (ir.Constant(ir.IntType(64), 0), False)
+
+        parent_stmt = body[parent_idx]
+        remaining_stmts = []
+
+        if isinstance(parent_stmt, IfStmt):
+            if ctx.kind == "if_then":
+                remaining_start = ctx.nested_stmt_index + 1
+                remaining_stmts = parent_stmt.then_body[remaining_start:]
+            elif ctx.kind == "if_else":
+                remaining_start = ctx.nested_stmt_index + 1
+                remaining_stmts = parent_stmt.else_body[remaining_start:]
+            elif ctx.kind == "if_elif":
+                elif_idx = ctx.branch_index - 2
+                if elif_idx >= 0 and elif_idx < len(parent_stmt.else_if_clauses):
+                    _, elif_body = parent_stmt.else_if_clauses[elif_idx]
+                    remaining_start = ctx.nested_stmt_index + 1
+                    remaining_stmts = elif_body[remaining_start:]
+
+        elif isinstance(parent_stmt, ForStmt):
+            remaining_start = ctx.nested_stmt_index + 1
+            remaining_stmts = parent_stmt.body[remaining_start:]
+
+        elif isinstance(parent_stmt, WhileStmt):
+            remaining_start = ctx.nested_stmt_index + 1
+            remaining_stmts = parent_stmt.body[remaining_start:]
+
+        # Execute remaining statements and check for return
+        for stmt in remaining_stmts:
+            if isinstance(stmt, ReturnStmt):
+                if stmt.value:
+                    return_val = cg._generate_expression(stmt.value)
+                    # Cast to i64
+                    if return_val.type != ir.IntType(64):
+                        if isinstance(return_val.type, ir.IntType):
+                            return_val = cg.builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.DoubleType):
+                            return_val = cg.builder.bitcast(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.PointerType):
+                            return_val = cg.builder.ptrtoint(return_val, ir.IntType(64))
+                    return (return_val, True)
+                else:
+                    return (ir.Constant(ir.IntType(64), 0), True)
+            else:
+                cg._generate_statement(stmt)
+                if cg.builder.block.is_terminated:
+                    break
+
+        return (ir.Constant(ir.IntType(64), 0), False)
+
+    def _setup_frame_locals_context(self, builder: ir.IRBuilder,
+                                      frame_ptr: ir.Value,
+                                      frame_info: TaskFrameInfo,
+                                      func: FunctionDecl):
+        """Set up locals to read/write from frame instead of stack."""
+        cg = self.cg
+        # Save and clear locals - we'll load from frame as needed
+        self._saved_locals = cg.locals.copy() if cg.locals else {}
+        self._saved_builder = cg.builder
+
+        cg.builder = builder
+        cg.locals = {}
+
+        # Create alloca proxies for frame fields that act as local variables
+        # These aren't real allocas - they're GEPs into the frame
+        for field_name, field_idx in frame_info.field_indices.items():
+            if field_name.startswith('__'):
+                continue  # Skip internal fields
+            # Create a GEP that points to this field
+            field_ptr = builder.gep(frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), field_idx)
+            ], inbounds=True, name=f"frame_{field_name}")
+            cg.locals[field_name] = field_ptr
+
+    def _execute_statements_until(self, builder: ir.IRBuilder,
+                                    body: list, start_idx: int, end_idx: int,
+                                    frame_ptr: ir.Value, frame_info: TaskFrameInfo,
+                                    out_ptr: ir.Value = None, step_fn: ir.Function = None):
+        """Execute statements from start_idx to end_idx (exclusive)."""
+        cg = self.cg
+        from ast_nodes import ReturnStmt, IfStmt
+
+        for i in range(start_idx, min(end_idx, len(body))):
+            stmt = body[i]
+            if isinstance(stmt, ReturnStmt):
+                # Don't execute return here - handled separately
+                continue
+            if isinstance(stmt, IfStmt) and out_ptr is not None and step_fn is not None:
+                # Check if this if statement has an early return in the then branch
+                if self._if_has_early_return(stmt):
+                    # Generate special handling for early-return if
+                    self._generate_early_return_if(
+                        builder, step_fn, stmt, frame_ptr, frame_info, out_ptr
+                    )
+                    continue
+            cg._generate_statement(stmt)
+            if cg.builder.block.is_terminated:
+                break
+
+    def _if_has_early_return(self, if_stmt) -> bool:
+        """Check if an if statement has an early return (return without suspension)."""
+        from ast_nodes import ReturnStmt
+        for stmt in if_stmt.then_body:
+            if isinstance(stmt, ReturnStmt):
+                return True
+        return False
+
+    def _generate_early_return_if(self, builder: ir.IRBuilder,
+                                    step_fn: ir.Function,
+                                    if_stmt,
+                                    frame_ptr: ir.Value,
+                                    frame_info: TaskFrameInfo,
+                                    out_ptr: ir.Value):
+        """
+        Generate code for an if statement with an early return.
+
+        This generates:
+        - Evaluate condition
+        - If true: execute then body, if return found store DONE and ret void
+        - If false: continue (fall through to next statement)
+        """
+        from ast_nodes import ReturnStmt
+
+        cg = self.cg
+
+        # Evaluate condition
+        cond_val = cg._generate_expression(if_stmt.condition)
+
+        # Convert to i1 if needed
+        if cond_val.type != ir.IntType(1):
+            if isinstance(cond_val.type, ir.IntType):
+                cond_val = builder.icmp_signed('!=', cond_val,
+                                                ir.Constant(cond_val.type, 0), name="cond")
+            else:
+                cond_val = ir.Constant(ir.IntType(1), 1)
+
+        # Create blocks
+        then_block = step_fn.append_basic_block("early_ret_then")
+        continue_block = step_fn.append_basic_block("early_ret_cont")
+
+        builder.cbranch(cond_val, then_block, continue_block)
+
+        # Then block: execute body and return if we find a return statement
+        builder.position_at_end(then_block)
+
+        for stmt in if_stmt.then_body:
+            if isinstance(stmt, ReturnStmt):
+                # Generate DONE result and return
+                if stmt.value:
+                    return_val = self._evaluate_expr_in_state_context(
+                        builder, stmt.value, frame_ptr, frame_info
+                    )
+                    if return_val.type != ir.IntType(64):
+                        if isinstance(return_val.type, ir.IntType):
+                            return_val = builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.PointerType):
+                            return_val = builder.ptrtoint(return_val, ir.IntType(64))
+                else:
+                    return_val = ir.Constant(ir.IntType(64), 0)
+
+                self._store_task_result_done(builder, out_ptr, return_val)
+                builder.ret_void()
+                break
+            else:
+                cg._generate_statement(stmt)
+                if cg.builder.block.is_terminated:
+                    break
+
+        # Make sure then block is terminated
+        if not builder.block.is_terminated:
+            builder.branch(continue_block)
+
+        # Continue block: fall through to next statement
+        builder.position_at_end(continue_block)
+        cg.builder = builder
+
+    def _execute_statements_and_return(self, builder: ir.IRBuilder,
+                                         body: list, start_idx: int, end_idx: int,
+                                         frame_ptr: ir.Value, frame_info: TaskFrameInfo) -> ir.Value:
+        """Execute remaining statements and return the return value."""
+        cg = self.cg
+        from ast_nodes import ReturnStmt
+
+        return_val = ir.Constant(ir.IntType(64), 0)
+
+        for i in range(start_idx, min(end_idx, len(body))):
+            stmt = body[i]
+            if isinstance(stmt, ReturnStmt):
+                # Evaluate return expression using state machine context
+                # This ensures task calls use the resolved value from the frame
+                if stmt.value:
+                    return_val = self._evaluate_expr_in_state_context(
+                        builder, stmt.value, frame_ptr, frame_info
+                    )
+                    # Cast to i64
+                    if return_val.type != ir.IntType(64):
+                        if isinstance(return_val.type, ir.IntType):
+                            return_val = cg.builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.DoubleType):
+                            return_val = cg.builder.bitcast(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.PointerType):
+                            return_val = cg.builder.ptrtoint(return_val, ir.IntType(64))
+                break  # Stop at return
+            else:
+                cg._generate_statement(stmt)
+                if cg.builder.block.is_terminated:
+                    break
+
+        return return_val
+
+    def _create_child_task_spawn(self, builder: ir.IRBuilder,
+                                   parent_frame_ptr: ir.Value,
+                                   parent_frame_info: TaskFrameInfo,
+                                   sp: SuspensionPoint) -> tuple:
+        """
+        Create a child task frame for a suspension point.
+
+        Returns (child_frame_ptr as i8*, child_step_fn as i8*).
+        """
+        cg = self.cg
+        callee_name = sp.callee_name
+
+        # Get child task's frame info
+        child_frame_info = self.task_frames.get(callee_name)
+        if child_frame_info is None:
+            # Child task might not have a frame yet - this shouldn't happen
+            # if tasks are processed in dependency order, but fall back gracefully
+            return (ir.Constant(ir.IntType(8).as_pointer(), None),
+                    ir.Constant(ir.IntType(8).as_pointer(), None))
+
+        # Get child's step function
+        child_step_fn = self.step_functions.get(callee_name)
+        if child_step_fn is None:
+            return (ir.Constant(ir.IntType(8).as_pointer(), None),
+                    ir.Constant(ir.IntType(8).as_pointer(), None))
+
+        # Allocate child frame on heap
+        frame_size = ir.Constant(ir.IntType(64), 64)  # Approximate size
+        malloc_fn = self._get_or_declare_malloc()
+        child_frame_mem = builder.call(malloc_fn, [frame_size], name="child_frame_mem")
+        child_frame_ptr = builder.bitcast(
+            child_frame_mem,
+            child_frame_info.llvm_frame_type.as_pointer(),
+            name="child_frame"
+        )
+
+        # Initialize child frame state to 0
+        state_ptr = builder.gep(child_frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), child_frame_info.field_indices['__state'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), state_ptr)
+
+        # Initialize child frame resolved to 0
+        resolved_ptr = builder.gep(child_frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), child_frame_info.field_indices['__resolved'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), resolved_ptr)
+
+        # Set waiter to parent frame (so child can wake parent when done)
+        waiter_ptr = builder.gep(child_frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), child_frame_info.field_indices['__waiter'])
+        ], inbounds=True)
+        parent_as_i8 = builder.bitcast(parent_frame_ptr, ir.IntType(8).as_pointer())
+        builder.store(parent_as_i8, waiter_ptr)
+
+        # Initialize child's branch_taken to 0
+        branch_ptr = builder.gep(child_frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), child_frame_info.field_indices['__branch_taken'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), branch_ptr)
+
+        # Evaluate arguments and store in child frame
+        call_expr = sp.call_expr
+        if hasattr(call_expr, 'args') and call_expr.args:
+            self._evaluate_and_store_args(
+                builder, parent_frame_ptr, parent_frame_info,
+                child_frame_ptr, child_frame_info,
+                call_expr.args
+            )
+
+        # Return child frame and step function as i8*
+        child_frame_i8 = builder.bitcast(child_frame_ptr, ir.IntType(8).as_pointer())
+        child_step_i8 = builder.bitcast(child_step_fn, ir.IntType(8).as_pointer())
+
+        return (child_frame_i8, child_step_i8)
+
+    def _evaluate_and_store_args(self, builder: ir.IRBuilder,
+                                   parent_frame_ptr: ir.Value,
+                                   parent_frame_info: TaskFrameInfo,
+                                   child_frame_ptr: ir.Value,
+                                   child_frame_info: TaskFrameInfo,
+                                   args: list):
+        """
+        Evaluate call arguments in state machine context and store in child frame.
+        """
+        cg = self.cg
+
+        for i, (arg_expr, param) in enumerate(zip(args, child_frame_info.parameters)):
+            # Evaluate the argument expression
+            arg_val = self._evaluate_expr_in_state_context(
+                builder, arg_expr, parent_frame_ptr, parent_frame_info
+            )
+
+            # Get the parameter's field index in child frame
+            param_idx = child_frame_info.field_indices.get(param.name)
+            if param_idx is None:
+                continue
+
+            # Get expected type and cast if needed
+            expected_type = child_frame_info.llvm_frame_type.elements[param_idx]
+            arg_val = cg._cast_value(arg_val, expected_type)
+
+            # Store in child frame
+            param_ptr = builder.gep(child_frame_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), param_idx)
+            ], inbounds=True)
+            builder.store(arg_val, param_ptr)
+
+    def _evaluate_expr_in_state_context(self, builder: ir.IRBuilder,
+                                          expr,
+                                          frame_ptr: ir.Value,
+                                          frame_info: TaskFrameInfo) -> ir.Value:
+        """
+        Evaluate an expression in the state machine context.
+
+        Variables are loaded from the frame instead of normal locals.
+        """
+        from ast_nodes import (
+            IntLiteral, FloatLiteral, StringLiteral, BoolLiteral,
+            Identifier, BinaryExpr, UnaryExpr, CallExpr, MethodCallExpr,
+            TernaryExpr, ListExpr, TupleExpr, IndexExpr, MemberExpr,
+            BinaryOp
+        )
+
+        cg = self.cg
+
+        if isinstance(expr, IntLiteral):
+            return ir.Constant(ir.IntType(64), expr.value)
+
+        elif isinstance(expr, FloatLiteral):
+            return ir.Constant(ir.DoubleType(), expr.value)
+
+        elif isinstance(expr, BoolLiteral):
+            return ir.Constant(ir.IntType(1), 1 if expr.value else 0)
+
+        elif isinstance(expr, StringLiteral):
+            # Use the code generator's string handling
+            return cg._generate_string_literal(expr.value)
+
+        elif isinstance(expr, Identifier):
+            # Load variable from frame if it's there
+            var_name = expr.name
+            if var_name in frame_info.field_indices:
+                var_idx = frame_info.field_indices[var_name]
+                var_ptr = builder.gep(frame_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), var_idx)
+                ], inbounds=True)
+                return builder.load(var_ptr, name=var_name)
+            else:
+                # Try normal codegen (for globals, functions, etc.)
+                saved_builder = cg.builder
+                cg.builder = builder
+                try:
+                    result = cg._generate_expression(expr)
+                finally:
+                    cg.builder = saved_builder
+                return result
+
+        elif isinstance(expr, BinaryExpr):
+            left = self._evaluate_expr_in_state_context(builder, expr.left, frame_ptr, frame_info)
+            right = self._evaluate_expr_in_state_context(builder, expr.right, frame_ptr, frame_info)
+
+            # Handle binary operators (op is a BinaryOp enum)
+            op = expr.op
+            if op == BinaryOp.ADD:
+                if isinstance(left.type, ir.IntType):
+                    return builder.add(left, right, name="add")
+                else:
+                    return builder.fadd(left, right, name="fadd")
+            elif op == BinaryOp.SUB:
+                if isinstance(left.type, ir.IntType):
+                    return builder.sub(left, right, name="sub")
+                else:
+                    return builder.fsub(left, right, name="fsub")
+            elif op == BinaryOp.MUL:
+                if isinstance(left.type, ir.IntType):
+                    return builder.mul(left, right, name="mul")
+                else:
+                    return builder.fmul(left, right, name="fmul")
+            elif op == BinaryOp.DIV:
+                if isinstance(left.type, ir.IntType):
+                    return builder.sdiv(left, right, name="div")
+                else:
+                    return builder.fdiv(left, right, name="fdiv")
+            elif op == BinaryOp.MOD:
+                return builder.srem(left, right, name="mod")
+            elif op in (BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE, BinaryOp.EQ, BinaryOp.NE):
+                if isinstance(left.type, ir.IntType):
+                    cmp_map = {
+                        BinaryOp.LT: 'slt', BinaryOp.GT: 'sgt',
+                        BinaryOp.LE: 'sle', BinaryOp.GE: 'sge',
+                        BinaryOp.EQ: 'eq', BinaryOp.NE: 'ne'
+                    }
+                    cmp = builder.icmp_signed(cmp_map[op], left, right, name="cmp")
+                else:
+                    cmp_map = {
+                        BinaryOp.LT: 'olt', BinaryOp.GT: 'ogt',
+                        BinaryOp.LE: 'ole', BinaryOp.GE: 'oge',
+                        BinaryOp.EQ: 'oeq', BinaryOp.NE: 'one'
+                    }
+                    cmp = builder.fcmp_ordered(cmp_map[op], left, right, name="cmp")
+                return builder.zext(cmp, ir.IntType(64))
+            elif op == BinaryOp.AND:
+                left_bool = builder.icmp_signed('!=', left, ir.Constant(left.type, 0))
+                right_bool = builder.icmp_signed('!=', right, ir.Constant(right.type, 0))
+                result = builder.and_(left_bool, right_bool)
+                return builder.zext(result, ir.IntType(64))
+            elif op == BinaryOp.OR:
+                left_bool = builder.icmp_signed('!=', left, ir.Constant(left.type, 0))
+                right_bool = builder.icmp_signed('!=', right, ir.Constant(right.type, 0))
+                result = builder.or_(left_bool, right_bool)
+                return builder.zext(result, ir.IntType(64))
+            else:
+                return ir.Constant(ir.IntType(64), 0)
+
+        elif isinstance(expr, UnaryExpr):
+            operand = self._evaluate_expr_in_state_context(builder, expr.operand, frame_ptr, frame_info)
+            op = expr.op
+            if op == '-':
+                if isinstance(operand.type, ir.IntType):
+                    return builder.neg(operand, name="neg")
+                else:
+                    return builder.fneg(operand, name="fneg")
+            elif op == 'not':
+                cmp = builder.icmp_signed('==', operand, ir.Constant(operand.type, 0))
+                return builder.zext(cmp, ir.IntType(64))
+            else:
+                return operand
+
+        elif isinstance(expr, CallExpr):
+            # Check if this is a task call that we've already resolved
+            callee_name = None
+            if isinstance(expr.callee, Identifier):
+                callee_name = expr.callee.name
+
+            if callee_name and callee_name in self._task_function_names:
+                # This is a task call - use the resolved value from frame
+                # The __resolved field contains the result from the child task
+                if '__resolved' in frame_info.field_indices:
+                    resolved_ptr = builder.gep(frame_ptr, [
+                        ir.Constant(ir.IntType(32), 0),
+                        ir.Constant(ir.IntType(32), frame_info.field_indices['__resolved'])
+                    ], inbounds=True)
+                    return builder.load(resolved_ptr, name="resolved_task_result")
+
+            # Non-task call within state machine - use normal codegen
+            saved_builder = cg.builder
+            cg.builder = builder
+            try:
+                result = cg._generate_expression(expr)
+            finally:
+                cg.builder = saved_builder
+            return result
+
+        else:
+            # For complex expressions, fall back to normal codegen
+            saved_builder = cg.builder
+            cg.builder = builder
+            try:
+                result = cg._generate_expression(expr)
+            finally:
+                cg.builder = saved_builder
+            return result
+
+    def _evaluate_final_return(self, builder: ir.IRBuilder,
+                                 frame_ptr: ir.Value,
+                                 frame_info: TaskFrameInfo,
+                                 func: FunctionDecl,
+                                 resolved_val: ir.Value) -> ir.Value:
+        """
+        Evaluate the final return expression in the state machine.
+
+        Finds the return statement in the function body and evaluates its
+        expression with variables loaded from the frame.
+        """
+        from ast_nodes import ReturnStmt
+
+        # Find the return statement in the function body
+        return_stmt = None
+        for stmt in func.body:
+            if isinstance(stmt, ReturnStmt):
+                return_stmt = stmt
+                break
+
+        if return_stmt is None or return_stmt.value is None:
+            # No return statement found or void return - use resolved value
+            return resolved_val
+
+        # Evaluate the return expression in state context
+        return_val = self._evaluate_expr_in_state_context(
+            builder, return_stmt.value, frame_ptr, frame_info
+        )
+
+        # Cast to i64 if needed
+        if return_val.type != ir.IntType(64):
+            if isinstance(return_val.type, ir.IntType):
+                return_val = builder.sext(return_val, ir.IntType(64))
+            elif isinstance(return_val.type, ir.DoubleType):
+                return_val = builder.bitcast(return_val, ir.IntType(64))
+            elif isinstance(return_val.type, ir.PointerType):
+                return_val = builder.ptrtoint(return_val, ir.IntType(64))
+
+        return return_val
 
     def _generate_entry_function(self, func: FunctionDecl,
                                    frame_info: TaskFrameInfo,
@@ -850,6 +2128,13 @@ class TaskTransformer:
             ir.Constant(ir.IntType(32), frame_info.field_indices['__waiter'])
         ], inbounds=True)
         builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), waiter_ptr)
+
+        # Initialize branch_taken to 0
+        branch_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__branch_taken'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), branch_ptr)
 
         # Copy parameters to frame
         for i, param in enumerate(func.params):
@@ -1007,6 +2292,13 @@ class TaskTransformer:
             ir.Constant(ir.IntType(32), frame_info.field_indices['__waiter'])
         ], inbounds=True)
         builder.store(ir.Constant(ir.IntType(8).as_pointer(), None), waiter_ptr)
+
+        # Initialize branch_taken to 0
+        branch_ptr = builder.gep(frame_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), frame_info.field_indices['__branch_taken'])
+        ], inbounds=True)
+        builder.store(ir.Constant(ir.IntType(64), 0), branch_ptr)
 
         # Copy parameters to frame
         for i, param in enumerate(frame_info.parameters):

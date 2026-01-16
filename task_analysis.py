@@ -21,6 +21,17 @@ from ast_nodes import (
 
 
 @dataclass
+class ControlFlowContext:
+    """Tracks the control flow context for a suspension point."""
+    kind: str                  # "if_then", "if_else", "if_elif", "for", "while", "match", or "top"
+    parent_stmt: Optional[Any] # The containing control flow statement
+    parent_stmt_index: int     # Index of parent statement in its body
+    branch_index: int          # For elif: which branch (0=then, 1=else, 2+=elif)
+    nested_stmt_index: int     # Index of statement within the branch body
+    parent_context: Optional['ControlFlowContext']  # For nested control flow
+
+
+@dataclass
 class SuspensionPoint:
     """A point where a task may suspend (yield to scheduler)."""
     node: Any                  # The AST node containing the task call
@@ -29,6 +40,7 @@ class SuspensionPoint:
     var_name: Optional[str]    # Variable receiving result (if VarDecl/Assignment)
     callee_name: str           # Name of the called task function
     stmt_index: int            # Index in the statement list
+    context: Optional[ControlFlowContext] = None  # Control flow context if nested
 
 
 @dataclass
@@ -83,11 +95,11 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
     points = []
     state_id = [0]  # Mutable counter
 
-    def process_statements(stmts: List[Stmt], base_index: int = 0):
+    def process_statements(stmts: List[Stmt], context: Optional[ControlFlowContext] = None):
         for i, stmt in enumerate(stmts):
-            process_statement(stmt, base_index + i)
+            process_statement(stmt, i, context)
 
-    def process_statement(stmt: Stmt, stmt_index: int):
+    def process_statement(stmt: Stmt, stmt_index: int, context: Optional[ControlFlowContext]):
         if isinstance(stmt, VarDecl):
             # Check if initializer contains a task call
             if stmt.initializer:
@@ -100,7 +112,8 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                         state_id=state_id[0],
                         var_name=stmt.name,
                         callee_name=callee_name,
-                        stmt_index=stmt_index
+                        stmt_index=stmt_index,
+                        context=context
                     ))
                     state_id[0] += 1
 
@@ -116,7 +129,8 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                     state_id=state_id[0],
                     var_name=var_name,
                     callee_name=callee_name,
-                    stmt_index=stmt_index
+                    stmt_index=stmt_index,
+                    context=context
                 ))
                 state_id[0] += 1
 
@@ -131,7 +145,8 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                     state_id=state_id[0],
                     var_name=None,
                     callee_name=callee_name,
-                    stmt_index=stmt_index
+                    stmt_index=stmt_index,
+                    context=context
                 ))
                 state_id[0] += 1
 
@@ -147,7 +162,8 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                         state_id=state_id[0],
                         var_name="__return_value",
                         callee_name=callee_name,
-                        stmt_index=stmt_index
+                        stmt_index=stmt_index,
+                        context=context
                     ))
                     state_id[0] += 1
 
@@ -162,31 +178,90 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                     state_id=state_id[0],
                     var_name="__if_cond",
                     callee_name=callee_name,
-                    stmt_index=stmt_index
+                    stmt_index=stmt_index,
+                    context=context
                 ))
                 state_id[0] += 1
-            # Process branches
-            process_statements(stmt.then_body)
+
+            # Process then branch with context
+            then_context = ControlFlowContext(
+                kind="if_then",
+                parent_stmt=stmt,
+                parent_stmt_index=stmt_index,
+                branch_index=0,
+                nested_stmt_index=0,  # Will be set per-statement
+                parent_context=context
+            )
+            for i, then_stmt in enumerate(stmt.then_body):
+                then_ctx = ControlFlowContext(
+                    kind="if_then",
+                    parent_stmt=stmt,
+                    parent_stmt_index=stmt_index,
+                    branch_index=0,
+                    nested_stmt_index=i,
+                    parent_context=context
+                )
+                process_statement(then_stmt, i, then_ctx)
+
+            # Process else branch with context
             if stmt.else_body:
-                process_statements(stmt.else_body)
-            for elif_cond, elif_body in stmt.else_if_clauses:
+                for i, else_stmt in enumerate(stmt.else_body):
+                    else_ctx = ControlFlowContext(
+                        kind="if_else",
+                        parent_stmt=stmt,
+                        parent_stmt_index=stmt_index,
+                        branch_index=1,
+                        nested_stmt_index=i,
+                        parent_context=context
+                    )
+                    process_statement(else_stmt, i, else_ctx)
+
+            # Process elif branches
+            for elif_idx, (elif_cond, elif_body) in enumerate(stmt.else_if_clauses):
                 call = find_task_call_in_expr(elif_cond, task_functions)
                 if call:
                     callee_name = get_callee_name(call)
+                    elif_cond_ctx = ControlFlowContext(
+                        kind="if_elif_cond",
+                        parent_stmt=stmt,
+                        parent_stmt_index=stmt_index,
+                        branch_index=2 + elif_idx,
+                        nested_stmt_index=-1,  # Condition, not body
+                        parent_context=context
+                    )
                     points.append(SuspensionPoint(
                         node=stmt,
                         call_expr=call,
                         state_id=state_id[0],
                         var_name="__elif_cond",
                         callee_name=callee_name,
-                        stmt_index=stmt_index
+                        stmt_index=stmt_index,
+                        context=elif_cond_ctx
                     ))
                     state_id[0] += 1
-                process_statements(elif_body)
+                for i, elif_stmt in enumerate(elif_body):
+                    elif_ctx = ControlFlowContext(
+                        kind="if_elif",
+                        parent_stmt=stmt,
+                        parent_stmt_index=stmt_index,
+                        branch_index=2 + elif_idx,
+                        nested_stmt_index=i,
+                        parent_context=context
+                    )
+                    process_statement(elif_stmt, i, elif_ctx)
 
         elif isinstance(stmt, ForStmt):
-            # Process loop body
-            process_statements(stmt.body)
+            # Process loop body with context
+            for i, for_stmt in enumerate(stmt.body):
+                for_ctx = ControlFlowContext(
+                    kind="for",
+                    parent_stmt=stmt,
+                    parent_stmt_index=stmt_index,
+                    branch_index=0,
+                    nested_stmt_index=i,
+                    parent_context=context
+                )
+                process_statement(for_stmt, i, for_ctx)
 
         elif isinstance(stmt, WhileStmt):
             # Check condition
@@ -199,16 +274,35 @@ def find_suspension_points(body: List[Stmt], task_functions: Set[str]) -> List[S
                     state_id=state_id[0],
                     var_name="__while_cond",
                     callee_name=callee_name,
-                    stmt_index=stmt_index
+                    stmt_index=stmt_index,
+                    context=context
                 ))
                 state_id[0] += 1
-            # Process body
-            process_statements(stmt.body)
+            # Process body with context
+            for i, while_stmt in enumerate(stmt.body):
+                while_ctx = ControlFlowContext(
+                    kind="while",
+                    parent_stmt=stmt,
+                    parent_stmt_index=stmt_index,
+                    branch_index=0,
+                    nested_stmt_index=i,
+                    parent_context=context
+                )
+                process_statement(while_stmt, i, while_ctx)
 
         elif isinstance(stmt, MatchStmt):
-            # Process match arms
-            for arm in stmt.arms:
-                process_statements(arm.body)
+            # Process match arms with context
+            for arm_idx, arm in enumerate(stmt.arms):
+                for i, arm_stmt in enumerate(arm.body):
+                    match_ctx = ControlFlowContext(
+                        kind="match",
+                        parent_stmt=stmt,
+                        parent_stmt_index=stmt_index,
+                        branch_index=arm_idx,
+                        nested_stmt_index=i,
+                        parent_context=context
+                    )
+                    process_statement(arm_stmt, i, match_ctx)
 
     process_statements(body)
     return points
@@ -294,7 +388,24 @@ def get_callee_name(call: Any) -> Optional[str]:
 
 def find_all_locals(body: List[Stmt]) -> Dict[str, Type]:
     """Find all local variable declarations in the function body."""
+    from ast_nodes import ListExpr, MapExpr, SetExpr, StringLiteral, ListType, MapType, SetType, PrimitiveType
     locals_dict = {}
+
+    def infer_type_from_expr(expr) -> Optional[Type]:
+        """Infer type from an expression for frame field generation."""
+        if isinstance(expr, ListExpr):
+            # List literal - infer element type from first element if possible
+            if expr.elements:
+                elem_type = infer_type_from_expr(expr.elements[0])
+                return ListType(element_type=elem_type)
+            return ListType(element_type=None)
+        elif isinstance(expr, MapExpr):
+            return MapType(key_type=None, value_type=None)
+        elif isinstance(expr, SetExpr):
+            return SetType(element_type=None)
+        elif isinstance(expr, StringLiteral):
+            return PrimitiveType(name="string")
+        return None
 
     def process_statements(stmts: List[Stmt]):
         for stmt in stmts:
@@ -304,6 +415,10 @@ def find_all_locals(body: List[Stmt]) -> Dict[str, Type]:
         if isinstance(stmt, VarDecl):
             if stmt.type_annotation:
                 locals_dict[stmt.name] = stmt.type_annotation
+            elif stmt.initializer:
+                # Try to infer type from initializer
+                inferred = infer_type_from_expr(stmt.initializer)
+                locals_dict[stmt.name] = inferred
             else:
                 # Type will be inferred during codegen
                 locals_dict[stmt.name] = None

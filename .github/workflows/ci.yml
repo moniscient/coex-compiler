@@ -40,7 +40,7 @@ jobs:
 
     - name: Build runtime libraries
       run: |
-        cd runtime && make
+        cd runtime && make clean && make
         ls -la *.a
 
     - name: Run tests

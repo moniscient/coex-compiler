@@ -32,6 +32,10 @@ htmlcov/
 *.out
 *.exe
 
+# Runtime libraries (must be built for each platform)
+runtime/*.a
+runtime/*.o
+
 # Compiled example binaries (Mach-O executables without extension)
 examples/factorial
 examples/stress_array_1m
