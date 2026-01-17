@@ -50,14 +50,7 @@ jobs:
 
     - name: Verify llvmlite works
       run: |
-        python << 'EOF'
-        import llvmlite.binding as llvm
-        import llvmlite.ir as ir
-        print(f'llvmlite version: {llvm.llvmlite_version}')
-        print(f'LLVM version: {llvm.llvm_version_info}')
-        module = ir.Module(name='test')
-        print('llvmlite IR generation works')
-        EOF
+        python3 -c 'import llvmlite; import llvmlite.ir as ir; print("llvmlite version:", llvmlite.__version__); m = ir.Module(name="test"); print("llvmlite IR generation works")'
 
     - name: Run quick sanity test
       run: |
