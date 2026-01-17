@@ -23,6 +23,38 @@ Write simple tests for bug completion and feature implementation. Then write str
 
 Write benchmarks that show the possibility of pathologically long run time compared to reasonable expectation from other langauges. Ask about long run times to determine whether they should be investigated as bugs or architectural immprovements.
 
+## Bug Tracking Protocol
+
+**MANDATORY**: When encountering any unexpected behavior, test failure, or anomaly during development—even if worked around or tangential to the current task—immediately append a bug report to `BUGS.md` before continuing. You must never continue past a discovered bug without first documenting it.
+
+### Bug Report Format
+```markdown
+### BUG-XXX: One-line summary
+- **Discovered**: YYYY-MM-DD, during [context]
+- **Category**: [Parser|Semantic|Codegen|Runtime|GC|Stdlib]
+- **Severity**: [Critical|High|Medium|Low]
+- **Reproduction**: Steps to reproduce
+- **Observed**: What actually happens
+- **Expected**: What should happen
+- **Hypothesis**: Theory about the cause
+- **Files**: Likely involved files
+- **Status**: Open
+```
+
+### Session Protocol
+1. **Session Start**: Review BUGS.md and summarize current state
+2. **Pre-Task**: Check if any open bugs interact with planned work
+3. **During Development**: Bug-on-discovery rule applies (document immediately)
+4. **Session End**: Review work done, ensure all encountered bugs are recorded
+
+### When to Report
+- Test failures that reveal unexpected behavior
+- Crashes or segfaults during testing
+- Incorrect output that differs from specification
+- Performance anomalies (unexpectedly slow operations)
+- Edge cases that produce wrong results
+- Any workaround you implement for an underlying issue
+
 ## Architecture
 
 ```
