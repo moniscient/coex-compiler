@@ -5,9 +5,13 @@ Generates LLVM IR for the JSON type, providing a tagged union for representing
 JSON values (null, bool, int, float, string, array, object).
 
 JSON values are stored as:
-- struct.Json { i8 tag, i64 value }
+- struct.Json { i64 tag, i64 value }
 - Tags: 0=null, 1=bool, 2=int, 3=float, 4=string, 5=array, 6=object
 - Values: primitives inline, pointers stored as i64
+
+IMPORTANT: All integer fields use i64 to ensure consistent alignment across platforms.
+Using smaller integer types (i8, i16, i32) for struct fields causes alignment differences
+between Linux and macOS that lead to incorrect field offsets at runtime.
 """
 
 from llvmlite import ir
@@ -43,17 +47,19 @@ class JsonGenerator:
         - array (tag=5, value is List* pointer holding [json])
         - object (tag=6, value is Map* pointer with string keys and json values)
 
-        struct.Json { i8 tag, i64 value }
+        struct.Json { i64 tag, i64 value }
+
+        IMPORTANT: All fields are i64 to ensure consistent alignment across platforms.
         """
         cg = self.cg
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Define the JSON struct: { i8 tag, i64 value }
+        # Define the JSON struct: { i64 tag, i64 value }
+        # IMPORTANT: Use i64 for all fields to ensure consistent alignment across platforms
         cg.json_struct = ir.global_context.get_identified_type("struct.Json")
         cg.json_struct.set_body(
-            i8,   # tag (field 0) - type discriminator
+            i64,  # tag (field 0) - type discriminator (i64 for alignment)
             i64,  # value (field 1) - inline value or pointer as i64
         )
 
@@ -125,10 +131,11 @@ class JsonGenerator:
         cg.json_new_object.attributes.add('noinline')
         cg.json_new_object.attributes.add('optnone')
 
-        # json_get_tag(Json*) -> i8
+        # json_get_tag(Json*) -> i64
+        # IMPORTANT: Returns i64 for consistent alignment across platforms
         cg.json_get_tag = ir.Function(
             cg.module,
-            ir.FunctionType(i8, [json_ptr]),
+            ir.FunctionType(i64, [json_ptr]),
             name="coex_json_get_tag"
         )
 
@@ -278,18 +285,18 @@ class JsonGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Allocate Json struct (9 bytes, but align to 16)
+        # Allocate Json struct (16 bytes: i64 tag + i64 value)
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_NULL (0)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_NULL), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_NULL), tag_ptr)
 
         # Set value to 0 (unused for null)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), value_ptr)
 
         builder.ret(json_ptr)
@@ -303,21 +310,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_BOOL (1)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_BOOL), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_BOOL), tag_ptr)
 
         # Set value (extend i1 to i64)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.zext(func.args[0], i64)
         builder.store(value_i64, value_ptr)
 
@@ -332,21 +338,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_INT (2)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_INT), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_INT), tag_ptr)
 
         # Set value
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         builder.store(func.args[0], value_ptr)
 
         builder.ret(json_ptr)
@@ -360,21 +365,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_FLOAT (3)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_FLOAT), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_FLOAT), tag_ptr)
 
         # Set value (bitcast f64 to i64)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.bitcast(func.args[0], i64)
         builder.store(value_i64, value_ptr)
 
@@ -389,21 +393,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_STRING (4)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_STRING), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_STRING), tag_ptr)
 
         # Set value (store pointer as i64)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.ptrtoint(func.args[0], i64)
         builder.store(value_i64, value_ptr)
 
@@ -418,21 +421,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_ARRAY (5)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_ARRAY), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_ARRAY), tag_ptr)
 
         # Set value (store pointer as i64)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.ptrtoint(func.args[0], i64)
         builder.store(value_i64, value_ptr)
 
@@ -447,21 +449,20 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
-        type_id = ir.Constant(i32, cg.gc.TYPE_JSON)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_JSON)  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, json_size, type_id)
         json_ptr = builder.bitcast(raw_ptr, cg.json_struct.as_pointer())
 
         # Set tag to JSON_TAG_OBJECT (6)
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        builder.store(ir.Constant(i8, self.JSON_TAG_OBJECT), tag_ptr)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+        builder.store(ir.Constant(i64, self.JSON_TAG_OBJECT), tag_ptr)
 
         # Set value (store pointer as i64)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.ptrtoint(func.args[0], i64)
         builder.store(value_i64, value_ptr)
 
@@ -475,10 +476,10 @@ class JsonGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Get tag field
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
         builder.ret(tag)
 
@@ -498,20 +499,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Is object: extract Map* and look up key
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
 
@@ -556,25 +556,24 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if array
-        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_ARRAY))
         builder.cbranch(is_arr, is_array, not_array)
 
         # Is array: extract List* and get element
         builder.position_at_end(is_array)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         list_ptr = builder.inttoptr(value_i64, cg.list_struct.as_pointer())
 
         # Get list length
-        len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        len_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         list_len = builder.load(len_ptr)
 
         # Check bounds
@@ -607,12 +606,11 @@ class JsonGenerator:
         func = cg.json_is_null
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_NULL))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_NULL))
         builder.ret(result)
 
     def _implement_json_is_bool(self):
@@ -621,12 +619,11 @@ class JsonGenerator:
         func = cg.json_is_bool
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_BOOL))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_BOOL))
         builder.ret(result)
 
     def _implement_json_is_int(self):
@@ -635,12 +632,11 @@ class JsonGenerator:
         func = cg.json_is_int
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_INT))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_INT))
         builder.ret(result)
 
     def _implement_json_is_float(self):
@@ -649,12 +645,11 @@ class JsonGenerator:
         func = cg.json_is_float
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_FLOAT))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_FLOAT))
         builder.ret(result)
 
     def _implement_json_is_string(self):
@@ -663,12 +658,11 @@ class JsonGenerator:
         func = cg.json_is_string
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_STRING))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_STRING))
         builder.ret(result)
 
     def _implement_json_is_array(self):
@@ -677,12 +671,11 @@ class JsonGenerator:
         func = cg.json_is_array
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_ARRAY))
         builder.ret(result)
 
     def _implement_json_is_object(self):
@@ -691,12 +684,11 @@ class JsonGenerator:
         func = cg.json_is_object
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        result = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.ret(result)
 
     def _implement_json_len(self):
@@ -710,20 +702,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if array
-        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_ARRAY))
         builder.cbranch(is_arr, is_array, is_object)
 
         # Array: get list length
         builder.position_at_end(is_array)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         list_ptr = builder.inttoptr(value_i64, cg.list_struct.as_pointer())
         arr_len = builder.call(cg.list_len, [list_ptr])
@@ -731,13 +722,13 @@ class JsonGenerator:
 
         # Check if object
         builder.position_at_end(is_object)
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, func.append_basic_block("get_obj_len"), not_collection)
 
         # Object: get map length
         get_obj_len = list(func.basic_blocks)[-1]
         builder.position_at_end(get_obj_len)
-        value_ptr2 = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr2 = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64_2 = builder.load(value_ptr2)
         map_ptr = builder.inttoptr(value_i64_2, cg.map_struct.as_pointer())
         obj_len = builder.call(cg.map_len, [map_ptr])
@@ -756,21 +747,20 @@ class JsonGenerator:
         not_object = func.append_basic_block("not_object")
         builder = ir.IRBuilder(entry)
 
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i1 = ir.IntType(1)
+        i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Object: check map.has_string(key)
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
         has_result = builder.call(cg.map_has_string, [map_ptr, func.args[1]])
@@ -790,20 +780,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Object: create new map with key set
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
 
@@ -832,20 +821,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if array
-        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_ARRAY))
         builder.cbranch(is_arr, is_array, not_array)
 
         # Array: create new list with element set
         builder.position_at_end(is_array)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         list_ptr = builder.inttoptr(value_i64, cg.list_struct.as_pointer())
 
@@ -874,20 +862,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if array
-        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_ARRAY))
+        is_arr = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_ARRAY))
         builder.cbranch(is_arr, is_array, not_array)
 
         # Array: append value
         builder.position_at_end(is_array)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         list_ptr = builder.inttoptr(value_i64, cg.list_struct.as_pointer())
 
@@ -915,20 +902,19 @@ class JsonGenerator:
         not_object = func.append_basic_block("not_object")
         builder = ir.IRBuilder(entry)
 
-        i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Object: remove key
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
 
@@ -953,20 +939,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Object: get keys from map
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
 
@@ -991,20 +976,19 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Check if object
-        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i8, self.JSON_TAG_OBJECT))
+        is_obj = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.cbranch(is_obj, is_object, not_object)
 
         # Object: get values from map
         builder.position_at_end(is_object)
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.load(value_ptr)
         map_ptr = builder.inttoptr(value_i64, cg.map_struct.as_pointer())
 
@@ -1027,15 +1011,14 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag
-        tag_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Get value
-        value_ptr = builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value = builder.load(value_ptr)
 
         # Create blocks for each JSON type
@@ -1053,13 +1036,13 @@ class JsonGenerator:
 
         # Switch on tag
         switch = builder.switch(tag, null_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_NULL), null_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_BOOL), bool_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_INT), int_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_FLOAT), float_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_STRING), string_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_ARRAY), array_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_OBJECT), object_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_NULL), null_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_BOOL), bool_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_INT), int_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_FLOAT), float_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_STRING), string_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_ARRAY), array_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_OBJECT), object_block)
 
         # NULL: return "null"
         builder.position_at_end(null_block)
@@ -1145,7 +1128,6 @@ class JsonGenerator:
         3. Wrap with "[" and "]"
         """
         cg = self.cg
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get list pointer
@@ -1222,7 +1204,6 @@ class JsonGenerator:
         3. Wrap with "{" and "}"
         """
         cg = self.cg
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get map pointer
@@ -1339,7 +1320,6 @@ class JsonGenerator:
         """
         cg = self.cg
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Use the already-declared function
@@ -1356,11 +1336,11 @@ class JsonGenerator:
         depth = func.args[2]
 
         # Get tag
-        tag_ptr = builder.gep(json_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(json_val, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Get value
-        value_ptr = builder.gep(json_val, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_val, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value = builder.load(value_ptr)
 
         # Create blocks for each JSON type
@@ -1378,13 +1358,13 @@ class JsonGenerator:
 
         # Switch on tag
         switch = builder.switch(tag, null_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_NULL), null_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_BOOL), bool_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_INT), int_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_FLOAT), float_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_STRING), string_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_ARRAY), array_block)
-        switch.add_case(ir.Constant(i8, self.JSON_TAG_OBJECT), object_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_NULL), null_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_BOOL), bool_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_INT), int_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_FLOAT), float_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_STRING), string_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_ARRAY), array_block)
+        switch.add_case(ir.Constant(i64, self.JSON_TAG_OBJECT), object_block)
 
         # NULL: return "null"
         builder.position_at_end(null_block)
@@ -1487,7 +1467,6 @@ class JsonGenerator:
                       indent_size: ir.Value, depth: ir.Value, result_ptr: ir.Value):
         """Generate code to pretty-print a JSON array."""
         cg = self.cg
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get list pointer
@@ -1582,7 +1561,6 @@ class JsonGenerator:
                        indent_size: ir.Value, depth: ir.Value, result_ptr: ir.Value):
         """Generate code to pretty-print a JSON object."""
         cg = self.cg
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get map pointer
@@ -1694,19 +1672,18 @@ class JsonGenerator:
         builder = ir.IRBuilder(entry)
 
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get string data pointer and length
         # Phase 4: String layout is { i64 owner_handle, i64 offset, i64 len, i64 size }
         str_ptr = func.args[0]
-        owner_handle_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_handle_ptr = builder.gep(str_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
         owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
-        offset_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset_ptr = builder.gep(str_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset_val = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset_val])
-        len_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        len_ptr = builder.gep(str_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         str_len = builder.load(len_ptr)
 
         # Check for empty string
@@ -1985,7 +1962,6 @@ class JsonGenerator:
         """
         cg = self.cg
         builder = cg.builder
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
@@ -1993,7 +1969,7 @@ class JsonGenerator:
         src_len = builder.call(cg.list_len, [list_ptr])
 
         # Get the element size from the list struct (field 3)
-        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         src_elem_size = builder.load(elem_size_ptr)
 
         # Create new list with 8-byte elements (for Json* pointers)
@@ -2070,7 +2046,6 @@ class JsonGenerator:
         """Convert a user-defined struct to JSON object with _type field."""
         cg = self.cg
         builder = cg.builder
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Create empty JSON object (starts with empty map)
@@ -2088,7 +2063,7 @@ class JsonGenerator:
         field_info = cg.type_fields[type_name]
         for idx, (field_name, field_type) in enumerate(field_info):
             # Extract field value
-            field_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            field_ptr = builder.gep(value, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), idx)], inbounds=True)
             field_val = builder.load(field_ptr)
 
             # Convert field value to JSON
@@ -2106,12 +2081,11 @@ class JsonGenerator:
         """Convert an enum to JSON object with _type and _variant fields."""
         cg = self.cg
         builder = cg.builder
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         func = builder.function
 
         # Get tag value (first field of enum struct)
-        tag_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(value, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
 
         # Create result alloca for PHI-like behavior
@@ -2153,7 +2127,7 @@ class JsonGenerator:
 
             # Add variant data fields (start at index 1, after tag)
             for field_idx, (field_name, field_type) in enumerate(variant_fields):
-                field_ptr = builder.gep(value, [ir.Constant(i32, 0), ir.Constant(i32, field_idx + 1)], inbounds=True)
+                field_ptr = builder.gep(value, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx + 1)], inbounds=True)
                 field_val = builder.load(field_ptr)
 
                 # Convert field value to JSON
@@ -2240,7 +2214,6 @@ class JsonGenerator:
         from ast_nodes import PrimitiveType, NamedType, ListType, OptionalType
         cg = self.cg
         builder = cg.builder
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Generate the source expression
@@ -2262,9 +2235,9 @@ class JsonGenerator:
 
         # JSON → Coex conversion
         # Get the JSON tag
-        tag_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(source, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        value_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(source, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value = builder.load(value_ptr)
 
         # Handle JSON → string: extract string if JSON is string type, else serialize
@@ -2371,7 +2344,7 @@ class JsonGenerator:
             return ir.Constant(i64, 0)
 
         # Check tag matches
-        tag_matches = builder.icmp_unsigned("==", tag, ir.Constant(i8, expected_tag))
+        tag_matches = builder.icmp_unsigned("==", tag, ir.Constant(i64, expected_tag))
 
         # Create blocks
         match_block = func.append_basic_block("as_match")
@@ -2455,13 +2428,12 @@ class JsonGenerator:
         cg = self.cg
         builder = cg.builder
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         func = builder.function
         type_name = target_type.name
 
         # Check it's an object (tag == 6)
-        is_object = builder.icmp_unsigned("==", tag, ir.Constant(i8, 6))
+        is_object = builder.icmp_unsigned("==", tag, ir.Constant(i64, 6))
 
         match_block = func.append_basic_block("as_struct_match")
         fail_block = func.append_basic_block("as_struct_fail")
@@ -2480,7 +2452,7 @@ class JsonGenerator:
 
         # Allocate struct via GC
         struct_size = ir.Constant(i64, len(cg.type_fields[type_name]) * 8)
-        type_id = ir.Constant(i32, cg.gc.get_type_id(type_name))
+        type_id = ir.Constant(ir.IntType(32), cg.gc.get_type_id(type_name))  # GC uses i32 for type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         struct_ptr = builder.bitcast(raw_ptr, struct_type.as_pointer())
 
@@ -2500,7 +2472,7 @@ class JsonGenerator:
             field_val = self.extract_json_value(field_json, field_type)
 
             # Store in struct
-            field_ptr = builder.gep(struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, idx)], inbounds=True)
+            field_ptr = builder.gep(struct_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), idx)], inbounds=True)
             builder.store(field_val, field_ptr)
 
         if is_optional:
@@ -2542,7 +2514,7 @@ class JsonGenerator:
         func = builder.function
 
         # Check it's an array (tag == 5)
-        is_array = builder.icmp_unsigned("==", tag, ir.Constant(i8, 5))
+        is_array = builder.icmp_unsigned("==", tag, ir.Constant(i64, 5))
 
         match_block = func.append_basic_block("as_list_match")
         fail_block = func.append_basic_block("as_list_fail")
@@ -2573,13 +2545,12 @@ class JsonGenerator:
         from ast_nodes import PrimitiveType
         cg = self.cg
         builder = cg.builder
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Get tag and value
-        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         tag = builder.load(tag_ptr)
-        value_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value = builder.load(value_ptr)
 
         if isinstance(target_type, PrimitiveType):
