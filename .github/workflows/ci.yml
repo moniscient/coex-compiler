@@ -55,7 +55,7 @@ jobs:
     - name: Run quick sanity test
       run: |
         # Run a single simple test to verify compiler works before full suite
-        python -m pytest tests/test_basic.py::TestHelloWorld -v --tb=long
+        python -m pytest tests/test_basic.py::TestIntegerArithmetic::test_addition -v --tb=long
 
     - name: Run tests
       run: |
