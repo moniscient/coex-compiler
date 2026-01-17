@@ -573,7 +573,7 @@ func main() -> int
 ~
 ''', "1\n")
 
-    @pytest.mark.xfail(reason="Nested UDT to JSON conversion not yet implemented")
+    @pytest.mark.xfail(reason="BUG-011: Nested UDT to JSON conversion not implemented")
     def test_nested_type_to_json(self, expect_output):
         """Nested user type converts to nested JSON."""
         expect_output('''

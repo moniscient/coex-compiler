@@ -34,7 +34,7 @@ class TestSafepointLatencyBound:
     because mutators spin-wait during GC, making safepoint cost O(heap_size).
     """
 
-    @pytest.mark.skip(reason="posix.time_ns() overflow issues - test logic is correct but timing is unreliable")
+    @pytest.mark.skip(reason="BUG-005: posix.time_ns() returns incorrect values")
     def test_safepoint_latency_single_threaded(self, compile_coex):
         """Measure worst-case safepoint latency in a single-threaded context.
 
@@ -195,7 +195,7 @@ class TestSafepointConcurrentBlocking:
     all threads spin-wait when any thread is in GC.
     """
 
-    @pytest.mark.xfail(reason="Non-blocking safepoints require shadow stack architecture changes - see implementation_prompts/phase1_nonblocking_safepoints.md")
+    @pytest.mark.xfail(reason="BUG-015: Non-blocking safepoints require shadow stack changes")
     def test_concurrent_gc_causes_serialization(self, compile_coex):
         """Detect serialization caused by blocking safepoints.
 

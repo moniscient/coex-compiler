@@ -711,14 +711,10 @@ class GarbageCollector:
         self.gc_cycle_id.linkage = 'internal'
 
         # ============================================================
-        # Thread-Local Storage Variables
+        # Thread-Local Storage Variables (see BUG-023)
         # ============================================================
-        # NOTE: llvmlite doesn't support LLVM's thread_local attribute,
-        # so we use pthread TLS (pthread_key_create, pthread_getspecific,
-        # pthread_setspecific) for truly thread-local storage.
-        #
-        # The pthread_key_t is stored as i64. On macOS it's an unsigned long,
-        # which fits in i64.
+        # We use pthread TLS due to BUG-023 (llvmlite TLS broken).
+        # The pthread_key_t is stored as i64 (fits unsigned long on macOS).
 
         # Pthread TLS key for ThreadEntry pointer (initialized in gc_init)
         self.tls_thread_entry_key = ir.GlobalVariable(
@@ -726,33 +722,27 @@ class GarbageCollector:
         self.tls_thread_entry_key.initializer = ir.Constant(self.i64, 0)
         self.tls_thread_entry_key.linkage = 'internal'
 
-        # Thread's shadow stack frame chain top
-        # NOTE: This is stored in ThreadEntry.shadow_stack_head, accessed via TLS key
+        # Thread's shadow stack frame chain top (stored in ThreadEntry)
         self.tls_frame_top = ir.GlobalVariable(
             self.module, self.i8_ptr, name="tls_frame_top")
         self.tls_frame_top.initializer = ir.Constant(self.i8_ptr, None)
         self.tls_frame_top.linkage = 'internal'
-        # NOTE: thread_local doesn't work in llvmlite, but kept for documentation
-        self.tls_frame_top.thread_local = 'localdynamic'
+        self.tls_frame_top.thread_local = 'localdynamic'  # BUG-023: ignored
 
-        # Thread's shadow stack depth
-        # NOTE: This is stored in ThreadEntry.stack_depth, accessed via TLS key
+        # Thread's shadow stack depth (stored in ThreadEntry)
         self.tls_frame_depth = ir.GlobalVariable(
             self.module, self.i64, name="tls_frame_depth")
         self.tls_frame_depth.initializer = ir.Constant(self.i64, 0)
         self.tls_frame_depth.linkage = 'internal'
-        # NOTE: thread_local doesn't work in llvmlite, but kept for documentation
-        self.tls_frame_depth.thread_local = 'localdynamic'
+        self.tls_frame_depth.thread_local = 'localdynamic'  # BUG-023: ignored
 
-        # Pointer to thread's ThreadEntry - DEPRECATED, use pthread TLS instead
-        # Kept for reference but all accesses should go through the pthread key
+        # Pointer to thread's ThreadEntry (use pthread TLS for actual access)
         self.tls_thread_entry = ir.GlobalVariable(
             self.module, self.thread_entry_type.as_pointer(), name="tls_thread_entry")
         self.tls_thread_entry.initializer = ir.Constant(
             self.thread_entry_type.as_pointer(), None)
         self.tls_thread_entry.linkage = 'internal'
-        # NOTE: thread_local doesn't work in llvmlite - use pthread TLS instead
-        self.tls_thread_entry.thread_local = 'localdynamic'
+        self.tls_thread_entry.thread_local = 'localdynamic'  # BUG-023: ignored
 
         # ============================================================
         # Phase 3: Segmented Shadow Stack TLS Globals
@@ -1774,13 +1764,12 @@ class GarbageCollector:
         # Unlock registry mutex
         builder.call(self.pthread_mutex_unlock, [mutex])
 
-        # Store in pthread TLS (replaces broken LLVM TLS)
+        # Store in pthread TLS (see BUG-023 for llvmlite TLS issue)
         tls_key = builder.load(self.tls_thread_entry_key)
         new_entry_i8 = builder.bitcast(new_entry, self.i8_ptr)
         builder.call(self.pthread_setspecific, [tls_key, new_entry_i8])
 
-        # Also store in the (broken) global for compatibility with code that
-        # hasn't been updated yet - TODO: remove once all uses are updated
+        # Also store in global for compatibility
         builder.store(new_entry, self.tls_thread_entry)
 
         # Initialize TLAB for this thread (allocates 256KB buffer)
@@ -2006,7 +1995,7 @@ class GarbageCollector:
         tls_key2 = builder.load(self.tls_thread_entry_key)
         builder.call(self.pthread_setspecific, [tls_key2, ir.Constant(self.i8_ptr, None)])
 
-        # Also clear the (broken) global for compatibility
+        # Also clear the global for compatibility
         builder.store(
             ir.Constant(self.thread_entry_type.as_pointer(), None),
             self.tls_thread_entry)
@@ -2029,7 +2018,7 @@ class GarbageCollector:
         entry_block = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry_block)
 
-        # Get from pthread TLS instead of broken LLVM TLS
+        # Get from pthread TLS (see BUG-023)
         tls_key = builder.load(self.tls_thread_entry_key)
         thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
         thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
@@ -2408,8 +2397,7 @@ class GarbageCollector:
         # ============================================================
         builder.position_at_end(finish)
 
-        # Update GC statistics (these could race but are just stats)
-        # TODO: Use atomic operations for accurate stats in multi-threaded case
+        # Update GC statistics (see BUG-018 for race condition)
         total_allocs_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         total_allocs = builder.load(total_allocs_ptr)
         new_total_allocs = builder.add(total_allocs, ir.Constant(self.i64, 1))
@@ -3622,8 +3610,8 @@ class GarbageCollector:
 
         NOTE: gc_segment_push already updates ThreadEntry.slot_index and
         ThreadEntry.segment_current via pthread_getspecific, so we don't
-        need to sync them again here. LLVM thread_local is broken in llvmlite
-        so we must NOT read from tls_slot_index or tls_segment_current.
+        need to sync them again here. Due to BUG-023, we must NOT read from
+        tls_slot_index or tls_segment_current directly.
         """
         # Call gc_segment_push to reserve slots in the segment chain
         # Returns the starting slot index (i64)

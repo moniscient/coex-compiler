@@ -142,7 +142,7 @@ func main() -> int
 ''', "1000000\n1\n1\n1\n1\n")
 
 
-@pytest.mark.xfail(reason="gc_async() race condition - requires Phase 4 TLAB allocation")
+@pytest.mark.xfail(reason="BUG-016: gc_async() race condition requires TLAB")
 class TestGCAsyncStress:
     """Stress tests using gc_async() with 1M allocations."""
 

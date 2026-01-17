@@ -90,7 +90,7 @@ func main() -> int
 ~
 ''', "3\n3\n")
 
-    @pytest.mark.skip(reason="String list printing has pre-existing bug - not related to PV")
+    @pytest.mark.skip(reason="BUG-007: String list printing bug")
     def test_list_of_strings(self, expect_output):
         """List of strings works correctly."""
         expect_output('''
@@ -103,7 +103,7 @@ func main() -> int
 ~
 ''', "hello\nworld\n3\n")
 
-    @pytest.mark.skip(reason="Nested list access has pre-existing bug - not related to PV")
+    @pytest.mark.skip(reason="BUG-008: Nested list access bug")
     def test_list_nested(self, expect_output):
         """Nested lists work correctly."""
         expect_output('''

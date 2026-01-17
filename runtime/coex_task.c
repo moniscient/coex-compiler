@@ -179,8 +179,7 @@ int coex_task_wait_any(TaskClosure** closures, int count) {
      * Simple polling implementation.
      * A more sophisticated implementation would use a shared condvar
      * among all tasks in the collection, but this works for now.
-     *
-     * TODO: Optimize with shared completion notification
+     * See BUG-024 for optimization tracking.
      */
     while (1) {
         /* Check each closure for completion */

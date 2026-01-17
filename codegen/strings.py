@@ -17,12 +17,11 @@ All Coex string operations use the 'size' field for bounds checking, never
 null termination. This is a deliberate security design to prevent buffer
 overrun vulnerabilities that plague null-terminated C strings.
 
-DANGEROUS HACK: C/POSIX Interop Null Termination
--------------------------------------------------
+C/POSIX Interop Null Termination (BUG-019)
+------------------------------------------
 String data buffers allocate ONE EXTRA BYTE beyond 'size' and write a null
-terminator at data[size]. This is a DANGEROUS HACK required solely for
-passing strings to C/POSIX functions (open, getenv, extern C calls) that
-expect null-terminated strings.
+terminator at data[size]. This is required for passing strings to C/POSIX
+functions (open, getenv, extern C calls) that expect null-terminated strings.
 
 THE COEX COMPILER MUST NEVER RELY ON THIS NULL BYTE FOR ITS OWN OPERATIONS.
 
@@ -30,8 +29,7 @@ The null byte exists only at position data[size], invisible to Coex code
 which always uses the size field. If you are writing Coex compiler code that
 reads strings, you MUST use the size field - never scan for null.
 
-If C interop is ever redesigned (e.g., explicit conversion functions), this
-hack should be removed and strings should allocate exactly 'size' bytes.
+See BUG-019 in BUGS.md for tracking this issue.
 """
 from llvmlite import ir
 from typing import TYPE_CHECKING
@@ -298,14 +296,14 @@ class StringGenerator:
         string_ptr = builder.bitcast(string_raw, cg.string_struct.as_pointer())
 
         # Allocate data buffer via GC
-        # DANGEROUS HACK: Allocate size+1 for C interop null terminator (see module docstring)
+        # BUG-019: Allocate size+1 for C interop null terminator
         data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         alloc_size = builder.add(byte_len, ir.Constant(i64, 1))
         data_raw = cg.gc.alloc_arena_or_gc(builder, alloc_size, data_type_id)
 
         # Copy data to new buffer
         builder.call(cg.memcpy, [data_raw, data, byte_len])
-        # DANGEROUS HACK: Write null at data[size] for C interop only - Coex uses size field
+        # BUG-019: Write null at data[size] for C interop
         null_ptr = builder.gep(data_raw, [byte_len])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
@@ -388,7 +386,7 @@ class StringGenerator:
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         # Allocate data buffer and copy literal data
-        # DANGEROUS HACK: Allocate size+1 for C interop null terminator (see module docstring)
+        # BUG-019: Allocate size+1 for C interop null terminator
         string_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING_DATA)
         alloc_size = builder.add(final_byte_len, ir.Constant(ir.IntType(64), 1))
         data_buf = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
@@ -635,7 +633,7 @@ class StringGenerator:
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         # Allocate data buffer
-        # DANGEROUS HACK: Allocate size+1 for C interop null terminator (see module docstring)
+        # BUG-019: Allocate size+1 for C interop null terminator
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         alloc_size = builder.add(total_size, ir.Constant(i64, 1))
         dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
@@ -657,7 +655,7 @@ class StringGenerator:
         b_data = builder.gep(b_owner, [b_offset])
         builder.call(cg.memcpy, [b_dest, b_data, b_size])
 
-        # DANGEROUS HACK: Write null at data[size] for C interop only - Coex uses size field
+        # BUG-019: Write null at data[size] for C interop
         null_ptr = builder.gep(dest_data, [total_size])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
@@ -772,7 +770,7 @@ class StringGenerator:
         result_str = builder.bitcast(raw_ptr, string_ptr_ty)
 
         # Allocate data buffer
-        # DANGEROUS HACK: Allocate size+1 for C interop null terminator (see module docstring)
+        # BUG-019: Allocate size+1 for C interop null terminator
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         alloc_size = builder.add(total_size, ir.Constant(i64, 1))
         dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
@@ -855,7 +853,7 @@ class StringGenerator:
         builder.branch(copy_loop_cond)
 
         builder.position_at_end(copy_loop_done)
-        # DANGEROUS HACK: Write null at data[size] for C interop only - Coex uses size field
+        # BUG-019: Write null at data[size] for C interop
         final_write_pos = builder.load(write_pos_ptr)
         null_ptr = builder.gep(dest_data, [final_write_pos])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)

@@ -193,14 +193,9 @@ func main() -> int
 ''', "666\n")
 
 
-@pytest.mark.xfail(reason="GC race condition with parallel Set allocations - non-deterministic crash")
+@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieveSmall:
-    """Small-scale parallel sieve tests.
-
-    NOTE: These tests are marked xfail due to a non-deterministic race condition
-    in the GC when parallel threads perform Set allocations. The crash pattern is
-    inconsistent - the same code can pass or fail depending on timing.
-    """
+    """Small-scale parallel sieve tests."""
 
     def test_parallel_sieve_100_2_tasks(self, expect_output):
         """Test parallel sieve to 100 with 2 tasks."""
@@ -277,13 +272,9 @@ func main() -> int
 ''', "25\n")
 
 
-@pytest.mark.xfail(reason="GC race condition with heavy parallel Set allocations")
+@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieve:
-    """Parallel sieve of Eratosthenes tests.
-
-    These tests are marked xfail due to a race condition in the GC when
-    multiple parallel threads perform heavy Set allocations. The issue appears
-    when segment sizes exceed ~60-75 elements with Set operations.
+    """Parallel sieve of Eratosthenes tests."""
     """
 
     def test_parallel_sieve_1000(self, expect_output):
@@ -451,12 +442,9 @@ func main() -> int
 ''', "1229\n")
 
 
-@pytest.mark.xfail(reason="GC race condition with heavy parallel Set allocations")
+@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieveStress:
-    """Stress tests for parallel sieve at scale.
-
-    These tests are marked xfail due to a race condition in the GC when
-    multiple parallel threads perform heavy Set allocations.
+    """Stress tests for parallel sieve at scale."""
     """
 
     def test_parallel_sieve_100k_24_tasks(self, compiler_root):
@@ -678,12 +666,9 @@ func main() -> int
 
 
 @skip_on_ci
-@pytest.mark.xfail(reason="GC race condition with parallel Set allocations")
+@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieve100M:
-    """100 million element stress test.
-
-    NOTE: This test is marked xfail due to a race condition in the GC when
-    parallel threads perform heavy Set allocations.
+    """100 million element stress test."""
     """
 
     def test_parallel_sieve_100m_full(self, compiler_root):

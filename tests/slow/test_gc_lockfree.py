@@ -16,12 +16,11 @@ With lock-free allocation, we should see significant speedup.
 
 IMPORTANT: These tests are designed to FAIL if a GC fix introduces
 blocking/mutex that halts other threads. Currently some tests are marked
-xfail because the existing GC has a race condition with Sets.
+xfail because the existing GC has a race condition with Sets (BUG-004).
 Once the race is fixed with a lock-free solution, all tests should PASS.
 If the fix uses a blocking mutex, the tests will FAIL (no speedup).
 
-NOTE: posix.time_ns() has a bug returning incorrect values.
-These tests use posix.time() (second granularity) with longer workloads.
+See BUG-005 for posix.time_ns() issues - these tests use posix.time() instead.
 """
 import pytest
 import subprocess

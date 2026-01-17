@@ -1294,13 +1294,8 @@ class CodeGenerator:
             self.builder.store(init_value, write_buf)
             return
 
-        # Track if we need to mark source as moved AFTER reading
-        # For unique bindings: = moves (source invalidated), := copies (source preserved)
-        # For non-unique bindings: both = and := preserve source
-        # NOTE: Full move tracking requires ownership analysis (Phase 2) to know
-        # which bindings are unique. For now, disable automatic move tracking.
+        # Track if we need to mark source as moved (see BUG-017)
         move_source_name = None
-        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         if stmt.type_annotation:
             llvm_type = self._get_llvm_type(stmt.type_annotation)
@@ -1604,10 +1599,8 @@ class CodeGenerator:
         # Get the existing alloca
         alloca = self.locals[stmt.name]
 
-        # Track if we need to mark source as moved
-        # NOTE: Full move tracking requires ownership analysis (Phase 2)
+        # Track if we need to mark source as moved (see BUG-017)
         move_source_name = None
-        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         # Generate the value
         value = self._generate_expression(stmt.initializer)

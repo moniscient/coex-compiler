@@ -260,7 +260,7 @@ func main() -> int
 ~
 ''', "111\n")
 
-    @pytest.mark.skip(reason="Requires true concurrent task execution - blocking receive hangs")
+    @pytest.mark.skip(reason="BUG-022: Bidirectional channels require concurrent execution")
     def test_bidirectional_channels(self, expect_output):
         """Two tasks communicating via channels works correctly"""
         expect_output('''

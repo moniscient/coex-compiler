@@ -338,10 +338,8 @@ class StatementGenerator:
             cg.builder.store(init_value, write_buf)
             return
 
-        # Track if we need to mark source as moved AFTER reading
-        # NOTE: Full move tracking requires ownership analysis (Phase 2)
+        # Track if we need to mark source as moved (see BUG-017)
         move_source_name = None
-        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         if stmt.type_annotation:
             llvm_type = cg._get_llvm_type(stmt.type_annotation)
@@ -659,10 +657,8 @@ class StatementGenerator:
         cg = self.cg
         alloca = cg.locals[stmt.name]
 
-        # Track if we need to mark source as moved
-        # NOTE: Full move tracking requires ownership analysis (Phase 2)
+        # Track if we need to mark source as moved (see BUG-017)
         move_source_name = None
-        # TODO: Enable once unique binding tracking is implemented in Phase 2
 
         # Track aliasing for in-place optimization safety
         # = operator shares pointer (both source and target may alias)

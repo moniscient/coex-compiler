@@ -202,7 +202,7 @@ func main() -> int
 ~
 ''', "30\n")
 
-    @pytest.mark.xfail(reason="Task-to-task suspension not fully implemented")
+    @pytest.mark.xfail(reason="BUG-013: Task-to-task suspension not implemented")
     def test_task_can_call_task(self, expect_output):
         """Task can call another task"""
         expect_output('''

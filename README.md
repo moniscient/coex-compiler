@@ -182,11 +182,13 @@ python3 coexc.py program.coex --emit-ast
 
 ### Known Limitations
 
-| Feature | Status |
+See [BUGS.md](BUGS.md) for tracked issues. Key limitations:
+
+| Feature | Bug ID |
 |---------|--------|
-| `list.append()` | Bug in method dispatch |
-| Concurrency | All features run sequentially |
-| `while` loops | Grammar exists, no codegen |
+| `list.append()` | BUG-021 |
+| Concurrency | BUG-012 |
+| `while` loops | BUG-020 |
 
 ### Concurrency Roadmap
 
