@@ -1054,6 +1054,8 @@ class GarbageCollector:
         # Unlike gc_arena_alloc, this handles header initialization and fallback.
         gc_alloc_arena_or_gc_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i32])
         self.gc_alloc_arena_or_gc = ir.Function(self.module, gc_alloc_arena_or_gc_ty, name="coex_gc_alloc_arena_or_gc")
+        # Mark return as noalias to prevent optimizer from incorrectly eliminating stores
+        self.gc_alloc_arena_or_gc.return_value.add_attribute('noalias')
 
         # gc_promote_to_heap(ptr: i8*) -> i8*
         # Promotes an arena-allocated object to the GC heap.

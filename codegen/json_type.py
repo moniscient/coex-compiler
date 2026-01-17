@@ -61,11 +61,15 @@ class JsonGenerator:
         json_ptr = cg.json_struct.as_pointer()
 
         # json_new_null() -> Json*
+        # Mark as noinline optnone to prevent optimizer from eliminating stores
+        # Note: llvmlite's optimizer incorrectly eliminates stores without optnone
         cg.json_new_null = ir.Function(
             cg.module,
             ir.FunctionType(json_ptr, []),
             name="coex_json_new_null"
         )
+        cg.json_new_null.attributes.add('noinline')
+        cg.json_new_null.attributes.add('optnone')
 
         # json_new_bool(i1 value) -> Json*
         cg.json_new_bool = ir.Function(
@@ -73,6 +77,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [ir.IntType(1)]),
             name="coex_json_new_bool"
         )
+        cg.json_new_bool.attributes.add('noinline')
+        cg.json_new_bool.attributes.add('optnone')
 
         # json_new_int(i64 value) -> Json*
         cg.json_new_int = ir.Function(
@@ -80,6 +86,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [i64]),
             name="coex_json_new_int"
         )
+        cg.json_new_int.attributes.add('noinline')
+        cg.json_new_int.attributes.add('optnone')
 
         # json_new_float(f64 value) -> Json*
         cg.json_new_float = ir.Function(
@@ -87,6 +95,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [ir.DoubleType()]),
             name="coex_json_new_float"
         )
+        cg.json_new_float.attributes.add('noinline')
+        cg.json_new_float.attributes.add('optnone')
 
         # json_new_string(String* value) -> Json*
         cg.json_new_string = ir.Function(
@@ -94,6 +104,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [cg.string_struct.as_pointer()]),
             name="coex_json_new_string"
         )
+        cg.json_new_string.attributes.add('noinline')
+        cg.json_new_string.attributes.add('optnone')
 
         # json_new_array(List* value) -> Json*
         cg.json_new_array = ir.Function(
@@ -101,6 +113,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [cg.list_struct.as_pointer()]),
             name="coex_json_new_array"
         )
+        cg.json_new_array.attributes.add('noinline')
+        cg.json_new_array.attributes.add('optnone')
 
         # json_new_object(Map* value) -> Json*
         cg.json_new_object = ir.Function(
@@ -108,6 +122,8 @@ class JsonGenerator:
             ir.FunctionType(json_ptr, [cg.map_struct.as_pointer()]),
             name="coex_json_new_object"
         )
+        cg.json_new_object.attributes.add('noinline')
+        cg.json_new_object.attributes.add('optnone')
 
         # json_get_tag(Json*) -> i8
         cg.json_get_tag = ir.Function(
