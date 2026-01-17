@@ -275,12 +275,16 @@ class StringGenerator:
         string_raw = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(string_raw, cg.string_struct.as_pointer())
 
-        # Allocate data buffer via GC
+        # Allocate data buffer via GC (include null terminator for C interop)
         data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        data_raw = cg.gc.alloc_arena_or_gc(builder, byte_len, data_type_id)
+        alloc_size = builder.add(byte_len, ir.Constant(i64, 1))
+        data_raw = cg.gc.alloc_arena_or_gc(builder, alloc_size, data_type_id)
 
-        # Copy data to new buffer
+        # Copy data to new buffer and add null terminator
         builder.call(cg.memcpy, [data_raw, data, byte_len])
+        # Write null terminator at end of string data
+        null_ptr = builder.gep(data_raw, [byte_len])
+        builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
         # Store owner_handle (ptrtoint for Phase 4 compatibility)
         owner_handle = builder.ptrtoint(data_raw, i64)
@@ -360,10 +364,13 @@ class StringGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
-        # Allocate data buffer and copy literal data
+        # Allocate data buffer and copy literal data (include null terminator for C interop)
         string_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING_DATA)
-        data_buf = cg.gc.alloc_arena_or_gc(builder, final_byte_len, string_data_type_id)
-        builder.call(cg.memcpy, [data_buf, cstr, final_byte_len])
+        # Allocate byte_len + 1 to include null terminator for POSIX/C string compatibility
+        alloc_size = builder.add(final_byte_len, ir.Constant(ir.IntType(64), 1))
+        data_buf = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
+        # Copy byte_len + 1 to include the null terminator from the C string literal
+        builder.call(cg.memcpy, [data_buf, cstr, alloc_size])
 
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
@@ -604,8 +611,10 @@ class StringGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
+        # Allocate data buffer with null terminator for C interop
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        dest_data = cg.gc.alloc_arena_or_gc(builder, total_size, string_data_type_id)
+        alloc_size = builder.add(total_size, ir.Constant(i64, 1))
+        dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
 
         a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         a_owner_handle = builder.load(a_owner_handle_ptr)
@@ -623,6 +632,10 @@ class StringGenerator:
         b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
         builder.call(cg.memcpy, [b_dest, b_data, b_size])
+
+        # Write null terminator
+        null_ptr = builder.gep(dest_data, [total_size])
+        builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
         owner_handle = builder.ptrtoint(dest_data, i64)
         owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -734,8 +747,10 @@ class StringGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
         result_str = builder.bitcast(raw_ptr, string_ptr_ty)
 
+        # Allocate data buffer with null terminator for C interop
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
-        dest_data = cg.gc.alloc_arena_or_gc(builder, total_size, string_data_type_id)
+        alloc_size = builder.add(total_size, ir.Constant(i64, 1))
+        dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
 
         owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.ptrtoint(dest_data, i64)
@@ -815,6 +830,10 @@ class StringGenerator:
         builder.branch(copy_loop_cond)
 
         builder.position_at_end(copy_loop_done)
+        # Write null terminator at end of joined string
+        final_write_pos = builder.load(write_pos_ptr)
+        null_ptr = builder.gep(dest_data, [final_write_pos])
+        builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
         builder.ret(result_str)
 
     def _implement_string_eq(self):
