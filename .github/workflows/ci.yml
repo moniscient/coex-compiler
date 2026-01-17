@@ -31,7 +31,11 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y clang llvm
+        echo "=== System versions ==="
         clang --version
+        llvm-config --version || echo "llvm-config not found"
+        echo "=== Python llvmlite info ==="
+        python -c "import llvmlite; print(f'llvmlite version: {llvmlite.__version__}')" || echo "llvmlite not yet installed"
 
     - name: Install Python dependencies
       run: |
@@ -43,6 +47,23 @@ jobs:
       run: |
         cd runtime && make clean && make
         ls -la *.a
+
+    - name: Verify llvmlite works
+      run: |
+        python -c "
+import llvmlite.binding as llvm
+import llvmlite.ir as ir
+print(f'llvmlite version: {llvm.llvmlite_version}')
+print(f'LLVM version: {llvm.llvm_version_info}')
+# Quick sanity check
+module = ir.Module(name='test')
+print('llvmlite IR generation works')
+"
+
+    - name: Run quick sanity test
+      run: |
+        # Run a single simple test to verify compiler works before full suite
+        python -m pytest tests/test_basic.py::TestHelloWorld -v --tb=long
 
     - name: Run tests
       run: |
