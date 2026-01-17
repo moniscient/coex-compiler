@@ -2125,7 +2125,7 @@ class LoopGenerator:
         # Extract body expression from block
         body_expr = self._extract_body_expr(stmt.body)
         if body_expr is None:
-            # Complex body - generate synthetic thread function
+            # Complex body - generate synthetic task function
             body_expr = self._generate_synthetic_task_for_body(
                 stmt.body, stmt.pattern, stmt.iterable, prefix="first"
             )

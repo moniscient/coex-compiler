@@ -9,6 +9,9 @@ Complex bodies include:
 
 These should be supported by generating synthetic task functions that
 execute via the work-stealing scheduler.
+
+Note: `first` uses racing semantics - whichever task completes first wins.
+Tests must accept any valid task result, not a specific one.
 """
 
 import pytest
@@ -17,14 +20,30 @@ import pytest
 class TestFirstComplexBody:
     """Tests for `first` with complex bodies"""
 
-    def test_first_with_if_else(self, expect_output):
-        """First with conditional dispatch based on loop variable"""
-        expect_output('''
+    def test_first_with_if_else(self, compile_coex):
+        """First with conditional dispatch based on loop variable.
+
+        Racing semantics: either task_a (100) or task_b (200) can win.
+        We add random busy-wait delays to introduce non-determinism.
+        """
+        result = compile_coex('''
 task task_a() -> int
+    # Random busy-wait delay
+    n = posix.random_seed() % 1000
+    x = 0
+    for j in 0..n
+        x = x + 1
+    ~
     return 100
 ~
 
 task task_b() -> int
+    # Random busy-wait delay
+    n = posix.random_seed() % 1000
+    x = 0
+    for j in 0..n
+        x = x + 1
+    ~
     return 200
 ~
 
@@ -39,20 +58,43 @@ func main() -> int
     print(result)
     return 0
 ~
-''', "100\n")
+''')
+        assert result.compile_success, f"Compilation failed:\n{result.compile_output}"
+        assert result.run_success, f"Execution failed:\n{result.run_output}"
+        # Racing: accept either valid result
+        assert result.run_output in ("100\n", "200\n"), \
+            f"Expected 100 or 200, got: {result.run_output!r}"
 
-    def test_first_with_multiple_conditions(self, expect_output):
-        """First with multiple conditional branches"""
-        expect_output('''
+    def test_first_with_multiple_conditions(self, compile_coex):
+        """First with multiple conditional branches.
+
+        Racing semantics: any of work_a (10), work_b (20), or work_c (30) can win.
+        """
+        result = compile_coex('''
 task work_a() -> int
+    n = posix.random_seed() % 1000
+    x = 0
+    for j in 0..n
+        x = x + 1
+    ~
     return 10
 ~
 
 task work_b() -> int
+    n = posix.random_seed() % 1000
+    x = 0
+    for j in 0..n
+        x = x + 1
+    ~
     return 20
 ~
 
 task work_c() -> int
+    n = posix.random_seed() % 1000
+    x = 0
+    for j in 0..n
+        x = x + 1
+    ~
     return 30
 ~
 
@@ -71,7 +113,12 @@ func main() -> int
     print(result)
     return 0
 ~
-''', "10\n")
+''')
+        assert result.compile_success, f"Compilation failed:\n{result.compile_output}"
+        assert result.run_success, f"Execution failed:\n{result.run_output}"
+        # Racing: accept any valid result
+        assert result.run_output in ("10\n", "20\n", "30\n"), \
+            f"Expected 10, 20, or 30, got: {result.run_output!r}"
 
     def test_first_with_local_computation(self, expect_output):
         """First body with local variable computation"""

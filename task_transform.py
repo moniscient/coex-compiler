@@ -757,6 +757,37 @@ class TaskTransformer:
             return sp.stmt_index
         return sp.context.parent_stmt_index
 
+    def _are_suspensions_mutually_exclusive(self, sp1: SuspensionPoint, sp2: SuspensionPoint) -> bool:
+        """
+        Check if two suspension points are in mutually exclusive branches of the same if/else.
+
+        Returns True if sp1 and sp2 are in different branches (then vs else) of the same
+        if statement, meaning only one can execute at runtime.
+        """
+        ctx1 = sp1.context
+        ctx2 = sp2.context
+
+        if ctx1 is None or ctx2 is None:
+            return False
+
+        # Both must be in if branches
+        if ctx1.kind not in ("if_then", "if_else", "if_elif"):
+            return False
+        if ctx2.kind not in ("if_then", "if_else", "if_elif"):
+            return False
+
+        # Must be in the SAME if statement (compare actual parent_stmt objects)
+        # parent_stmt_index alone is ambiguous for nested ifs
+        if ctx1.parent_stmt is not ctx2.parent_stmt:
+            return False
+
+        # Must be in different branches
+        if ctx1.branch_index == ctx2.branch_index:
+            return False
+
+        # They are in different branches of the same if statement - mutually exclusive
+        return True
+
     def _generate_state_blocks(self, builder: ir.IRBuilder,
                                 step_fn: ir.Function,
                                 frame_ptr: ir.Value,
@@ -865,35 +896,63 @@ class TaskTransformer:
                 builder.store(resolved_val, var_ptr)
 
             if state_idx < len(suspension_points):
-                # More suspensions - execute from after current to next suspension
+                # More suspensions - but check if they're mutually exclusive
                 next_sp = suspension_points[state_idx]
 
-                # Execute from after current suspension to next suspension
-                self._execute_from_suspension_to_next(
-                    builder, func.body, sp, next_sp, frame_ptr, frame_info
-                )
+                # Check if current suspension is a return statement
+                # If so, the result should be returned immediately, not continue to next
+                if sp.var_name == "__return_value":
+                    # This is a return statement suspension - just return the resolved value
+                    self._store_task_result_done(builder, out_ptr, resolved_val)
+                    builder.ret_void()
+                elif self._are_suspensions_mutually_exclusive(sp, next_sp):
+                    # Current and next suspensions are in different branches of the same if/else
+                    # We completed one branch, so skip the other and return the result
+                    return_val = self._execute_from_suspension_to_end(
+                        builder, func.body, sp, frame_ptr, frame_info
+                    )
+                    self._store_task_result_done(builder, out_ptr, return_val)
+                    builder.ret_void()
+                else:
+                    # Execute from after current suspension to next suspension
+                    self._execute_from_suspension_to_next(
+                        builder, func.body, sp, next_sp, frame_ptr, frame_info
+                    )
 
-                # Update state and spawn next child
-                next_state = state_idx + 1
-                state_ptr = builder.gep(frame_ptr, [
-                    ir.Constant(ir.IntType(32), 0),
-                    ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
-                ], inbounds=True)
-                builder.store(ir.Constant(ir.IntType(64), next_state), state_ptr)
+                    # Update state and spawn next child
+                    next_state = state_idx + 1
+                    state_ptr = builder.gep(frame_ptr, [
+                        ir.Constant(ir.IntType(32), 0),
+                        ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+                    ], inbounds=True)
+                    builder.store(ir.Constant(ir.IntType(64), next_state), state_ptr)
 
-                child_frame, child_step_fn = self._create_child_task_spawn(
-                    builder, frame_ptr, frame_info, next_sp
-                )
-                self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
-                builder.ret_void()
+                    child_frame, child_step_fn = self._create_child_task_spawn(
+                        builder, frame_ptr, frame_info, next_sp
+                    )
+                    self._store_task_result_spawn(builder, out_ptr, child_frame, child_step_fn)
+                    builder.ret_void()
             else:
                 # Last state - execute remaining statements and return
-                return_val = self._execute_from_suspension_to_end(
-                    builder, func.body, sp, frame_ptr, frame_info
-                )
+                # Check if this is a bare expression at the end that should be the implicit return
+                from ast_nodes import ExprStmt, ReturnStmt
+                is_bare_expr = sp.var_name is None and isinstance(sp.node, ExprStmt)
 
-                self._store_task_result_done(builder, out_ptr, return_val)
-                builder.ret_void()
+                # Check if there are any statements after this suspension that could affect return
+                remaining_stmts = func.body[sp.stmt_index + 1:]
+                has_return_after = any(isinstance(s, ReturnStmt) for s in remaining_stmts)
+
+                if is_bare_expr and not has_return_after and len(remaining_stmts) == 0:
+                    # Bare task call expression at end of function - use resolved value as return
+                    self._store_task_result_done(builder, out_ptr, resolved_val)
+                    builder.ret_void()
+                else:
+                    return_val = self._execute_from_suspension_to_end(
+                        builder, func.body, sp, frame_ptr, frame_info
+                    )
+
+                    self._store_task_result_done(builder, out_ptr, return_val)
+                    builder.ret_void()
 
     def _generate_conditional_state_0(self, builder: ir.IRBuilder,
                                         step_fn: ir.Function,
@@ -993,54 +1052,22 @@ class TaskTransformer:
         # Generate skip path (condition skips suspension, execute other branch)
         builder.position_at_end(skip_block)
 
-        # Execute the other branch
+        # Execute the other branch using the step function protocol
         if ctx.kind == "if_then":
             # Execute else branch
             if if_stmt.else_body:
-                for stmt in if_stmt.else_body:
-                    if isinstance(stmt, ReturnStmt):
-                        if stmt.value:
-                            return_val = cg._generate_expression(stmt.value)
-                            if return_val.type != ir.IntType(64):
-                                if isinstance(return_val.type, ir.IntType):
-                                    return_val = builder.sext(return_val, ir.IntType(64))
-                                elif isinstance(return_val.type, ir.PointerType):
-                                    return_val = builder.ptrtoint(return_val, ir.IntType(64))
-                            self._store_task_result_done(builder, out_ptr, return_val)
-                            builder.ret_void()
-                            return
-                        else:
-                            self._store_task_result_done(builder, out_ptr,
-                                                          ir.Constant(ir.IntType(64), 0))
-                            builder.ret_void()
-                            return
-                    else:
-                        cg._generate_statement(stmt)
-                        if cg.builder.block.is_terminated:
-                            return
+                terminated = self._generate_statements_in_step_context(
+                    builder, step_fn, if_stmt.else_body, frame_ptr, frame_info, out_ptr
+                )
+                if terminated:
+                    return
         else:
             # Execute then branch (no suspension in then)
-            for stmt in if_stmt.then_body:
-                if isinstance(stmt, ReturnStmt):
-                    if stmt.value:
-                        return_val = cg._generate_expression(stmt.value)
-                        if return_val.type != ir.IntType(64):
-                            if isinstance(return_val.type, ir.IntType):
-                                return_val = builder.sext(return_val, ir.IntType(64))
-                            elif isinstance(return_val.type, ir.PointerType):
-                                return_val = builder.ptrtoint(return_val, ir.IntType(64))
-                        self._store_task_result_done(builder, out_ptr, return_val)
-                        builder.ret_void()
-                        return
-                    else:
-                        self._store_task_result_done(builder, out_ptr,
-                                                      ir.Constant(ir.IntType(64), 0))
-                        builder.ret_void()
-                        return
-                else:
-                    cg._generate_statement(stmt)
-                    if cg.builder.block.is_terminated:
-                        return
+            terminated = self._generate_statements_in_step_context(
+                builder, step_fn, if_stmt.then_body, frame_ptr, frame_info, out_ptr
+            )
+            if terminated:
+                return
 
         # Continue after if statement
         start_idx = parent_idx + 1
@@ -1642,6 +1669,125 @@ class TaskTransformer:
                 return True
         return False
 
+    def _generate_statements_in_step_context(self, builder: ir.IRBuilder,
+                                               step_fn: ir.Function,
+                                               stmts: list,
+                                               frame_ptr: ir.Value,
+                                               frame_info: TaskFrameInfo,
+                                               out_ptr: ir.Value) -> bool:
+        """
+        Generate statements in step function context, handling returns properly.
+
+        Returns True if the block was terminated (return executed), False otherwise.
+        """
+        from ast_nodes import ReturnStmt, IfStmt
+
+        cg = self.cg
+
+        for stmt in stmts:
+            if isinstance(stmt, ReturnStmt):
+                # Handle return - use step function protocol
+                if stmt.value:
+                    return_val = cg._generate_expression(stmt.value)
+                    if return_val.type != ir.IntType(64):
+                        if isinstance(return_val.type, ir.IntType):
+                            return_val = builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, ir.PointerType):
+                            return_val = builder.ptrtoint(return_val, ir.IntType(64))
+                else:
+                    return_val = ir.Constant(ir.IntType(64), 0)
+                self._store_task_result_done(builder, out_ptr, return_val)
+                builder.ret_void()
+                return True
+            elif isinstance(stmt, IfStmt):
+                # Handle nested if/else with step function return protocol
+                terminated = self._generate_if_in_step_context(
+                    builder, step_fn, stmt, frame_ptr, frame_info, out_ptr
+                )
+                if terminated:
+                    return True
+            else:
+                # Regular statement
+                cg._generate_statement(stmt)
+                if cg.builder.block.is_terminated:
+                    return True
+
+        return False
+
+    def _generate_if_in_step_context(self, builder: ir.IRBuilder,
+                                       step_fn: ir.Function,
+                                       if_stmt,
+                                       frame_ptr: ir.Value,
+                                       frame_info: TaskFrameInfo,
+                                       out_ptr: ir.Value) -> bool:
+        """
+        Generate an if/else statement in step function context.
+
+        Handles returns using the step function protocol (ret void with out_result).
+        Returns True if all branches return (block terminated).
+        """
+        from ast_nodes import IfStmt
+
+        cg = self.cg
+
+        # Evaluate condition
+        cond_val = cg._generate_expression(if_stmt.condition)
+
+        # Convert to i1 if needed
+        if cond_val.type != ir.IntType(1):
+            if isinstance(cond_val.type, ir.IntType):
+                cond_val = builder.icmp_signed('!=', cond_val,
+                                                ir.Constant(cond_val.type, 0), name="cond")
+            else:
+                cond_val = ir.Constant(ir.IntType(1), 1)
+
+        # Create blocks
+        then_block = step_fn.append_basic_block("if_then")
+        else_block = step_fn.append_basic_block("if_else") if if_stmt.else_body else None
+        merge_block = step_fn.append_basic_block("if_merge")
+
+        # Branch
+        if else_block:
+            builder.cbranch(cond_val, then_block, else_block)
+        else:
+            builder.cbranch(cond_val, then_block, merge_block)
+
+        # Generate then branch
+        builder.position_at_end(then_block)
+        cg.builder = builder
+        then_terminated = self._generate_statements_in_step_context(
+            builder, step_fn, if_stmt.then_body, frame_ptr, frame_info, out_ptr
+        )
+        if not then_terminated and not builder.block.is_terminated:
+            builder.branch(merge_block)
+
+        # Generate else branch
+        else_terminated = False
+        if else_block:
+            builder.position_at_end(else_block)
+            cg.builder = builder
+            else_terminated = self._generate_statements_in_step_context(
+                builder, step_fn, if_stmt.else_body, frame_ptr, frame_info, out_ptr
+            )
+            if not else_terminated and not builder.block.is_terminated:
+                builder.branch(merge_block)
+
+        # Check if all branches are terminated
+        all_terminated = then_terminated and (else_terminated if else_block else True)
+
+        # Only position at merge block if not all branches return
+        if not all_terminated:
+            builder.position_at_end(merge_block)
+            cg.builder = builder
+        else:
+            # All branches return - add unreachable to merge block for IR validity
+            builder.position_at_end(merge_block)
+            builder.unreachable()
+            # Position back at a valid block (though code won't reach here)
+
+        # Return True if all branches are terminated
+        return all_terminated
+
     def _generate_early_return_if(self, builder: ir.IRBuilder,
                                     step_fn: ir.Function,
                                     if_stmt,
@@ -1771,8 +1917,9 @@ class TaskTransformer:
             return (ir.Constant(ir.IntType(8).as_pointer(), None),
                     ir.Constant(ir.IntType(8).as_pointer(), None))
 
-        # Allocate child frame on heap
-        frame_size = ir.Constant(ir.IntType(64), 64)  # Approximate size
+        # Allocate child frame on heap - calculate actual size from frame type
+        num_fields = len(child_frame_info.llvm_frame_type.elements)
+        frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         child_frame_mem = builder.call(malloc_fn, [frame_size], name="child_frame_mem")
         child_frame_ptr = builder.bitcast(
@@ -2103,7 +2250,8 @@ class TaskTransformer:
 
         # Allocate frame on heap (using malloc for now)
         # In the future, this should use GC allocation
-        frame_size = ir.Constant(ir.IntType(64), 64)  # Approximate size
+        num_fields = len(frame_info.llvm_frame_type.elements)
+        frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
@@ -2266,8 +2414,10 @@ class TaskTransformer:
         if frame_info is None:
             return None
 
-        # Allocate frame on heap
-        frame_size = ir.Constant(ir.IntType(64), 64)  # Approximate size
+        # Allocate frame on heap - calculate actual size from frame type
+        # Each field is 8 bytes (i64 or pointer)
+        num_fields = len(frame_info.llvm_frame_type.elements)
+        frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")

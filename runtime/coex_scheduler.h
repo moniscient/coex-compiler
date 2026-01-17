@@ -56,7 +56,7 @@ typedef struct SchedulerTask {
     void* frame;                      /* Task frame (heap-allocated) */
     StepFunction step_fn;             /* Step function pointer */
     struct SchedulerTask* waiter;     /* Parent task to wake on completion */
-    int64_t resolved_value;           /* Value from completed subtask */
+    _Atomic int64_t resolved_value;   /* Value from completed subtask (atomic for visibility) */
     atomic_bool cancelled;            /* Cancellation flag */
 
     /* For main thread waiting */
@@ -103,8 +103,9 @@ typedef struct MostContext {
     pthread_cond_t cond;          /* Signal main when all done */
     int64_t task_count;           /* Number of spawned tasks */
     atomic_int_fast64_t remaining; /* Tasks still running */
-    int64_t* results;             /* Array of results */
-    atomic_int_fast64_t result_count; /* Number of collected results (lock-free) */
+    _Atomic int64_t* results;     /* Array of results (atomic for visibility) */
+    atomic_int_fast64_t result_count; /* Number of slots claimed */
+    atomic_int_fast64_t results_stored; /* Number of results actually stored */
     int64_t capacity;             /* Capacity of results array */
 } MostContext;
 

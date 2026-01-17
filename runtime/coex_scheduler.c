@@ -267,6 +267,9 @@ static void handle_first_completion(SchedulerTask* task, int64_t value);
 static void handle_most_completion(SchedulerTask* task, int64_t value);
 
 void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
+    /* Load resolved_value with acquire semantics to synchronize with writer */
+    int64_t resolved_val = atomic_load_explicit(&task->resolved_value, memory_order_acquire);
+
     /* Check cancellation */
     if (atomic_load(&task->cancelled)) {
         /* For first/most, still need to track completion */
@@ -290,7 +293,7 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
 
     /* Call step function with output parameter */
     TaskResult result;
-    task->step_fn(task->frame, task->resolved_value, &result);
+    task->step_fn(task->frame, resolved_val, &result);
     atomic_fetch_add(&tasks_executed, 1);
 
     /* Check cancellation again */
@@ -327,8 +330,8 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
                 pthread_cond_signal(task->main_cond);
                 pthread_mutex_unlock(task->main_mutex);
             } else if (task->waiter) {
-                /* Wake parent task */
-                task->waiter->resolved_value = result.value;
+                /* Wake parent task - use atomic store with release semantics */
+                atomic_store_explicit(&task->waiter->resolved_value, result.value, memory_order_release);
                 deque_push_bottom(&worker_deques[worker_id], task->waiter);
                 wake_one_worker();
             }
@@ -386,11 +389,17 @@ static void handle_first_completion(SchedulerTask* task, int64_t value) {
 static void handle_most_completion(SchedulerTask* task, int64_t value) {
     MostContext* ctx = (MostContext*)task->completion_context;
 
-    /* Add result using lock-free atomic increment */
+    /* Result value stored with proper synchronization */
+
+    /* Claim a slot in the results array */
     int64_t idx = atomic_fetch_add(&ctx->result_count, 1);
     if (idx < ctx->capacity) {
-        ctx->results[idx] = value;
+        /* Store result with release semantics */
+        atomic_store_explicit(&ctx->results[idx], value, memory_order_release);
     }
+
+    /* Increment stored count AFTER storing (with release semantics) */
+    atomic_fetch_add_explicit(&ctx->results_stored, 1, memory_order_release);
 
     /* Check if we're the last one */
     int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
@@ -487,7 +496,7 @@ int64_t coex_scheduler_spawn_and_wait(void* frame, StepFunction step_fn) {
     task->frame = frame;
     task->step_fn = step_fn;
     task->waiter = NULL;
-    task->resolved_value = 0;
+    atomic_store(&task->resolved_value, 0);
     atomic_store(&task->cancelled, false);
 
     /* Setup main thread waiting */
@@ -529,7 +538,7 @@ SchedulerTask* coex_scheduler_spawn_child(void* frame, StepFunction step_fn,
     task->frame = frame;
     task->step_fn = step_fn;
     task->waiter = parent;
-    task->resolved_value = 0;
+    atomic_store(&task->resolved_value, 0);
     atomic_store(&task->cancelled, false);
     return task;
 }
@@ -580,7 +589,7 @@ void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index,
     task->frame = frame;
     task->step_fn = step_fn;
     task->waiter = NULL;
-    task->resolved_value = 0;
+    atomic_store(&task->resolved_value, 0);
     atomic_store(&task->cancelled, false);
     task->completion_context = ctx;
     task->completion_type = COMPLETION_FIRST;
@@ -616,8 +625,9 @@ MostContext* coex_scheduler_most_context_create(int64_t count) {
     pthread_cond_init(&ctx->cond, NULL);
     ctx->task_count = count;
     atomic_store(&ctx->remaining, count);
-    ctx->results = calloc(count, sizeof(int64_t));
+    ctx->results = calloc(count, sizeof(_Atomic int64_t));
     atomic_store(&ctx->result_count, 0);
+    atomic_store(&ctx->results_stored, 0);
     ctx->capacity = count;
 
     return ctx;
@@ -642,7 +652,7 @@ void coex_scheduler_most_spawn_task(MostContext* ctx,
     task->frame = frame;
     task->step_fn = step_fn;
     task->waiter = NULL;
-    task->resolved_value = 0;
+    atomic_store(&task->resolved_value, 0);
     atomic_store(&task->cancelled, false);
     task->completion_context = ctx;
     task->completion_type = COMPLETION_MOST;
@@ -663,9 +673,17 @@ void coex_scheduler_most_wait(MostContext* ctx,
     while (atomic_load(&ctx->remaining) > 0) {
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
     }
-    *out_results = ctx->results;
-    *out_count = atomic_load(&ctx->result_count);
     pthread_mutex_unlock(&ctx->mutex);
+
+    /* Wait until all results are actually stored (spin briefly if needed) */
+    while (atomic_load_explicit(&ctx->results_stored, memory_order_acquire) < ctx->task_count) {
+        /* Brief spin - this should rarely execute */
+        atomic_thread_fence(memory_order_acquire);
+    }
+
+    /* Cast to non-atomic pointer for caller (results are now stable) */
+    *out_results = (int64_t*)ctx->results;
+    *out_count = atomic_load(&ctx->result_count);
 }
 
 /* ============================================================================
