@@ -841,7 +841,14 @@ class CodeGenerator:
         # Declare methods for all types
         for type_decl in program.types:
             self._declare_type_methods(type_decl)
-        
+
+        # Prepare all task functions for mutual recursion support
+        # This creates frame types and declares step functions for ALL tasks
+        # before any step function body is generated, allowing tasks to
+        # reference each other (e.g., is_even calling is_odd and vice versa)
+        if self._task is not None:
+            self._task.prepare_all_tasks_for_mutual_recursion(program.functions)
+
         # Second pass: generate function bodies
         for func in program.functions:
             self._generate_function(func)

@@ -75,6 +75,75 @@ class TaskTransformer:
         return self._task_function_names
 
     # ========================================================================
+    # Mutual Recursion Support
+    # ========================================================================
+
+    def prepare_all_tasks_for_mutual_recursion(self, task_functions: List[FunctionDecl]):
+        """
+        Prepare all task functions for mutual recursion support.
+
+        This method must be called BEFORE generating any task function bodies.
+        It creates frame types and declares step functions for ALL tasks,
+        allowing mutual recursion between tasks (e.g., is_even calling is_odd
+        and is_odd calling is_even).
+
+        Without this preparation, a task being generated cannot reference
+        another task that hasn't been generated yet.
+        """
+        # First pass: analyze all tasks and create their frame types
+        task_analyses = {}
+        for func in task_functions:
+            if func.kind != FunctionKind.TASK:
+                continue
+            analysis = analyze_task(func, self._task_function_names)
+            if analysis.suspension_points:  # Only tasks with suspension points need this
+                task_analyses[func.name] = (func, analysis)
+                # Create frame type for this task
+                self.get_or_create_frame_type(func, analysis)
+
+        # Second pass: declare step functions for all analyzed tasks
+        # This ensures all step functions exist before any body is generated
+        for func_name, (func, analysis) in task_analyses.items():
+            if func_name not in self.step_functions:
+                frame_info = self.task_frames[func_name]
+                self._declare_step_function(func, frame_info)
+
+    def _declare_step_function(self, func: FunctionDecl, frame_info: TaskFrameInfo) -> ir.Function:
+        """
+        Declare a step function without generating its body.
+
+        This creates the function signature and registers it, allowing other
+        tasks to reference it during their code generation.
+        """
+        cg = self.cg
+
+        # TaskResult struct matches C layout
+        task_result_type = ir.LiteralStructType([
+            ir.IntType(32),  # kind (offset 0)
+            ir.IntType(32),  # padding (offset 4)
+            ir.IntType(64),  # value or frame as i64 (offset 8)
+            ir.IntType(8).as_pointer(),  # step_fn (offset 16)
+        ])
+
+        # Step function type: void step(Frame*, i64 resolved, TaskResult* out)
+        step_fn_type = ir.FunctionType(
+            ir.VoidType(),
+            [frame_info.llvm_frame_type.as_pointer(), ir.IntType(64),
+             task_result_type.as_pointer()]
+        )
+
+        step_fn_name = f"__{func.name}_step"
+        step_fn = ir.Function(cg.module, step_fn_type, name=step_fn_name)
+        step_fn.args[0].name = "frame"
+        step_fn.args[1].name = "resolved"
+        step_fn.args[2].name = "out_result"
+
+        # Register step function
+        self.step_functions[func.name] = step_fn
+
+        return step_fn
+
+    # ========================================================================
     # Scheduler Runtime Integration
     # ========================================================================
 
@@ -616,23 +685,26 @@ class TaskTransformer:
             ir.IntType(8).as_pointer(),  # step_fn (offset 16)
         ])
 
-        # Step function type: void step(Frame*, i64 resolved, TaskResult* out)
-        # Note: this signature uses output parameter to avoid ABI issues
-        step_fn_type = ir.FunctionType(
-            ir.VoidType(),
-            [frame_info.llvm_frame_type.as_pointer(), ir.IntType(64),
-             task_result_type.as_pointer()]
-        )
+        # Check if step function was already declared (for mutual recursion support)
+        # If so, reuse it; otherwise create a new one
+        step_fn = self.step_functions.get(func.name)
+        if step_fn is None:
+            # Step function type: void step(Frame*, i64 resolved, TaskResult* out)
+            # Note: this signature uses output parameter to avoid ABI issues
+            step_fn_type = ir.FunctionType(
+                ir.VoidType(),
+                [frame_info.llvm_frame_type.as_pointer(), ir.IntType(64),
+                 task_result_type.as_pointer()]
+            )
 
-        step_fn_name = f"__{func.name}_step"
-        step_fn = ir.Function(cg.module, step_fn_type, name=step_fn_name)
-        step_fn.args[0].name = "frame"
-        step_fn.args[1].name = "resolved"
-        step_fn.args[2].name = "out_result"
+            step_fn_name = f"__{func.name}_step"
+            step_fn = ir.Function(cg.module, step_fn_type, name=step_fn_name)
+            step_fn.args[0].name = "frame"
+            step_fn.args[1].name = "resolved"
+            step_fn.args[2].name = "out_result"
 
-        # Register step function early for recursive calls
-        # This must happen before generating the body so recursive calls can find it
-        self.step_functions[func.name] = step_fn
+            # Register step function early for recursive calls
+            self.step_functions[func.name] = step_fn
 
         # Create entry block
         entry = step_fn.append_basic_block("entry")
