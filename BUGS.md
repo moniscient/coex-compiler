@@ -104,17 +104,6 @@
 - **Status**: Open (blocked on Phase 4 TLAB implementation)
 - **Note**: Tests currently pass (xpassed) but architectural race condition remains
 
-### BUG-018: GC stats not atomic in multi-threaded case
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: GC
-- **Severity**: Low
-- **Reproduction**: Run multi-threaded program and check `gc_dump_stats()`
-- **Observed**: Stats may show incorrect values due to races
-- **Expected**: Stats should be accurate even with concurrent allocations
-- **Hypothesis**: Stats counters updated with plain load/store, not atomics
-- **Files**: `coex_gc.py:2412`
-- **Status**: Open
-
 ### BUG-023: llvmlite thread_local attribute silently ignored
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen
@@ -313,6 +302,23 @@
   - The marshaling copies string data to a temporary buffer with null terminator, safe for slice views
   - All 14 tests in test_cstring.py pass including slice edge cases
 
+### BUG-018: GC stats not atomic in multi-threaded case
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: GC
+- **Severity**: Low
+- **Reproduction**: Run multi-threaded program and check `gc_dump_stats()`
+- **Observed**: Stats showed inconsistent values due to race conditions (98k-102k variance)
+- **Expected**: Stats should be accurate even with concurrent allocations
+- **Hypothesis**: Stats counters updated with plain load/store, not atomics
+- **Files**: `coex_gc.py:2400-2417`, `coex_gc.py:3378-3382`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Replaced load-add-store pattern with atomic_rmw operations:
+  - `gc_alloc()` now uses `atomic_rmw('add', ...)` for total_allocations, total_bytes, allocations_since, bytes_since
+  - `gc()` now uses `atomic_rmw('add', ...)` for collections_completed counter
+  - Before fix: 16-thread test showed ~4% variance (98k-102k allocations)
+  - After fix: Exactly consistent counts across all runs (128068 allocations)
+  - New test file: test_gc_stats_atomic.py
+
 ---
 
 ## Notes
@@ -327,5 +333,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 10 bugs
-- **Resolved**: 15 bugs
+- **Open**: 9 bugs
+- **Resolved**: 16 bugs

@@ -2397,27 +2397,20 @@ class GarbageCollector:
         # ============================================================
         builder.position_at_end(finish)
 
-        # Update GC statistics (see BUG-018 for race condition)
+        # Update GC statistics using atomic operations (BUG-018 fix)
+        # Use 'monotonic' ordering - we only need atomicity, not synchronization
         total_allocs_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        total_allocs = builder.load(total_allocs_ptr)
-        new_total_allocs = builder.add(total_allocs, ir.Constant(self.i64, 1))
-        builder.store(new_total_allocs, total_allocs_ptr)
+        builder.atomic_rmw('add', total_allocs_ptr, ir.Constant(self.i64, 1), 'monotonic')
 
-        total_bytes_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        total_bytes = builder.load(total_bytes_ptr)
         aligned_size_final = builder.load(size_ptr)
-        new_total_bytes = builder.add(total_bytes, aligned_size_final)
-        builder.store(new_total_bytes, total_bytes_ptr)
+        total_bytes_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.atomic_rmw('add', total_bytes_ptr, aligned_size_final, 'monotonic')
 
         allocs_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        allocs_since = builder.load(allocs_since_ptr)
-        new_allocs_since = builder.add(allocs_since, ir.Constant(self.i64, 1))
-        builder.store(new_allocs_since, allocs_since_ptr)
+        builder.atomic_rmw('add', allocs_since_ptr, ir.Constant(self.i64, 1), 'monotonic')
 
         bytes_since_ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
-        bytes_since = builder.load(bytes_since_ptr)
-        new_bytes_since = builder.add(bytes_since, aligned_size_final)
-        builder.store(new_bytes_since, bytes_since_ptr)
+        builder.atomic_rmw('add', bytes_since_ptr, aligned_size_final, 'monotonic')
 
         # Atomically increment allocation count for GC threshold triggering
         # Use atomic add to avoid race conditions in multi-threaded code
@@ -3382,13 +3375,11 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), self.gc_phase)
 
         # Phase 9: Update statistics
-        # Increment collections_completed (gc_stats offset 4 = index 32/8)
+        # Increment collections_completed atomically (BUG-018 fix)
         collections_ptr = builder.gep(self.gc_stats, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
         ], inbounds=True)
-        old_collections = builder.load(collections_ptr)
-        new_collections = builder.add(old_collections, ir.Constant(self.i64, 1))
-        builder.store(new_collections, collections_ptr)
+        builder.atomic_rmw('add', collections_ptr, ir.Constant(self.i64, 1), 'monotonic')
 
         # Reset allocations_since_last_gc (gc_stats offset 2 = index 16/8)
         alloc_since_ptr = builder.gep(self.gc_stats, [
