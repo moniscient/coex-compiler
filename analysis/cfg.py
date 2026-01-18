@@ -430,7 +430,7 @@ def _collect_expr_uses_impl(expr: Expr, uses: Set[str]):
             _collect_expr_uses_impl(elem, uses)
 
     elif isinstance(expr, (ListComprehension, SetComprehension)):
-        _collect_expr_uses_impl(expr.body, uses)
+        _collect_expr_uses_impl(expr.value, uses)
         for clause in expr.clauses:
             _collect_expr_uses_impl(clause.iterable, uses)
             if clause.condition:

@@ -381,14 +381,14 @@ class ComprehensionClause:
 @dataclass
 class ListComprehension(Expr):
     """[expr for pattern in iterable if condition]"""
-    body: Expr
+    value: Expr
     clauses: List[ComprehensionClause]
 
 
 @dataclass
 class SetComprehension(Expr):
     """{expr for pattern in iterable if condition}"""
-    body: Expr
+    value: Expr
     clauses: List[ComprehensionClause]
 
 

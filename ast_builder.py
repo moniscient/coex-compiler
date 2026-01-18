@@ -1213,9 +1213,9 @@ class ASTBuilder:
         """Visit a list literal or list comprehension"""
         # Check if this is a comprehension
         if ctx.comprehensionClauses():
-            body = self.visit_expression(ctx.expression())
+            value = self.visit_expression(ctx.expression())
             clauses = self.visit_comprehension_clauses(ctx.comprehensionClauses())
-            return ListComprehension(body, clauses)
+            return ListComprehension(value, clauses)
         
         # Regular list literal
         elements = []
@@ -1238,8 +1238,8 @@ class ASTBuilder:
                 return MapComprehension(key, value, clauses)
             else:
                 # Set comprehension: {expr for ...}
-                body = self.visit_expression(expressions[0])
-                return SetComprehension(body, clauses)
+                value = self.visit_expression(expressions[0])
+                return SetComprehension(value, clauses)
 
         # Map/JSON literal: {key: value, ...}
         if ctx.mapEntryList():

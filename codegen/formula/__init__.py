@@ -237,9 +237,21 @@ def _check_comprehension(node, codegen: 'CodeGenerator') -> Optional[OffloadCand
 
     clause = node.clauses[0]
 
-    # Check if body is a formula expression
-    if not _is_formula_expression(node.body, codegen):
-        return None
+    # Check if value is a formula expression
+    # For MapComprehension, check both key and value
+    from ast_nodes import MapComprehension
+    if isinstance(node, MapComprehension):
+        if not _is_formula_expression(node.key, codegen):
+            return None
+        if not _is_formula_expression(node.value, codegen):
+            return None
+        # For maps, use value as the formula expression (key is typically simple)
+        formula_expr = node.value
+    else:
+        # ListComprehension and SetComprehension use 'value' field
+        if not _is_formula_expression(node.value, codegen):
+            return None
+        formula_expr = node.value
 
     # Check filter if present
     if clause.condition is not None:
@@ -254,7 +266,7 @@ def _check_comprehension(node, codegen: 'CodeGenerator') -> Optional[OffloadCand
     return OffloadCandidate(
         construct_type='comprehension',
         original_node=node,
-        formula_expr=node.body,
+        formula_expr=formula_expr,
         collection_expr=clause.iterable,
         loop_var=loop_var,
         filter_expr=clause.condition

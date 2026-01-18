@@ -59,7 +59,7 @@ class ComprehensionGenerator:
         self._comp_temp_alloca = cg.builder.alloca(ir.IntType(64), name="comp_temp")
 
         # Generate the nested loop structure
-        self._generate_comprehension_loop(expr.clauses, 0, expr.body, result_alloca, "list")
+        self._generate_comprehension_loop(expr.clauses, 0, expr.value, result_alloca, "list")
 
         # Clear the temp alloca reference
         self._comp_temp_alloca = None
@@ -72,8 +72,8 @@ class ComprehensionGenerator:
         cg = self.cg
         i64 = ir.IntType(64)
 
-        # Infer element type from the body expression and compute flags
-        elem_type = cg._infer_type_from_expr(expr.body)
+        # Infer element type from the value expression and compute flags
+        elem_type = cg._infer_type_from_expr(expr.value)
         flags = cg._compute_set_flags(elem_type)
 
         # Create result set with appropriate flags
@@ -85,7 +85,7 @@ class ComprehensionGenerator:
         cg.builder.store(set_ptr, result_alloca)
 
         # Generate the nested loop structure
-        self._generate_comprehension_loop(expr.clauses, 0, expr.body, result_alloca, "set")
+        self._generate_comprehension_loop(expr.clauses, 0, expr.value, result_alloca, "set")
 
         return cg.builder.load(result_alloca)
 

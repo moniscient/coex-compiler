@@ -79,7 +79,6 @@ func main() -> int
 ~
 ''', "3\n")
 
-    @pytest.mark.xfail(reason="BUG-029: MapComprehension not handled in formula offload check")
     def test_array_map_comprehension(self, expect_output):
         """Array iteration in map comprehension."""
         expect_output('''
