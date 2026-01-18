@@ -230,9 +230,13 @@ func main() -> int
 ~
 ''', "12\n")
 
-    def test_first_unchanged(self, expect_output):
-        """first-collection with tasks still works."""
-        expect_output('''
+    def test_first_unchanged(self, compile_coex):
+        """first-collection with tasks still works.
+
+        Note: first returns whichever task completes first, which is
+        non-deterministic. We just verify the result is one of the valid values.
+        """
+        result = compile_coex('''
 thread identity(x: int) -> int
     return x
 ~
@@ -243,4 +247,9 @@ func main() -> int
     print(result)
     return 0
 ~
-''', "42\n")
+''')
+        assert result.compile_success, f"Compilation failed:\n{result.compile_output}"
+        assert result.run_success, f"Execution failed:\n{result.run_output}"
+        # first returns whichever task completes first - any of these is valid
+        assert result.run_output in ("42\n", "43\n", "44\n"), \
+            f"Expected one of 42, 43, 44 but got: {result.run_output!r}"
