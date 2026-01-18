@@ -169,6 +169,24 @@ SchedulerTask* coex_scheduler_spawn_child(void* frame, StepFunction step_fn,
  */
 void coex_scheduler_ready_task(SchedulerTask* task);
 
+/**
+ * Spawn a task asynchronously (fire-and-forget).
+ * Returns a handle that can be joined later.
+ *
+ * @param frame      Initial task frame (heap-allocated)
+ * @param step_fn    Task step function
+ * @return           Task handle for later join
+ */
+SchedulerTask* coex_scheduler_spawn_async(void* frame, StepFunction step_fn);
+
+/**
+ * Wait for an async-spawned task to complete and get result.
+ *
+ * @param task       Task handle from coex_scheduler_spawn_async
+ * @return           Task return value
+ */
+int64_t coex_scheduler_join_task(SchedulerTask* task);
+
 /* ============================================================================
  * Worker Operations (internal)
  * ============================================================================ */

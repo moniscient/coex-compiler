@@ -473,6 +473,9 @@ class FunctionGenerator:
         # The nursery tracks thread handles and closures for join-at-exit
         if cg._thread is not None:
             cg._thread.init_nursery(cg.builder, max_tasks=64)
+        # Initialize task nursery for lightweight task fire-and-forget
+        if cg._task is not None:
+            cg._task.init_task_nursery(cg.builder, max_tasks=64)
         # ====================================================================
 
         # GC Safe-point check: trigger GC if allocation threshold exceeded
@@ -526,6 +529,9 @@ class FunctionGenerator:
             # Join nursery tasks before return (structured concurrency guarantee)
             if cg._thread is not None and cg._thread.has_active_nursery():
                 cg._thread.join_nursery(cg.builder)
+            # Join task nursery for lightweight tasks
+            if cg._task is not None and cg._task.has_active_task_nursery():
+                cg._task.join_task_nursery(cg.builder)
 
             # Pop arena before GC frame (Phase 6)
             if cg.arena_start is not None and cg.gc is not None:

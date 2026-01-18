@@ -66,6 +66,14 @@ class TaskTransformer:
         self._most_spawn_task_fn = None
         self._most_wait_fn = None
 
+        # Async spawn/join for fire-and-forget
+        self._spawn_async_fn = None
+        self._join_task_fn = None
+
+        # Task nursery tracking (for fire-and-forget bare calls)
+        self._nursery_task_handles_alloca: Optional[ir.Value] = None
+        self._nursery_task_count_alloca: Optional[ir.Value] = None
+
     def register_task_function(self, name: str):
         """Register a function name as a task function."""
         self._task_function_names.add(name)
@@ -166,6 +174,27 @@ class TaskTransformer:
             )
             self._scheduler_spawn_and_wait_fn = ir.Function(
                 module, fn_type, name="coex_scheduler_spawn_and_wait"
+            )
+
+        # SchedulerTask* coex_scheduler_spawn_async(void* frame, void* step_fn)
+        # Returns task handle for later join
+        if self._spawn_async_fn is None:
+            fn_type = ir.FunctionType(
+                ir.IntType(8).as_pointer(),  # Returns SchedulerTask* as i8*
+                [ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer()]
+            )
+            self._spawn_async_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_spawn_async"
+            )
+
+        # int64_t coex_scheduler_join_task(SchedulerTask* task)
+        if self._join_task_fn is None:
+            fn_type = ir.FunctionType(
+                ir.IntType(64),
+                [ir.IntType(8).as_pointer()]  # SchedulerTask* as i8*
+            )
+            self._join_task_fn = ir.Function(
+                module, fn_type, name="coex_scheduler_join_task"
             )
 
     def ensure_scheduler_init(self, builder: ir.IRBuilder):
@@ -275,6 +304,171 @@ class TaskTransformer:
         """Get most wait function."""
         self.declare_first_most_functions()
         return self._most_wait_fn
+
+    # ========================================================================
+    # Task Nursery for Fire-and-Forget
+    # ========================================================================
+
+    def reset_nursery(self):
+        """Reset nursery state for a new function."""
+        self._nursery_task_handles_alloca = None
+        self._nursery_task_count_alloca = None
+
+    def init_task_nursery(self, builder: ir.IRBuilder, max_tasks: int = 64):
+        """Initialize task nursery for fire-and-forget bare calls.
+
+        The nursery tracks spawned task handles that will be joined at function exit.
+        """
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Array of task handles (SchedulerTask*)
+        handles_array_type = ir.ArrayType(i8_ptr, max_tasks)
+        self._nursery_task_handles_alloca = builder.alloca(handles_array_type, name="task_nursery_handles")
+
+        # Counter for current number of tasks
+        self._nursery_task_count_alloca = builder.alloca(i64, name="task_nursery_count")
+        builder.store(ir.Constant(i64, 0), self._nursery_task_count_alloca)
+
+    def add_to_task_nursery(self, builder: ir.IRBuilder, task_handle: ir.Value):
+        """Add a spawned task to the nursery for later join.
+
+        Args:
+            task_handle: SchedulerTask* returned by spawn_async
+        """
+        if self._nursery_task_count_alloca is None:
+            raise RuntimeError("Task nursery not initialized - call init_task_nursery first")
+
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+
+        # Get current count
+        count = builder.load(self._nursery_task_count_alloca, name="task_nursery_idx")
+
+        # Store handle at index
+        handle_ptr = builder.gep(
+            self._nursery_task_handles_alloca,
+            [ir.Constant(i32, 0), count],
+            inbounds=True,
+            name="task_handle_slot"
+        )
+        builder.store(task_handle, handle_ptr)
+
+        # Increment count
+        new_count = builder.add(count, ir.Constant(i64, 1), name="new_task_count")
+        builder.store(new_count, self._nursery_task_count_alloca)
+
+    def join_task_nursery(self, builder: ir.IRBuilder):
+        """Join all tasks in the nursery at function exit."""
+        if self._nursery_task_count_alloca is None:
+            # No nursery initialized, nothing to do
+            return
+
+        self.declare_scheduler_functions()
+
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+
+        # Get final count
+        count = builder.load(self._nursery_task_count_alloca, name="final_task_count")
+
+        # Create loop to join all tasks
+        func = builder.function
+        cond_check = func.append_basic_block("task_join_check")
+        join_body = func.append_basic_block("task_join_body")
+        join_done = func.append_basic_block("task_join_done")
+
+        # Allocate loop counter
+        loop_idx = builder.alloca(i64, name="task_join_idx")
+        builder.store(ir.Constant(i64, 0), loop_idx)
+        builder.branch(cond_check)
+
+        # Check condition: idx < count
+        builder.position_at_end(cond_check)
+        idx = builder.load(loop_idx, name="idx")
+        is_less = builder.icmp_unsigned('<', idx, count, name="has_more_tasks")
+        builder.cbranch(is_less, join_body, join_done)
+
+        # Join body: call join_task for task at idx
+        builder.position_at_end(join_body)
+        idx = builder.load(loop_idx, name="idx2")
+
+        # Get task handle at index
+        handle_ptr = builder.gep(
+            self._nursery_task_handles_alloca,
+            [ir.Constant(i32, 0), idx],
+            inbounds=True,
+            name="task_handle_ptr"
+        )
+        task_handle = builder.load(handle_ptr, name="task_handle")
+
+        # Call join_task (result ignored for fire-and-forget)
+        builder.call(self._join_task_fn, [task_handle])
+
+        # Increment index
+        new_idx = builder.add(idx, ir.Constant(i64, 1), name="next_idx")
+        builder.store(new_idx, loop_idx)
+        builder.branch(cond_check)
+
+        # Done
+        builder.position_at_end(join_done)
+
+        # Reset nursery state
+        self._nursery_task_handles_alloca = None
+        self._nursery_task_count_alloca = None
+
+    def has_active_task_nursery(self) -> bool:
+        """Check if there's an active task nursery."""
+        return self._nursery_task_count_alloca is not None
+
+    def spawn_task_async(self, task_name: str, arg_values: List[ir.Value],
+                         builder: ir.IRBuilder) -> ir.Value:
+        """Spawn a task asynchronously for fire-and-forget.
+
+        Returns the task handle (SchedulerTask*) for later join.
+        """
+        cg = self.cg
+
+        # Ensure scheduler is initialized
+        self.ensure_scheduler_init(builder)
+
+        # Get frame info and step function
+        frame_info = self.task_frames.get(task_name)
+        step_fn = self.step_functions.get(task_name)
+
+        if frame_info is None or step_fn is None:
+            # Task without suspension points - call directly, return null handle
+            # This shouldn't happen for tasks that need async spawn
+            if task_name in cg.functions:
+                task_fn = cg.functions[task_name]
+                cast_args = []
+                for i, arg in enumerate(arg_values):
+                    if i < len(task_fn.args):
+                        expected = task_fn.args[i].type
+                        cast_args.append(cg._cast_value(arg, expected))
+                    else:
+                        cast_args.append(arg)
+                builder.call(task_fn, cast_args)
+            return ir.Constant(ir.IntType(8).as_pointer(), 0)
+
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Allocate frame
+        frame_ptr = self.allocate_task_frame(task_name, arg_values, builder)
+        if frame_ptr is None:
+            return ir.Constant(i8_ptr, 0)
+
+        # Get step function as i8*
+        step_fn_ptr = builder.bitcast(step_fn, i8_ptr, name="step_fn_ptr")
+
+        # Call spawn_async to get task handle
+        task_handle = builder.call(
+            self._spawn_async_fn,
+            [frame_ptr, step_fn_ptr],
+            name="task_handle"
+        )
+
+        return task_handle
 
     # ========================================================================
     # Frame Type Generation

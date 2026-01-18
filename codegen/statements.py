@@ -332,9 +332,12 @@ class StatementGenerator:
                 # Don't join here - that's the fire-and-forget behavior
         elif kind == FunctionKind.TASK:
             # Use work-stealing scheduler for lightweight tasks
-            # For now, tasks also go through the scheduler synchronously
-            # Future: add nursery support for scheduler-based tasks
-            cg._task.generate_task_call(name, arg_values, cg.builder)
+            # Fire-and-forget: spawn async and add to task nursery
+            if cg._task is not None:
+                task_handle = cg._task.spawn_task_async(name, arg_values, cg.builder)
+                # Add to task nursery for deferred join at function exit
+                if cg._task.has_active_task_nursery():
+                    cg._task.add_to_task_nursery(cg.builder, task_handle)
 
     def generate_var_decl(self, stmt: VarDecl):
         """Generate a local variable declaration or reassignment"""
@@ -1114,6 +1117,9 @@ class StatementGenerator:
             # Join nursery tasks before return (structured concurrency guarantee)
             if cg._thread is not None and cg._thread.has_active_nursery():
                 cg._thread.join_nursery(cg.builder)
+            # Join task nursery for lightweight tasks
+            if cg._task is not None and cg._task.has_active_task_nursery():
+                cg._task.join_task_nursery(cg.builder)
 
             # Promote escaping values before arena pop (Phase 6)
             # If returning a pointer and we have an arena, the value might be arena-allocated
@@ -1136,6 +1142,9 @@ class StatementGenerator:
             # Join nursery tasks before return (structured concurrency guarantee)
             if cg._thread is not None and cg._thread.has_active_nursery():
                 cg._thread.join_nursery(cg.builder)
+            # Join task nursery for lightweight tasks
+            if cg._task is not None and cg._task.has_active_task_nursery():
+                cg._task.join_task_nursery(cg.builder)
 
             # Pop arena before GC frame (Phase 6)
             if getattr(cg, 'arena_start', None) is not None and cg.gc is not None:

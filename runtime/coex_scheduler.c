@@ -323,19 +323,33 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
             } else if (task->completion_type == COMPLETION_MOST) {
                 handle_most_completion(task, result.value);
             } else if (task->main_mutex) {
-                /* Waiting main thread */
+                /* Waiting main thread (either spawn_and_wait or spawn_async) */
                 pthread_mutex_lock(task->main_mutex);
                 *task->main_result = result.value;
                 atomic_store(task->main_done, true);
                 pthread_cond_signal(task->main_cond);
                 pthread_mutex_unlock(task->main_mutex);
+                /*
+                 * For spawn_async tasks, don't free here - join_task will free.
+                 * For spawn_and_wait tasks, the mutex/cond are stack-allocated,
+                 * so we need to NOT free the task yet. spawn_and_wait handles
+                 * freeing after it wakes.
+                 *
+                 * We differentiate by checking if main_mutex was heap-allocated
+                 * (spawn_async sets a flag or we check address range - for now,
+                 * we DON'T free here and let the caller handle it)
+                 */
+                /* Don't free task - join_task or spawn_and_wait will handle it */
             } else if (task->waiter) {
                 /* Wake parent task - use atomic store with release semantics */
                 atomic_store_explicit(&task->waiter->resolved_value, result.value, memory_order_release);
                 deque_push_bottom(&worker_deques[worker_id], task->waiter);
                 wake_one_worker();
+                free(task);
+            } else {
+                /* No one waiting - free task */
+                free(task);
             }
-            free(task);
             break;
         }
 
@@ -528,6 +542,9 @@ int64_t coex_scheduler_spawn_and_wait(void* frame, StepFunction step_fn) {
     pthread_mutex_destroy(&mutex);
     pthread_cond_destroy(&cond);
 
+    /* Free task (scheduler no longer frees tasks with main_mutex) */
+    free(task);
+
     return result;
 }
 
@@ -549,6 +566,68 @@ void coex_scheduler_ready_task(SchedulerTask* task) {
     deque_push_bottom(&global_queue, task);
     pthread_mutex_unlock(&global_queue_mutex);
     wake_one_worker();
+}
+
+SchedulerTask* coex_scheduler_spawn_async(void* frame, StepFunction step_fn) {
+    /* Ensure scheduler is running */
+    coex_scheduler_ensure_init();
+
+    /* Create task */
+    SchedulerTask* task = malloc(sizeof(SchedulerTask));
+    memset(task, 0, sizeof(SchedulerTask));
+    task->frame = frame;
+    task->step_fn = step_fn;
+    task->waiter = NULL;
+    atomic_store(&task->resolved_value, 0);
+    atomic_store(&task->cancelled, false);
+
+    /* Setup for async waiting (join later) */
+    task->main_mutex = malloc(sizeof(pthread_mutex_t));
+    task->main_cond = malloc(sizeof(pthread_cond_t));
+    task->main_result = malloc(sizeof(int64_t));
+    task->main_done = malloc(sizeof(atomic_bool));
+
+    pthread_mutex_init(task->main_mutex, NULL);
+    pthread_cond_init(task->main_cond, NULL);
+    *task->main_result = 0;
+    atomic_store(task->main_done, false);
+
+    /* Submit to global queue */
+    pthread_mutex_lock(&global_queue_mutex);
+    deque_push_bottom(&global_queue, task);
+    pthread_mutex_unlock(&global_queue_mutex);
+
+    /* Wake a worker */
+    wake_one_worker();
+
+    /* Return handle for later join */
+    return task;
+}
+
+int64_t coex_scheduler_join_task(SchedulerTask* task) {
+    if (!task) return 0;
+
+    /* Wait for completion */
+    pthread_mutex_lock(task->main_mutex);
+    while (!atomic_load(task->main_done)) {
+        pthread_cond_wait(task->main_cond, task->main_mutex);
+    }
+    pthread_mutex_unlock(task->main_mutex);
+
+    int64_t result = *task->main_result;
+
+    /* Cleanup */
+    pthread_mutex_destroy(task->main_mutex);
+    pthread_cond_destroy(task->main_cond);
+    free(task->main_mutex);
+    free(task->main_cond);
+    free(task->main_result);
+    free(task->main_done);
+
+    /* Free the task struct itself */
+    free(task);
+
+    return result;
 }
 
 /* ============================================================================
