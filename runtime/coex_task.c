@@ -28,6 +28,17 @@ typedef struct ThreadStartArg {
     TaskClosure* closure;
 } ThreadStartArg;
 
+/*
+ * SharedWaiter - Used by coex_task_wait_any for efficient notification.
+ * Multiple closures can register the same SharedWaiter, and any completion
+ * will signal it immediately.
+ */
+typedef struct SharedWaiter {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int completed_index;  // Index of first completed task, or -1
+} SharedWaiter;
+
 /* ============================================================
  * Internal Functions
  * ============================================================ */
@@ -84,6 +95,7 @@ TaskClosure* coex_task_closure_alloc(size_t params_size) {
     /* Initialize synchronization primitives */
     pthread_mutex_init(&closure->mutex, NULL);
     pthread_cond_init(&closure->cond, NULL);
+    closure->shared_waiter = NULL;
 
     return closure;
 }
@@ -155,7 +167,16 @@ void coex_task_signal_complete(TaskClosure* closure) {
     pthread_mutex_lock(&closure->mutex);
     atomic_store(&closure->completed, true);
     pthread_cond_broadcast(&closure->cond);
+
+    /* Also signal shared waiter if present (for wait_any) */
+    SharedWaiter* waiter = closure->shared_waiter;
     pthread_mutex_unlock(&closure->mutex);
+
+    if (waiter != NULL) {
+        pthread_mutex_lock(&waiter->mutex);
+        pthread_cond_signal(&waiter->cond);
+        pthread_mutex_unlock(&waiter->mutex);
+    }
 }
 
 void coex_task_wait_complete(TaskClosure* closure) {
@@ -175,38 +196,61 @@ int coex_task_wait_any(TaskClosure** closures, int count) {
         return -1;
     }
 
+    /* First check if any task is already complete */
+    for (int i = 0; i < count; i++) {
+        if (atomic_load(&closures[i]->completed)) {
+            return i;
+        }
+    }
+
     /*
-     * Simple polling implementation.
-     * A more sophisticated implementation would use a shared condvar
-     * among all tasks in the collection, but this works for now.
-     * See BUG-024 for optimization tracking.
+     * No task complete yet - set up a shared waiter so any completion
+     * will wake us immediately.
      */
-    while (1) {
-        /* Check each closure for completion */
+    SharedWaiter waiter;
+    pthread_mutex_init(&waiter.mutex, NULL);
+    pthread_cond_init(&waiter.cond, NULL);
+    waiter.completed_index = -1;
+
+    /* Register shared waiter with all closures */
+    for (int i = 0; i < count; i++) {
+        pthread_mutex_lock(&closures[i]->mutex);
+        closures[i]->shared_waiter = &waiter;
+        pthread_mutex_unlock(&closures[i]->mutex);
+    }
+
+    int result = -1;
+
+    /* Wait loop - any completion signals our shared waiter */
+    pthread_mutex_lock(&waiter.mutex);
+    while (result == -1) {
+        /* Check for completions */
         for (int i = 0; i < count; i++) {
             if (atomic_load(&closures[i]->completed)) {
-                return i;
+                result = i;
+                break;
             }
         }
 
-        /*
-         * No completion found - wait on the first closure's condvar
-         * with a short timeout, then poll again.
-         * This is not optimal but avoids complex multi-condvar setup.
-         */
-        pthread_mutex_lock(&closures[0]->mutex);
-        if (!atomic_load(&closures[0]->completed)) {
-            struct timespec timeout;
-            clock_gettime(CLOCK_REALTIME, &timeout);
-            timeout.tv_nsec += 1000000; /* 1ms timeout */
-            if (timeout.tv_nsec >= 1000000000) {
-                timeout.tv_sec += 1;
-                timeout.tv_nsec -= 1000000000;
-            }
-            pthread_cond_timedwait(&closures[0]->cond, &closures[0]->mutex, &timeout);
+        if (result == -1) {
+            /* Wait for signal from any completing task */
+            pthread_cond_wait(&waiter.cond, &waiter.mutex);
         }
-        pthread_mutex_unlock(&closures[0]->mutex);
     }
+    pthread_mutex_unlock(&waiter.mutex);
+
+    /* Unregister shared waiter from all closures */
+    for (int i = 0; i < count; i++) {
+        pthread_mutex_lock(&closures[i]->mutex);
+        closures[i]->shared_waiter = NULL;
+        pthread_mutex_unlock(&closures[i]->mutex);
+    }
+
+    /* Clean up */
+    pthread_mutex_destroy(&waiter.mutex);
+    pthread_cond_destroy(&waiter.cond);
+
+    return result;
 }
 
 void coex_task_wait_all(TaskClosure** closures, int count) {

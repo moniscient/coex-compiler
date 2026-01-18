@@ -104,16 +104,6 @@
 - **Files**: `coex_gc.py` (TLS variables), all code using thread-local state
 - **Status**: Open (workaround in place: use pthread TLS via ThreadEntry struct)
 
-### BUG-024: Task completion notification not optimized
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Runtime
-- **Severity**: Low
-- **Reproduction**: N/A - performance optimization
-- **Observed**: Each task completion may have redundant notifications
-- **Expected**: Shared completion notification for better performance
-- **Hypothesis**: Current implementation notifies individually rather than batching
-- **Files**: `runtime/coex_task.c:183`
-- **Status**: Open
 
 ### BUG-025: GC stack overflow with large lists (500k+ elements)
 - **Discovered**: 2025-01-17, during codebase scan
@@ -308,6 +298,22 @@
   - After fix: Exactly consistent counts across all runs (128068 allocations)
   - New test file: test_gc_stats_atomic.py
 
+### BUG-024: Task completion notification not optimized
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Runtime
+- **Severity**: Low
+- **Reproduction**: N/A - performance optimization
+- **Observed**: `coex_task_wait_any` polled with 1ms timeout, only waiting on first task
+- **Expected**: Immediate wake-up when any task completes
+- **Files**: `runtime/coex_task.c`, `runtime/coex_task.h`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Implemented shared waiter mechanism for `wait_any`:
+  - Added `SharedWaiter` struct with mutex/condvar for wait groups
+  - Added `shared_waiter` field to `TaskClosure` (after LLVM-visible fields)
+  - `coex_task_wait_any` now registers a shared waiter with all closures
+  - `coex_task_signal_complete` signals the shared waiter if present
+  - All 21 first/most tests pass, eliminating 1ms polling delay
+
 ### BUG-011: Nested UDT to JSON conversion not implemented
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen
@@ -339,5 +345,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 8 bugs
-- **Resolved**: 17 bugs
+- **Open**: 7 bugs
+- **Resolved**: 18 bugs

@@ -15,12 +15,18 @@
 #include <stddef.h>
 
 /*
+ * Forward declaration for shared waiter (used by wait_any)
+ */
+struct SharedWaiter;
+
+/*
  * TaskClosure - Per-task execution context
  *
  * Allocated by parent before spawn, passed to child thread.
  * Parent reads result/exception after join.
  *
- * Memory layout must match LLVM struct in codegen/task.py
+ * Memory layout: First 5 fields must match LLVM struct in codegen/task.py.
+ * Fields after 'completed' are only accessed by C runtime.
  */
 typedef struct TaskClosure {
     void* params;               // Pointer to parameter struct (task-specific)
@@ -30,6 +36,7 @@ typedef struct TaskClosure {
     atomic_bool completed;      // Task finished flag
     pthread_mutex_t mutex;      // For completion signaling
     pthread_cond_t cond;        // For completion signaling
+    struct SharedWaiter* shared_waiter;  // Optional shared waiter for wait_any
 } TaskClosure;
 
 /*
