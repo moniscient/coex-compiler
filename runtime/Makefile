@@ -20,8 +20,12 @@ SCHEDULER_OBJ = coex_scheduler.o
 CHANNEL_LIB = libcoex_channel.a
 CHANNEL_OBJ = coex_channel.o
 
+# Metal GPU Dispatch Stub
+METAL_LIB = libcoex_metal.a
+METAL_OBJ = coex_metal_stub.o
+
 # All libraries
-LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB)
+LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB) $(METAL_LIB)
 
 all: $(LIBS)
 
@@ -53,6 +57,13 @@ $(CHANNEL_LIB): $(CHANNEL_OBJ)
 coex_channel.o: coex_channel.c coex_channel.h coex_scheduler.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Metal Stub Library
+$(METAL_LIB): $(METAL_OBJ)
+	$(AR) rcs $@ $^
+
+coex_metal_stub.o: coex_metal_stub.c coex_metal_stub.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # Test targets
 test_task: test_coex_task.c coex_task.c coex_task.h
 	$(CC) $(CFLAGS) -o $@ test_coex_task.c coex_task.c -lpthread
@@ -61,6 +72,6 @@ test: test_task
 	./test_task
 
 clean:
-	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) $(LIBS) test_task
+	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) $(METAL_OBJ) $(LIBS) test_task
 
 .PHONY: all test clean

@@ -457,12 +457,212 @@ def _get_backend():
 def _generate_gpu_offload(candidate: OffloadCandidate, backend, codegen: 'CodeGenerator') -> OffloadResult:
     """Generate GPU kernel and dispatch code for an offload candidate.
 
-    Currently raises NotImplementedError - full GPU kernel generation
-    will be implemented in a future phase.
+    This function validates everything BEFORE generating any LLVM IR to avoid
+    corrupting builder state on failure. The flow is:
+    1. Check collection type is Array (no implicit conversion yet)
+    2. Transpile formula body to GPU code (string only, no LLVM)
+    3. Generate kernel source
+    4. Only then generate LLVM IR for dispatch
+
+    Args:
+        candidate: Information about the offloadable construct
+        backend: GPU backend instance (Metal, CUDA)
+        codegen: CodeGenerator instance
+
+    Returns:
+        OffloadResult with the generated LLVM IR value
     """
-    raise NotImplementedError(
-        "GPU kernel generation not yet implemented. Using task fallback."
+    from llvmlite import ir
+    from codegen.formula.marshaling import MarshalingGenerator, get_element_size
+    from codegen.formula.transpiler import FormulaTranspiler, infer_element_type, infer_return_type
+    from ast_nodes import ListType, ArrayType, SetType, PrimitiveType, Identifier
+
+    # === VALIDATION PHASE - No LLVM IR generation ===
+    # Check everything that could fail BEFORE modifying builder state
+
+    # Phase 2 limitation: Only handle direct Array types for now.
+    # List/Set would require implicit conversion which adds complexity.
+    collection_type = _get_collection_type(candidate.collection_expr, codegen)
+    if collection_type is None or not isinstance(collection_type, ArrayType):
+        # Not a direct Array - fall back to CPU path
+        raise NotImplementedError(
+            "GPU offload currently only supports Array types directly. "
+            "Lists/Sets require conversion which is not yet implemented."
+        )
+
+    # Transpile formula body to GPU code FIRST (no LLVM generation)
+    # This validates that the formula can be transpiled before we modify builder state
+    transpiler = FormulaTranspiler(codegen)
+    loop_var = candidate.loop_var
+
+    try:
+        formula_body_code = transpiler.transpile(candidate.formula_expr, loop_var)
+    except Exception as e:
+        raise NotImplementedError(f"Cannot transpile formula to GPU code: {e}")
+
+    # Determine element type and output type
+    input_elem_type = 'int'  # Default
+    if collection_type:
+        input_elem_type = infer_element_type(collection_type)
+
+    output_type = infer_return_type(candidate.formula_expr, codegen)
+
+    # Generate kernel source (still no LLVM generation)
+    kernel_name = _generate_kernel_name(codegen)
+    input_params = [(loop_var, input_elem_type)]
+
+    if candidate.construct_type == 'comprehension':
+        kernel_source = backend.emit_map_kernel(
+            kernel_name=kernel_name,
+            formula_body=formula_body_code,
+            input_params=input_params,
+            output_type=output_type
+        )
+    else:
+        # first/most use predicate kernels
+        kernel_source = backend.emit_predicate_kernel(
+            kernel_name=kernel_name,
+            predicate_body=formula_body_code,
+            input_params=input_params
+        )
+
+    # === LLVM IR GENERATION PHASE ===
+    # Everything validated, safe to generate IR now
+
+    marshaler = MarshalingGenerator(codegen)
+    builder = codegen.builder
+    i64 = ir.IntType(64)
+    i8_ptr = ir.IntType(8).as_pointer()
+
+    # Generate collection expression
+    collection_value = codegen._generate_expression(candidate.collection_expr)
+
+    # Extract buffer info (zero-copy for input)
+    input_ptr, count, elem_size = marshaler.array_to_buffer(builder, collection_value)
+
+    # Create string constants for kernel source and name
+    kernel_source_global = _create_string_constant(codegen, kernel_source)
+    kernel_name_global = _create_string_constant(codegen, kernel_name)
+
+    # Ensure malloc/free are declared for output buffer
+    marshaler.ensure_malloc_free()
+
+    # Allocate output buffer
+    output_elem_size = ir.Constant(i64, get_element_size(output_type))
+    output_buffer = marshaler.allocate_output_buffer(builder, count, output_elem_size)
+
+    # Declare and call coex_metal_dispatch
+    dispatch_func = _get_or_declare_metal_dispatch(codegen)
+    builder.call(dispatch_func, [
+        kernel_source_global,
+        kernel_name_global,
+        builder.bitcast(input_ptr, i8_ptr),
+        count,
+        output_buffer,
+        output_elem_size
+    ])
+
+    # Create result Array from output buffer
+    result_array = marshaler.buffer_to_array(builder, output_buffer, count, output_elem_size)
+
+    # Free temporary output buffer (data has been copied to array)
+    marshaler.free_output_buffer(builder, output_buffer)
+
+    return OffloadResult(handled=True, value=result_array)
+
+
+def _is_array_type(llvm_type) -> bool:
+    """Check if an LLVM type is an Array pointer."""
+    from llvmlite import ir
+    if isinstance(llvm_type, ir.PointerType):
+        pointee = llvm_type.pointee
+        if hasattr(pointee, 'name') and 'Array' in str(pointee.name):
+            return True
+    return False
+
+
+def _convert_to_array(value, codegen: 'CodeGenerator'):
+    """Convert a collection to Array using codegen's conversion helpers."""
+    llvm_type = value.type
+    if hasattr(llvm_type, 'pointee') and hasattr(llvm_type.pointee, 'name'):
+        type_name = str(llvm_type.pointee.name)
+        if 'List' in type_name:
+            return codegen.conversions.list_to_array(value)
+        elif 'Set' in type_name:
+            return codegen.conversions.set_to_array(value)
+    # If we can't convert, just return as-is (will likely cause issues)
+    return value
+
+
+def _get_collection_type(expr, codegen: 'CodeGenerator'):
+    """Get the Coex type of a collection expression."""
+    from ast_nodes import Identifier, ListType, ArrayType, SetType
+
+    if isinstance(expr, Identifier):
+        if expr.name in codegen.var_coex_types:
+            return codegen.var_coex_types[expr.name]
+    return None
+
+
+# Counter for unique kernel names
+_kernel_counter = 0
+
+
+def _generate_kernel_name(codegen: 'CodeGenerator') -> str:
+    """Generate a unique kernel name."""
+    global _kernel_counter
+    _kernel_counter += 1
+    return f"coex_kernel_{_kernel_counter}"
+
+
+def _create_string_constant(codegen: 'CodeGenerator', value: str):
+    """Create a global string constant and return a pointer to it."""
+    from llvmlite import ir
+
+    # Create null-terminated string data
+    data = (value + '\0').encode('utf-8')
+    str_type = ir.ArrayType(ir.IntType(8), len(data))
+
+    # Create unique global name
+    global _kernel_counter
+    global_name = f".str.kernel.{_kernel_counter}"
+
+    # Create global constant
+    str_global = ir.GlobalVariable(codegen.module, str_type, name=global_name)
+    str_global.initializer = ir.Constant(str_type, bytearray(data))
+    str_global.global_constant = True
+    str_global.linkage = 'private'
+
+    # Get pointer to first element
+    i32 = ir.IntType(32)
+    return codegen.builder.gep(
+        str_global,
+        [ir.Constant(i32, 0), ir.Constant(i32, 0)],
+        inbounds=True
     )
+
+
+def _get_or_declare_metal_dispatch(codegen: 'CodeGenerator'):
+    """Get or declare the coex_metal_dispatch external function."""
+    from llvmlite import ir
+
+    func_name = "coex_metal_dispatch"
+
+    # Check if already declared
+    try:
+        return codegen.module.get_global(func_name)
+    except KeyError:
+        pass
+
+    # Declare the function
+    # void coex_metal_dispatch(const char* src, const char* name,
+    #                          void* in, int64_t count, void* out, int64_t elem_size)
+    i8_ptr = ir.IntType(8).as_pointer()
+    i64 = ir.IntType(64)
+    void = ir.VoidType()
+
+    func_type = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr, i64, i8_ptr, i64])
+    return ir.Function(codegen.module, func_type, name=func_name)
 
 
 # =============================================================================
