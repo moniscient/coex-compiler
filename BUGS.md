@@ -382,6 +382,42 @@
   - Added explicit MapComprehension handling in `_check_comprehension` to check both `key` and `value`
 - **Tests**: `tests/test_array_comprehension.py::test_array_map_comprehension` now passes
 
+### BUG-030: Array filter comprehension not working
+- **Discovered**: 2026-01-18, during GPU offload testing
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `[x for x in arr if x % 2 == 0]` where `arr` is an Array<int> with values [0,1,2,3,4,5]
+- **Observed**: Returns 6 elements instead of 3; GPU offload was ignoring the filter condition
+- **Expected**: Should return only even elements [0, 2, 4]
+- **Files**: `codegen/formula/__init__.py`
+- **Status**: Fixed (2026-01-18)
+- **Resolution**: GPU offload was incorrectly handling filtered comprehensions. The filter condition was checked for eligibility but then ignored in the kernel. Fixed by restricting GPU offload to only handle ListComprehensions without filter conditions. Comprehensions with filters now use the correct CPU path.
+- **Tests**: `tests/test_array_comprehension.py::test_array_iteration_with_filter` passes
+
+### BUG-031: Set comprehension over Array not working
+- **Discovered**: 2026-01-18, during GPU offload testing
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `{x for x in arr}` where `arr` is an Array<int> with values [0,1,2,0,1]
+- **Observed**: Returns 5 elements instead of 3 (GPU was producing Array instead of Set)
+- **Expected**: Should return Set with 3 unique elements {0, 1, 2}
+- **Files**: `codegen/formula/__init__.py`
+- **Status**: Fixed (2026-01-18)
+- **Resolution**: GPU offload was incorrectly handling SetComprehension. The GPU kernel produces an Array output, but Sets have different semantics (deduplication). Fixed by restricting GPU offload to only handle ListComprehension. Set comprehensions now use the correct CPU path which properly constructs Sets.
+- **Tests**: `tests/test_array_comprehension.py::test_array_set_comprehension` passes
+
+### BUG-032: Map comprehension over Array not working
+- **Discovered**: 2026-01-18, during GPU offload testing
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `{x: x * 10 for x in arr}` where `arr` is an Array<int> with values [1,2,3]
+- **Observed**: Returns wrong values (GPU was producing Array instead of Map)
+- **Expected**: Should return map {1: 10, 2: 20, 3: 30}
+- **Files**: `codegen/formula/__init__.py`
+- **Status**: Fixed (2026-01-18)
+- **Resolution**: GPU offload was incorrectly handling MapComprehension. The GPU kernel produces an Array output, but Maps have different semantics (key-value pairs). Fixed by restricting GPU offload to only handle ListComprehension. Map comprehensions now use the correct CPU path which properly constructs Maps.
+- **Tests**: `tests/test_array_comprehension.py::test_array_map_comprehension` passes
+
 ### BUG-027: Flaky test - first with computation in body returns wrong result
 - **Discovered**: 2026-01-18, during GPU offload implementation testing
 - **Category**: Runtime
@@ -389,10 +425,14 @@
 - **Reproduction**: Run `python3 -m pytest tests/test_complex_first_most.py::TestComplexBodyTokenRing::test_first_with_computation_in_body`
 - **Observed**: Test returns 625 (25^2) or 1225 (35^2) non-deterministically instead of 225 (15^2)
 - **Expected**: Should return 225, which is (10+5)^2 - the first element's computation
-- **Hypothesis**: Race condition in `first` construct when body has local variable computation before task call. The first result is not correctly captured; instead a later result overwrites it.
-- **Files**: `codegen/statements.py` (first/most generation), `runtime/coex_scheduler.c`
-- **Status**: Open
-- **Notes**: This test was intermittently passing. The race condition likely existed but wasn't manifesting consistently. Not related to GPU offload changes.
+- **Files**: `runtime/coex_scheduler.c`, `runtime/coex_scheduler.h`
+- **Status**: Fixed (2026-01-18)
+- **Resolution**: Implemented priority-based winner selection for `first` construct. When multiple tasks complete around the same time, the task with the lowest element index now wins. Key changes:
+  1. Changed `has_winner` (boolean) to `winner_index` (int64, initialized to INT64_MAX) in FirstContext
+  2. Modified `handle_first_completion` to use CAS loop to only allow lower-indexed tasks to become winners
+  3. Added re-check of winner_index under mutex before updating winner_value to prevent race where a later task overwrites the correct value
+  4. Changed `coex_scheduler_first_wait` to wait until all tasks complete, ensuring the lowest-indexed task's value is stored before returning
+- **Root Cause**: When parent tasks (`__first_body_1`) completed around the same time, whichever called `handle_first_completion` first would win, regardless of element index. Additionally, the winner_value update could be overwritten by a higher-indexed task that got the mutex later.
 
 ---
 
@@ -407,6 +447,6 @@
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2026-01-17)
-- **Open**: 4 bugs
-- **Resolved**: 22 bugs
+### Bug Count Summary (as of 2026-01-18)
+- **Open**: 4 bugs (BUG-004, BUG-015, BUG-016, BUG-023)
+- **Resolved**: 29 bugs

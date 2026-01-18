@@ -147,6 +147,7 @@ class OffloadCandidate:
 # Lazy-loaded backend instance
 _backend_instance = None
 _formulas_used: bool = False
+_gpu_offload_used: bool = False  # True if GPU offload code was actually generated
 
 
 # =============================================================================
@@ -201,8 +202,11 @@ def try_offload(node: Any, codegen: 'CodeGenerator') -> Optional[OffloadResult]:
         return _generate_task_fallback(node, codegen)
 
     # Generate GPU kernel and dispatch
+    global _gpu_offload_used
     try:
-        return _generate_gpu_offload(candidate, backend, codegen)
+        result = _generate_gpu_offload(candidate, backend, codegen)
+        _gpu_offload_used = True  # Mark that GPU code was generated
+        return result
     except (NotImplementedError, Exception) as e:
         # GPU generation failed - fall back to task
         codegen._emit_warning(
@@ -217,11 +221,19 @@ def formulas_used() -> bool:
     return _formulas_used
 
 
+def gpu_offload_used() -> bool:
+    """Check if GPU offload code was generated in the current compilation."""
+    return _gpu_offload_used
+
+
 def reset_state():
     """Reset module state. Primarily for testing."""
-    global _backend_instance, _formulas_used
+    global _backend_instance, _formulas_used, _gpu_offload_used, _kernel_counter, _string_counter
     _backend_instance = None
     _formulas_used = False
+    _gpu_offload_used = False
+    _kernel_counter = 0
+    _string_counter = 0
     reset_detection()
 
 
@@ -231,32 +243,30 @@ def reset_state():
 
 def _check_comprehension(node, codegen: 'CodeGenerator') -> Optional[OffloadCandidate]:
     """Check if a comprehension is offload-eligible."""
+    from ast_nodes import ListComprehension
+
+    # Only GPU offload ListComprehension - not Set or Map.
+    # Set and Map have different semantics (deduplication, key-value pairs)
+    # that require CPU-side processing.
+    if not isinstance(node, ListComprehension):
+        return None
+
     # Only handle single-clause comprehensions for now
     if len(node.clauses) != 1:
         return None
 
     clause = node.clauses[0]
 
-    # Check if value is a formula expression
-    # For MapComprehension, check both key and value
-    from ast_nodes import MapComprehension
-    if isinstance(node, MapComprehension):
-        if not _is_formula_expression(node.key, codegen):
-            return None
-        if not _is_formula_expression(node.value, codegen):
-            return None
-        # For maps, use value as the formula expression (key is typically simple)
-        formula_expr = node.value
-    else:
-        # ListComprehension and SetComprehension use 'value' field
-        if not _is_formula_expression(node.value, codegen):
-            return None
-        formula_expr = node.value
-
-    # Check filter if present
+    # Don't GPU offload if there's a filter condition.
+    # Filter predicates require conditional output which the simple
+    # map kernel doesn't support yet.
     if clause.condition is not None:
-        if not _is_formula_expression(clause.condition, codegen):
-            return None
+        return None
+
+    # Check if value is a formula expression
+    if not _is_formula_expression(node.value, codegen):
+        return None
+    formula_expr = node.value
 
     # Extract loop variable name
     loop_var = _extract_pattern_name(clause.pattern)
@@ -618,6 +628,7 @@ def _get_collection_type(expr, codegen: 'CodeGenerator'):
 
 # Counter for unique kernel names
 _kernel_counter = 0
+_string_counter = 0  # Separate counter for string constants
 
 
 def _generate_kernel_name(codegen: 'CodeGenerator') -> str:
@@ -636,8 +647,9 @@ def _create_string_constant(codegen: 'CodeGenerator', value: str):
     str_type = ir.ArrayType(ir.IntType(8), len(data))
 
     # Create unique global name
-    global _kernel_counter
-    global_name = f".str.kernel.{_kernel_counter}"
+    global _string_counter
+    _string_counter += 1
+    global_name = f".str.kernel.{_string_counter}"
 
     # Create global constant
     str_global = ir.GlobalVariable(codegen.module, str_type, name=global_name)

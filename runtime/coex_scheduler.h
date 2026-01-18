@@ -83,11 +83,15 @@ typedef struct {
 /**
  * Context for 'first' structured concurrency.
  * Tracks multiple spawned tasks, returns first result.
+ *
+ * Winner selection: The task with the LOWEST element index wins.
+ * This ensures deterministic results when multiple tasks complete
+ * around the same time (e.g., the first element's result is preferred).
  */
 typedef struct FirstContext {
     pthread_mutex_t mutex;        /* Protects result fields */
     pthread_cond_t cond;          /* Signal main when done */
-    atomic_bool has_winner;       /* True when first task completes */
+    atomic_int_fast64_t winner_index; /* Index of winning task (INT64_MAX = no winner yet) */
     int64_t winner_value;         /* Result from winning task */
     int64_t task_count;           /* Number of spawned tasks */
     atomic_int_fast64_t completed; /* Number of tasks done/cancelled */

@@ -301,7 +301,13 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
         /* For first/most, still need to track completion */
         if (task->completion_type == COMPLETION_FIRST) {
             FirstContext* ctx = (FirstContext*)task->completion_context;
-            atomic_fetch_add(&ctx->completed, 1);
+            int64_t new_completed = atomic_fetch_add(&ctx->completed, 1) + 1;
+            /* Signal if all tasks are now done (for wait condition check) */
+            if (new_completed >= ctx->task_count) {
+                pthread_mutex_lock(&ctx->mutex);
+                pthread_cond_signal(&ctx->cond);
+                pthread_mutex_unlock(&ctx->mutex);
+            }
         } else if (task->completion_type == COMPLETION_MOST) {
             MostContext* ctx = (MostContext*)task->completion_context;
             int64_t remaining = atomic_fetch_sub(&ctx->remaining, 1) - 1;
@@ -372,31 +378,67 @@ void coex_scheduler_run_task(SchedulerTask* task, int worker_id) {
     }
 }
 
-/* Handle completion of a first-wins task */
+/* Handle completion of a first-wins task.
+ *
+ * Priority-based winner selection: The task with the LOWEST element index wins.
+ * This ensures that if elements 0 and 1 both complete around the same time,
+ * element 0's result is used (deterministic behavior).
+ */
 static void handle_first_completion(SchedulerTask* task, int64_t value) {
     FirstContext* ctx = (FirstContext*)task->completion_context;
+    int64_t my_index = task->completion_index;
 
-    /* Try to claim winner slot */
-    bool expected = false;
-    if (atomic_compare_exchange_strong(&ctx->has_winner, &expected, true)) {
-        /* We won! */
+    /* Try to become the winner using compare-and-swap loop.
+     * We only win if our index is lower than the current winner_index.
+     */
+    int64_t current_winner;
+    bool became_winner = false;
+
+    do {
+        current_winner = atomic_load(&ctx->winner_index);
+        if (my_index >= current_winner) {
+            /* A task with a lower (or equal) index already won */
+            break;
+        }
+        /* Try to set ourselves as winner */
+        if (atomic_compare_exchange_weak(&ctx->winner_index, &current_winner, my_index)) {
+            became_winner = true;
+            break;
+        }
+        /* CAS failed, retry */
+    } while (1);
+
+    if (became_winner) {
+        /* We won the CAS, but another task with a lower index might have
+         * won after us. Re-check winner_index under the mutex to avoid
+         * overwriting the correct winner's value.
+         */
         pthread_mutex_lock(&ctx->mutex);
-        ctx->winner_value = value;
 
-        /* Cancel siblings */
-        for (int64_t i = 0; i < ctx->task_count; i++) {
-            if (i != task->completion_index && ctx->tasks[i]) {
-                atomic_store(&ctx->tasks[i]->cancelled, true);
+        /* Only update value if we're still the winner */
+        if (atomic_load(&ctx->winner_index) == my_index) {
+            ctx->winner_value = value;
+
+            /* Cancel siblings with HIGHER indexes (they can't win now) */
+            for (int64_t i = my_index + 1; i < ctx->task_count; i++) {
+                if (ctx->tasks[i]) {
+                    atomic_store(&ctx->tasks[i]->cancelled, true);
+                }
             }
         }
 
-        /* Signal main thread */
+        /* Signal main thread regardless (to re-check condition) */
         pthread_cond_signal(&ctx->cond);
         pthread_mutex_unlock(&ctx->mutex);
     }
 
-    /* Track completion */
-    atomic_fetch_add(&ctx->completed, 1);
+    /* Track completion and signal if all tasks are done */
+    int64_t new_completed = atomic_fetch_add(&ctx->completed, 1) + 1;
+    if (new_completed >= ctx->task_count) {
+        pthread_mutex_lock(&ctx->mutex);
+        pthread_cond_signal(&ctx->cond);
+        pthread_mutex_unlock(&ctx->mutex);
+    }
 }
 
 /* Handle completion of a most task */
@@ -640,7 +682,7 @@ FirstContext* coex_scheduler_first_context_create(int64_t count) {
 
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
-    atomic_store(&ctx->has_winner, false);
+    atomic_store(&ctx->winner_index, INT64_MAX);  /* No winner yet */
     ctx->winner_value = 0;
     ctx->task_count = count;
     atomic_store(&ctx->completed, 0);
@@ -688,7 +730,19 @@ int64_t coex_scheduler_first_wait(FirstContext* ctx) {
     wake_all_workers();
 
     pthread_mutex_lock(&ctx->mutex);
-    while (!atomic_load(&ctx->has_winner)) {
+    /* Wait until ALL tasks have completed.
+     *
+     * We must wait for all tasks because:
+     * 1. Priority-based winner selection means a later-completing task with
+     *    a lower index can become the winner.
+     * 2. The winner_value update happens under the mutex, but winner_index
+     *    is updated via CAS outside the mutex. We need to ensure the correct
+     *    winner's value is stored before returning.
+     *
+     * By waiting for all tasks, we guarantee the lowest-indexed task that
+     * completed has updated winner_value.
+     */
+    while (atomic_load(&ctx->completed) < ctx->task_count) {
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
     }
     int64_t result = ctx->winner_value;
