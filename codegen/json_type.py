@@ -2194,12 +2194,26 @@ class JsonGenerator:
             return builder.call(cg.json_new_object, [map_ptr])
 
         # Handle user-defined types
+        # Note: UDT fields are stored as i64 GC handles, not raw pointers (BUG-011 fix)
         if isinstance(field_type, NamedType):
-            if isinstance(field_val.type, ir.IntType):
-                udt_ptr = builder.inttoptr(field_val, cg.type_registry[field_type.name].as_pointer())
-            else:
-                udt_ptr = field_val
-            return self.convert_udt_to_json(udt_ptr, field_type.name)
+            if field_type.name in cg.type_registry:
+                # field_val is an i64 handle - dereference to get pointer
+                if isinstance(field_val.type, ir.IntType):
+                    ptr_i8 = builder.call(cg.gc.gc_handle_deref, [field_val])
+                    udt_ptr = builder.bitcast(ptr_i8, cg.type_registry[field_type.name].as_pointer())
+                else:
+                    udt_ptr = field_val
+                return self.convert_udt_to_json(udt_ptr, field_type.name)
+            # Enum check - enums are also reference types stored as handles
+            elif field_type.name in cg.enum_variants:
+                if isinstance(field_val.type, ir.IntType):
+                    # Get the enum struct type from the registry
+                    enum_struct = cg.type_registry.get(field_type.name)
+                    if enum_struct:
+                        ptr_i8 = builder.call(cg.gc.gc_handle_deref, [field_val])
+                        udt_ptr = builder.bitcast(ptr_i8, enum_struct.as_pointer())
+                        return self.convert_enum_to_json(udt_ptr, field_type.name)
+                return builder.call(cg.json_new_null, [])
 
         # Fallback - treat as int
         if isinstance(field_val.type, ir.IntType):

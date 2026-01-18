@@ -70,17 +70,6 @@
 - **Files**: `codegen.py` (matrix/CA cell access implementation)
 - **Status**: Open
 
-### BUG-011: Nested UDT to JSON conversion not implemented
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Codegen
-- **Severity**: Low
-- **Reproduction**: Create nested user-defined types and convert to JSON
-- **Observed**: Conversion fails or produces incorrect output
-- **Expected**: Nested types should serialize to nested JSON objects
-- **Hypothesis**: JSON codegen only handles flat UDTs, not recursive traversal
-- **Files**: `codegen.py` (JSON implementation)
-- **Status**: Open
-
 ### BUG-015: Non-blocking safepoints require shadow stack changes
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: GC
@@ -319,6 +308,23 @@
   - After fix: Exactly consistent counts across all runs (128068 allocations)
   - New test file: test_gc_stats_atomic.py
 
+### BUG-011: Nested UDT to JSON conversion not implemented
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Codegen
+- **Severity**: Low
+- **Reproduction**: Create nested user-defined types and convert to JSON
+- **Observed**: Segfault when converting UDT with nested UDT/enum fields to JSON
+- **Expected**: Nested types should serialize to nested JSON objects
+- **Hypothesis**: JSON codegen only handles flat UDTs, not recursive traversal
+- **Files**: `codegen/json_type.py` (convert_field_to_json)
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Fixed `convert_field_to_json` to properly handle GC handles:
+  - UDT fields are stored as i64 GC handles, not raw pointers
+  - Was incorrectly using `inttoptr(handle)` treating handle value as address
+  - Now calls `gc_handle_deref(handle)` to get actual pointer, then bitcasts
+  - Added support for nested enum fields in UDTs
+  - All 62 JSON tests pass including new deeply-nested and enum tests
+
 ---
 
 ## Notes
@@ -333,5 +339,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 9 bugs
-- **Resolved**: 16 bugs
+- **Open**: 8 bugs
+- **Resolved**: 17 bugs

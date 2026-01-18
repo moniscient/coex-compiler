@@ -573,7 +573,6 @@ func main() -> int
 ~
 ''', "1\n")
 
-    @pytest.mark.xfail(reason="BUG-011: Nested UDT to JSON conversion not implemented")
     def test_nested_type_to_json(self, expect_output):
         """Nested user type converts to nested JSON."""
         expect_output('''
@@ -614,6 +613,62 @@ func main() -> int
     return 0
 ~
 ''', "3\n")
+
+    def test_deeply_nested_types_to_json(self, expect_output):
+        """Multiple levels of nested UDTs convert correctly."""
+        expect_output('''
+type Level3:
+    value: int
+~
+
+type Level2:
+    nested: Level3
+    label: string
+~
+
+type Level1:
+    child: Level2
+    id: int
+~
+
+func main() -> int
+    l3: Level3 = Level3(value: 42)
+    l2: Level2 = Level2(nested: l3, label: "test")
+    l1: Level1 = Level1(child: l2, id: 1)
+    j: json = l1
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_nested_enum_in_udt_to_json(self, expect_output):
+        """UDT containing an enum field converts correctly."""
+        expect_output('''
+type Status:
+    case Active
+    case Inactive
+~
+
+type User:
+    name: string
+    status: Status
+~
+
+func main() -> int
+    u: User = User(name: "Alice", status: Status.Active)
+    j: json = u
+    if j.is_object()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
 
 
 class TestJsonToCoexConversion:
