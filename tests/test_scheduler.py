@@ -57,9 +57,9 @@ task step(x: int) -> int
 ~
 
 func main() -> int
-    a = step(0)
-    b = step(a)
-    c = step(b)
+    a := step(0)
+    b := step(a)
+    c := step(b)
     print(c)
     return 0
 ~
@@ -73,7 +73,7 @@ task inner(x: int) -> int
 ~
 
 task outer(x: int) -> int
-    y = inner(x)
+    y := inner(x)
     return y + 1
 ~
 
@@ -128,9 +128,9 @@ task work(id: int) -> int
 ~
 
 func main() -> int
-    a = work(1)
-    b = work(2)
-    c = work(3)
+    a := work(1)
+    b := work(2)
+    c := work(3)
     print(a + b + c)
     return 0
 ~
@@ -146,7 +146,7 @@ task leaf(x: int) -> int
 task coordinator() -> int
     total = 0
     for i in 0..10
-        result = leaf(i)
+        result := leaf(i)
         total = total + result
     ~
     return total
@@ -178,8 +178,8 @@ task parent2() -> int
 ~
 
 func main() -> int
-    a = parent1()
-    b = parent2()
+    a := parent1()
+    b := parent2()
     print(a)
     print(b)
     return 0
@@ -198,9 +198,9 @@ task batch_b() -> int
 ~
 
 func main() -> int
-    a = batch_a()
+    a := batch_a()
     print(a)
-    b = batch_b()
+    b := batch_b()
     print(b)
     return 0
 ~
@@ -216,7 +216,7 @@ task tiny(x: int) -> int
 task spawn_many() -> int
     total = 0
     for i in 0..100
-        result = tiny(i)
+        result := tiny(i)
         total = total + result
     ~
     return total
@@ -239,8 +239,8 @@ task fib(n: int) -> int
     if n <= 1
         return n
     ~
-    a = fib(n - 1)
-    b = fib(n - 2)
+    a := fib(n - 1)
+    b := fib(n - 2)
     return a + b
 ~
 
@@ -261,7 +261,7 @@ task chain(n: int, acc: int) -> int
     if n <= 0
         return acc
     ~
-    next_acc = increment(acc)
+    next_acc := increment(acc)
     return chain(n - 1, next_acc)
 ~
 
@@ -284,7 +284,7 @@ task get_ten() -> int
 
 task use_local() -> int
     x = 5
-    y = get_ten()
+    y := get_ten()
     return x + y
 ~
 
@@ -305,8 +305,8 @@ task multi_local() -> int
     a = 1
     b = 2
     c = 3
-    x = get_value(10)
-    y = get_value(20)
+    x := get_value(10)
+    y := get_value(20)
     return a + b + c + x + y
 ~
 
@@ -325,7 +325,7 @@ task get_number() -> int
 
 task heap_local() -> int
     items = [1, 2, 3, 4, 5]
-    value = get_number()
+    value := get_number()
     return items.len() + value
 ~
 
@@ -348,7 +348,7 @@ task get_value() -> int
 
 task conditional(flag: bool) -> int
     if flag
-        x = get_value()
+        x := get_value()
         return x
     else
         return 0
@@ -370,7 +370,7 @@ task get_value() -> int
 
 task conditional(flag: bool) -> int
     if flag
-        x = get_value()
+        x := get_value()
         return x
     else
         return 0
@@ -393,7 +393,7 @@ task double(x: int) -> int
 task loop_suspend() -> int
     total = 0
     for i in 0..5
-        val = double(i)
+        val := double(i)
         total = total + val
     ~
     return total

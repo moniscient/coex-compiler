@@ -83,27 +83,6 @@
 - **Files**: `coex_gc.py` (TLS variables), all code using thread-local state
 - **Status**: Open (workaround in place: use pthread TLS via ThreadEntry struct)
 
-### BUG-026: Test files use `=` instead of `:=` for task assignment
-- **Discovered**: 2026-01-17, during GPU offload implementation testing
-- **Category**: Semantic
-- **Severity**: Low
-- **Reproduction**: Run `python3 -m pytest tests/test_scheduler.py tests/test_task_state_machine.py`
-- **Observed**: 6 tests fail with error: `Cannot assign task result with '=' operator. Use ':=' for blocking assignment`
-- **Expected**: Tests should use correct `:=` syntax for task calls
-- **Hypothesis**: Tests were written before BUG-012 fix enforced `:=` for task assignment
-- **Files**:
-  - `tests/test_scheduler.py` (lines 149, 219: `result = leaf(i)`, `result = tiny(i)`)
-  - `tests/test_task_state_machine.py` (similar patterns)
-- **Status**: Open
-- **Failing Tests**:
-  - `test_scheduler.py::TestTaskExecution::test_sequential_tasks`
-  - `test_scheduler.py::TestConcurrentExecution::test_parallel_tasks`
-  - `test_scheduler.py::TestSchedulerInvariants::test_result_delivered_to_correct_waiter`
-  - `test_scheduler.py::TestSchedulerInvariants::test_workers_reused_across_batches`
-  - `test_task_state_machine.py::TestTaskStateMachine::test_both_branches_suspend`
-  - `test_task_state_machine.py::TestTaskInvariants::test_func_can_call_task`
-
-
 ---
 
 ## Resolved Bugs
@@ -362,6 +341,20 @@
   - Added support for nested enum fields in UDTs
   - All 62 JSON tests pass including new deeply-nested and enum tests
 
+### BUG-026: Test files use `=` instead of `:=` for task assignment
+- **Discovered**: 2026-01-17, during GPU offload implementation testing
+- **Category**: Semantic
+- **Severity**: Low
+- **Reproduction**: Run `python3 -m pytest tests/test_scheduler.py tests/test_task_state_machine.py`
+- **Observed**: 6 tests fail with error: `Cannot assign task result with '=' operator`
+- **Expected**: Tests should use correct `:=` syntax for task calls
+- **Files**: `tests/test_scheduler.py`, `tests/test_task_state_machine.py`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Updated all task call assignments from `=` to `:=`:
+  - Fixed ~25 occurrences across both test files
+  - Tests were written before BUG-012 fix enforced `:=` for task assignment
+  - All 34 tests now pass
+
 ---
 
 ## Notes
@@ -376,5 +369,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 5 bugs
-- **Resolved**: 21 bugs
+- **Open**: 4 bugs
+- **Resolved**: 22 bugs

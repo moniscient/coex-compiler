@@ -37,7 +37,7 @@ task inner() -> int
 ~
 
 task outer(x: int) -> int
-    y = inner()
+    y := inner()
     return x + y
 ~
 
@@ -63,9 +63,9 @@ task step3() -> int
 ~
 
 task pipeline() -> int
-    a = step1()
-    b = step2()
-    c = step3()
+    a := step1()
+    b := step2()
+    c := step3()
     return a + b + c
 ~
 
@@ -84,7 +84,7 @@ task get_value() -> int
 
 task uses_locals() -> int
     x = 10
-    y = get_value()
+    y := get_value()
     z = 20
     return x + y + z
 ~
@@ -104,7 +104,7 @@ task maybe_suspend(flag: bool) -> int
 
 task conditional(flag: bool) -> int
     if flag
-        x = maybe_suspend(flag)
+        x := maybe_suspend(flag)
         return x
     else
         return 0
@@ -126,7 +126,7 @@ task maybe_suspend(flag: bool) -> int
 
 task conditional(flag: bool) -> int
     if flag
-        x = maybe_suspend(flag)
+        x := maybe_suspend(flag)
         return x
     else
         return 0
@@ -152,10 +152,10 @@ task branch_b() -> int
 
 task both_branches(flag: bool) -> int
     if flag
-        x = branch_a()
+        x := branch_a()
         return x
     else
-        y = branch_b()
+        y := branch_b()
         return y
     ~
 ~
@@ -177,7 +177,7 @@ task process_item(x: int) -> int
 task loop_with_suspend() -> int
     total = 0
     for i in 0..3
-        result = process_item(i)
+        result := process_item(i)
         total = total + result
     ~
     return total
@@ -197,12 +197,12 @@ task level3() -> int
 ~
 
 task level2() -> int
-    x = level3()
+    x := level3()
     return x + 1
 ~
 
 task level1() -> int
-    x = level2()
+    x := level2()
     return x + 1
 ~
 
@@ -226,7 +226,7 @@ task inner_task() -> int
 
 task allocates() -> int
     x = [1, 2, 3, 4, 5]
-    y = inner_task()
+    y := inner_task()
     gc()
     return x.len() + y
 ~
@@ -248,7 +248,7 @@ task get_number() -> int
 
 task holder() -> int
     big_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    value = get_number()
+    value := get_number()
     gc()
     return big_list.len() + value
 ~
@@ -276,8 +276,8 @@ task task_two() -> int
 ~
 
 task ordered() -> int
-    a = task_one()
-    b = task_two()
+    a := task_one()
+    b := task_two()
     return a * 10 + b
 ~
 
@@ -340,7 +340,7 @@ task compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(5)
+    result := compute(5)
     print(result)
     return 0
 ~
