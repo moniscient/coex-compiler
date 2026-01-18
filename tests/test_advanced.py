@@ -202,7 +202,6 @@ func main() -> int
 ~
 ''', "7\n")
 
-    @pytest.mark.xfail(reason="BUG-009: Matrix formula tick() not generating correct code")
     def test_matrix_formula_simple(self, expect_output):
         """Matrix formula that sets all cells to constant."""
         expect_output('''
@@ -223,7 +222,6 @@ func main() -> int
 ~
 ''', "2\n")
 
-    @pytest.mark.xfail(reason="BUG-010: Matrix cell keyword access not working")
     def test_matrix_cell_access(self, expect_output):
         """Matrix formula using cell keyword for current value."""
         expect_output('''

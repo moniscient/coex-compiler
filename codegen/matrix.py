@@ -429,6 +429,11 @@ class MatrixGenerator:
                 var_alloca = cg.builder.alloca(i64, name=var_name)
                 cg.locals[var_name] = var_alloca
 
+        # Create __matrix_result to capture return values from formula body
+        result_alloca = cg.builder.alloca(elem_type, name="matrix_result")
+        cg.builder.store(ir.Constant(elem_type, 0), result_alloca)
+        cg.locals["__matrix_result"] = result_alloca
+
         # Create loop: for y in 0..height: for x in 0..width: body
         y_var = cg.builder.alloca(i64, name="cell_y")
         cg.builder.store(ir.Constant(i64, 0), y_var)
@@ -461,6 +466,9 @@ class MatrixGenerator:
         x_loop_inc = func.append_basic_block("x_loop_inc")
         x_loop_end = func.append_basic_block("x_loop_end")
 
+        # Store x_loop_inc so return statements can branch to it
+        cg.locals["__matrix_x_loop_inc"] = x_loop_inc
+
         cg.builder.branch(x_loop_cond)
 
         cg.builder.position_at_end(x_loop_cond)
@@ -470,39 +478,39 @@ class MatrixGenerator:
 
         cg.builder.position_at_end(x_loop_body)
 
+        # Reset __matrix_result before each cell's formula execution
+        cg.builder.store(ir.Constant(elem_type, 0), result_alloca)
+
         # Generate formula body
-        result = None
         for stmt in method.body:
-            result = cg._generate_statement(stmt)
+            cg._generate_statement(stmt)
             if cg.builder.block.is_terminated:
                 break
 
-        # Only generate write-to-buffer code if block isn't already terminated by return
+        # If block isn't terminated (no explicit return), branch to x_loop_inc
         if not cg.builder.block.is_terminated:
-            # If no explicit return, the formula should return a value
-            # Write result to write buffer
-            if result is None:
-                result = ir.Constant(elem_type, 0)
-
-            # Calculate write index
-            x_val = cg.builder.load(x_var)
-            y_val = cg.builder.load(y_var)
-            width_val = cg.builder.load(width_alloca)
-            write_buf = cg.builder.load(write_alloca)
-
-            row_offset = cg.builder.mul(y_val, width_val)
-            write_idx = cg.builder.add(row_offset, x_val)
-            write_ptr = cg.builder.gep(write_buf, [write_idx])
-
-            # Store result if we have one (non-void expression result)
-            if result is not None and hasattr(result, 'type') and result.type != ir.VoidType():
-                cg.builder.store(result, write_ptr)
-
             cg.builder.branch(x_loop_inc)
 
-        # x increment
+        # x_loop_inc: Write result to cell, then increment
         cg.builder.position_at_end(x_loop_inc)
+
+        # Read the result value (set by return statement or default 0)
+        result_val = cg.builder.load(result_alloca, name="cell_result")
+
+        # Calculate write index
         x_val = cg.builder.load(x_var)
+        y_val = cg.builder.load(y_var)
+        width_val = cg.builder.load(width_alloca)
+        write_buf = cg.builder.load(write_alloca)
+
+        row_offset = cg.builder.mul(y_val, width_val)
+        write_idx = cg.builder.add(row_offset, x_val)
+        write_ptr = cg.builder.gep(write_buf, [write_idx])
+
+        # Write the result to the cell
+        cg.builder.store(result_val, write_ptr)
+
+        # Increment x
         next_x = cg.builder.add(x_val, ir.Constant(i64, 1))
         cg.builder.store(next_x, x_var)
         cg.builder.branch(x_loop_cond)

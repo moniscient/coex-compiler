@@ -48,27 +48,6 @@
 - **Files**: `coex_gc.py`, `tests/test_thread_stress.py`
 - **Status**: Open
 
-### BUG-009: Matrix formula tick() not generating correct code
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Codegen
-- **Severity**: Medium
-- **Reproduction**: Define a matrix with a formula and call `tick()`
-- **Observed**: Incorrect code generation for cellular automata step
-- **Expected**: Formula should be applied to each cell, producing new matrix state
-- **Hypothesis**: Matrix tick codegen incomplete or incorrectly structured
-- **Files**: `codegen.py` (matrix/CA implementation)
-- **Status**: Open
-
-### BUG-010: Matrix cell keyword access not working
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Codegen
-- **Severity**: Medium
-- **Reproduction**: Use `cell` keyword in matrix formula to access neighbors
-- **Observed**: Incorrect access or compilation error
-- **Expected**: `cell` should provide access to neighboring cell values
-- **Hypothesis**: Cell keyword codegen not properly resolving neighbor offsets
-- **Files**: `codegen.py` (matrix/CA cell access implementation)
-- **Status**: Open
 
 ### BUG-015: Non-blocking safepoints require shadow stack changes
 - **Discovered**: 2025-01-17, during codebase scan
@@ -298,6 +277,34 @@
   - After fix: Exactly consistent counts across all runs (128068 allocations)
   - New test file: test_gc_stats_atomic.py
 
+### BUG-009: Matrix formula tick() not generating correct code
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Define a matrix with a formula and call `tick()`
+- **Observed**: LLVM error: `ret i64 1` in void-returning function
+- **Expected**: Formula should be applied to each cell, producing new matrix state
+- **Files**: `codegen/matrix.py`, `codegen/statements.py`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Fixed matrix formula return statement handling:
+  - Matrix formula methods are void-returning, but `return` sets cell value
+  - Added `__matrix_result` alloca to capture return values
+  - Modified `generate_return` to detect matrix context and store value instead of `ret`
+  - Return now branches to x_loop_inc which writes value to cell
+  - All 5 matrix tests pass
+
+### BUG-010: Matrix cell keyword access not working
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Use `cell` keyword in matrix formula to access current cell value
+- **Observed**: Same LLVM error as BUG-009 (return type mismatch)
+- **Expected**: `cell` should provide access to current cell value
+- **Files**: `codegen/matrix.py`, `codegen/statements.py`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Fixed by same change as BUG-009. The `cell` keyword was working correctly;
+  the issue was that formulas using `cell` also use `return` which had the same bug.
+
 ### BUG-024: Task completion notification not optimized
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Runtime
@@ -345,5 +352,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 7 bugs
-- **Resolved**: 18 bugs
+- **Open**: 5 bugs
+- **Resolved**: 20 bugs
