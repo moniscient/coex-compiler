@@ -275,7 +275,6 @@ func main() -> int
 @pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieve:
     """Parallel sieve of Eratosthenes tests."""
-    """
 
     def test_parallel_sieve_1000(self, expect_output):
         """Test parallel sieve to 1000 with 4 tasks."""
@@ -445,7 +444,6 @@ func main() -> int
 @pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieveStress:
     """Stress tests for parallel sieve at scale."""
-    """
 
     def test_parallel_sieve_100k_24_tasks(self, compiler_root):
         """Test parallel sieve to 100K with 24 tasks."""
@@ -669,7 +667,6 @@ func main() -> int
 @pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
 class TestParallelSieve100M:
     """100 million element stress test."""
-    """
 
     def test_parallel_sieve_100m_full(self, compiler_root):
         """Full 100M parallel sieve test from stress test file."""

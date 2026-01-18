@@ -19,7 +19,7 @@ task receiver(ch: Channel<int>) -> int
 func main() -> int
     ch: Channel<int> = Channel.new()
     ch.send(42)
-    result = receiver(ch)
+    result := receiver(ch)
     print(result)
     return 0
 ~
@@ -59,7 +59,7 @@ thread sender(ch: Channel<int>) -> void
 func main() -> int
     ch: Channel<int> = Channel.new()
     sender(ch)
-    result = receiver(ch)
+    result := receiver(ch)
     print(result)
     return 0
 ~
@@ -79,7 +79,7 @@ thread receiver(ch: Channel<int>) -> int
 func main() -> int
     ch: Channel<int> = Channel.new()
     sender(ch)
-    result = receiver(ch)
+    result := receiver(ch)
     print(result)
     return 0
 ~

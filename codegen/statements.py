@@ -278,11 +278,76 @@ class StatementGenerator:
         elif isinstance(stmt, LlvmIrStmt):
             cg._generate_llvm_ir_block(stmt)
         elif isinstance(stmt, ExprStmt):
-            cg._generate_expression(stmt.expr)
+            # Check if this is a bare thread/task call (fire-and-forget)
+            if self._is_thread_or_task_call(stmt.expr):
+                self._generate_fire_and_forget_call(stmt.expr)
+            else:
+                cg._generate_expression(stmt.expr)
+
+    def _is_thread_or_task_call(self, expr) -> bool:
+        """Check if expression is a call to a thread or task function."""
+        cg = self.cg
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name
+                if name in cg.func_decls:
+                    kind = cg.func_decls[name].kind
+                    return kind in (FunctionKind.THREAD, FunctionKind.TASK)
+        return False
+
+    def _generate_fire_and_forget_call(self, expr: CallExpr):
+        """Generate a bare thread/task call that joins at function exit.
+
+        This implements fire-and-forget semantics: the task is spawned and
+        added to the nursery for deferred join, but execution continues
+        immediately without waiting for the result.
+        """
+        cg = self.cg
+        name = expr.callee.name
+        task_decl = cg.func_decls[name]
+        func = cg.functions[name]
+
+        # Evaluate arguments
+        arg_values = []
+        for i, arg in enumerate(expr.args):
+            arg_val = cg._generate_expression(arg)
+            if i < len(func.args):
+                expected = func.args[i].type
+                arg_val = cg._cast_value(arg_val, expected)
+            arg_values.append(arg_val)
+
+        # Check function kind
+        kind = task_decl.kind
+        if kind == FunctionKind.THREAD:
+            # Use pthread-based thread spawning
+            if cg._thread is not None:
+                # Spawn and add to nursery - will be joined at function exit
+                thread_handle, closure_ptr = cg._thread.spawn_task(
+                    cg.builder,
+                    task_decl,
+                    func,
+                    arg_values,
+                    add_to_nursery=True  # Key: deferred join
+                )
+                # Don't join here - that's the fire-and-forget behavior
+        elif kind == FunctionKind.TASK:
+            # Use work-stealing scheduler for lightweight tasks
+            # For now, tasks also go through the scheduler synchronously
+            # Future: add nursery support for scheduler-based tasks
+            cg._task.generate_task_call(name, arg_values, cg.builder)
 
     def generate_var_decl(self, stmt: VarDecl):
         """Generate a local variable declaration or reassignment"""
         cg = self.cg
+
+        # BUG-012: Compile error for = assignment with thread/task calls
+        # Only := is allowed for blocking assignment; = is reserved for future futures
+        if not stmt.is_copy and self._is_thread_or_task_call(stmt.initializer):
+            kind_name = "thread" if cg.func_decls[stmt.initializer.callee.name].kind == FunctionKind.THREAD else "task"
+            raise RuntimeError(
+                f"Cannot assign {kind_name} result with '=' operator. "
+                f"Use ':=' for blocking assignment: {stmt.name} := {stmt.initializer.callee.name}(...)"
+            )
 
         # Track whether this is a new variable for scope registration
         is_new_var = stmt.name not in cg.locals

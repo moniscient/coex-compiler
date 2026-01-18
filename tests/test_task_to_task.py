@@ -21,7 +21,7 @@ task callee() -> int
 ~
 
 task caller() -> int
-    x = callee()
+    x := callee()
     return x + 1
 ~
 
@@ -39,9 +39,9 @@ task produce(x: int) -> int
 ~
 
 task consumer() -> int
-    a = produce(1)
-    b = produce(2)
-    c = produce(3)
+    a := produce(1)
+    b := produce(2)
+    c := produce(3)
     return a + b + c
 ~
 
@@ -59,12 +59,12 @@ task add1(x: int) -> int
 ~
 
 task add2(x: int) -> int
-    y = add1(x)
+    y := add1(x)
     return y + 2
 ~
 
 task add3(x: int) -> int
-    y = add2(x)
+    y := add2(x)
     return y + 3
 ~
 
@@ -92,13 +92,13 @@ task step2() -> int
 ~
 
 task ordered() -> int
-    a = step1()
-    b = step2()
+    a := step1()
+    b := step2()
     return a + b
 ~
 
 func main() -> int
-    result = ordered()
+    result := ordered()
     print(result)
     return 0
 ~
@@ -114,13 +114,13 @@ task inner() -> int
 
 task outer() -> int
     print(1)
-    x = inner()
+    x := inner()
     print(3)
     return x
 ~
 
 func main() -> int
-    result = outer()
+    result := outer()
     print(result)
     return 0
 ~
@@ -140,7 +140,7 @@ task get_value() -> int
 task uses_locals() -> int
     x = 10
     y = 20
-    z = get_value()
+    z := get_value()
     return x + y + z
 ~
 
@@ -159,9 +159,9 @@ task fetch(n: int) -> int
 
 task complex_calc() -> int
     a = 1
-    b = fetch(2)
+    b := fetch(2)
     c = 3
-    d = fetch(4)
+    d := fetch(4)
     e = 5
     return a + b + c + d + e
 ~
@@ -188,18 +188,18 @@ task make_twenty() -> int
 ~
 
 task uses_ten() -> int
-    x = make_ten()
+    x := make_ten()
     return x + 1
 ~
 
 task uses_twenty() -> int
-    y = make_twenty()
+    y := make_twenty()
     return y + 1
 ~
 
 func main() -> int
-    a = uses_ten()
-    b = uses_twenty()
+    a := uses_ten()
+    b := uses_twenty()
     print(a)
     print(b)
     return 0
@@ -218,18 +218,18 @@ task slow(id: int) -> int
 ~
 
 task a_task() -> int
-    x = slow(1)
+    x := slow(1)
     return x * 10
 ~
 
 task b_task() -> int
-    y = slow(2)
+    y := slow(2)
     return y * 10
 ~
 
 func main() -> int
-    ra = a_task()
-    rb = b_task()
+    ra := a_task()
+    rb := b_task()
     print(ra)
     print(rb)
     return 0
@@ -247,7 +247,7 @@ task factorial(n: int) -> int
     if n <= 1
         return 1
     ~
-    sub = factorial(n - 1)
+    sub := factorial(n - 1)
     return n * sub
 ~
 
@@ -264,8 +264,8 @@ task fib(n: int) -> int
     if n <= 1
         return n
     ~
-    a = fib(n - 1)
-    b = fib(n - 2)
+    a := fib(n - 1)
+    b := fib(n - 2)
     return a + b
 ~
 
@@ -314,7 +314,7 @@ task compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(21)
+    result := compute(21)
     print(result)
     return 0
 ~
@@ -332,8 +332,8 @@ task triple(x: int) -> int
 ~
 
 func main() -> int
-    a = double(10)
-    b = triple(10)
+    a := double(10)
+    b := triple(10)
     print(a)
     print(b)
     return 0

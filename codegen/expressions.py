@@ -1405,10 +1405,16 @@ class ExpressionGenerator:
 
     def _generate_thread_call(self, name: str, func: ir.Function,
                               args: PyList) -> ir.Value:
-        """Generate code for a thread function call.
+        """Generate code for a thread function call with := assignment.
 
-        Currently executes synchronously (spawn, join immediately, return result).
-        This matches the "single assignment" semantics where result is used.
+        This is the BLOCKING call path used when a thread result is assigned
+        with the := operator. It spawns the thread, joins immediately, and
+        returns the result. This is the correct behavior for sequential
+        execution where the result is needed.
+
+        For fire-and-forget (bare call without assignment), see
+        StatementGenerator._generate_fire_and_forget_call() which adds
+        to nursery for deferred join at function exit.
 
         Args:
             name: Thread function name
@@ -1422,13 +1428,6 @@ class ExpressionGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
-
-        # Emit warning for single task assignment (executes sequentially)
-        cg._emit_warning(
-            "WARN",
-            f"Single task assignment '{name}(...)' executes sequentially. "
-            f"Use 'for', 'first', or 'most' for concurrent execution."
-        )
 
         # Get task function declaration
         task_decl = cg.func_decls[name]

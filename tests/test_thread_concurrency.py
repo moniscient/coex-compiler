@@ -21,7 +21,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(21)
+    result := compute(21)
     print(result)
     return 0
 ~
@@ -35,7 +35,7 @@ thread add(a: int, b: int) -> int
 ~
 
 func main() -> int
-    result = add(17, 25)
+    result := add(17, 25)
     print(result)
     return 0
 ~
@@ -53,7 +53,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(32)
+    result := compute(32)
     print(result)
     return 0
 ~
@@ -67,9 +67,9 @@ thread double(x: int) -> int
 ~
 
 func main() -> int
-    a = double(10)
-    b = double(5)
-    c = double(3)
+    a := double(10)
+    b := double(5)
+    c := double(3)
     print(a + b + c)
     return 0
 ~
@@ -89,7 +89,7 @@ thread sum_to(n: int) -> int
 ~
 
 func main() -> int
-    result = sum_to(10)
+    result := sum_to(10)
     print(result)
     return 0
 ~
@@ -103,7 +103,7 @@ thread get_answer() -> int
 ~
 
 func main() -> int
-    result = get_answer()
+    result := get_answer()
     print(result)
     return 0
 ~
@@ -117,11 +117,12 @@ thread inner(x: int) -> int
 ~
 
 thread outer(x: int) -> int
-    return inner(x) * 2
+    inner_result := inner(x)
+    return inner_result * 2
 ~
 
 func main() -> int
-    result = outer(20)
+    result := outer(20)
     print(result)
     return 0
 ~
@@ -139,8 +140,8 @@ thread abs_val(x: int) -> int
 ~
 
 func main() -> int
-    a = abs_val(-42)
-    b = abs_val(42)
+    a := abs_val(-42)
+    b := abs_val(42)
     print(a)
     print(b)
     return 0
@@ -155,18 +156,20 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(10) + compute(11)
+    a := compute(10)
+    b := compute(11)
+    result = a + b
     print(result)
     return 0
 ~
 ''', "42\n")
 
 
-class TestTaskWarnings:
-    """Tests for task-related compiler warnings."""
+class TestTaskAssignmentErrors:
+    """Tests for task assignment semantics (BUG-012)."""
 
-    def test_single_task_assignment_warning(self, compile_coex):
-        """Test that single thread assignment emits a warning."""
+    def test_equals_assignment_error(self, compile_coex):
+        """Test that = assignment with thread call produces compile error."""
         result = compile_coex('''
 thread compute(x: int) -> int
     return x * 2
@@ -178,32 +181,38 @@ func main() -> int
     return 0
 ~
 ''')
-        # Verify compilation succeeded and output is correct
-        assert result.compile_success
-        assert result.run_output == "42\n"
-        # Verify warning is emitted for single thread assignment
-        assert "WARN" in result.compile_output
-        assert "executes sequentially" in result.compile_output
+        # Should fail to compile - = not allowed for thread calls
+        assert not result.compile_success
+        assert "Cannot assign thread result with '=' operator" in result.compile_output
 
-    def test_multiple_task_calls_multiple_warnings(self, compile_coex):
-        """Test that each thread call emits its own warning."""
-        result = compile_coex('''
+    def test_copy_assign_works(self, expect_output):
+        """Test that := assignment with thread call works (blocking)."""
+        expect_output('''
 thread compute(x: int) -> int
     return x * 2
 ~
 
 func main() -> int
-    a = compute(10)
-    b = compute(5)
+    result := compute(21)
+    print(result)
+    return 0
+~
+''', "42\n")
+
+    def test_multiple_copy_assigns(self, expect_output):
+        """Test multiple := assignments work correctly."""
+        expect_output('''
+thread compute(x: int) -> int
+    return x * 2
+~
+
+func main() -> int
+    a := compute(10)
+    b := compute(5)
     print(a + b)
     return 0
 ~
-''')
-        assert result.compile_success
-        assert result.run_output == "30\n"
-        # Should have multiple warnings (one per thread call)
-        warn_count = result.compile_output.count("WARN")
-        assert warn_count >= 2, f"Expected at least 2 warnings, got {warn_count}"
+''', "30\n")
 
 
 class TestForCollectionBlock:
@@ -354,9 +363,9 @@ func main() -> int
 ~
 ''', "42\n")
 
-    def test_first_larger_collection(self, expect_output):
-        """Test first with larger collection - first result wins."""
-        expect_output('''
+    def test_first_larger_collection(self, compile_coex):
+        """Test first with larger collection - first result wins (racy)."""
+        result = compile_coex('''
 thread identity(x: int) -> int
     return x
 ~
@@ -367,7 +376,12 @@ func main() -> int
     print(result)
     return 0
 ~
-''', "10\n")
+''')
+        assert result.compile_success
+        assert result.run_success
+        # Result is racy - any of the values could win
+        valid_results = ["10\n", "20\n", "30\n", "40\n", "50\n"]
+        assert result.run_output in valid_results
 
     def test_first_no_sequential_warning(self, compile_coex):
         """Test that first collection does not emit sequential warning."""
@@ -527,7 +541,7 @@ thread count_to(n: int) -> int
 ~
 
 func main() -> int
-    result = count_to(100)
+    result := count_to(100)
     print(result)
     return 0
 ~
@@ -545,7 +559,7 @@ thread sum_range(n: int) -> int
 ~
 
 func main() -> int
-    result = sum_range(10)
+    result := sum_range(10)
     print(result)
     return 0
 ~
@@ -564,7 +578,7 @@ thread sum_list(items: [int]) -> int
 
 func main() -> int
     data = [1, 2, 3, 4, 5]
-    result = sum_list(data)
+    result := sum_list(data)
     print(result)
     return 0
 ~

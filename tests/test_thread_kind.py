@@ -12,14 +12,14 @@ class TestThreadKeyword:
     """Tests for basic thread keyword functionality."""
 
     def test_thread_basic_return(self, expect_output):
-        """Thread function returns a value."""
+        """Thread function returns a value with := blocking assignment."""
         expect_output('''
 thread compute(x: int) -> int
     return x * 2
 ~
 
 func main() -> int
-    result = compute(5)
+    result := compute(5)
     print(result)
     return 0
 ~
@@ -33,7 +33,7 @@ thread add(a: int, b: int) -> int
 ~
 
 func main() -> int
-    result = add(10, 20)
+    result := add(10, 20)
     print(result)
     return 0
 ~
@@ -51,7 +51,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(5)
+    result := compute(5)
     print(result)
     return 0
 ~
@@ -65,11 +65,12 @@ thread inner(x: int) -> int
 ~
 
 thread outer(x: int) -> int
-    return inner(x) * 2
+    inner_result := inner(x)
+    return inner_result * 2
 ~
 
 func main() -> int
-    result = outer(5)
+    result := outer(5)
     print(result)
     return 0
 ~
@@ -83,7 +84,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(7)
+    result := compute(7)
     print(result)
     return 0
 ~
@@ -132,14 +133,14 @@ class TestTaskKeywordFunctionality:
     """Tests that the `task` keyword works as lightweight coroutines."""
 
     def test_task_basic_execution(self, expect_output):
-        """Task function executes and returns value."""
+        """Task function executes and returns value with := blocking assignment."""
         expect_output('''
 task compute() -> int
     return 42
 ~
 
 func main() -> int
-    result = compute()
+    result := compute()
     print(result)
     return 0
 ~
@@ -153,7 +154,7 @@ task compute(x: int) -> int
 ~
 
 func main() -> int
-    result = compute(21)
+    result := compute(21)
     print(result)
     return 0
 ~
