@@ -55,10 +55,16 @@ class TestMetalBackend:
     """Test Metal backend implementation."""
 
     def test_metal_type_mapping(self):
-        """Metal backend should correctly map Coex types."""
+        """Metal backend should correctly map Coex types.
+
+        Coex int is 64-bit, so maps to Metal 'long'.
+        Coex float is 64-bit, so maps to Metal 'double'.
+        """
         backend = MetalBackend()
-        assert backend.map_type('int') == 'int'
-        assert backend.map_type('float') == 'float'
+        # Coex int is 64-bit -> Metal long
+        assert backend.map_type('int') == 'long'
+        # Coex float is 64-bit -> Metal double
+        assert backend.map_type('float') == 'double'
         assert backend.map_type('bool') == 'bool'
         assert backend.map_type('int64') == 'long'
         assert backend.map_type('float64') == 'double'

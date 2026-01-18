@@ -18,11 +18,12 @@ class MetalBackend(FormulaBackend):
     """
 
     # Coex type to Metal type mapping
+    # IMPORTANT: Coex int is 64-bit, so maps to Metal 'long' (int64_t)
     TYPE_MAP = {
-        'int': 'int',
+        'int': 'long',         # Coex int is 64-bit
         'int64': 'long',
-        'float': 'float',
-        'float64': 'double',  # Note: check device capability
+        'float': 'double',     # Coex float is 64-bit
+        'float64': 'double',
         'bool': 'bool',
         'byte': 'uint8_t',
     }
