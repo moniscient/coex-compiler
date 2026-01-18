@@ -309,8 +309,12 @@ class TaskTransformer:
     # Task Nursery for Fire-and-Forget
     # ========================================================================
 
-    def reset_nursery(self):
-        """Reset nursery state for a new function."""
+    def reset_for_function(self):
+        """Reset nursery state for a new function generation.
+
+        Must be called at the start of each function generation to ensure
+        nursery allocas from previous functions don't leak into the new one.
+        """
         self._nursery_task_handles_alloca = None
         self._nursery_task_count_alloca = None
 

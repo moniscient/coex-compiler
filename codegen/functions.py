@@ -423,6 +423,8 @@ class FunctionGenerator:
         # Reset task nursery state for new function
         if cg._thread is not None:
             cg._thread.reset_for_function()
+        if cg._task is not None:
+            cg._task.reset_for_function()
 
         # ====================================================================
         # GC Shadow Stack Integration
@@ -620,6 +622,8 @@ class FunctionGenerator:
         # Reset task nursery state for new function
         if cg._thread is not None:
             cg._thread.reset_for_function()
+        if cg._task is not None:
+            cg._task.reset_for_function()
 
         # Save and initialize GC state for this monomorphized function
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
@@ -991,6 +995,8 @@ class FunctionGenerator:
         # Reset task nursery state for new method
         if cg._thread is not None:
             cg._thread.reset_for_function()
+        if cg._task is not None:
+            cg._task.reset_for_function()
 
         # Initialize GC state for this method
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
