@@ -126,16 +126,6 @@
 - **Files**: `codegen/strings.py` (multiple locations marked DANGEROUS HACK)
 - **Status**: Open (see `implementation_prompts/cstring.txt` for proposed fix)
 
-### BUG-022: Bidirectional channels require true concurrent execution
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Runtime
-- **Severity**: Medium
-- **Reproduction**: Create two tasks that both send and receive on channels
-- **Observed**: Hangs on blocking receive (deadlock)
-- **Expected**: Both tasks should run concurrently, enabling bidirectional communication
-- **Hypothesis**: Related to BUG-012 (synchronous task calls)
-- **Files**: `codegen.py` (channel/task implementation)
-- **Status**: Open (blocked on concurrent task execution)
 
 ### BUG-023: llvmlite thread_local attribute silently ignored
 - **Discovered**: 2025-01-17, during codebase scan
@@ -305,6 +295,21 @@
   - `=` assignment (`result = work()`) is now a compile error
   - All 12 tests in test_fire_and_forget.py pass
 
+### BUG-022: Bidirectional channels require true concurrent execution
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Runtime
+- **Severity**: Medium
+- **Reproduction**: Create two tasks that both send and receive on channels
+- **Observed**: Hangs on blocking receive (deadlock)
+- **Expected**: Both tasks should run concurrently, enabling bidirectional communication
+- **Files**: `runtime/coex_channel.c`, `runtime/coex_channel.h`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Fixed channel synchronization to use mutex/condvar instead of busy spin:
+  - Added ChannelSync struct with pthread_mutex_t and pthread_cond_t to TaskChannel
+  - Updated coex_channel_send() to lock mutex, signal condvar after buffering
+  - Updated coex_channel_receive() to lock mutex, wait on condvar when buffer empty
+  - All 12 tests in test_channel_inference.py pass including bidirectional channels
+
 ---
 
 ## Notes
@@ -318,6 +323,6 @@
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2025-01-17)
-- **Open**: 12 bugs
-- **Resolved**: 13 bugs
+### Bug Count Summary (as of 2026-01-17)
+- **Open**: 11 bugs
+- **Resolved**: 14 bugs

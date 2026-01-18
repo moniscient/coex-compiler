@@ -16,6 +16,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 /* Forward declarations */
 struct SchedulerTask;
@@ -54,6 +56,16 @@ typedef struct {
 } ChannelBuffer;
 
 /**
+ * Channel synchronization for thread/func callers.
+ * Uses mutex + condition variable for proper blocking.
+ */
+typedef struct {
+    pthread_mutex_t mutex;              /* Protects buffer and count */
+    pthread_cond_t cond;                /* Signals when data available */
+    atomic_int_fast64_t buffer_count;   /* Atomic count for non-blocking check */
+} ChannelSync;
+
+/**
  * TaskChannel structure.
  *
  * Layout (48 bytes, 6 i64 fields for GC compatibility):
@@ -63,6 +75,9 @@ typedef struct {
  *   [3] count         - Cached item count for fast access
  *   [4] waiters_ptr   - Pointer to ChannelWaitQueue (traced by GC)
  *   [5] elem_size     - Size of each element (currently always 8 for i64)
+ *
+ * NOTE: ChannelSync is stored immediately after the 6-field struct
+ * for thread/func synchronization. The GC only sees the first 6 fields.
  */
 typedef struct {
     int64_t buffer_ptr;                 /* Pointer stored as i64 */
@@ -71,6 +86,8 @@ typedef struct {
     int64_t count;                      /* Cached item count */
     int64_t waiters_ptr;                /* Wait queue pointer as i64 */
     int64_t elem_size;                  /* Element size (8 for all types via handles) */
+    /* Extended fields for thread synchronization (not seen by GC) */
+    ChannelSync sync;                   /* Mutex/condvar for func/thread callers */
 } TaskChannel;
 
 /* ============================================================================

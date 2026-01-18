@@ -201,7 +201,7 @@ task make_channel() -> Channel<int>
 ~
 
 func main() -> int
-    ch = make_channel()
+    ch := make_channel()
     print(ch.receive())
     return 0
 ~
@@ -260,7 +260,6 @@ func main() -> int
 ~
 ''', "111\n")
 
-    @pytest.mark.skip(reason="BUG-022: Bidirectional channels require concurrent execution")
     def test_bidirectional_channels(self, expect_output):
         """Two tasks communicating via channels works correctly"""
         expect_output('''
@@ -278,7 +277,7 @@ func main() -> int
     req: Channel<int> = Channel.new()
     resp: Channel<int> = Channel.new()
     echo_server(req, resp)
-    result = client(req, resp)
+    result := client(req, resp)
     print(result)
     return 0
 ~

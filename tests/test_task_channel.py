@@ -191,7 +191,7 @@ task test() -> string
 ~
 
 func main() -> int
-    s = test()
+    s := test()
     print(s)
     return 0
 ~

@@ -168,6 +168,11 @@ TaskChannel* coex_channel_new(int64_t elem_size) {
     channel->waiters_ptr = (int64_t)(intptr_t)waiters;
     channel->elem_size = elem_size;
 
+    /* Initialize synchronization for func/thread callers */
+    pthread_mutex_init(&channel->sync.mutex, NULL);
+    pthread_cond_init(&channel->sync.cond, NULL);
+    atomic_store(&channel->sync.buffer_count, 0);
+
     return channel;
 }
 
@@ -175,13 +180,18 @@ void coex_channel_send(TaskChannel* channel, int64_t value) {
     ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
     ChannelWaitQueue* waiters = (ChannelWaitQueue*)(intptr_t)channel->waiters_ptr;
 
-    /* Check if any receivers are waiting */
+    /* Lock for thread-safety */
+    pthread_mutex_lock(&channel->sync.mutex);
+
+    /* Check if any task receivers are waiting */
     if (waiters->count > 0) {
         /* Direct handoff - wake receiver with value */
         SchedulerTask* task = channel_waitqueue_pop(waiters);
         if (task) {
             /* Store value in task's resolved field */
             task->resolved_value = value;
+
+            pthread_mutex_unlock(&channel->sync.mutex);
 
             /* Add task back to ready queue */
             /* Note: This requires scheduler integration */
@@ -190,17 +200,26 @@ void coex_channel_send(TaskChannel* channel, int64_t value) {
         }
     }
 
-    /* No waiters - buffer the value */
+    /* No task waiters - buffer the value */
     channel_buffer_push(buffer, value);
 
     /* Update cached counts */
     channel->count = buffer->count;
     channel->head = buffer->head;
     channel->tail = buffer->tail;
+
+    /* Update atomic count and signal waiting threads/funcs */
+    atomic_store(&channel->sync.buffer_count, buffer->count);
+    pthread_cond_signal(&channel->sync.cond);
+
+    pthread_mutex_unlock(&channel->sync.mutex);
 }
 
 int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value) {
     ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
+
+    /* Lock for thread-safe access */
+    pthread_mutex_lock(&channel->sync.mutex);
 
     if (buffer->count > 0) {
         /* Data available - return immediately */
@@ -210,10 +229,13 @@ int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value) {
         channel->count = buffer->count;
         channel->head = buffer->head;
         channel->tail = buffer->tail;
+        atomic_store(&channel->sync.buffer_count, buffer->count);
 
+        pthread_mutex_unlock(&channel->sync.mutex);
         return 0;  /* Success */
     }
 
+    pthread_mutex_unlock(&channel->sync.mutex);
     /* No data - caller should suspend */
     return -1;  /* Should suspend */
 }
@@ -221,10 +243,13 @@ int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value) {
 int64_t coex_channel_receive(TaskChannel* channel) {
     ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
 
-    /* Spin wait for data (only for func/thread context, not recommended) */
+    /* Lock for thread-safe access */
+    pthread_mutex_lock(&channel->sync.mutex);
+
+    /* Wait for data using condition variable */
     while (buffer->count == 0) {
-        /* Busy wait - in production, should use condition variable */
-        /* This path is for non-task callers only */
+        /* Block on condvar - releases mutex while waiting, reacquires on wake */
+        pthread_cond_wait(&channel->sync.cond, &channel->sync.mutex);
     }
 
     int64_t value = channel_buffer_pop(buffer);
@@ -233,13 +258,20 @@ int64_t coex_channel_receive(TaskChannel* channel) {
     channel->count = buffer->count;
     channel->head = buffer->head;
     channel->tail = buffer->tail;
+    atomic_store(&channel->sync.buffer_count, buffer->count);
+
+    pthread_mutex_unlock(&channel->sync.mutex);
 
     return value;
 }
 
 void coex_channel_add_waiter(TaskChannel* channel, SchedulerTask* task) {
     ChannelWaitQueue* waiters = (ChannelWaitQueue*)(intptr_t)channel->waiters_ptr;
+
+    /* Lock for thread-safe access to wait queue */
+    pthread_mutex_lock(&channel->sync.mutex);
     channel_waitqueue_push(waiters, task);
+    pthread_mutex_unlock(&channel->sync.mutex);
 }
 
 SchedulerTask* coex_channel_wake_waiter(TaskChannel* channel) {
