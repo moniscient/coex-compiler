@@ -355,6 +355,41 @@
   - Tests were written before BUG-012 fix enforced `:=` for task assignment
   - All 34 tests now pass
 
+### BUG-028: Array iteration in comprehensions not implemented
+- **Discovered**: 2026-01-18, during GPU offload implementation testing
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `[f(x) for x in arr]` where `arr` is an Array<T>
+- **Observed**: Loop variable `x` is not bound; falls through to "unknown iterable type" path
+- **Expected**: Array iteration should work like List iteration in comprehensions
+- **Files**: `codegen/comprehensions.py:210-212` - Array case falls through without binding pattern
+- **Status**: Fixed (2026-01-18)
+- **Resolution**: Added Array iteration support in `codegen/comprehensions.py` after List handling. Uses `array_len` and `array_get` to iterate, same pattern as List iteration.
+- **Tests**: `tests/test_array_comprehension.py` - 5 passing tests covering basic iteration, filters, formulas, set comprehensions, and multiple clauses.
+
+### BUG-029: MapComprehension not handled in formula offload check
+- **Discovered**: 2026-01-18, during BUG-028 fix testing
+- **Category**: Codegen
+- **Severity**: Low
+- **Reproduction**: `{x: x * 10 for x in arr}` where `arr` is an Array<T>
+- **Observed**: `AttributeError: 'MapComprehension' object has no attribute 'body'` in formula offload check
+- **Expected**: MapComprehension should use `key` and `value` fields instead of `body`
+- **Files**: `codegen/formula/__init__.py:241` - `_check_comprehension` accesses `node.body` but MapComprehension has `node.key`/`node.value`
+- **Status**: Open
+- **Notes**: MapComprehension has `key` and `value` fields, not `body`. The formula offload check should handle this case.
+
+### BUG-027: Flaky test - first with computation in body returns wrong result
+- **Discovered**: 2026-01-18, during GPU offload implementation testing
+- **Category**: Runtime
+- **Severity**: High
+- **Reproduction**: Run `python3 -m pytest tests/test_complex_first_most.py::TestComplexBodyTokenRing::test_first_with_computation_in_body`
+- **Observed**: Test returns 625 (25^2) or 1225 (35^2) non-deterministically instead of 225 (15^2)
+- **Expected**: Should return 225, which is (10+5)^2 - the first element's computation
+- **Hypothesis**: Race condition in `first` construct when body has local variable computation before task call. The first result is not correctly captured; instead a later result overwrites it.
+- **Files**: `codegen/statements.py` (first/most generation), `runtime/coex_scheduler.c`
+- **Status**: Open
+- **Notes**: This test was intermittently passing. The race condition likely existed but wasn't manifesting consistently. Not related to GPU offload changes.
+
 ---
 
 ## Notes

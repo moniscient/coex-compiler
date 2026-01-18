@@ -207,6 +207,71 @@ class ComprehensionGenerator:
                 cg.builder.branch(loop_cond)
 
             cg.builder.position_at_end(loop_end)
+
+        # Check if it's an Array
+        elif isinstance(iterable.type, ir.PointerType) and hasattr(iterable.type.pointee, 'name') and iterable.type.pointee.name == "struct.Array":
+            # Generate array iteration
+            length = cg.builder.call(cg.array_len, [iterable])
+
+            # Loop counter
+            idx_alloca = cg.builder.alloca(ir.IntType(64), name=f"__arr_idx_{clause_idx}")
+            cg.builder.store(ir.Constant(ir.IntType(64), 0), idx_alloca)
+
+            # Loop blocks
+            loop_cond = func.append_basic_block(f"comp_arr_loop_cond_{clause_idx}")
+            loop_body = func.append_basic_block(f"comp_arr_loop_body_{clause_idx}")
+            loop_end = func.append_basic_block(f"comp_arr_loop_end_{clause_idx}")
+
+            cg.builder.branch(loop_cond)
+
+            # Condition: idx < length
+            cg.builder.position_at_end(loop_cond)
+            idx = cg.builder.load(idx_alloca)
+            cond = cg.builder.icmp_signed("<", idx, length)
+            cg.builder.cbranch(cond, loop_body, loop_end)
+
+            # Body
+            cg.builder.position_at_end(loop_body)
+
+            # Reload idx in this block
+            idx = cg.builder.load(idx_alloca)
+
+            # Get element pointer and load value
+            elem_ptr = cg.builder.call(cg.array_get, [iterable, idx])
+            elem_ptr_cast = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+            elem_val = cg.builder.load(elem_ptr_cast)
+
+            # Bind pattern variables
+            cg._bind_pattern(clause.pattern, elem_val)
+
+            # Check condition if present
+            if clause.condition:
+                cond_val = cg._generate_expression(clause.condition)
+                cond_bool = cg._to_bool(cond_val)
+
+                then_block = func.append_basic_block(f"comp_arr_then_{clause_idx}")
+                after_block = func.append_basic_block(f"comp_arr_after_{clause_idx}")
+
+                cg.builder.cbranch(cond_bool, then_block, after_block)
+
+                cg.builder.position_at_end(then_block)
+                self._generate_comprehension_loop(clauses, clause_idx + 1, body, result_alloca, comp_type)
+                if not cg.builder.block.is_terminated:
+                    cg.builder.branch(after_block)
+
+                cg.builder.position_at_end(after_block)
+            else:
+                self._generate_comprehension_loop(clauses, clause_idx + 1, body, result_alloca, comp_type)
+
+            # Increment counter
+            if not cg.builder.block.is_terminated:
+                idx = cg.builder.load(idx_alloca)
+                next_idx = cg.builder.add(idx, ir.Constant(ir.IntType(64), 1))
+                cg.builder.store(next_idx, idx_alloca)
+                cg.builder.branch(loop_cond)
+
+            cg.builder.position_at_end(loop_end)
+
         else:
             # Unknown iterable type - skip for now
             self._generate_comprehension_loop(clauses, clause_idx + 1, body, result_alloca, comp_type)
