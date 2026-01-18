@@ -1,0 +1,41 @@
+---
+
+## Implementation Prompt: C-Compatible String Marshaling for Extern Functions
+
+### Problem Statement
+
+The Coex compiler currently has a bug when passing strings to POSIX functions or C extern FFI calls: strings that end exactly on a 64-bit boundary lack the null terminator that C functions expect. The proposed fix of appending a null byte to all strings is architecturally unsound because it conflicts with Coex's fundamental design around immutability and value semantics.
+
+Coex strings are length-specified, not null-terminated. They may be slices into larger immutable heap objects, substring views, or references to string literals in read-only memory. Mandating null termination at the storage level would require copying in numerous cases where no copy is currently necessary, undermining performance and creating special-case complexity throughout the string handling code.
+
+### Design Constraint
+
+The solution must respect the following invariant: Coex string representation remains length-specified internally, with no assumption of null termination in any Coex-native code path. The null termination requirement is purely a marshaling concern at the C FFI boundary.
+
+### Required Implementation
+
+#### The `cstring` Method
+
+Introduce a new string method `cstring()` that returns a `[byte]` array containing a copy of the string's contents with a null terminator appended. The returned array has length `string.length + 1`, with the final byte being zero. This method always allocates and copies, providing a simple and predictable contract: the caller receives an ordinary Coex byte array that happens to be suitable for C interoperability.
+
+The `cstring` method serves two purposes: it provides an explicit mechanism for programmers who need null-terminated data for interoperability scenarios beyond simple extern calls, and it provides the canonical implementation that the compiler's automatic marshaling will invoke.
+
+#### Automatic Marshaling at Extern Boundaries
+
+When the compiler generates code for an extern call that accepts a string parameter, it must emit marshaling code that ensures the C function receives a null-terminated buffer. The marshaling logic should follow this decision process:
+
+First, check whether the byte immediately following the string's extent (at offset `base + length`) is accessible and contains a null. This handles the common case where strings were originally constructed with trailing padding or where the allocator's alignment behavior leaves null bytes in place. If this check succeeds, pass the string's base pointer directly with no copying.
+
+Second, if the following byte is not accessible or is not null, invoke the same underlying allocation and copy logic that `cstring` uses to produce a temporary buffer. This buffer can be stack-allocated for strings below a reasonable threshold (perhaps 4KB) and heap-allocated for larger strings, with the heap allocation freed immediately after the extern call returns.
+
+The critical architectural point is that the automatic marshaling path and the explicit `cstring` method share the same implementation. There should be a single internal function that performs the allocation, copy, and null-termination; `cstring` calls it to produce a managed `[byte]` array, while the marshaling codegen calls it to produce a temporary buffer with appropriate lifetime.
+
+### Optimization Consideration
+
+For extern functions called in tight loops, the compiler should hoist the marshaling conversion outside the loop when the string argument is loop-invariant. A hoisted conversion eliminates per-iteration marshaling overhead entirely. The shared implementation between explicit and automatic marshaling means this optimization applies uniformly regardless of how the null-terminated buffer was obtained.
+
+### Testing Requirements
+
+Add test cases that specifically exercise strings ending on 64-bit boundaries when passed to extern functions. Include tests for string slices, substring views, and strings that happen to have accessible null bytes following them versus those that do not. Test the explicit `cstring` method independently, verifying that it produces correct null-terminated byte arrays for all string variants including empty strings, single-character strings, and strings containing embedded nulls. Verify that pure Coex string operations remain unaffected by this change.
+
+---

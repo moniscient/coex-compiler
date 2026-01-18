@@ -1,0 +1,60 @@
+Here's an implementation prompt for adding task sleep functionality to Coex:
+
+---
+
+**Implement Task Sleep with Timer Heap**
+
+Add a `sleep(duration)` function for Coex tasks that yields the coroutine and reschedules it after the specified duration, allowing the worker thread to continue executing other tasks.
+
+**Core Components**
+
+The timer heap should be a min-heap of sleeping tasks keyed by absolute wake time. Store entries as pairs of (wake_time, task_pointer) where wake_time is computed as current_time + duration at the moment of the sleep call. Use `clock_gettime(CLOCK_MONOTONIC, ...)` for timing to avoid issues with wall-clock adjustments. The heap belongs to the thread pool and requires synchronization for access.
+
+**Sleep Operation**
+
+When a task calls `sleep(duration_ns)`:
+
+1. Compute the absolute wake time by reading CLOCK_MONOTONIC and adding the duration.
+2. Save the coroutine's continuation state (the resume point after the sleep call).
+3. Acquire the timer heap lock, push the (wake_time, task) entry, release the lock.
+4. Yield control back to the worker's scheduling loop—do not block the thread.
+
+**Worker Scheduling Loop Modification**
+
+Modify the worker's task acquisition logic to check the timer heap when no other work is available. The priority order should be: local queue, steal from other workers, then check timer heap. When checking the timer heap, peek at the root while holding the lock. If the root's wake time has passed, pop it and return that task for execution. If multiple tasks have expired wake times, consider popping all of them and enqueueing all but one to the local queue.
+
+**Idle Behavior**
+
+When a worker has no local tasks, nothing to steal, and the timer heap's soonest wake time is in the future, the worker should wait efficiently rather than spin. Use a condition variable with a timeout set to the duration until the soonest wake time. Any operation that adds new ready work (task spawn, task completion, sleep insertion with earlier wake time) should signal this condition variable.
+
+**Cancellation Integration**
+
+A sleeping task that gets cancelled should be marked as cancelled but may remain in the timer heap. When popped from the heap, check the cancellation flag and discard the task rather than rescheduling it if cancelled. This avoids the complexity of heap removal.
+
+**Data Structures**
+
+```
+struct sleeping_task {
+    uint64_t wake_time_ns;
+    task_t *task;
+};
+
+struct timer_heap {
+    sleeping_task *entries;
+    size_t count;
+    size_t capacity;
+    pthread_mutex_t lock;
+};
+```
+
+Implement standard min-heap operations: push (sift up), pop (sift down), peek. The comparison is solely on wake_time_ns.
+
+**Coex Language Interface**
+
+Expose sleep as a built-in task function with signature `sleep(duration: u64) -> void` where duration is in nanoseconds. This should only be callable from task context, not from func or formula. The compiler should emit a call to the runtime's sleep implementation which handles the coroutine suspension.
+
+**Testing**
+
+Write tests that verify: a single task sleeping and waking at approximately the correct time; multiple tasks sleeping for different durations wake in the correct order; a sleeping task that gets cancelled does not resume; worker threads remain productive while tasks sleep; sleep with zero duration yields but resumes promptly.
+
+---
