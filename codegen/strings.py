@@ -17,19 +17,21 @@ All Coex string operations use the 'size' field for bounds checking, never
 null termination. This is a deliberate security design to prevent buffer
 overrun vulnerabilities that plague null-terminated C strings.
 
-C/POSIX Interop Null Termination (BUG-019)
-------------------------------------------
-String data buffers allocate ONE EXTRA BYTE beyond 'size' and write a null
-terminator at data[size]. This is required for passing strings to C/POSIX
-functions (open, getenv, extern C calls) that expect null-terminated strings.
+C/POSIX Interop (BUG-019 RESOLVED)
+----------------------------------
+When passing strings to C/extern functions, the compiler automatically creates
+null-terminated copies via `_marshal_string_for_extern()` in core.py. This
+ensures slice views are correctly null-terminated at the FFI boundary.
 
-THE COEX COMPILER MUST NEVER RELY ON THIS NULL BYTE FOR ITS OWN OPERATIONS.
+For explicit use, strings have a `cstring()` method that returns a [byte] array
+with the string's bytes plus a null terminator.
 
-The null byte exists only at position data[size], invisible to Coex code
-which always uses the size field. If you are writing Coex compiler code that
-reads strings, you MUST use the size field - never scan for null.
+String data buffers still allocate ONE EXTRA BYTE beyond 'size' and write a null
+terminator at data[size] for full (non-slice) strings, but this is no longer
+relied upon for extern calls.
 
-See BUG-019 in BUGS.md for tracking this issue.
+THE COEX COMPILER MUST NEVER RELY ON NULL BYTES FOR ITS OWN OPERATIONS.
+Always use the size field - never scan for null.
 """
 from llvmlite import ir
 from typing import TYPE_CHECKING
@@ -208,6 +210,11 @@ class StringGenerator:
         string_to_bytes_ty = ir.FunctionType(list_ptr, [string_ptr])
         cg.string_to_bytes = ir.Function(cg.module, string_to_bytes_ty, name="coex_string_to_bytes")
 
+        # string_cstring(s: String*) -> List* (byte array with null terminator)
+        # BUG-019: Produces a null-terminated byte array for C interop
+        string_cstring_ty = ir.FunctionType(list_ptr, [string_ptr])
+        cg.string_cstring = ir.Function(cg.module, string_cstring_ty, name="coex_string_cstring")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()
@@ -237,6 +244,7 @@ class StringGenerator:
         self._implement_string_from_bytes()
         self._implement_string_to_bytes()
         self._implement_string_split()
+        self._implement_string_cstring()  # BUG-019: C-compatible null-terminated string
         # Note: string_validjson is implemented after JSON type is created
 
         # Register String type methods
@@ -1892,6 +1900,82 @@ class StringGenerator:
         final_result = builder.load(list_ptr)
         builder.ret(final_result)
 
+    def _implement_string_cstring(self):
+        """Convert String to null-terminated byte array for C interop (BUG-019).
+
+        Returns a [byte] array containing the string's bytes plus a null terminator.
+        This is the safe way to pass strings to C functions, especially for slice
+        views where the original null terminator may not be at the expected position.
+
+        The returned array has length = string.size + 1, with the last byte being 0.
+        """
+        cg = self.cg
+        func = cg.string_cstring
+        func.args[0].name = "s"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+
+        s = func.args[0]
+
+        # Get string data pointer and size
+        data_ptr = builder.call(cg.string_data, [s])
+        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
+
+        # Calculate new size (size + 1 for null terminator)
+        new_size = builder.add(byte_size, one)
+
+        # Create a new byte array list with capacity for size + 1 bytes
+        byte_list = builder.call(cg.list_new, [one])  # elem_size = 1 for bytes
+
+        # We need to append all bytes one at a time, then append null
+        # Store list pointer for updates
+        list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="list")
+        builder.store(byte_list, list_ptr)
+
+        # Loop through all bytes in the string
+        idx_ptr = builder.alloca(i64, name="idx")
+        builder.store(zero, idx_ptr)
+
+        loop_header = func.append_basic_block("loop_header")
+        loop_body = func.append_basic_block("loop_body")
+        loop_end = func.append_basic_block("loop_end")
+
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_header)
+        idx = builder.load(idx_ptr)
+        in_bounds = builder.icmp_unsigned("<", idx, byte_size)
+        builder.cbranch(in_bounds, loop_body, loop_end)
+
+        builder.position_at_end(loop_body)
+        # Get source byte pointer
+        src_byte_ptr = builder.gep(data_ptr, [idx])
+        # Append to list
+        current_list = builder.load(list_ptr)
+        new_list = builder.call(cg.list_append, [current_list, src_byte_ptr, one])
+        builder.store(new_list, list_ptr)
+        # Increment index
+        new_idx = builder.add(idx, one)
+        builder.store(new_idx, idx_ptr)
+        builder.branch(loop_header)
+
+        builder.position_at_end(loop_end)
+        # Append the null terminator
+        null_byte = builder.alloca(i8, name="null_byte")
+        builder.store(ir.Constant(i8, 0), null_byte)
+        current_list = builder.load(list_ptr)
+        final_list = builder.call(cg.list_append, [current_list, null_byte, one])
+
+        builder.ret(final_list)
+
     def implement_string_validjson(self):
         """Implement string_validjson - called after JSON type is created."""
         cg = self.cg
@@ -1934,6 +2018,7 @@ class StringGenerator:
             "validjson": "coex_string_validjson",
             "bytes": "coex_string_to_bytes",
             "split": "coex_string_split",
+            "cstring": "coex_string_cstring",
         }
 
         # Store function references for direct access
@@ -1964,3 +2049,4 @@ class StringGenerator:
         cg.functions["coex_string_from_hex"] = cg.string_from_hex
         cg.functions["coex_string_from_bytes"] = cg.string_from_bytes
         cg.functions["coex_string_to_bytes"] = cg.string_to_bytes
+        cg.functions["coex_string_cstring"] = cg.string_cstring

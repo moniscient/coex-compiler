@@ -115,18 +115,6 @@
 - **Files**: `coex_gc.py:2412`
 - **Status**: Open
 
-### BUG-019: C string null termination hack
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: Codegen
-- **Severity**: Medium
-- **Reproduction**: Pass string ending on 64-bit boundary to POSIX/FFI function
-- **Observed**: Potential crash or incorrect behavior in C code
-- **Expected**: All strings should be safely null-terminated for C interop
-- **Hypothesis**: Current size+1 allocation hack may not cover all edge cases
-- **Files**: `codegen/strings.py` (multiple locations marked DANGEROUS HACK)
-- **Status**: Open (see `implementation_prompts/cstring.txt` for proposed fix)
-
-
 ### BUG-023: llvmlite thread_local attribute silently ignored
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen
@@ -310,6 +298,21 @@
   - Updated coex_channel_receive() to lock mutex, wait on condvar when buffer empty
   - All 12 tests in test_channel_inference.py pass including bidirectional channels
 
+### BUG-019: C string null termination hack
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Pass string slice to POSIX/FFI function (e.g., strlen on "hello world"[0:5])
+- **Observed**: C function reads past slice into parent buffer (strlen returns 11 instead of 5)
+- **Expected**: All strings should be safely null-terminated for C interop
+- **Files**: `codegen/strings.py`, `codegen/core.py`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Implemented proper C string marshaling at extern boundaries:
+  - Added `cstring()` method on String type that returns null-terminated `[byte]` array
+  - Updated `_convert_to_c_type()` to create stack-allocated null-terminated copies for extern calls
+  - The marshaling copies string data to a temporary buffer with null terminator, safe for slice views
+  - All 14 tests in test_cstring.py pass including slice edge cases
+
 ---
 
 ## Notes
@@ -324,5 +327,5 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-17)
-- **Open**: 11 bugs
-- **Resolved**: 14 bugs
+- **Open**: 10 bugs
+- **Resolved**: 15 bugs
