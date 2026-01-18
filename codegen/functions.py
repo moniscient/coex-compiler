@@ -34,6 +34,79 @@ class FunctionGenerator:
         self.cg = cg
 
     # ========================================================================
+    # Formula32 Precision Conversion Helpers
+    # ========================================================================
+
+    def narrow_to_32bit(self, builder: ir.IRBuilder, value: ir.Value,
+                        coex_type: Type) -> ir.Value:
+        """Narrow a 64-bit value to 32-bit for formula32 semantics.
+
+        For integers: saturate to INT32 range, then truncate
+        For floats: fptrunc f64 to f32
+
+        Args:
+            builder: LLVM IR builder
+            value: The 64-bit value to narrow
+            coex_type: The Coex type annotation (to determine if int or float)
+
+        Returns:
+            The narrowed 32-bit value (still stored in 64-bit container for ABI)
+        """
+        if coex_type is None:
+            return value
+
+        type_name = getattr(coex_type, 'name', str(coex_type))
+
+        if type_name in ('int', 'int64'):
+            # Saturate to INT32 range, then truncate and sign-extend
+            # This ensures 32-bit overflow semantics
+            i32_max = ir.Constant(ir.IntType(64), 2147483647)
+            i32_min = ir.Constant(ir.IntType(64), -2147483648)
+
+            # Clamp to INT32 range
+            clamped = builder.select(
+                builder.icmp_signed('>', value, i32_max),
+                i32_max, value
+            )
+            clamped = builder.select(
+                builder.icmp_signed('<', clamped, i32_min),
+                i32_min, clamped
+            )
+
+            # Truncate to i32 and sign-extend back to i64
+            # This gives us 32-bit arithmetic semantics in a 64-bit container
+            i32_val = builder.trunc(clamped, ir.IntType(32))
+            return builder.sext(i32_val, ir.IntType(64))
+
+        elif type_name in ('float', 'float64'):
+            # Truncate to f32 and extend back to f64
+            # This gives us 32-bit float precision in a 64-bit container
+            f32_val = builder.fptrunc(value, ir.FloatType())
+            return builder.fpext(f32_val, ir.DoubleType())
+
+        return value
+
+    def widen_from_32bit(self, builder: ir.IRBuilder, value: ir.Value,
+                         coex_type: Type) -> ir.Value:
+        """Widen a value from 32-bit semantics to 64-bit for return.
+
+        For formula32, values are already in 64-bit containers but limited
+        to 32-bit range/precision. This method ensures proper casting
+        for the return type.
+
+        Args:
+            builder: LLVM IR builder
+            value: The value (in 64-bit container) to widen
+            coex_type: The Coex return type
+
+        Returns:
+            The properly typed 64-bit value for return
+        """
+        # Values are already in 64-bit containers from narrow_to_32bit
+        # Just ensure proper type for return
+        return value
+
+    # ========================================================================
     # Function Declaration
     # ========================================================================
 
@@ -129,7 +202,7 @@ class FunctionGenerator:
         # task and formula cannot call extern (they must be non-blocking)
         if hasattr(cg, 'current_function') and cg.current_function:
             caller_kind = cg.current_function.kind
-            if caller_kind == FunctionKind.FORMULA:
+            if caller_kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                 raise RuntimeError(
                     f"Cannot call extern function '{name}' from formula "
                     f"'{cg.current_function.name}'. Extern functions can only "
@@ -460,7 +533,7 @@ class FunctionGenerator:
         # the arena, which is bulk-freed on return. This provides ~10x faster
         # allocation for temporaries that don't escape.
         cg.arena_start = None
-        if func.kind == FunctionKind.FORMULA and cg.gc is not None:
+        if func.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32) and cg.gc is not None:
             # Push arena scope - saves TLAB cursor as arena start
             cg.arena_start = cg.builder.call(cg.gc.gc_arena_push, [])
             cg.use_arena_allocation = True
@@ -499,6 +572,11 @@ class FunctionGenerator:
             param_value = llvm_param
             if cg._needs_parameter_copy(param.type_annotation):
                 param_value = cg._generate_deep_copy(llvm_param, param.type_annotation)
+
+            # Formula32: narrow parameters to 32-bit precision
+            # This ensures 32-bit overflow/precision semantics on CPU
+            if func.kind == FunctionKind.FORMULA32:
+                param_value = self.narrow_to_32bit(cg.builder, param_value, param.type_annotation)
 
             # Allocate on stack and store the value
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
@@ -665,6 +743,10 @@ class FunctionGenerator:
             param_value = llvm_param
             if cg._needs_parameter_copy(param_type):
                 param_value = cg._generate_deep_copy(llvm_param, param_type)
+
+            # Formula32: narrow parameters to 32-bit precision
+            if func_decl.kind == FunctionKind.FORMULA32:
+                param_value = self.narrow_to_32bit(cg.builder, param_value, param_type)
 
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.builder.store(param_value, alloca)

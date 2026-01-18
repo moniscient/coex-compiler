@@ -346,7 +346,10 @@ def _check_for_assign(node, codegen: 'CodeGenerator') -> Optional[OffloadCandida
 
 
 def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
-    """Check if an expression consists only of formula-kind function calls."""
+    """Check if an expression consists only of formula-kind function calls.
+
+    Both formula and formula32 are valid for GPU offload.
+    """
     from ast_nodes import (
         FunctionKind, CallExpr, Identifier, BinaryExpr, UnaryExpr,
         IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, CharLiteral, NilLiteral,
@@ -358,10 +361,10 @@ def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
         if func_name is None:
             return False
 
-        # Check if it's a formula
+        # Check if it's a formula (formula or formula32)
         if func_name in codegen.func_decls:
             decl = codegen.func_decls[func_name]
-            if decl.kind != FunctionKind.FORMULA:
+            if decl.kind not in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                 return False
         else:
             # Unknown function - might be a builtin
@@ -396,6 +399,46 @@ def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
 
     else:
         return False
+
+
+def _get_formula_precision(expr, codegen: 'CodeGenerator') -> int:
+    """Get precision (32 or 64) for a formula expression.
+
+    Returns 32 if any formula32 function is used in the expression,
+    otherwise returns 64 (default precision).
+    """
+    from ast_nodes import FunctionKind, CallExpr, BinaryExpr, UnaryExpr, MemberExpr, IndexExpr
+
+    if isinstance(expr, CallExpr):
+        func_name = _get_call_name(expr)
+        if func_name and func_name in codegen.func_decls:
+            decl = codegen.func_decls[func_name]
+            if decl.kind == FunctionKind.FORMULA32:
+                return 32
+
+        # Check arguments for formula32 usage
+        for arg in expr.args:
+            if _get_formula_precision(arg, codegen) == 32:
+                return 32
+        return 64
+
+    elif isinstance(expr, BinaryExpr):
+        left_precision = _get_formula_precision(expr.left, codegen)
+        right_precision = _get_formula_precision(expr.right, codegen)
+        # If either side uses 32-bit, the whole expression is 32-bit
+        return 32 if (left_precision == 32 or right_precision == 32) else 64
+
+    elif isinstance(expr, UnaryExpr):
+        return _get_formula_precision(expr.operand, codegen)
+
+    elif isinstance(expr, IndexExpr):
+        return _get_formula_precision(expr.object, codegen)
+
+    elif isinstance(expr, MemberExpr):
+        return _get_formula_precision(expr.object, codegen)
+
+    else:
+        return 64  # Default to 64-bit precision
 
 
 # Math functions that are formula-compatible (pure, no side effects)

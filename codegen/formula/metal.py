@@ -17,13 +17,23 @@ class MetalBackend(FormulaBackend):
     Generates Metal Shading Language (MSL) kernel source code.
     """
 
-    # Coex type to Metal type mapping
+    # Coex type to Metal type mapping (64-bit, default)
     # IMPORTANT: Coex int is 64-bit, so maps to Metal 'long' (int64_t)
     TYPE_MAP = {
         'int': 'long',         # Coex int is 64-bit
         'int64': 'long',
         'float': 'double',     # Coex float is 64-bit
         'float64': 'double',
+        'bool': 'bool',
+        'byte': 'uint8_t',
+    }
+
+    # 32-bit type mapping for formula32 functions
+    TYPE_MAP_32 = {
+        'int': 'int',          # 32-bit integer
+        'int64': 'int',        # Narrowed to 32-bit
+        'float': 'float',      # 32-bit float
+        'float64': 'float',    # Narrowed to 32-bit
         'bool': 'bool',
         'byte': 'uint8_t',
     }
@@ -54,14 +64,23 @@ class MetalBackend(FormulaBackend):
     def get_name(self) -> str:
         return "Metal (Apple GPU)"
 
-    def map_type(self, coex_type: str) -> str:
-        """Map Coex type to Metal type."""
-        if coex_type in self.TYPE_MAP:
-            return self.TYPE_MAP[coex_type]
+    def map_type(self, coex_type: str, precision: int = 64) -> str:
+        """Map Coex type to Metal type.
+
+        Args:
+            coex_type: The Coex type name
+            precision: 32 or 64 for formula32 or formula functions
+
+        Returns:
+            The corresponding Metal type name.
+        """
+        type_map = self.TYPE_MAP_32 if precision == 32 else self.TYPE_MAP
+        if coex_type in type_map:
+            return type_map[coex_type]
         # Handle array types like [int] -> device int*
         if coex_type.startswith('[') and coex_type.endswith(']'):
             inner = coex_type[1:-1]
-            return f"device {self.map_type(inner)}*"
+            return f"device {self.map_type(inner, precision)}*"
         return coex_type
 
     def emit_map_kernel(
@@ -69,28 +88,43 @@ class MetalBackend(FormulaBackend):
         kernel_name: str,
         formula_body: str,
         input_params: List[Tuple[str, str]],
-        output_type: str
+        output_type: str,
+        precision: int = 64
     ) -> str:
         """Emit a Metal map kernel for parallel element-wise operations.
 
         Generates MSL code that processes each element in parallel.
-        """
-        metal_output_type = self.map_type(output_type)
 
-        # Build buffer parameters
+        For precision=32 (formula32), the kernel uses 32-bit types internally
+        while maintaining 64-bit buffer interfaces for Coex ABI compatibility.
+        Narrowing happens on load, widening happens on store.
+
+        Args:
+            kernel_name: Name for the kernel function
+            formula_body: The formula body transpiled to C-like syntax
+            input_params: List of (parameter_name, coex_type) tuples
+            output_type: Coex type of output elements
+            precision: 32 or 64 - determines internal compute precision
+        """
+        # Buffer types are always 64-bit for ABI compatibility
+        metal_buffer_output_type = self.map_type(output_type, precision=64)
+        # Internal compute type depends on precision
+        metal_compute_type = self.map_type(output_type, precision=precision)
+
+        # Build buffer parameters (always 64-bit interface)
         buffer_params = []
         buffer_idx = 0
 
         for param_name, param_type in input_params:
-            metal_type = self.map_type(param_type)
+            metal_type = self.map_type(param_type, precision=64)  # 64-bit buffers
             buffer_params.append(
                 f"    device const {metal_type}* {param_name} [[buffer({buffer_idx})]]"
             )
             buffer_idx += 1
 
-        # Output buffer
+        # Output buffer (64-bit)
         buffer_params.append(
-            f"    device {metal_output_type}* _output [[buffer({buffer_idx})]]"
+            f"    device {metal_buffer_output_type}* _output [[buffer({buffer_idx})]]"
         )
 
         # Thread index
@@ -100,8 +134,14 @@ class MetalBackend(FormulaBackend):
 
         params_str = ",\n".join(buffer_params)
 
-        # Generate input loading statements
-        input_loads = self._emit_input_loads(input_params)
+        # Generate input loading statements with precision conversion
+        input_loads = self._emit_input_loads(input_params, precision)
+
+        # Generate store with widening if needed
+        if precision == 32:
+            store_stmt = f"    _output[_id] = ({metal_buffer_output_type})_result;"
+        else:
+            store_stmt = "    _output[_id] = _result;"
 
         return f'''#include <metal_stdlib>
 using namespace metal;
@@ -112,11 +152,11 @@ kernel void {kernel_name}(
     // Load inputs for this thread
 {input_loads}
 
-    // Formula body
-    {metal_output_type} _result = {formula_body};
+    // Formula body (precision={precision})
+    {metal_compute_type} _result = {formula_body};
 
     // Store output
-    _output[_id] = _result;
+{store_stmt}
 }}
 '''
 
@@ -124,19 +164,26 @@ kernel void {kernel_name}(
         self,
         kernel_name: str,
         predicate_body: str,
-        input_params: List[Tuple[str, str]]
+        input_params: List[Tuple[str, str]],
+        precision: int = 64
     ) -> str:
         """Emit a Metal predicate kernel for filter operations.
 
         Each thread evaluates the predicate for one element.
         Results are stored as 0/1 in output buffer for subsequent reduction.
+
+        Args:
+            kernel_name: Name for the kernel function
+            predicate_body: The predicate formula transpiled to C-like syntax
+            input_params: List of (parameter_name, coex_type) tuples
+            precision: 32 or 64 - determines internal compute precision
         """
-        # Build buffer parameters
+        # Build buffer parameters (always 64-bit interface)
         buffer_params = []
         buffer_idx = 0
 
         for param_name, param_type in input_params:
-            metal_type = self.map_type(param_type)
+            metal_type = self.map_type(param_type, precision=64)
             buffer_params.append(
                 f"    device const {metal_type}* {param_name} [[buffer({buffer_idx})]]"
             )
@@ -153,7 +200,7 @@ kernel void {kernel_name}(
         )
 
         params_str = ",\n".join(buffer_params)
-        input_loads = self._emit_input_loads(input_params)
+        input_loads = self._emit_input_loads(input_params, precision)
 
         return f'''#include <metal_stdlib>
 using namespace metal;
@@ -161,7 +208,7 @@ using namespace metal;
 kernel void {kernel_name}(
 {params_str}
 ) {{
-    // Load inputs for this thread
+    // Load inputs for this thread (precision={precision})
 {input_loads}
 
     // Evaluate predicate
@@ -172,12 +219,23 @@ kernel void {kernel_name}(
 }}
 '''
 
-    def _emit_input_loads(self, input_params: List[Tuple[str, str]]) -> str:
-        """Emit Metal input loading statements."""
+    def _emit_input_loads(self, input_params: List[Tuple[str, str]], precision: int = 64) -> str:
+        """Emit Metal input loading statements with precision conversion.
+
+        For precision=32, loads from 64-bit buffers and narrows to 32-bit.
+        For precision=64, loads directly without conversion.
+        """
         loads = []
         for param_name, param_type in input_params:
-            metal_type = self.map_type(param_type)
-            loads.append(f"    {metal_type} _{param_name} = {param_name}[_id];")
+            # Compute type depends on precision
+            metal_compute_type = self.map_type(param_type, precision=precision)
+
+            if precision == 32:
+                # Load from 64-bit buffer and narrow to 32-bit
+                loads.append(f"    {metal_compute_type} _{param_name} = ({metal_compute_type}){param_name}[_id];")
+            else:
+                # Load directly (no conversion needed)
+                loads.append(f"    {metal_compute_type} _{param_name} = {param_name}[_id];")
         return "\n".join(loads)
 
     def emit_dispatch_code(

@@ -1294,7 +1294,7 @@ class CodeGenerator:
 
         # Formulas require const bindings for purity
         if not stmt.is_const and self.current_function is not None:
-            if self.current_function.kind == FunctionKind.FORMULA:
+            if self.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                 raise RuntimeError(
                     f"Formula '{self.current_function.name}' requires const bindings. "
                     f"Use 'const {stmt.name} = ...' instead of '{stmt.name} = ...'."

@@ -16,6 +16,7 @@ from enum import Enum, auto
 
 class FunctionKind(Enum):
     FORMULA = auto()
+    FORMULA32 = auto()  # 32-bit precision formula (for GPU)
     TASK = auto()    # Lightweight coroutine (stackless)
     THREAD = auto()  # OS-level concurrency (pthreads)
     FUNC = auto()

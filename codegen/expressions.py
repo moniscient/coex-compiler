@@ -25,7 +25,7 @@ from ast_nodes import (
     SelfExpr, CellExpr, CellIndexExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
-    AtomicType
+    AtomicType, ListType, ArrayType, SetType, FunctionDecl
 )
 
 if TYPE_CHECKING:
@@ -1269,8 +1269,12 @@ class ExpressionGenerator:
                     return self._generate_task_call(name, func, expr.args)
 
                 args = []
+                func_decl = cg.func_decls.get(name)
                 for i, arg in enumerate(expr.args):
                     arg_val = self.generate_expression(arg)
+                    # Try implicit collection conversion if we have parameter type info
+                    if func_decl:
+                        arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
                     if i < len(func.args):
                         expected = func.args[i].type
                         arg_val = cg._cast_value(arg_val, expected)
@@ -1286,9 +1290,13 @@ class ExpressionGenerator:
                 if type_args:
                     mangled = cg._monomorphize_function(name, type_args)
                     func = cg.functions[mangled]
+                    func_decl = cg.generic_functions[name]
                     args = []
                     for i, arg in enumerate(expr.args):
                         arg_val = self.generate_expression(arg)
+                        # Try implicit collection conversion if we have parameter type info
+                        if func_decl:
+                            arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
                         if i < len(func.args):
                             expected = func.args[i].type
                             arg_val = cg._cast_value(arg_val, expected)
@@ -1307,9 +1315,13 @@ class ExpressionGenerator:
                     if func_name in module_info.functions:
                         mangled = module_info.functions[func_name]
                         func = cg.functions[mangled]
+                        func_decl = cg.func_decls.get(mangled)
                         args = []
                         for i, arg in enumerate(expr.args):
                             arg_val = self.generate_expression(arg)
+                            # Try implicit collection conversion if we have parameter type info
+                            if func_decl:
+                                arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
                             if i < len(func.args):
                                 expected = func.args[i].type
                                 arg_val = cg._cast_value(arg_val, expected)
@@ -1358,6 +1370,64 @@ class ExpressionGenerator:
         return ir.Constant(ir.IntType(64), 0)
 
     # ========================================================================
+    # Implicit Collection Conversion for Function Arguments
+    # ========================================================================
+
+    def _convert_function_arg_if_needed(self, arg_val: ir.Value, param_idx: int,
+                                        func_decl: FunctionDecl) -> ir.Value:
+        """Try implicit collection conversion for a function argument.
+
+        If the expected parameter type is a collection type (List, Array, Set)
+        and the argument is a different collection type, perform implicit conversion
+        and emit a compiler warning.
+
+        Args:
+            arg_val: The LLVM value of the argument
+            param_idx: Index of the parameter in the function declaration
+            func_decl: The AST function declaration containing parameter types
+
+        Returns:
+            The (possibly converted) argument value
+        """
+        cg = self.cg
+
+        # Check if we have parameter type info
+        if param_idx >= len(func_decl.params):
+            return arg_val
+
+        param = func_decl.params[param_idx]
+        expected_type = param.type_annotation
+
+        # Only try conversion for collection types
+        if not isinstance(expected_type, (ListType, ArrayType, SetType)):
+            return arg_val
+
+        # Try implicit collection conversion
+        converted_value, was_converted = cg._try_implicit_collection_conversion(
+            arg_val, expected_type
+        )
+
+        if was_converted:
+            # Get source struct name for warning message
+            source_struct = "unknown"
+            if isinstance(arg_val.type, ir.PointerType) and hasattr(arg_val.type.pointee, 'name'):
+                source_struct = arg_val.type.pointee.name
+
+            # Determine target struct name
+            if isinstance(expected_type, ListType):
+                target_struct = "struct.List"
+            elif isinstance(expected_type, ArrayType):
+                target_struct = "struct.Array"
+            else:
+                target_struct = "struct.Set"
+
+            warning_msg = cg._get_conversion_warning_message(source_struct, target_struct)
+            cg._emit_warning("PERF", f"Parameter '{param.name}': {warning_msg}")
+            return converted_value
+
+        return arg_val
+
+    # ========================================================================
     # Function Kind Hierarchy Check
     # ========================================================================
 
@@ -1382,11 +1452,13 @@ class ExpressionGenerator:
 
         # Define what each kind can call
         # Key = caller kind, Value = set of allowed callee kinds
+        # formula32 has same purity constraints as formula (can call formula or formula32)
         allowed = {
-            FunctionKind.FORMULA: {FunctionKind.FORMULA},
-            FunctionKind.TASK: {FunctionKind.FORMULA, FunctionKind.TASK},
-            FunctionKind.THREAD: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD},
-            FunctionKind.FUNC: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD, FunctionKind.FUNC},
+            FunctionKind.FORMULA: {FunctionKind.FORMULA, FunctionKind.FORMULA32},
+            FunctionKind.FORMULA32: {FunctionKind.FORMULA, FunctionKind.FORMULA32},
+            FunctionKind.TASK: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK},
+            FunctionKind.THREAD: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK, FunctionKind.THREAD},
+            FunctionKind.FUNC: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK, FunctionKind.THREAD, FunctionKind.FUNC},
             FunctionKind.EXTERN: set(),  # extern can't call anything (it's a declaration)
         }
 
@@ -1606,7 +1678,7 @@ class ExpressionGenerator:
                 if isinstance(coex_type, AtomicType):
                     # Formula purity check: formulas cannot use atomic operations
                     if hasattr(cg, 'current_function') and cg.current_function:
-                        if cg.current_function.kind == FunctionKind.FORMULA:
+                        if cg.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                             raise RuntimeError(
                                 f"Cannot use atomic operations in formula '{cg.current_function.name}'. "
                                 f"Formulas must be pure and cannot use mutable atomic state."
