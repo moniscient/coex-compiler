@@ -83,17 +83,26 @@
 - **Files**: `coex_gc.py` (TLS variables), all code using thread-local state
 - **Status**: Open (workaround in place: use pthread TLS via ThreadEntry struct)
 
+### BUG-026: Test files use `=` instead of `:=` for task assignment
+- **Discovered**: 2026-01-17, during GPU offload implementation testing
+- **Category**: Semantic
+- **Severity**: Low
+- **Reproduction**: Run `python3 -m pytest tests/test_scheduler.py tests/test_task_state_machine.py`
+- **Observed**: 6 tests fail with error: `Cannot assign task result with '=' operator. Use ':=' for blocking assignment`
+- **Expected**: Tests should use correct `:=` syntax for task calls
+- **Hypothesis**: Tests were written before BUG-012 fix enforced `:=` for task assignment
+- **Files**:
+  - `tests/test_scheduler.py` (lines 149, 219: `result = leaf(i)`, `result = tiny(i)`)
+  - `tests/test_task_state_machine.py` (similar patterns)
+- **Status**: Open
+- **Failing Tests**:
+  - `test_scheduler.py::TestTaskExecution::test_sequential_tasks`
+  - `test_scheduler.py::TestConcurrentExecution::test_parallel_tasks`
+  - `test_scheduler.py::TestSchedulerInvariants::test_result_delivered_to_correct_waiter`
+  - `test_scheduler.py::TestSchedulerInvariants::test_workers_reused_across_batches`
+  - `test_task_state_machine.py::TestTaskStateMachine::test_both_branches_suspend`
+  - `test_task_state_machine.py::TestTaskInvariants::test_func_can_call_task`
 
-### BUG-025: GC stack overflow with large lists (500k+ elements)
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: GC
-- **Severity**: High
-- **Reproduction**: Create list with 500,000-750,000+ elements, trigger GC
-- **Observed**: `EXC_BAD_ACCESS (code=2)` at stack addresses during GC free-list traversal
-- **Expected**: GC should handle arbitrarily large collections
-- **Hypothesis**: Recursive free-list traversal exhausts stack space
-- **Files**: `coex_gc.py`, `prompts/gc_stack_overflow_fix.md`
-- **Status**: Open (500k tests pass, but 750k+ may still fail)
 
 ---
 
@@ -321,6 +330,21 @@
   - `coex_task_signal_complete` signals the shared waiter if present
   - All 21 first/most tests pass, eliminating 1ms polling delay
 
+### BUG-025: GC stack overflow with large lists (500k+ elements)
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Create list with 500,000-750,000+ elements, trigger GC
+- **Observed**: Was crashing with `EXC_BAD_ACCESS` at stack addresses during GC marking
+- **Expected**: GC should handle arbitrarily large collections
+- **Files**: `coex_gc.py`
+- **Status**: Resolved (2026-01-17)
+- **Resolution**: Fixed by Phase 5 worklist-based marking implementation:
+  - `gc_mark_object` now uses `gc_mark_push` to add child handles to worklist
+  - `gc_mark_drain` processes worklist iteratively instead of recursive calls
+  - Verified with stress tests: 750k, 1M, and 10M element lists all pass
+  - All 12 GC stress tests pass including 1M allocations with nested function calls
+
 ### BUG-011: Nested UDT to JSON conversion not implemented
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen
@@ -353,4 +377,4 @@
 
 ### Bug Count Summary (as of 2026-01-17)
 - **Open**: 5 bugs
-- **Resolved**: 20 bugs
+- **Resolved**: 21 bugs

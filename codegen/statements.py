@@ -278,6 +278,12 @@ class StatementGenerator:
         elif isinstance(stmt, LlvmIrStmt):
             cg._generate_llvm_ir_block(stmt)
         elif isinstance(stmt, ExprStmt):
+            # Check for bare formula call and emit warning
+            if self._is_formula_call(stmt.expr):
+                cg._emit_warning(
+                    "WARN",
+                    "bare formula calls have no purpose"
+                )
             # Check if this is a bare thread/task call (fire-and-forget)
             if self._is_thread_or_task_call(stmt.expr):
                 self._generate_fire_and_forget_call(stmt.expr)
@@ -293,6 +299,17 @@ class StatementGenerator:
                 if name in cg.func_decls:
                     kind = cg.func_decls[name].kind
                     return kind in (FunctionKind.THREAD, FunctionKind.TASK)
+        return False
+
+    def _is_formula_call(self, expr) -> bool:
+        """Check if expression is a call to a formula function."""
+        cg = self.cg
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name
+                if name in cg.func_decls:
+                    kind = cg.func_decls[name].kind
+                    return kind == FunctionKind.FORMULA
         return False
 
     def _generate_fire_and_forget_call(self, expr: CallExpr):
