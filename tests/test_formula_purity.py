@@ -254,8 +254,8 @@ thread th1() -> int
 
 func test_all() -> int
     a = f1()
-    b = t1()
-    c = th1()
+    b := t1()
+    c := th1()
     return a + b + c
 ~
 

@@ -137,7 +137,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    result: int = compute(21)
+    result := compute(21)
     print(result)
     return 0
 ~
