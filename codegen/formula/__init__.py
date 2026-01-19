@@ -346,9 +346,64 @@ def _check_for_assign(node, codegen: 'CodeGenerator') -> Optional[OffloadCandida
 
 
 def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
-    """Check if an expression consists only of formula-kind function calls.
+    """Check if an expression contains a formula-kind function call.
+
+    An expression is a "formula expression" eligible for GPU offload if:
+    1. It contains at least one call to a formula or formula32 function
+    2. All other parts are safe constituents (literals, identifiers, operators)
 
     Both formula and formula32 are valid for GPU offload.
+    """
+    return _contains_formula_call(expr, codegen) and _is_safe_expression(expr, codegen)
+
+
+def _contains_formula_call(expr, codegen: 'CodeGenerator') -> bool:
+    """Check if an expression contains at least one formula function call."""
+    from ast_nodes import (
+        FunctionKind, CallExpr, BinaryExpr, UnaryExpr, MemberExpr, IndexExpr,
+        IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, CharLiteral, NilLiteral,
+        Identifier
+    )
+
+    if isinstance(expr, CallExpr):
+        func_name = _get_call_name(expr)
+        if func_name is None:
+            return False
+
+        # Check if it's a formula (formula or formula32)
+        if func_name in codegen.func_decls:
+            decl = codegen.func_decls[func_name]
+            if decl.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+                return True
+
+        # Also check if any argument contains a formula call
+        for arg in expr.args:
+            if _contains_formula_call(arg, codegen):
+                return True
+        return False
+
+    elif isinstance(expr, BinaryExpr):
+        return (_contains_formula_call(expr.left, codegen) or
+                _contains_formula_call(expr.right, codegen))
+
+    elif isinstance(expr, UnaryExpr):
+        return _contains_formula_call(expr.operand, codegen)
+
+    elif isinstance(expr, IndexExpr):
+        return (_contains_formula_call(expr.collection, codegen) or
+                _contains_formula_call(expr.index, codegen))
+
+    elif isinstance(expr, MemberExpr):
+        return _contains_formula_call(expr.object, codegen)
+
+    else:
+        return False
+
+
+def _is_safe_expression(expr, codegen: 'CodeGenerator') -> bool:
+    """Check if an expression consists only of safe constructs for GPU offload.
+
+    Safe constructs: formula calls, builtins, literals, identifiers, basic operators.
     """
     from ast_nodes import (
         FunctionKind, CallExpr, Identifier, BinaryExpr, UnaryExpr,
@@ -361,28 +416,26 @@ def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
         if func_name is None:
             return False
 
-        # Check if it's a formula (formula or formula32)
+        # Check if it's a formula (formula or formula32) or builtin
         if func_name in codegen.func_decls:
             decl = codegen.func_decls[func_name]
             if decl.kind not in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                 return False
-        else:
-            # Unknown function - might be a builtin
-            if func_name not in _FORMULA_BUILTINS:
-                return False
+        elif func_name not in _FORMULA_BUILTINS:
+            return False
 
         # Check all arguments recursively
         for arg in expr.args:
-            if not _is_formula_expression(arg, codegen):
+            if not _is_safe_expression(arg, codegen):
                 return False
         return True
 
     elif isinstance(expr, BinaryExpr):
-        return (_is_formula_expression(expr.left, codegen) and
-                _is_formula_expression(expr.right, codegen))
+        return (_is_safe_expression(expr.left, codegen) and
+                _is_safe_expression(expr.right, codegen))
 
     elif isinstance(expr, UnaryExpr):
-        return _is_formula_expression(expr.operand, codegen)
+        return _is_safe_expression(expr.operand, codegen)
 
     elif isinstance(expr, (IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, CharLiteral, NilLiteral)):
         return True
@@ -391,11 +444,11 @@ def _is_formula_expression(expr, codegen: 'CodeGenerator') -> bool:
         return True
 
     elif isinstance(expr, IndexExpr):
-        return (_is_formula_expression(expr.collection, codegen) and
-                _is_formula_expression(expr.index, codegen))
+        return (_is_safe_expression(expr.collection, codegen) and
+                _is_safe_expression(expr.index, codegen))
 
     elif isinstance(expr, MemberExpr):
-        return _is_formula_expression(expr.object, codegen)
+        return _is_safe_expression(expr.object, codegen)
 
     else:
         return False
@@ -616,6 +669,11 @@ def _generate_gpu_offload(candidate: OffloadCandidate, backend, codegen: 'CodeGe
     output_elem_size = ir.Constant(i64, get_element_size(output_type))
     output_buffer = marshaler.allocate_output_buffer(builder, count, output_elem_size)
 
+    # Determine type_code for Metal conversion: 0=float, 1=int
+    # Metal doesn't support 64-bit types, so we convert 64-bit <-> 32-bit
+    type_code_value = 0 if output_type in ('float', 'float64', 'double') else 1
+    type_code = ir.Constant(i64, type_code_value)
+
     # Declare and call coex_metal_dispatch
     dispatch_func = _get_or_declare_metal_dispatch(codegen)
     builder.call(dispatch_func, [
@@ -624,7 +682,8 @@ def _generate_gpu_offload(candidate: OffloadCandidate, backend, codegen: 'CodeGe
         builder.bitcast(input_ptr, i8_ptr),
         count,
         output_buffer,
-        output_elem_size
+        output_elem_size,
+        type_code
     ])
 
     # Create result Array from output buffer
@@ -723,12 +782,12 @@ def _get_or_declare_metal_dispatch(codegen: 'CodeGenerator'):
 
     # Declare the function
     # void coex_metal_dispatch(const char* src, const char* name,
-    #                          void* in, int64_t count, void* out, int64_t elem_size)
+    #                          void* in, int64_t count, void* out, int64_t elem_size, int64_t type_code)
     i8_ptr = ir.IntType(8).as_pointer()
     i64 = ir.IntType(64)
     void = ir.VoidType()
 
-    func_type = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr, i64, i8_ptr, i64])
+    func_type = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr, i64, i8_ptr, i64, i64])
     return ir.Function(codegen.module, func_type, name=func_name)
 
 

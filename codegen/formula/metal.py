@@ -17,18 +17,33 @@ class MetalBackend(FormulaBackend):
     Generates Metal Shading Language (MSL) kernel source code.
     """
 
-    # Coex type to Metal type mapping (64-bit, default)
-    # IMPORTANT: Coex int is 64-bit, so maps to Metal 'long' (int64_t)
+    # Coex type to Metal type mapping
+    # NOTE: Metal Shading Language does NOT support 64-bit types (double, long)!
+    # All floating point operations use 32-bit float.
+    # Integer operations use 32-bit int (Metal 'long' is not widely supported).
+    # Buffer interfaces remain 64-bit for Coex ABI compatibility - we narrow on load
+    # and widen on store in the kernel code.
     TYPE_MAP = {
-        'int': 'long',         # Coex int is 64-bit
+        'int': 'int',          # Metal doesn't support 64-bit int well, use 32-bit
+        'int64': 'int',        # Narrowed to 32-bit for compute
+        'float': 'float',      # Metal doesn't support double, use 32-bit float
+        'float64': 'float',    # Narrowed to 32-bit for compute
+        'bool': 'bool',
+        'byte': 'uint8_t',
+    }
+
+    # Buffer type mapping - these are the types used for buffer declarations
+    # Buffers can be 64-bit because they're just memory, but compute uses 32-bit
+    BUFFER_TYPE_MAP = {
+        'int': 'long',         # Coex int is 64-bit in memory
         'int64': 'long',
-        'float': 'double',     # Coex float is 64-bit
+        'float': 'double',     # Coex float is 64-bit in memory
         'float64': 'double',
         'bool': 'bool',
         'byte': 'uint8_t',
     }
 
-    # 32-bit type mapping for formula32 functions
+    # 32-bit type mapping for formula32 functions (same as TYPE_MAP now)
     TYPE_MAP_32 = {
         'int': 'int',          # 32-bit integer
         'int64': 'int',        # Narrowed to 32-bit
@@ -95,36 +110,35 @@ class MetalBackend(FormulaBackend):
 
         Generates MSL code that processes each element in parallel.
 
-        For precision=32 (formula32), the kernel uses 32-bit types internally
-        while maintaining 64-bit buffer interfaces for Coex ABI compatibility.
-        Narrowing happens on load, widening happens on store.
+        IMPORTANT: Metal Shading Language does NOT support 64-bit types (double, long).
+        All operations use 32-bit types. The precision parameter is ignored for Metal -
+        we always use 32-bit precision. Data conversion between Coex's 64-bit types
+        and Metal's 32-bit types happens in the marshaling layer.
 
         Args:
             kernel_name: Name for the kernel function
             formula_body: The formula body transpiled to C-like syntax
             input_params: List of (parameter_name, coex_type) tuples
             output_type: Coex type of output elements
-            precision: 32 or 64 - determines internal compute precision
+            precision: Ignored for Metal (always uses 32-bit due to Metal limitations)
         """
-        # Buffer types are always 64-bit for ABI compatibility
-        metal_buffer_output_type = self.map_type(output_type, precision=64)
-        # Internal compute type depends on precision
-        metal_compute_type = self.map_type(output_type, precision=precision)
+        # Metal only supports 32-bit types - always use TYPE_MAP (which is now 32-bit)
+        metal_output_type = self.map_type(output_type, precision=32)
 
-        # Build buffer parameters (always 64-bit interface)
+        # Build buffer parameters (32-bit types for Metal)
         buffer_params = []
         buffer_idx = 0
 
         for param_name, param_type in input_params:
-            metal_type = self.map_type(param_type, precision=64)  # 64-bit buffers
+            metal_type = self.map_type(param_type, precision=32)
             buffer_params.append(
                 f"    device const {metal_type}* {param_name} [[buffer({buffer_idx})]]"
             )
             buffer_idx += 1
 
-        # Output buffer (64-bit)
+        # Output buffer (32-bit)
         buffer_params.append(
-            f"    device {metal_buffer_output_type}* _output [[buffer({buffer_idx})]]"
+            f"    device {metal_output_type}* _output [[buffer({buffer_idx})]]"
         )
 
         # Thread index
@@ -134,14 +148,11 @@ class MetalBackend(FormulaBackend):
 
         params_str = ",\n".join(buffer_params)
 
-        # Generate input loading statements with precision conversion
-        input_loads = self._emit_input_loads(input_params, precision)
+        # Generate input loading statements (all 32-bit for Metal)
+        input_loads = self._emit_input_loads(input_params, precision=32)
 
-        # Generate store with widening if needed
-        if precision == 32:
-            store_stmt = f"    _output[_id] = ({metal_buffer_output_type})_result;"
-        else:
-            store_stmt = "    _output[_id] = _result;"
+        # Store directly (no conversion needed, all 32-bit)
+        store_stmt = "    _output[_id] = _result;"
 
         return f'''#include <metal_stdlib>
 using namespace metal;
@@ -152,8 +163,8 @@ kernel void {kernel_name}(
     // Load inputs for this thread
 {input_loads}
 
-    // Formula body (precision={precision})
-    {metal_compute_type} _result = {formula_body};
+    // Formula body (32-bit precision - Metal limitation)
+    {metal_output_type} _result = {formula_body};
 
     // Store output
 {store_stmt}

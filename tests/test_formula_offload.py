@@ -57,17 +57,19 @@ class TestMetalBackend:
     def test_metal_type_mapping(self):
         """Metal backend should correctly map Coex types.
 
-        Coex int is 64-bit, so maps to Metal 'long'.
-        Coex float is 64-bit, so maps to Metal 'double'.
+        Metal does NOT support 64-bit types (double, long).
+        All types are mapped to 32-bit equivalents for GPU computation.
+        Data conversion (64-bit <-> 32-bit) happens in the Metal dispatch layer.
         """
         backend = MetalBackend()
-        # Coex int is 64-bit -> Metal long
-        assert backend.map_type('int') == 'long'
-        # Coex float is 64-bit -> Metal double
-        assert backend.map_type('float') == 'double'
+        # Metal doesn't support 64-bit, so we use 32-bit types
+        # Coex int (64-bit) -> Metal int (32-bit)
+        assert backend.map_type('int') == 'int'
+        # Coex float (64-bit) -> Metal float (32-bit)
+        assert backend.map_type('float') == 'float'
         assert backend.map_type('bool') == 'bool'
-        assert backend.map_type('int64') == 'long'
-        assert backend.map_type('float64') == 'double'
+        assert backend.map_type('int64') == 'int'
+        assert backend.map_type('float64') == 'float'
 
     def test_metal_map_kernel_structure(self):
         """Metal map kernel should have correct structure."""
