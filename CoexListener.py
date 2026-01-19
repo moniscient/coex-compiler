@@ -737,6 +737,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#relativeIndex.
+    def enterRelativeIndex(self, ctx:CoexParser.RelativeIndexContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#relativeIndex.
+    def exitRelativeIndex(self, ctx:CoexParser.RelativeIndexContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#methodName.
     def enterMethodName(self, ctx:CoexParser.MethodNameContext):
         pass

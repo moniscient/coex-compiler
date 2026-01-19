@@ -1015,6 +1015,14 @@ class ASTBuilder:
             else:
                 # Member access: obj.field
                 return MemberExpr(base, member)
+        elif ctx.relativeIndex():
+            # Relative indexing for cellular automata: arr@[offset] or arr@[i, j]
+            # Must check before LBRACKET since @[ contains [
+            relative_index = ctx.relativeIndex()
+            offsets = []
+            for expr in relative_index.expression():
+                offsets.append(self.visit_expression(expr))
+            return RelativeIndexExpr(base, offsets)
         elif ctx.LBRACKET():
             # Index or slice access: obj[index], obj[i, j], or obj[start:end]
             slice_or_index = ctx.sliceOrIndex()

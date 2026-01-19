@@ -1303,9 +1303,16 @@ class GarbageCollector:
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
         self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': [32]}
         self.type_descriptors['Channel'] = self.TYPE_CHANNEL
-        # Array: { i8* owner, i64 offset, i64 len, i64 cap, i64 elem_size } = 40 bytes
-        # For slice views, owner points to the shared data buffer (traced via mark_array)
-        self.type_info[self.TYPE_ARRAY] = {'size': 40, 'ref_offsets': [0]}
+        # Array N-D struct (104 bytes = 13 i64 fields):
+        #   Field 0: handle (i64) - GC handle for data buffer
+        #   Field 1: ndim (i64) - number of dimensions
+        #   Field 2: shape [4 x i64] - dimensions
+        #   Field 3: strides [4 x i64] - byte strides
+        #   Field 4: offset (i64) - byte offset for views
+        #   Field 5: elem_size (i64) - element size
+        #   Field 6: type_id (i64) - element type
+        # For slice views, handle points to shared data buffer (traced via mark_array)
+        self.type_info[self.TYPE_ARRAY] = {'size': 104, 'ref_offsets': [0]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
         # JSON: { i8 tag, i64 value } = 16 bytes (with padding)
         # The value field at offset 8 may be a pointer (for string/array/object)
@@ -2873,16 +2880,22 @@ class GarbageCollector:
         builder.call(self.gc_mark_push, [tail_handle])  # Push to worklist
         builder.branch(done)
 
-        # Mark Array: owner pointer at field 0
-        # Array struct: { i64 owner (0), i64 offset (1), i64 len (2), i64 cap (3), i64 elem_size (4) }
-        # Owner stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
+        # Mark Array: handle pointer at field 0
+        # N-D Array struct (104 bytes):
+        #   Field 0: handle (i64) - GC handle for data buffer
+        #   Field 1: ndim (i64) - number of dimensions
+        #   Field 2: shape [4 x i64] - dimensions
+        #   Field 3: strides [4 x i64] - byte strides
+        #   Field 4: offset (i64) - byte offset for views
+        #   Field 5: elem_size (i64) - element size
+        #   Field 6: type_id (i64) - element type
+        # Handle stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
         builder.position_at_end(mark_array)
-        array_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
-        array_typed = builder.bitcast(ptr, array_ptr_type)
-        owner_i64_ptr = builder.gep(array_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        owner_i64 = builder.load(owner_i64_ptr)
-        owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
-        owner_handle = builder.call(self.gc_ptr_to_handle, [owner_ptr])
+        # Just read the first i64 at offset 0 (the handle field)
+        handle_i64_ptr = builder.bitcast(ptr, self.i64.as_pointer())
+        handle_i64 = builder.load(handle_i64_ptr)
+        handle_ptr = builder.inttoptr(handle_i64, self.i8_ptr)  # Convert i64 to pointer
+        owner_handle = builder.call(self.gc_ptr_to_handle, [handle_ptr])
         builder.call(self.gc_mark_push, [owner_handle])  # Push to worklist
         builder.branch(done)
 

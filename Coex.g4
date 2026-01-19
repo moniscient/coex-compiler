@@ -450,8 +450,14 @@ postfixOp
     | DOT INTEGER_LITERAL                                     // Tuple index access: t.0, t.1
     | DOT methodName genericArgs? LPAREN argumentList? RPAREN
     | LBRACKET sliceOrIndex RBRACKET                          // Index or slice
+    | AT LBRACKET relativeIndex RBRACKET                      // Relative index: arr@[offset] or arr@[i, j]
     | LPAREN argumentList? RPAREN
     | AS typeExpr                                             // Type cast: j as Person, j as int?
+    ;
+
+// Relative index expression for cellular automata
+relativeIndex
+    : expression (COMMA expression)*                          // Single or multi-dimensional offset
     ;
 
 // Method names can be identifiers or type keywords (for .int(), .float(), .string(), .bool())

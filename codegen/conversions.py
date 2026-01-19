@@ -33,6 +33,15 @@ class ConversionGenerator:
         Creates a new Array with the same elements as the List.
         For Persistent Vector List, we iterate using list_get since
         the data is stored in a tree structure, not contiguously.
+
+        N-D Array struct layout:
+            Field 0: handle (i64) - GC handle for data buffer
+            Field 1: ndim (i64) - number of dimensions
+            Field 2: shape [4 x i64] - dimensions
+            Field 3: strides [4 x i64] - byte strides
+            Field 4: offset (i64) - byte offset for views
+            Field 5: elem_size (i64) - element size
+            Field 6: type_id (i64) - element type
         """
         func = self.cg.builder.function
         i32 = ir.IntType(32)
@@ -46,20 +55,18 @@ class ConversionGenerator:
         elem_size_ptr = self.cg.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.cg.builder.load(elem_size_ptr)
 
-        # Create new Array with same capacity as List length
+        # Create new Array with same length as List
+        # array_new initializes all fields including shape[0]=len, strides[0]=elem_size
         array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, elem_size])
 
-        # Set Array len = list_len (field 2 in Array layout)
-        array_len_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        self.cg.builder.store(list_len, array_len_ptr)
-
-        # Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.cg.builder.load(array_owner_handle_ptr)
-        array_owner = self.cg.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Array data: compute handle + offset
+        # Field 0: handle, Field 4: offset
+        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle = self.cg.builder.load(array_handle_ptr)
+        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
-        array_data = self.cg.builder.gep(array_owner, [array_offset])
+        array_data = self.cg.builder.gep(array_base, [array_offset])
 
         # For Persistent Vector List, we can't just memcpy - we need to iterate
         # through the list using list_get since data may be in tree structure.
@@ -109,6 +116,15 @@ class ConversionGenerator:
 
         Creates a new Array with the elements from the HAMT-based Set.
         Uses set_to_list to collect keys, then copies to array.
+
+        N-D Array struct layout:
+            Field 0: handle (i64) - GC handle for data buffer
+            Field 1: ndim (i64) - number of dimensions
+            Field 2: shape [4 x i64] - dimensions
+            Field 3: strides [4 x i64] - byte strides
+            Field 4: offset (i64) - byte offset for views
+            Field 5: elem_size (i64) - element size
+            Field 6: type_id (i64) - element type
         """
         func = self.cg.builder.function
         i32 = ir.IntType(32)
@@ -118,7 +134,7 @@ class ConversionGenerator:
         # Get Set len (number of elements)
         set_len = self.cg.builder.call(self.cg.set_len, [set_ptr])
 
-        # Create Array with capacity = set_len, elem_size = 8 (i64 keys)
+        # Create Array with len = set_len, elem_size = 8 (i64 keys)
         elem_size = ir.Constant(i64, 8)
         array_ptr = self.cg.builder.call(self.cg.array_new, [set_len, elem_size])
 
@@ -130,21 +146,18 @@ class ConversionGenerator:
         list_data_handle = self.cg.builder.load(list_data_handle_ptr)
         list_data = self.cg.builder.inttoptr(list_data_handle, i8_ptr)
 
-        # Get array data pointer: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.cg.builder.load(array_owner_handle_ptr)
-        array_owner = self.cg.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Get array data pointer: compute handle + offset
+        # Field 0: handle, Field 4: offset
+        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle = self.cg.builder.load(array_handle_ptr)
+        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
-        array_data = self.cg.builder.gep(array_owner, [array_offset])
+        array_data = self.cg.builder.gep(array_base, [array_offset])
 
         # Copy list data to array: len * 8 bytes
         copy_size = self.cg.builder.mul(set_len, elem_size)
         self.cg.builder.call(self.cg.memcpy, [array_data, list_data, copy_size])
-
-        # Set array len (field 2 in Array layout)
-        arr_len_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        self.cg.builder.store(set_len, arr_len_ptr)
 
         return array_ptr
 
@@ -154,6 +167,15 @@ class ConversionGenerator:
         Creates a new List with the same elements as the Array.
         For Persistent Vector List, we iterate through the array and
         append each element to build the list.
+
+        N-D Array struct layout:
+            Field 0: handle (i64) - GC handle for data buffer
+            Field 1: ndim (i64) - number of dimensions
+            Field 2: shape [4 x i64] - dimensions
+            Field 3: strides [4 x i64] - byte strides
+            Field 4: offset (i64) - byte offset for views
+            Field 5: elem_size (i64) - element size
+            Field 6: type_id (i64) - element type
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
@@ -161,20 +183,21 @@ class ConversionGenerator:
 
         func = self.cg.builder.function
 
-        # Get Array length
+        # Get Array length (shape[0] for 1D arrays)
         array_len = self.cg.builder.call(self.cg.array_len, [array_ptr])
 
-        # Get Array elem_size (field 4 in Array layout)
-        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        # Get Array elem_size (field 5 in N-D Array layout)
+        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.cg.builder.load(elem_size_ptr)
 
-        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.cg.builder.load(array_owner_handle_ptr)
-        array_owner = self.cg.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Get Array data: compute handle + offset
+        # Field 0: handle, Field 4: offset
+        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle = self.cg.builder.load(array_handle_ptr)
+        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
-        array_data = self.cg.builder.gep(array_owner, [array_offset])
+        array_data = self.cg.builder.gep(array_base, [array_offset])
 
         # Create new empty List with same elem_size
         list_ptr = self.cg.builder.call(self.cg.list_new, [elem_size])
@@ -226,6 +249,15 @@ class ConversionGenerator:
 
         Creates a new Set with the same elements as the Array.
         Duplicate elements in the Array are deduplicated.
+
+        N-D Array struct layout:
+            Field 0: handle (i64) - GC handle for data buffer
+            Field 1: ndim (i64) - number of dimensions
+            Field 2: shape [4 x i64] - dimensions
+            Field 3: strides [4 x i64] - byte strides
+            Field 4: offset (i64) - byte offset for views
+            Field 5: elem_size (i64) - element size
+            Field 6: type_id (i64) - element type
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
@@ -233,20 +265,21 @@ class ConversionGenerator:
 
         func = self.cg.builder.function
 
-        # Get Array length
+        # Get Array length (shape[0] for 1D arrays)
         array_len = self.cg.builder.call(self.cg.array_len, [array_ptr])
 
-        # Get Array elem_size (field 4 in Array layout)
-        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        # Get Array elem_size (field 5 in N-D Array layout)
+        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.cg.builder.load(elem_size_ptr)
 
-        # Get Array data: compute owner + offset (Phase 4: owner is i64 handle)
-        array_owner_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        array_owner_handle = self.cg.builder.load(array_owner_handle_ptr)
-        array_owner = self.cg.builder.inttoptr(array_owner_handle, i8_ptr)
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Get Array data: compute handle + offset
+        # Field 0: handle, Field 4: offset
+        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle = self.cg.builder.load(array_handle_ptr)
+        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
-        array_data = self.cg.builder.gep(array_owner, [array_offset])
+        array_data = self.cg.builder.gep(array_base, [array_offset])
 
         # Create new empty Set with flags indicating element type
         flags = self.cg.MAP_FLAG_KEY_IS_PTR if elem_is_ptr else 0

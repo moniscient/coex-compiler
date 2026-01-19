@@ -19,7 +19,7 @@ from typing import List as PyList
 from ast_nodes import (
     Expr, IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, NilLiteral,
     Identifier, BinaryExpr, BinaryOp, UnaryExpr, UnaryOp, CallExpr,
-    MethodCallExpr, MemberExpr, IndexExpr, SliceExpr, TernaryExpr,
+    MethodCallExpr, MemberExpr, IndexExpr, RelativeIndexExpr, SliceExpr, TernaryExpr,
     ListExpr, MapExpr, SetExpr, TupleExpr, RangeExpr, LambdaExpr,
     SelfExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
@@ -81,6 +81,9 @@ class ExpressionGenerator:
 
         elif isinstance(expr, IndexExpr):
             return self.generate_index(expr)
+
+        elif isinstance(expr, RelativeIndexExpr):
+            return self.generate_relative_index(expr)
 
         elif isinstance(expr, SliceExpr):
             return self.generate_slice(expr)
@@ -725,20 +728,45 @@ class ExpressionGenerator:
 
         # Check if this is a user-defined type with a get method
         type_name = cg._get_type_name_from_ptr(obj.type)
+
+        # Special handling for Array multi-index BEFORE generic type_methods
+        # This handles arr[i, j] syntax for 2D arrays
+        if type_name == "Array" and len(expr.indices) >= 2:
+            row_idx = self.generate_expression(expr.indices[0])
+            col_idx = self.generate_expression(expr.indices[1])
+            row_idx = cg._cast_value(row_idx, ir.IntType(64))
+            col_idx = cg._cast_value(col_idx, ir.IntType(64))
+
+            elem_ptr = cg.builder.call(cg.array_get_2d, [obj, row_idx, col_idx])
+
+            # Get element type from Coex type tracking
+            elem_llvm_type = ir.IntType(64)  # default
+            if isinstance(expr.object, Identifier):
+                var_name = expr.object.name
+                if var_name in cg.var_coex_types:
+                    from ast_nodes import ArrayType
+                    coex_type = cg.var_coex_types[var_name]
+                    if isinstance(coex_type, ArrayType):
+                        elem_llvm_type = cg._get_llvm_type(coex_type.element_type)
+
+            typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+            return cg.builder.load(typed_ptr)
+
         if type_name and type_name in cg.type_methods:
             method_map = cg.type_methods[type_name]
             if "get" in method_map:
                 mangled = method_map["get"]
                 func = cg.functions[mangled]
 
-                # Build args: self first, then indices
+                # Build args: self first, then indices (but only as many as function expects)
                 args = [obj]
                 for i, idx_expr in enumerate(expr.indices):
+                    # Only add indices if function has matching parameters
+                    if i + 1 >= len(func.args):
+                        break
                     idx_val = self.generate_expression(idx_expr)
-                    # Cast to expected type (args[i+1] because args[0] is self)
-                    if i + 1 < len(func.args):
-                        expected = func.args[i + 1].type
-                        idx_val = cg._cast_value(idx_val, expected)
+                    expected = func.args[i + 1].type
+                    idx_val = cg._cast_value(idx_val, expected)
                     args.append(idx_val)
 
                 result = cg.builder.call(func, args)
@@ -765,7 +793,37 @@ class ExpressionGenerator:
         if isinstance(obj.type, ir.PointerType):
             pointee = obj.type.pointee
             if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                # Array indexing - call array_get and load the value
+                # Array indexing
+                # For N-D arrays:
+                # - arr[i] on 1D array: returns element
+                # - arr[i, j] on 2D array: returns element
+                # - arr[i] on 2D array: returns row view (1D array)
+
+                # Check if we have 2D indexing (multiple indices)
+                if len(expr.indices) >= 2:
+                    # 2D indexing with comma syntax: arr[row, col]
+                    row_idx = self.generate_expression(expr.indices[0])
+                    col_idx = self.generate_expression(expr.indices[1])
+                    row_idx = cg._cast_value(row_idx, ir.IntType(64))
+                    col_idx = cg._cast_value(col_idx, ir.IntType(64))
+
+                    elem_ptr = cg.builder.call(cg.array_get_2d, [obj, row_idx, col_idx])
+
+                    # Get element type from Coex type tracking
+                    elem_llvm_type = ir.IntType(64)  # default
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in cg.var_coex_types:
+                            from ast_nodes import ArrayType
+                            coex_type = cg.var_coex_types[var_name]
+                            if isinstance(coex_type, ArrayType):
+                                elem_llvm_type = cg._get_llvm_type(coex_type.element_type)
+
+                    typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+                    return cg.builder.load(typed_ptr)
+
+                # Single index - works for 1D arrays
+                # For 2D arrays, could return row view but for now returns element at linear index
                 if index.type != ir.IntType(64):
                     index = cg._cast_value(index, ir.IntType(64))
 
@@ -827,6 +885,70 @@ class ExpressionGenerator:
             return cg.builder.load(ptr)
 
         return ir.Constant(ir.IntType(64), 0)
+
+    def generate_relative_index(self, expr: RelativeIndexExpr) -> ir.Value:
+        """Generate code for relative indexing: arr[[offset]] or arr[[i, j]]
+
+        Used in cellular automata formulas to access neighbors relative to
+        the current position. Requires __ca_row__ and __ca_col__ (or __ca_pos__)
+        variables to be set in the current scope.
+
+        For 1D: arr[[offset]] accesses arr[__ca_pos__ + offset]
+        For 2D: arr[[r, c]] accesses arr[__ca_row__ + r, __ca_col__ + c]
+        """
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        obj = self.generate_expression(expr.object)
+        offsets = [self.generate_expression(off) for off in expr.offsets]
+
+        # Ensure offsets are i64
+        offsets = [cg._cast_value(off, i64) for off in offsets]
+
+        if len(offsets) == 1:
+            # 1D relative indexing: arr[[offset]]
+            # Look for __ca_pos__ variable
+            if "__ca_pos__" not in cg.locals:
+                raise RuntimeError("Relative indexing [[]] requires __ca_pos__ variable. "
+                                   "Use within a cellular automata context.")
+
+            ca_pos_ptr = cg.locals["__ca_pos__"]
+            ca_pos = builder.load(ca_pos_ptr)
+
+            # Compute absolute index: __ca_pos__ + offset
+            offset = offsets[0]
+            abs_index = builder.add(ca_pos, offset)
+
+            # Access element at absolute index
+            elem_ptr = builder.call(cg.array_get, [obj, abs_index])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            return builder.load(elem_ptr_i64)
+
+        elif len(offsets) == 2:
+            # 2D relative indexing: arr[[row_off, col_off]]
+            # Look for __ca_row__ and __ca_col__ variables
+            if "__ca_row__" not in cg.locals or "__ca_col__" not in cg.locals:
+                raise RuntimeError("2D relative indexing [[r, c]] requires __ca_row__ and "
+                                   "__ca_col__ variables. Use within a cellular automata context.")
+
+            ca_row_ptr = cg.locals["__ca_row__"]
+            ca_col_ptr = cg.locals["__ca_col__"]
+            ca_row = builder.load(ca_row_ptr)
+            ca_col = builder.load(ca_col_ptr)
+
+            # Compute absolute indices
+            row_off, col_off = offsets
+            abs_row = builder.add(ca_row, row_off)
+            abs_col = builder.add(ca_col, col_off)
+
+            # Access element at (abs_row, abs_col)
+            elem_ptr = builder.call(cg.array_get_2d, [obj, abs_row, abs_col])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            return builder.load(elem_ptr_i64)
+
+        else:
+            raise RuntimeError(f"Relative indexing supports 1D or 2D offsets, got {len(offsets)}")
 
     def generate_slice(self, expr: SliceExpr) -> ir.Value:
         """Generate code for slice read: obj[start:end]
@@ -1497,9 +1619,18 @@ class ExpressionGenerator:
                         return cg.builder.call(cg.string_from_bytes, [arg_val])
                     return cg.builder.call(cg.string_from_literal, [cg._get_string_literal("")])
 
-                # Special handling for Array.filled(size, value)
+                # Special handling for Array.zeros(size)
+                # Creates a zero-initialized array of `size` elements
+                if type_name == "Array" and expr.method == "zeros" and len(expr.args) >= 1:
+                    size_val = self.generate_expression(expr.args[0])
+                    size_val = cg._cast_value(size_val, ir.IntType(64))
+                    elem_size = ir.Constant(ir.IntType(64), 8)  # default to i64 elements
+                    # array_new initializes to zero via GC allocator
+                    return cg.builder.call(cg.array_new, [size_val, elem_size])
+
+                # Special handling for Array.fill(size, value)
                 # Creates an array of `size` elements, all initialized to `value`
-                if type_name == "Array" and expr.method == "filled" and len(expr.args) == 2:
+                if type_name == "Array" and expr.method == "fill" and len(expr.args) == 2:
                     size_val = self.generate_expression(expr.args[0])
                     size_val = cg._cast_value(size_val, ir.IntType(64))
                     fill_val = self.generate_expression(expr.args[1])
@@ -1518,28 +1649,173 @@ class ExpressionGenerator:
                         elem_size = ir.Constant(ir.IntType(64), 8)  # default
 
                     # Allocate the array
-                    array_ptr = cg.builder.call(cg.array_filled, [size_val, elem_size])
+                    array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
 
-                    # Fill with value using memset for bools, or loop for other types
-                    if isinstance(fill_val.type, ir.IntType) and fill_val.type.width == 1:
-                        # For bool arrays, use memset
-                        # Get data pointer from array
-                        owner_ptr = cg.builder.gep(array_ptr, [
-                            ir.Constant(ir.IntType(32), 0),
-                            ir.Constant(ir.IntType(32), 0)
-                        ], inbounds=True)
-                        owner_handle = cg.builder.load(owner_ptr)
-                        data_ptr = cg.builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+                    # Get data pointer: handle (field 0) + offset (field 4)
+                    handle_ptr = cg.builder.gep(array_ptr, [
+                        ir.Constant(ir.IntType(32), 0),
+                        ir.Constant(ir.IntType(32), 0)
+                    ], inbounds=True)
+                    handle = cg.builder.load(handle_ptr)
+                    base_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+                    offset_ptr = cg.builder.gep(array_ptr, [
+                        ir.Constant(ir.IntType(32), 0),
+                        ir.Constant(ir.IntType(32), 4)
+                    ], inbounds=True)
+                    offset = cg.builder.load(offset_ptr)
+                    data_ptr = cg.builder.gep(base_ptr, [offset])
 
-                        # memset to fill_val (0 for false, 1 for true)
-                        fill_byte = cg.builder.zext(fill_val, ir.IntType(8))
-                        cg.builder.call(cg.memset, [data_ptr, fill_byte, size_val])
-                    else:
-                        # For other types, we'd need a fill loop
-                        # For now, just set len = size (data is uninitialized/zero)
-                        pass
+                    # Fill loop
+                    func = cg.builder.function
+                    idx_alloca = cg.builder.alloca(ir.IntType(64), name="fill_idx")
+                    cg.builder.store(ir.Constant(ir.IntType(64), 0), idx_alloca)
 
+                    cond_bb = func.append_basic_block("fill_cond")
+                    body_bb = func.append_basic_block("fill_body")
+                    end_bb = func.append_basic_block("fill_end")
+
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(cond_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    done = cg.builder.icmp_unsigned(">=", idx, size_val)
+                    cg.builder.cbranch(done, end_bb, body_bb)
+
+                    cg.builder.position_at_end(body_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    elem_offset = cg.builder.mul(idx, elem_size)
+                    elem_ptr = cg.builder.gep(data_ptr, [elem_offset])
+
+                    # Store value based on type
+                    if isinstance(fill_val.type, ir.IntType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, fill_val.type.as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+                    elif isinstance(fill_val.type, ir.DoubleType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, ir.DoubleType().as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+                    elif isinstance(fill_val.type, ir.PointerType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, fill_val.type.as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+
+                    next_idx = cg.builder.add(idx, ir.Constant(ir.IntType(64), 1))
+                    cg.builder.store(next_idx, idx_alloca)
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(end_bb)
                     return array_ptr
+
+                # Legacy alias: Array.filled -> Array.fill
+                if type_name == "Array" and expr.method == "filled" and len(expr.args) == 2:
+                    size_val = self.generate_expression(expr.args[0])
+                    size_val = cg._cast_value(size_val, ir.IntType(64))
+                    fill_val = self.generate_expression(expr.args[1])
+                    elem_size = ir.Constant(ir.IntType(64), 8)
+                    array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
+
+                    # Get data pointer
+                    handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+                    handle = cg.builder.load(handle_ptr)
+                    base_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+                    offset_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
+                    offset = cg.builder.load(offset_ptr)
+                    data_ptr = cg.builder.gep(base_ptr, [offset])
+
+                    # Fill loop
+                    func = cg.builder.function
+                    idx_alloca = cg.builder.alloca(ir.IntType(64), name="filled_idx")
+                    cg.builder.store(ir.Constant(ir.IntType(64), 0), idx_alloca)
+
+                    cond_bb = func.append_basic_block("filled_cond")
+                    body_bb = func.append_basic_block("filled_body")
+                    end_bb = func.append_basic_block("filled_end")
+
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(cond_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    done = cg.builder.icmp_unsigned(">=", idx, size_val)
+                    cg.builder.cbranch(done, end_bb, body_bb)
+
+                    cg.builder.position_at_end(body_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    elem_offset = cg.builder.mul(idx, elem_size)
+                    elem_ptr = cg.builder.gep(data_ptr, [elem_offset])
+
+                    if isinstance(fill_val.type, ir.IntType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, fill_val.type.as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+                    elif isinstance(fill_val.type, ir.DoubleType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, ir.DoubleType().as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+                    elif isinstance(fill_val.type, ir.PointerType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, fill_val.type.as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+
+                    next_idx = cg.builder.add(idx, ir.Constant(ir.IntType(64), 1))
+                    cg.builder.store(next_idx, idx_alloca)
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(end_bb)
+                    return array_ptr
+
+                # Special handling for Array.identity(n)
+                # Creates an n x n identity matrix (2D array with 1s on diagonal)
+                if type_name == "Array" and expr.method == "identity" and len(expr.args) == 1:
+                    n_val = self.generate_expression(expr.args[0])
+                    n_val = cg._cast_value(n_val, ir.IntType(64))
+                    elem_size = ir.Constant(ir.IntType(64), 8)  # i64/f64 elements
+
+                    # Create 2D array
+                    array_ptr = cg.builder.call(cg.array_new_2d, [n_val, n_val, elem_size])
+
+                    # Get data pointer
+                    handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+                    handle = cg.builder.load(handle_ptr)
+                    data_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+
+                    # Fill diagonal with 1s using a loop
+                    func = cg.builder.function
+                    idx_alloca = cg.builder.alloca(ir.IntType(64), name="ident_idx")
+                    cg.builder.store(ir.Constant(ir.IntType(64), 0), idx_alloca)
+
+                    cond_bb = func.append_basic_block("ident_cond")
+                    body_bb = func.append_basic_block("ident_body")
+                    end_bb = func.append_basic_block("ident_end")
+
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(cond_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    done = cg.builder.icmp_unsigned(">=", idx, n_val)
+                    cg.builder.cbranch(done, end_bb, body_bb)
+
+                    cg.builder.position_at_end(body_bb)
+                    idx = cg.builder.load(idx_alloca)
+                    # Calculate offset: (idx * n + idx) * elem_size = idx * (n + 1) * elem_size
+                    n_plus_1 = cg.builder.add(n_val, ir.Constant(ir.IntType(64), 1))
+                    diag_idx = cg.builder.mul(idx, n_plus_1)
+                    elem_offset = cg.builder.mul(diag_idx, elem_size)
+                    elem_ptr = cg.builder.gep(data_ptr, [elem_offset])
+                    typed_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                    cg.builder.store(ir.Constant(ir.IntType(64), 1), typed_ptr)
+
+                    next_idx = cg.builder.add(idx, ir.Constant(ir.IntType(64), 1))
+                    cg.builder.store(next_idx, idx_alloca)
+                    cg.builder.branch(cond_bb)
+
+                    cg.builder.position_at_end(end_bb)
+                    return array_ptr
+
+                # Special handling for Array.zeros_2d(rows, cols)
+                # Creates a 2D zero-initialized array
+                if type_name == "Array" and expr.method == "zeros_2d" and len(expr.args) == 2:
+                    rows = self.generate_expression(expr.args[0])
+                    rows = cg._cast_value(rows, ir.IntType(64))
+                    cols = self.generate_expression(expr.args[1])
+                    cols = cg._cast_value(cols, ir.IntType(64))
+                    elem_size = ir.Constant(ir.IntType(64), 8)
+                    # array_new_2d initializes to zero via GC allocator
+                    return cg.builder.call(cg.array_new_2d, [rows, cols, elem_size])
 
                 # Look for static methods (factory methods)
                 mangled = f"{type_name}_{expr.method}"
@@ -1919,8 +2195,400 @@ class ExpressionGenerator:
                     return cg._list_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
+        # Array element-wise operations and reductions
+        if isinstance(obj.type, ir.PointerType):
+            pointee = obj.type.pointee
+            if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                return self._generate_array_operation(obj, method, expr.args)
+
         # Generic method lookup failed
         if type_name:
             raise RuntimeError(f"Undefined method '{method}' on type '{type_name}'")
         else:
             raise RuntimeError(f"Undefined method '{method}' on unknown type")
+
+    def _generate_array_operation(self, array_ptr: ir.Value, method: str, args: list) -> ir.Value:
+        """Generate element-wise operations and reductions for Array<T>.
+
+        Element-wise ops (return new Array):
+        - scale(scalar) - multiply all by scalar
+        - add(other) - element-wise addition
+        - sub(other) - element-wise subtraction
+        - mul(other) - Hadamard product
+        - div(other) - element-wise division
+
+        Reductions (return scalar):
+        - sum() - sum all elements
+        - min() - minimum element
+        - max() - maximum element
+        """
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        zero = ir.Constant(i64, 0)
+        one = ir.Constant(i64, 1)
+
+        # Get total element count
+        total_elements = builder.call(cg.array_total_size, [array_ptr])
+        elem_size = ir.Constant(i64, 8)  # Assume 64-bit elements
+
+        # Get source data pointer
+        src_data = builder.call(cg.array_get, [array_ptr, zero])
+
+        if method == "scale":
+            # scale(scalar) - multiply all elements by scalar
+            scalar = cg._generate_expression(args[0])
+            scalar_i64 = cg._cast_value(scalar, i64)
+
+            # Create new array with same size
+            new_arr = builder.call(cg.array_new, [total_elements, elem_size])
+            dst_data = builder.call(cg.array_get, [new_arr, zero])
+
+            # Loop over elements
+            idx_ptr = builder.alloca(i64, name="scale_idx")
+            builder.store(zero, idx_ptr)
+
+            loop_bb = builder.append_basic_block("scale_loop")
+            body_bb = builder.append_basic_block("scale_body")
+            exit_bb = builder.append_basic_block("scale_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+            src_elem_ptr = builder.gep(src_data, [offset])
+            src_elem_ptr_i64 = builder.bitcast(src_elem_ptr, i64.as_pointer())
+            src_elem = builder.load(src_elem_ptr_i64)
+
+            result_elem = builder.mul(src_elem, scalar_i64)
+
+            dst_elem_ptr = builder.gep(dst_data, [offset])
+            dst_elem_ptr_i64 = builder.bitcast(dst_elem_ptr, i64.as_pointer())
+            builder.store(result_elem, dst_elem_ptr_i64)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            return new_arr
+
+        elif method in ("add", "sub", "mul", "div"):
+            # Binary element-wise operations
+            other_arr = cg._generate_expression(args[0])
+
+            # Create new array with same size
+            new_arr = builder.call(cg.array_new, [total_elements, elem_size])
+            dst_data = builder.call(cg.array_get, [new_arr, zero])
+            other_data = builder.call(cg.array_get, [other_arr, zero])
+
+            # Loop over elements
+            idx_ptr = builder.alloca(i64, name=f"{method}_idx")
+            builder.store(zero, idx_ptr)
+
+            loop_bb = builder.append_basic_block(f"{method}_loop")
+            body_bb = builder.append_basic_block(f"{method}_body")
+            exit_bb = builder.append_basic_block(f"{method}_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+
+            src_elem_ptr = builder.gep(src_data, [offset])
+            src_elem_ptr_i64 = builder.bitcast(src_elem_ptr, i64.as_pointer())
+            src_elem = builder.load(src_elem_ptr_i64)
+
+            other_elem_ptr = builder.gep(other_data, [offset])
+            other_elem_ptr_i64 = builder.bitcast(other_elem_ptr, i64.as_pointer())
+            other_elem = builder.load(other_elem_ptr_i64)
+
+            if method == "add":
+                result_elem = builder.add(src_elem, other_elem)
+            elif method == "sub":
+                result_elem = builder.sub(src_elem, other_elem)
+            elif method == "mul":
+                result_elem = builder.mul(src_elem, other_elem)
+            elif method == "div":
+                result_elem = builder.sdiv(src_elem, other_elem)
+
+            dst_elem_ptr = builder.gep(dst_data, [offset])
+            dst_elem_ptr_i64 = builder.bitcast(dst_elem_ptr, i64.as_pointer())
+            builder.store(result_elem, dst_elem_ptr_i64)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            return new_arr
+
+        elif method == "sum":
+            # sum() - sum all elements
+            acc_ptr = builder.alloca(i64, name="sum_acc")
+            builder.store(zero, acc_ptr)
+
+            idx_ptr = builder.alloca(i64, name="sum_idx")
+            builder.store(zero, idx_ptr)
+
+            loop_bb = builder.append_basic_block("sum_loop")
+            body_bb = builder.append_basic_block("sum_body")
+            exit_bb = builder.append_basic_block("sum_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+            elem_ptr = builder.gep(src_data, [offset])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            elem = builder.load(elem_ptr_i64)
+
+            acc = builder.load(acc_ptr)
+            new_acc = builder.add(acc, elem)
+            builder.store(new_acc, acc_ptr)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            return builder.load(acc_ptr)
+
+        elif method == "mean":
+            # mean() - compute average of all elements (integer division)
+            acc_ptr = builder.alloca(i64, name="mean_acc")
+            builder.store(zero, acc_ptr)
+
+            idx_ptr = builder.alloca(i64, name="mean_idx")
+            builder.store(zero, idx_ptr)
+
+            loop_bb = builder.append_basic_block("mean_loop")
+            body_bb = builder.append_basic_block("mean_body")
+            exit_bb = builder.append_basic_block("mean_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+            elem_ptr = builder.gep(src_data, [offset])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            elem = builder.load(elem_ptr_i64)
+
+            acc = builder.load(acc_ptr)
+            new_acc = builder.add(acc, elem)
+            builder.store(new_acc, acc_ptr)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            total_sum = builder.load(acc_ptr)
+            # Integer division for mean
+            mean_val = builder.sdiv(total_sum, total_elements)
+            return mean_val
+
+        elif method == "min":
+            # min() - find minimum element
+            # Initialize with first element
+            first_ptr = builder.bitcast(src_data, i64.as_pointer())
+            first_elem = builder.load(first_ptr)
+            min_ptr = builder.alloca(i64, name="min_val")
+            builder.store(first_elem, min_ptr)
+
+            idx_ptr = builder.alloca(i64, name="min_idx")
+            builder.store(one, idx_ptr)  # Start at index 1
+
+            loop_bb = builder.append_basic_block("min_loop")
+            body_bb = builder.append_basic_block("min_body")
+            exit_bb = builder.append_basic_block("min_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+            elem_ptr = builder.gep(src_data, [offset])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            elem = builder.load(elem_ptr_i64)
+
+            current_min = builder.load(min_ptr)
+            is_smaller = builder.icmp_signed("<", elem, current_min)
+            new_min = builder.select(is_smaller, elem, current_min)
+            builder.store(new_min, min_ptr)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            return builder.load(min_ptr)
+
+        elif method == "max":
+            # max() - find maximum element
+            # Initialize with first element
+            first_ptr = builder.bitcast(src_data, i64.as_pointer())
+            first_elem = builder.load(first_ptr)
+            max_ptr = builder.alloca(i64, name="max_val")
+            builder.store(first_elem, max_ptr)
+
+            idx_ptr = builder.alloca(i64, name="max_idx")
+            builder.store(one, idx_ptr)  # Start at index 1
+
+            loop_bb = builder.append_basic_block("max_loop")
+            body_bb = builder.append_basic_block("max_body")
+            exit_bb = builder.append_basic_block("max_exit")
+
+            builder.branch(loop_bb)
+            builder.position_at_start(loop_bb)
+
+            idx = builder.load(idx_ptr)
+            cond = builder.icmp_signed("<", idx, total_elements)
+            builder.cbranch(cond, body_bb, exit_bb)
+
+            builder.position_at_start(body_bb)
+            idx = builder.load(idx_ptr)
+            offset = builder.mul(idx, elem_size)
+            elem_ptr = builder.gep(src_data, [offset])
+            elem_ptr_i64 = builder.bitcast(elem_ptr, i64.as_pointer())
+            elem = builder.load(elem_ptr_i64)
+
+            current_max = builder.load(max_ptr)
+            is_larger = builder.icmp_signed(">", elem, current_max)
+            new_max = builder.select(is_larger, elem, current_max)
+            builder.store(new_max, max_ptr)
+
+            next_idx = builder.add(idx, one)
+            builder.store(next_idx, idx_ptr)
+            builder.branch(loop_bb)
+
+            builder.position_at_start(exit_bb)
+            return builder.load(max_ptr)
+
+        elif method == "flatten":
+            # flatten() - convert N-D array to 1D array
+            # Create new 1D array with total_elements
+            new_arr = builder.call(cg.array_new, [total_elements, elem_size])
+            dst_data = builder.call(cg.array_get, [new_arr, zero])
+
+            # Copy all data (already in row-major order)
+            copy_size = builder.mul(total_elements, elem_size)
+            builder.call(cg.memcpy, [dst_data, src_data, copy_size])
+
+            return new_arr
+
+        elif method == "transpose":
+            # transpose() - swap rows and cols in 2D array
+            i32 = ir.IntType(32)
+
+            # Get original shape
+            rows = builder.call(cg.array_shape, [array_ptr, zero])
+            cols = builder.call(cg.array_shape, [array_ptr, one])
+
+            # Create new 2D array with swapped dimensions
+            new_arr = builder.call(cg.array_new_2d, [cols, rows, elem_size])
+
+            # Loop over all elements and copy with transposed indices
+            row_ptr = builder.alloca(i64, name="trans_row")
+            col_ptr = builder.alloca(i64, name="trans_col")
+            builder.store(zero, row_ptr)
+
+            row_loop = builder.append_basic_block("trans_row_loop")
+            row_body = builder.append_basic_block("trans_row_body")
+            col_loop = builder.append_basic_block("trans_col_loop")
+            col_body = builder.append_basic_block("trans_col_body")
+            col_exit = builder.append_basic_block("trans_col_exit")
+            row_exit = builder.append_basic_block("trans_row_exit")
+
+            builder.branch(row_loop)
+            builder.position_at_start(row_loop)
+            r = builder.load(row_ptr)
+            row_cond = builder.icmp_signed("<", r, rows)
+            builder.cbranch(row_cond, row_body, row_exit)
+
+            builder.position_at_start(row_body)
+            builder.store(zero, col_ptr)
+            builder.branch(col_loop)
+
+            builder.position_at_start(col_loop)
+            c = builder.load(col_ptr)
+            col_cond = builder.icmp_signed("<", c, cols)
+            builder.cbranch(col_cond, col_body, col_exit)
+
+            builder.position_at_start(col_body)
+            r = builder.load(row_ptr)
+            c = builder.load(col_ptr)
+
+            # Get element at [r, c] in original
+            src_elem = builder.call(cg.array_get_2d, [array_ptr, r, c])
+            src_elem_i64 = builder.bitcast(src_elem, i64.as_pointer())
+            val = builder.load(src_elem_i64)
+
+            # Store at [c, r] in new array
+            dst_elem = builder.call(cg.array_get_2d, [new_arr, c, r])
+            dst_elem_i64 = builder.bitcast(dst_elem, i64.as_pointer())
+            builder.store(val, dst_elem_i64)
+
+            next_c = builder.add(c, one)
+            builder.store(next_c, col_ptr)
+            builder.branch(col_loop)
+
+            builder.position_at_start(col_exit)
+            r = builder.load(row_ptr)
+            next_r = builder.add(r, one)
+            builder.store(next_r, row_ptr)
+            builder.branch(row_loop)
+
+            builder.position_at_start(row_exit)
+            return new_arr
+
+        elif method == "reshape":
+            # reshape(rows, cols) - reshape array to new 2D dimensions
+            new_rows = cg._generate_expression(args[0])
+            new_cols = cg._generate_expression(args[1])
+            new_rows_i64 = cg._cast_value(new_rows, i64)
+            new_cols_i64 = cg._cast_value(new_cols, i64)
+
+            # Create new 2D array with specified dimensions
+            new_arr = builder.call(cg.array_new_2d, [new_rows_i64, new_cols_i64, elem_size])
+            dst_data = builder.call(cg.array_get, [new_arr, zero])
+
+            # Copy all data sequentially (row-major order preserved)
+            copy_size = builder.mul(total_elements, elem_size)
+            builder.call(cg.memcpy, [dst_data, src_data, copy_size])
+
+            return new_arr
+
+        else:
+            raise RuntimeError(f"Unknown array operation: {method}")

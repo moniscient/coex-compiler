@@ -279,3 +279,132 @@ func main() -> int
     return 0
 ~
 ''', "3\n")
+
+
+class TestImplicitFunctionParameterConversion:
+    """Tests for implicit collection conversion when passing arguments to functions."""
+
+    def test_list_to_array_param(self, expect_output):
+        """List implicitly converts to Array when passed to function expecting Array."""
+        expect_output('''
+func process_array(arr: Array<int>) -> int
+    return arr.len()
+~
+
+func main() -> int
+    list = [1, 2, 3, 4, 5]
+    result = process_array(list)
+    print(result)
+    return 0
+~
+''', "5\n")
+
+    def test_array_to_list_param(self, expect_output):
+        """Array implicitly converts to List when passed to function expecting List."""
+        expect_output('''
+func process_list(list: List<int>) -> int
+    return list.len()
+~
+
+func main() -> int
+    arr: Array<int> = [10, 20, 30].packed()
+    result = process_list(arr)
+    print(result)
+    return 0
+~
+''', "3\n")
+
+    def test_list_to_set_param(self, expect_output):
+        """List implicitly converts to Set when passed to function expecting Set."""
+        expect_output('''
+func process_set(s: Set<int>) -> int
+    return s.len()
+~
+
+func main() -> int
+    list = [1, 2, 2, 3, 3, 3]
+    result = process_set(list)
+    print(result)
+    return 0
+~
+''', "3\n")
+
+    def test_set_to_list_param(self, expect_output):
+        """Set implicitly converts to List when passed to function expecting List."""
+        expect_output('''
+func process_list(list: List<int>) -> int
+    return list.len()
+~
+
+func main() -> int
+    s = {100, 200, 300}
+    result = process_list(s)
+    print(result)
+    return 0
+~
+''', "3\n")
+
+    def test_set_to_array_param(self, expect_output):
+        """Set implicitly converts to Array when passed to function expecting Array."""
+        expect_output('''
+func process_array(arr: Array<int>) -> int
+    return arr.len()
+~
+
+func main() -> int
+    s = {5, 10, 15, 20}
+    result = process_array(s)
+    print(result)
+    return 0
+~
+''', "4\n")
+
+    def test_array_to_set_param(self, expect_output):
+        """Array implicitly converts to Set when passed to function expecting Set."""
+        expect_output('''
+func process_set(s: Set<int>) -> int
+    return s.len()
+~
+
+func main() -> int
+    arr: Array<int> = [1, 1, 2, 2, 3].packed()
+    result = process_set(arr)
+    print(result)
+    return 0
+~
+''', "3\n")
+
+    def test_multiple_converted_params(self, expect_output):
+        """Multiple parameters can be implicitly converted in the same call."""
+        expect_output('''
+func combine(arr: Array<int>, s: Set<int>) -> int
+    return arr.len() + s.len()
+~
+
+func main() -> int
+    list = [1, 2, 3]
+    another_list = [10, 10, 20, 20, 30]
+    result = combine(list, another_list)
+    print(result)
+    return 0
+~
+''', "6\n")
+
+    def test_param_conversion_preserves_data(self, expect_output):
+        """Implicit conversion preserves the actual data values."""
+        expect_output('''
+func sum_array(arr: Array<int>) -> int
+    total = 0
+    for i in 0..arr.len()
+        total = total + arr.get(i)
+    ~
+    return total
+~
+
+func main() -> int
+    list = [10, 20, 30, 40]
+    result = sum_array(list)
+    print(result)
+    return 0
+~
+''', "100\n")

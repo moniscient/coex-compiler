@@ -394,18 +394,26 @@ class CodeGenerator:
         self._json = JsonGenerator(self)
         self._json.create_json_type()
 
-        # Create Array type and helpers (dense, contiguous collection)
-        # struct Array { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }
-        # Phase 4: Owner is now an i64 handle (pointer stored as integer for GC handles)
-        # Offset enables slice views without data copying.
-        # NOTE: No refcount - GC handles memory, COW done via always-copy semantics
+        # Create Array type and helpers (dense N-D collection)
+        # N-D Array struct (104 bytes = 13 i64 fields):
+        #   Field 0: handle (i64) - GC handle for data buffer
+        #   Field 1: ndim (i64) - number of dimensions (1, 2, ...)
+        #   Field 2: shape [4 x i64] - dimensions [dim0, dim1, dim2, dim3]
+        #   Field 3: strides [4 x i64] - byte strides per dimension
+        #   Field 4: offset (i64) - byte offset into buffer (for views)
+        #   Field 5: elem_size (i64) - 8 for int/float, 1 for byte
+        #   Field 6: type_id (i64) - element type identifier
+        # For 1D: shape[0]=len, strides[0]=elem_size
+        # For 2D: shape=[rows,cols], strides=[cols*elem_size, elem_size]
         self.array_struct = ir.global_context.get_identified_type("struct.Array")
         self.array_struct.set_body(
-            ir.IntType(64),  # owner_handle (field 0) - handle to data buffer (Phase 4)
-            ir.IntType(64),  # offset (field 1) - byte offset into owner's data
-            ir.IntType(64),  # len (field 2) - element count
-            ir.IntType(64),  # cap (field 3) - capacity
-            ir.IntType(64),  # elem_size (field 4) - element size in bytes
+            ir.IntType(64),              # handle (field 0) - GC handle to data buffer
+            ir.IntType(64),              # ndim (field 1) - number of dimensions
+            ir.ArrayType(ir.IntType(64), 4),  # shape (field 2) - [4 x i64]
+            ir.ArrayType(ir.IntType(64), 4),  # strides (field 3) - [4 x i64]
+            ir.IntType(64),              # offset (field 4) - byte offset for views
+            ir.IntType(64),              # elem_size (field 5) - element size in bytes
+            ir.IntType(64),              # type_id (field 6) - element type identifier
         )
         # Array helpers moved to codegen/array.py - ArrayGenerator class
         self._array = ArrayGenerator(self)
@@ -2547,7 +2555,15 @@ class CodeGenerator:
         """Generate code for Array(capacity, initial_value) constructor.
 
         Creates an Array with the given capacity, initialized with the given value.
-        Array layout: { i8* data, i64 len, i64 cap, i64 elem_size }
+
+        N-D Array struct layout:
+            Field 0: handle (i64) - GC handle for data buffer
+            Field 1: ndim (i64) - number of dimensions
+            Field 2: shape [4 x i64] - dimensions
+            Field 3: strides [4 x i64] - byte strides
+            Field 4: offset (i64) - byte offset for views
+            Field 5: elem_size (i64) - element size
+            Field 6: type_id (i64) - element type
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
@@ -2574,20 +2590,18 @@ class CodeGenerator:
             elem_size = ir.Constant(i64, 8)  # default
 
         # Call array_new to create the array
+        # array_new now sets shape[0] = capacity automatically
         array_ptr = self.builder.call(self.array_new, [capacity, elem_size])
 
-        # Set len = capacity (we're initializing all elements) - field 2
-        len_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        self.builder.store(capacity, len_ptr)
-
         # Fill the array with the initial value
-        # Get data pointer: compute owner + offset (Phase 4: owner is i64 handle)
-        owner_handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner_handle = self.builder.load(owner_handle_ptr)
-        owner_ptr = self.builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
-        offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        # Get data pointer: compute handle + offset
+        # Field 0: handle, Field 4: offset
+        handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        handle_val = self.builder.load(handle_ptr)
+        base_ptr = self.builder.inttoptr(handle_val, ir.IntType(8).as_pointer())
+        offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         offset_val = self.builder.load(offset_ptr)
-        data_ptr = self.builder.gep(owner_ptr, [offset_val])
+        data_ptr = self.builder.gep(base_ptr, [offset_val])
 
         # Loop to initialize all elements
         current_func = self.builder.block.parent

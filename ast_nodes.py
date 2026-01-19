@@ -299,6 +299,18 @@ class IndexExpr(Expr):
 
 
 @dataclass
+class RelativeIndexExpr(Expr):
+    """Relative indexing for cellular automata: arr[[offset]] or arr[[i, j]]
+
+    Used in formulas to express neighbor access relative to current position.
+    When a formula containing [[]] is applied to an array, the compiler
+    transforms it into per-element execution with position tracking.
+    """
+    object: Expr
+    offsets: List[Expr]  # Offset values for each dimension
+
+
+@dataclass
 class SliceExpr(Expr):
     """Slice access: obj[start:end]
 

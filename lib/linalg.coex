@@ -1,0 +1,74 @@
+# Linear algebra module for Coex standard library
+#
+# Provides matrix operations for Array<T> types:
+# - matmul(a, b) - Matrix multiplication
+# - matvec(a, x) - Matrix-vector multiplication
+# - dot(a, b) - Dot product of 1D arrays
+#
+# Note: These use 'func' instead of 'formula' because they need loops with
+# rebindable counters. They are functionally pure (no external side effects).
+
+# Dot product of two 1D arrays
+func dot(_ a: Array<int>, _ b: Array<int>) -> int
+    n: int = a.len()
+    sum: int = 0
+    i: int = 0
+    while i < n
+        sum = sum + a.get(i) * b.get(i)
+        i = i + 1
+    ~
+    return sum
+~
+
+# Matrix-vector multiplication: y = A * x
+# A is m x n, x is length n, result is length m
+func matvec(_ a: Array<int>, _ x: Array<int>) -> Array<int>
+    m: int = a.shape(0)
+    n: int = a.shape(1)
+
+    result: Array<int> = Array.zeros(m)
+
+    i: int = 0
+    while i < m
+        sum: int = 0
+        j: int = 0
+        while j < n
+            sum = sum + a[i, j] * x.get(j)
+            j = j + 1
+        ~
+        result = result.set(i, sum)
+        i = i + 1
+    ~
+    return result
+~
+
+# Matrix multiplication: C = A * B
+# A is m x k, B is k x n, result is m x n
+func matmul(_ a: Array<int>, _ b: Array<int>) -> Array<int>
+    m: int = a.shape(0)
+    k: int = a.shape(1)
+    n: int = b.shape(1)
+
+    result: Array<int> = Array.zeros_2d(m, n)
+
+    i: int = 0
+    while i < m
+        j: int = 0
+        while j < n
+            sum: int = 0
+            p: int = 0
+            while p < k
+                sum = sum + a[i, p] * b[p, j]
+                p = p + 1
+            ~
+            # Set result[i, j] = sum using flatten/set/reshape
+            idx: int = i * n + j
+            flat: Array<int> = result.flatten()
+            flat = flat.set(idx, sum)
+            result = flat.reshape(m, n)
+            j = j + 1
+        ~
+        i = i + 1
+    ~
+    return result
+~
