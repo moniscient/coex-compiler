@@ -615,8 +615,12 @@ class PosixGenerator:
         """Create posix.time_ns() static method - returns nanosecond precision time.
 
         Uses clock_gettime with runtime platform detection:
-        - macOS: CLOCK_MONOTONIC = 1
-        - Linux: CLOCK_MONOTONIC = 4
+        - macOS: CLOCK_UPTIME_RAW = 8 (true nanosecond precision)
+        - Linux: CLOCK_MONOTONIC = 1
+
+        Note: macOS CLOCK_REALTIME only provides microsecond precision, but
+        CLOCK_UPTIME_RAW provides true nanosecond precision. CLOCK_MONOTONIC
+        on macOS is 6 but CLOCK_UPTIME_RAW is preferred for benchmarking.
         """
         cg = self.cg
         # posix.time_ns() -> int
@@ -649,15 +653,15 @@ class PosixGenerator:
         is_linux_cond = builder.icmp_signed(">=", fd, zero)
         builder.cbranch(is_linux_cond, is_linux, is_macos)
 
-        # Linux path: close fd and use CLOCK_MONOTONIC = 4
+        # Linux path: close fd and use CLOCK_MONOTONIC = 1
         builder.position_at_end(is_linux)
         builder.call(cg.posix_close_syscall, [fd])
-        clock_id_linux = ir.Constant(i32, 4)  # CLOCK_MONOTONIC on Linux
+        clock_id_linux = ir.Constant(i32, 1)  # CLOCK_MONOTONIC on Linux
         builder.branch(call_clock)
 
-        # macOS path: use CLOCK_MONOTONIC = 1
+        # macOS path: use CLOCK_UPTIME_RAW = 8 (true nanosecond precision)
         builder.position_at_end(is_macos)
-        clock_id_macos = ir.Constant(i32, 1)  # CLOCK_MONOTONIC on macOS
+        clock_id_macos = ir.Constant(i32, 8)  # CLOCK_UPTIME_RAW on macOS
         builder.branch(call_clock)
 
         # Call clock_gettime
