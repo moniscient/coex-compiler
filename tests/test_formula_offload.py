@@ -120,11 +120,18 @@ class TestCUDABackend:
     """Test CUDA backend stub."""
 
     def test_cuda_type_mapping(self):
-        """CUDA backend should correctly map Coex types."""
+        """CUDA backend should correctly map Coex types.
+
+        Coex int is 64-bit, so maps to CUDA 'long long'.
+        Coex float is 64-bit, so maps to CUDA 'double'.
+        """
         backend = CUDABackend()
-        assert backend.map_type('int') == 'int'
-        assert backend.map_type('float') == 'float'
+        # Coex int is 64-bit -> CUDA long long
+        assert backend.map_type('int') == 'long long'
+        # Coex float is 64-bit -> CUDA double
+        assert backend.map_type('float') == 'double'
         assert backend.map_type('int64') == 'long long'
+        assert backend.map_type('float64') == 'double'
 
     def test_cuda_map_kernel_structure(self):
         """CUDA map kernel should have correct structure."""
