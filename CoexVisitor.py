@@ -144,41 +144,6 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by CoexParser#matrixDecl.
-    def visitMatrixDecl(self, ctx:CoexParser.MatrixDeclContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixDimensions.
-    def visitMatrixDimensions(self, ctx:CoexParser.MatrixDimensionsContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixBody.
-    def visitMatrixBody(self, ctx:CoexParser.MatrixBodyContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixClause.
-    def visitMatrixClause(self, ctx:CoexParser.MatrixClauseContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixTypeDecl.
-    def visitMatrixTypeDecl(self, ctx:CoexParser.MatrixTypeDeclContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixInitDecl.
-    def visitMatrixInitDecl(self, ctx:CoexParser.MatrixInitDeclContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by CoexParser#matrixMethodDecl.
-    def visitMatrixMethodDecl(self, ctx:CoexParser.MatrixMethodDeclContext):
-        return self.visitChildren(ctx)
-
-
     # Visit a parse tree produced by CoexParser#block.
     def visitBlock(self, ctx:CoexParser.BlockContext):
         return self.visitChildren(ctx)

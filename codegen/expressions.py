@@ -11,7 +11,6 @@ This module handles:
 - Index and slice operations
 - Collection literals (list, map, set, tuple)
 - Range expressions
-- Cell access (matrix)
 """
 from llvmlite import ir
 from typing import TYPE_CHECKING, Optional, Dict
@@ -22,7 +21,7 @@ from ast_nodes import (
     Identifier, BinaryExpr, BinaryOp, UnaryExpr, UnaryOp, CallExpr,
     MethodCallExpr, MemberExpr, IndexExpr, SliceExpr, TernaryExpr,
     ListExpr, MapExpr, SetExpr, TupleExpr, RangeExpr, LambdaExpr,
-    SelfExpr, CellExpr, CellIndexExpr, LlvmIrExpr, AsExpr,
+    SelfExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
     AtomicType, ListType, ArrayType, SetType, FunctionDecl
@@ -124,14 +123,6 @@ class ExpressionGenerator:
             if "self" in cg.locals:
                 return cg.builder.load(cg.locals["self"])
             return ir.Constant(ir.IntType(64), 0)
-
-        elif isinstance(expr, CellExpr):
-            # Matrix cell reference - current cell value
-            return self.generate_cell_access()
-
-        elif isinstance(expr, CellIndexExpr):
-            # Matrix cell[dx, dy] - relative neighbor access
-            return self.generate_cell_index_access(expr)
 
         elif isinstance(expr, LlvmIrExpr):
             return cg._generate_llvm_ir_block(expr)
@@ -727,12 +718,6 @@ class ExpressionGenerator:
         """
         cg = self.cg
 
-        # Special case: cell[dx, dy] is neighbor access in matrix formulas
-        if isinstance(expr.object, CellExpr) and len(expr.indices) == 2:
-            # Convert to CellIndexExpr and use that handler
-            cell_idx = CellIndexExpr(expr.indices[0], expr.indices[1])
-            return self.generate_cell_index_access(cell_idx)
-
         obj = self.generate_expression(expr.object)
 
         if not expr.indices:
@@ -928,106 +913,6 @@ class ExpressionGenerator:
                 return cg.builder.call(func, [obj])
 
         return ir.Constant(ir.IntType(64), 0)
-
-    # ========================================================================
-    # Cell Access (Matrix/CA)
-    # ========================================================================
-
-    def generate_cell_access(self) -> ir.Value:
-        """Generate code to access current cell value (cell keyword)."""
-        cg = self.cg
-
-        if cg.current_matrix is None:
-            return ir.Constant(ir.IntType(64), 0)
-
-        # Get read buffer and current position
-        read_buf = cg.builder.load(cg.locals["__read_buffer"])
-        x = cg.builder.load(cg.locals["__cell_x"])
-        y = cg.builder.load(cg.locals["__cell_y"])
-        width = cg.builder.load(cg.locals["__width"])
-
-        # Calculate index: y * width + x
-        row_offset = cg.builder.mul(y, width)
-        idx = cg.builder.add(row_offset, x)
-
-        # Load value
-        elem_ptr = cg.builder.gep(read_buf, [idx])
-        return cg.builder.load(elem_ptr)
-
-    def generate_cell_index_access(self, expr: CellIndexExpr) -> ir.Value:
-        """Generate code for relative cell access: cell[dx, dy].
-
-        Returns nil (as optional) if out of bounds.
-        """
-        cg = self.cg
-
-        if cg.current_matrix is None:
-            return ir.Constant(ir.IntType(64), 0)
-
-        # Get current position and offsets
-        x = cg.builder.load(cg.locals["__cell_x"])
-        y = cg.builder.load(cg.locals["__cell_y"])
-
-        dx = self.generate_expression(expr.dx)
-        dy = self.generate_expression(expr.dy)
-
-        # Ensure i64
-        if dx.type != ir.IntType(64):
-            dx = cg.builder.sext(dx, ir.IntType(64))
-        if dy.type != ir.IntType(64):
-            dy = cg.builder.sext(dy, ir.IntType(64))
-
-        # Calculate target position
-        target_x = cg.builder.add(x, dx)
-        target_y = cg.builder.add(y, dy)
-
-        # Get dimensions
-        width = cg.builder.load(cg.locals["__width"])
-        height = cg.builder.load(cg.locals["__height"])
-
-        # Bounds check
-        x_valid_low = cg.builder.icmp_signed(">=", target_x, ir.Constant(ir.IntType(64), 0))
-        x_valid_high = cg.builder.icmp_signed("<", target_x, width)
-        y_valid_low = cg.builder.icmp_signed(">=", target_y, ir.Constant(ir.IntType(64), 0))
-        y_valid_high = cg.builder.icmp_signed("<", target_y, height)
-
-        x_valid = cg.builder.and_(x_valid_low, x_valid_high)
-        y_valid = cg.builder.and_(y_valid_low, y_valid_high)
-        in_bounds = cg.builder.and_(x_valid, y_valid)
-
-        # Create result based on bounds
-        func = cg.builder.function
-        in_bounds_block = func.append_basic_block("cell_in_bounds")
-        out_bounds_block = func.append_basic_block("cell_out_bounds")
-        merge_block = func.append_basic_block("cell_merge")
-
-        cg.builder.cbranch(in_bounds, in_bounds_block, out_bounds_block)
-
-        # In bounds: load value
-        cg.builder.position_at_end(in_bounds_block)
-        read_buf = cg.builder.load(cg.locals["__read_buffer"])
-        row_offset = cg.builder.mul(target_y, width)
-        idx = cg.builder.add(row_offset, target_x)
-        elem_ptr = cg.builder.gep(read_buf, [idx])
-        in_bounds_val = cg.builder.load(elem_ptr)
-        in_bounds_end = cg.builder.block
-        cg.builder.branch(merge_block)
-
-        # Out of bounds: return nil (0 for now)
-        cg.builder.position_at_end(out_bounds_block)
-        # For optional support, we'd return a nil marker
-        # For now, return 0
-        out_bounds_val = ir.Constant(in_bounds_val.type, 0)
-        out_bounds_end = cg.builder.block
-        cg.builder.branch(merge_block)
-
-        # Merge
-        cg.builder.position_at_end(merge_block)
-        phi = cg.builder.phi(in_bounds_val.type)
-        phi.add_incoming(in_bounds_val, in_bounds_end)
-        phi.add_incoming(out_bounds_val, out_bounds_end)
-
-        return phi
 
     # ========================================================================
     # Pattern Binding

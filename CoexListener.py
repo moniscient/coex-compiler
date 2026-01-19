@@ -251,69 +251,6 @@ class CoexListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by CoexParser#matrixDecl.
-    def enterMatrixDecl(self, ctx:CoexParser.MatrixDeclContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixDecl.
-    def exitMatrixDecl(self, ctx:CoexParser.MatrixDeclContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixDimensions.
-    def enterMatrixDimensions(self, ctx:CoexParser.MatrixDimensionsContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixDimensions.
-    def exitMatrixDimensions(self, ctx:CoexParser.MatrixDimensionsContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixBody.
-    def enterMatrixBody(self, ctx:CoexParser.MatrixBodyContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixBody.
-    def exitMatrixBody(self, ctx:CoexParser.MatrixBodyContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixClause.
-    def enterMatrixClause(self, ctx:CoexParser.MatrixClauseContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixClause.
-    def exitMatrixClause(self, ctx:CoexParser.MatrixClauseContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixTypeDecl.
-    def enterMatrixTypeDecl(self, ctx:CoexParser.MatrixTypeDeclContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixTypeDecl.
-    def exitMatrixTypeDecl(self, ctx:CoexParser.MatrixTypeDeclContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixInitDecl.
-    def enterMatrixInitDecl(self, ctx:CoexParser.MatrixInitDeclContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixInitDecl.
-    def exitMatrixInitDecl(self, ctx:CoexParser.MatrixInitDeclContext):
-        pass
-
-
-    # Enter a parse tree produced by CoexParser#matrixMethodDecl.
-    def enterMatrixMethodDecl(self, ctx:CoexParser.MatrixMethodDeclContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#matrixMethodDecl.
-    def exitMatrixMethodDecl(self, ctx:CoexParser.MatrixMethodDeclContext):
-        pass
-
-
     # Enter a parse tree produced by CoexParser#block.
     def enterBlock(self, ctx:CoexParser.BlockContext):
         pass

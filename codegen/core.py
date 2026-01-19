@@ -48,9 +48,6 @@ from codegen.result import ResultGenerator
 # Import in-place mutation operations for uniqueness optimization
 from codegen.inplace_ops import create_inplace_operations
 
-# Import Matrix/CA generator module
-from codegen.matrix import MatrixGenerator
-
 # Import Module/FFI generator module
 from codegen.modules import ModuleGenerator
 
@@ -448,17 +445,6 @@ class CodeGenerator:
         self._posix = PosixGenerator(self)
         self._posix.create_posix_type()
 
-        # Matrix helpers moved to codegen/matrix.py - MatrixGenerator class
-        self._matrix = MatrixGenerator(self)
-        # Matrix registry for tracking declared matrices
-        self.matrix_decls: Dict[str, 'MatrixDecl'] = {}  # name -> MatrixDecl
-        self.matrix_structs: Dict[str, ir.Type] = {}  # name -> LLVM struct type
-
-        # Current matrix context for cell expressions
-        self.current_matrix: Optional[str] = None
-        self.current_cell_x: Optional[ir.Value] = None
-        self.current_cell_y: Optional[ir.Value] = None
-
         # Module/FFI helpers moved to codegen/modules.py - ModuleGenerator class
         self._modules = ModuleGenerator(self)
 
@@ -825,14 +811,6 @@ class CodeGenerator:
             if not type_decl.type_params:  # Skip generic types (checked at monomorphization)
                 self._check_trait_implementations(type_decl)
 
-        # Register matrices BEFORE function generation (so main() can use them)
-        for matrix_decl in program.matrices:
-            self._matrix.register_matrix(matrix_decl)
-
-        # Declare matrix formula methods (register names before function generation)
-        for matrix_decl in program.matrices:
-            self._matrix.declare_matrix_methods(matrix_decl)
-        
         # Store function declarations for return type inference
         for func in program.functions:
             self.func_decls[func.name] = func
@@ -859,10 +837,6 @@ class CodeGenerator:
         # Generate method bodies for all types
         for type_decl in program.types:
             self._generate_type_methods(type_decl)
-        
-        # Generate matrix formula methods (after functions, as they may reference them)
-        for matrix_decl in program.matrices:
-            self._matrix.generate_matrix_methods(matrix_decl)
 
         # Phase 9: Finalize GC type tables after all types are registered
         # This creates the offset arrays for user types so gc_mark_object can
@@ -2561,14 +2535,6 @@ class CodeGenerator:
         """Generate code for range expression - delegated to ExpressionGenerator"""
         return self._expressions.generate_range(expr)
 
-    def _generate_cell_access(self) -> ir.Value:
-        """Generate code for cell access - delegated to ExpressionGenerator"""
-        return self._expressions.generate_cell_access()
-
-    def _generate_cell_index_access(self, expr: CellIndexExpr) -> ir.Value:
-        """Generate code for cell index access - delegated to ExpressionGenerator"""
-        return self._expressions.generate_cell_index_access(expr)
-
     def _bind_pattern(self, pattern, value):
         """Bind pattern variables - delegated to ExpressionGenerator"""
         return self._expressions.bind_pattern(pattern, value)
@@ -2758,16 +2724,7 @@ class CodeGenerator:
             else:
                 initial = ir.Constant(ir.IntType(64), 0)  # nil
             return self.builder.call(self.atomic_ref_new, [initial])
-        
-        # Check if this is a matrix type
-        if type_name in self.matrix_decls:
-            # Call the matrix constructor function
-            func_name = f"Matrix_{type_name}_new"
-            if func_name in self.functions:
-                func = self.functions[func_name]
-                return self.builder.call(func, [])
-            return ir.Constant(ir.IntType(8).as_pointer(), None)
-        
+
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
 
@@ -3351,11 +3308,6 @@ class CodeGenerator:
             # Call json_get_field
             return self.builder.call(self.json_get_field, [obj, key_str])
 
-        # Handle known members for built-in types
-        if expr.member == "width" or expr.member == "height":
-            # Matrix dimensions
-            return ir.Constant(ir.IntType(64), 0)
-
         return ir.Constant(ir.IntType(64), 0)
 
     def _get_tuple_field_info(self, expr: Expr) -> Optional[PyList[tuple]]:
@@ -3380,15 +3332,9 @@ class CodeGenerator:
     
     def _generate_index(self, expr: IndexExpr) -> ir.Value:
         """Generate code for index access: obj[idx] or obj[idx1, idx2]
-        
+
         For user-defined types, this calls the .get() method.
         """
-        # Special case: cell[dx, dy] is neighbor access in matrix formulas
-        if isinstance(expr.object, CellExpr) and len(expr.indices) == 2:
-            # Convert to CellIndexExpr and use that handler
-            cell_idx = CellIndexExpr(expr.indices[0], expr.indices[1])
-            return self._generate_cell_index_access(cell_idx)
-        
         obj = self._generate_expression(expr.object)
         
         if not expr.indices:
@@ -3860,30 +3806,8 @@ class CodeGenerator:
         """Get the LLVM type for array elements - delegated to LoopGenerator"""
         return self._loops.get_array_element_type_for_pattern(stmt)
 
-    def _generate_matrix_return(self, value: ir.Value):
-        """Handle return statement inside matrix formula - writes to write buffer."""
-        if self.current_matrix is None:
-            return
-        
-        # Write to current cell in write buffer
-        write_buf = self.builder.load(self.locals["__write_buffer"])
-        x = self.builder.load(self.locals["__cell_x"])
-        y = self.builder.load(self.locals["__cell_y"])
-        width = self.builder.load(self.locals["__width"])
-        
-        row_offset = self.builder.mul(y, width)
-        idx = self.builder.add(row_offset, x)
-        elem_ptr = self.builder.gep(write_buf, [idx])
-        self.builder.store(value, elem_ptr)
-
     # ========================================================================
     # Compilation
-    # ========================================================================
-    
-
-    # ========================================================================
-    # Matrix (Cellular Automata) Implementation
-    # moved to codegen/matrix.py - MatrixGenerator class
     # ========================================================================
 
     def _get_type_size(self, llvm_type: ir.Type) -> int:
@@ -3924,9 +3848,9 @@ class CodeGenerator:
     
     def _collect_local_variables(self, stmts: list) -> set:
         """Collect all variable names assigned in a list of statements.
-        
-        This is used to pre-allocate local variables in matrix formulas
-        to prevent stack overflow from allocas inside loops.
+
+        This is used to pre-allocate local variables to prevent stack
+        overflow from allocas inside loops.
         """
         var_names = set()
         

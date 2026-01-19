@@ -1125,17 +1125,6 @@ class StatementGenerator:
         """Generate return statement"""
         cg = self.cg
 
-        # Special handling for matrix formulas: return sets cell value, doesn't exit
-        if cg.current_matrix is not None and stmt.value:
-            ret_val = cg._generate_expression(stmt.value)
-            # Store in __matrix_result for the matrix loop to write to cell
-            if "__matrix_result" in cg.locals:
-                cg.builder.store(ret_val, cg.locals["__matrix_result"])
-            # Branch to x_loop_inc to continue the loop (don't terminate with ret)
-            if "__matrix_x_loop_inc" in cg.locals:
-                cg.builder.branch(cg.locals["__matrix_x_loop_inc"])
-            return
-
         if stmt.value:
             ret_val = cg._generate_expression(stmt.value)
             func = cg.builder.function

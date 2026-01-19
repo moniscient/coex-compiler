@@ -240,19 +240,6 @@ class SelfExpr(Expr):
 
 
 @dataclass
-class CellExpr(Expr):
-    """Reference to current cell in matrix formulas"""
-    pass
-
-
-@dataclass
-class CellIndexExpr(Expr):
-    """Relative cell access: cell[dx, dy]"""
-    dx: Expr
-    dy: Expr
-
-
-@dataclass
 class BinaryExpr(Expr):
     op: BinaryOp
     left: Expr
@@ -807,17 +794,6 @@ class TraitDecl:
 
 
 @dataclass
-class MatrixDecl:
-    """Matrix (cellular automaton) declaration"""
-    name: str
-    width: Expr
-    height: Expr
-    element_type: Type
-    init_value: Expr
-    methods: List[FunctionDecl] = field(default_factory=list)
-
-
-@dataclass
 class ImportDecl:
     """Import declaration: import module_name or import "library.cxz" """
     module: str  # Module name, e.g., "math" or library name extracted from path
@@ -851,5 +827,4 @@ class Program:
     directives: List['DirectiveDecl'] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)
-    matrices: List[MatrixDecl] = field(default_factory=list)
     functions: List[FunctionDecl] = field(default_factory=list)

@@ -8,7 +8,6 @@
  * This grammar implements the complete Coex language including:
  * - Four function kinds: formula, thread, func, extern
  * - Structured concurrency with channels and atomics
- * - Cellular automata (matrices) with parallel cell updates
  * - Static polymorphism through traits
  * - Pattern matching with match/case
  * - Temporal constraints with within/else
@@ -54,7 +53,6 @@ declaration
     : functionDecl
     | typeDecl
     | traitDecl
-    | matrixDecl
     ;
 
 // ----------------------------------------------------------------------------
@@ -160,40 +158,6 @@ traitBody
 
 traitMethodDecl
     : functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType?
-    ;
-
-// ----------------------------------------------------------------------------
-// Matrix Declarations (Cellular Automata)
-// ----------------------------------------------------------------------------
-
-matrixDecl
-    : MATRIX IDENTIFIER LBRACKET matrixDimensions RBRACKET COLON matrixBody blockTerminator
-    ;
-
-matrixDimensions
-    : expression (COMMA expression)?
-    ;
-
-matrixBody
-    : NEWLINE* (matrixClause (NEWLINE+ matrixClause)*)? NEWLINE*
-    ;
-
-matrixClause
-    : matrixTypeDecl
-    | matrixInitDecl
-    | matrixMethodDecl
-    ;
-
-matrixTypeDecl
-    : TYPE COLON typeExpr
-    ;
-
-matrixInitDecl
-    : INIT COLON expression
-    ;
-
-matrixMethodDecl
-    : FORMULA IDENTIFIER LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* block
     ;
 
 // ----------------------------------------------------------------------------
@@ -518,8 +482,6 @@ primaryExpr
     | IDENTIFIER genericArgs                                // Generic type: List<int>
     | IDENTIFIER
     | SELF
-    | CELL
-    | CELL LBRACKET expression COMMA expression RBRACKET
     | LPAREN expression RPAREN
     | LPAREN tupleElements RPAREN
     | listLiteral
@@ -689,7 +651,6 @@ TASK        : 'task' ;    // Reserved for future coroutine system
 TYPE        : 'type' ;
 EXTERN      : 'extern' ;
 TRAIT       : 'trait' ;
-MATRIX      : 'matrix' ;
 INIT        : 'init' ;
 
 // Control flow
@@ -760,7 +721,6 @@ TILDE       : '~' ;
 
 // Special identifiers
 SELF        : 'self' ;
-CELL        : 'cell' ;
 
 // Primitive type keywords
 INT_TYPE        : 'int' ;

@@ -39,8 +39,6 @@ class ASTBuilder:
                     program.types.append(decl)
                 elif isinstance(decl, TraitDecl):
                     program.traits.append(decl)
-                elif isinstance(decl, MatrixDecl):
-                    program.matrices.append(decl)
 
         return program
 
@@ -122,8 +120,6 @@ class ASTBuilder:
             return self.visit_type_decl(child)
         elif isinstance(child, CoexParser.TraitDeclContext):
             return self.visit_trait_decl(child)
-        elif isinstance(child, CoexParser.MatrixDeclContext):
-            return self.visit_matrix_decl(child)
 
         return None
     
@@ -361,50 +357,7 @@ class ASTBuilder:
         body = []
 
         return FunctionDecl(kind, name, [], params, return_type, body, [], return_unique)
-    
-    def visit_matrix_decl(self, ctx: CoexParser.MatrixDeclContext) -> MatrixDecl:
-        """Visit a matrix declaration"""
-        name = ctx.IDENTIFIER().getText()
-        
-        # Dimensions
-        dims = ctx.matrixDimensions()
-        width = self.visit_expression(dims.expression(0))
-        height = self.visit_expression(dims.expression(1)) if len(dims.expression()) > 1 else width
-        
-        # Element type and init value from matrix body
-        element_type = PrimitiveType("int")  # default
-        init_value = IntLiteral(0)
-        methods = []
-        
-        if ctx.matrixBody():
-            for clause in ctx.matrixBody().matrixClause():
-                if clause.matrixTypeDecl():
-                    element_type = self.visit_type_expr(clause.matrixTypeDecl().typeExpr())
-                elif clause.matrixInitDecl():
-                    init_value = self.visit_expression(clause.matrixInitDecl().expression())
-                elif clause.matrixMethodDecl():
-                    methods.append(self.visit_matrix_method_decl(clause.matrixMethodDecl()))
-        
-        return MatrixDecl(name, width, height, element_type, init_value, methods)
-    
-    def visit_matrix_method_decl(self, ctx: CoexParser.MatrixMethodDeclContext) -> FunctionDecl:
-        """Visit a matrix method declaration"""
-        name = ctx.IDENTIFIER().getText()
-        
-        params = []
-        if ctx.parameterList():
-            params = self.visit_param_list(ctx.parameterList())
-        
-        return_type = None
-        return_unique = False
-        if ctx.returnType():
-            return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-            return_unique = ctx.returnType().UNIQUE() is not None
 
-        body = self.visit_block(ctx.block())
-
-        return FunctionDecl(FunctionKind.FORMULA, name, [], params, return_type, body, [], return_unique)
-    
     # ========================================================================
     # Types
     # ========================================================================
@@ -1161,14 +1114,6 @@ class ASTBuilder:
             return Identifier(name)
         elif ctx.SELF():
             return SelfExpr()
-        elif ctx.CELL():
-            if ctx.LBRACKET():
-                # cell[dx, dy]
-                exprs = ctx.expression()
-                dx = self.visit_expression(exprs[0])
-                dy = self.visit_expression(exprs[1])
-                return CellIndexExpr(dx, dy)
-            return CellExpr()
         elif ctx.LPAREN():
             exprs = ctx.expression()
             if exprs:

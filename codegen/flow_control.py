@@ -67,16 +67,6 @@ class FlowControlGenerator:
 
             value = cg._generate_expression(stmt.value)
 
-            # In matrix formula context, write to buffer and continue loop
-            if cg.current_matrix is not None:
-                cg._generate_matrix_return(value)
-                # Branch to x_loop_inc (next cell)
-                # Find the increment block
-                for block in func.blocks:
-                    if block.name == "x_loop_inc":
-                        cg.builder.branch(block)
-                        return
-
             # Cast to function return type if needed (e.g., wrap in optional)
             value = cg._cast_value(value, ret_type)
 
