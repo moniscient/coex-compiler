@@ -83,9 +83,156 @@
 - **Files**: `coex_gc.py` (TLS variables), all code using thread-local state
 - **Status**: Open (workaround in place: use pthread TLS via ThreadEntry struct)
 
+### BUG-033: Scheduler initialization uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low (review for necessity)
+- **Reproduction**: Scheduler lazy initialization via `coex_scheduler_ensure_init()`
+- **Observed**: Uses `scheduler_init_mutex` (pthread_mutex) at `coex_scheduler.c:26`
+- **Expected**: TBD - review if lock-free initialization is feasible
+- **Hypothesis**: Double-checked locking pattern; mutex only held briefly during init
+- **Files**: `runtime/coex_scheduler.c:26, 479-509`
+- **Status**: Open (under review)
+
+### BUG-035: Global work queue uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Medium (review for necessity)
+- **Reproduction**: Tasks submitted from main thread use global queue
+- **Observed**: Uses `global_queue_mutex` at `coex_scheduler.c:39`
+- **Expected**: TBD - review if lock-free queue is feasible
+- **Hypothesis**: Protects global deque during push/steal; could use lock-free MPSC
+- **Files**: `runtime/coex_scheduler.c:39, 209-211, 570-572, 607-609, 638-640, 723-725, 795-797`
+- **Status**: Open (under review)
+
+### BUG-036: Deque resize uses lock
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low (review for necessity)
+- **Reproduction**: Chase-Lev deque grows when full
+- **Observed**: Uses `resize_lock` in Deque struct at `coex_scheduler.h:80`
+- **Expected**: TBD - review if resize can be lock-free
+- **Hypothesis**: Required for safe buffer reallocation while stealers active
+- **Files**: `runtime/coex_scheduler.h:80`, `runtime/coex_scheduler.c:70-77, 108-111`
+- **Status**: Open (under review)
+
+### BUG-042: Channel synchronization uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Medium (review for necessity)
+- **Reproduction**: Channels used from func/thread context
+- **Observed**: Uses `mutex` + `cond` in ChannelSync at `coex_channel.h:63-64`
+- **Expected**: TBD - review if lock-free channel is feasible
+- **Hypothesis**: Required for blocking receive; could use lock-free for send
+- **Files**: `runtime/coex_channel.h:63-64`, `runtime/coex_channel.c:172-174, 184-216, 222-265, 272-274`
+- **Status**: Open (under review)
+
+### BUG-043: GC main mutex for handle allocation
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: GC
+- **Severity**: Medium (review for necessity)
+- **Reproduction**: Handle allocation slow path, async GC coordination
+- **Observed**: Uses `gc_mutex` at `coex_gc.py:568`
+- **Expected**: TBD - review scope of mutex protection
+- **Hypothesis**: Protects handle table growth, free list refill, GC coordination
+- **Files**: `coex_gc.py:568, 1426-1428, 1956-1985, 2258-2262, 3925-3967, 4085-4212, 7792-7855`
+- **Status**: Open (under review)
+
+### BUG-044: GC registry mutex for thread tracking
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: GC
+- **Severity**: Low (review for necessity)
+- **Reproduction**: Thread registration/unregistration during GC
+- **Observed**: Uses `gc_registry_mutex` at `coex_gc.py:696-699`
+- **Expected**: TBD - protects thread registry during iteration
+- **Hypothesis**: Required for safe iteration while threads register/unregister
+- **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
+- **Status**: Open (under review)
+
 ---
 
 ## Resolved Bugs
+
+### BUG-045: Metal GPU offload crashes with double types
+- **Discovered**: 2026-01-18, during GPU offload testing
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**:
+  ```coex
+  formula compute(x: float) -> float
+      return x * 2.0
+  ~
+
+  func main() -> int
+      data: Array<float> = [1.0, 2.0, 3.0].toArray()
+      result: Array<float> = [compute(x) for x in data]  # CRASH
+      return 0
+  ~
+  ```
+- **Observed**: Segfault in Metal's `newLibraryWithSource` with error "double is not supported in Metal"
+- **Expected**: GPU offload should work with Coex's 64-bit float type
+- **Root Cause**: Metal Shading Language does NOT support 64-bit types (double, long). The Metal backend was incorrectly mapping Coex's 64-bit float to Metal's `double`, causing kernel compilation to fail.
+- **Files**: `codegen/formula/metal.py`, `runtime/coex_metal.m`
+- **Status**: Resolved
+- **Resolution**:
+  1. Updated MetalBackend.TYPE_MAP to use 32-bit types (`float` instead of `double`)
+  2. Modified `coex_metal_dispatch()` to convert 64-bit Coex data to 32-bit for Metal input
+  3. Added conversion back from 32-bit to 64-bit for output
+  4. Metal GPU offload now works correctly, with some precision loss due to 32-bit computation
+
+### BUG-034: Worker parking uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `parking_mutex` + `parking_cond` at `coex_scheduler.c:33-34`
+- **Files**: `runtime/coex_scheduler.c:33-34, 173-204`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
+
+### BUG-037: FirstContext completion uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `mutex` + `cond` in FirstContext at `coex_scheduler.h:92-93`
+- **Files**: `runtime/coex_scheduler.h:92-93`, `runtime/coex_scheduler.c:416-441, 682-700, 728-751`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
+
+### BUG-038: MostContext completion uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `mutex` + `cond` in MostContext at `coex_scheduler.h:106-107`
+- **Files**: `runtime/coex_scheduler.h:106-107`, `runtime/coex_scheduler.c:462-467, 753-775, 800-820`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
+
+### BUG-039: SchedulerTask main thread wait uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `main_mutex` + `main_cond` in SchedulerTask at `coex_scheduler.h:63-64`
+- **Files**: `runtime/coex_scheduler.h:63-64`, `runtime/coex_scheduler.c:333-337, 559-586, 627-657`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
+
+### BUG-040: TaskClosure completion signaling uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `mutex` + `cond` in TaskClosure at `coex_task.h:37-38`
+- **Files**: `runtime/coex_task.h:37-38`, `runtime/coex_task.c:96-97, 107-108, 167-188`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
+
+### BUG-041: SharedWaiter wait_any uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Observed**: Uses `mutex` + `cond` in SharedWaiter at `coex_task.c:37-38`
+- **Files**: `runtime/coex_task.c:36-40, 210-253`
+- **Status**: Resolved (by design)
+- **Resolution**: Required by POSIX - `pthread_cond_wait` mandates a mutex companion
 
 ### BUG-001: Mutual recursion segfault in task coroutines
 - **Discovered**: 2025-01-17, during task testing
@@ -127,9 +274,14 @@
 - **Category**: Stdlib
 - **Severity**: High
 - **Reproduction**: Call `posix.time_ns()` and compare to expected nanosecond timestamp
-- **Files**: `codegen.py` (posix module implementation)
-- **Status**: Resolved (2025-01-17)
-- **Resolution**: All 14 tests in test_posix.py pass, including `test_posix_time_ns_returns_positive`
+- **Files**: `codegen/posix.py`
+- **Status**: Resolved (2026-01-19)
+- **Resolution**: Fixed incorrect clock constants in `_create_posix_time_ns`:
+  - Linux: Changed from 4 to 1 (CLOCK_MONOTONIC)
+  - macOS: Changed from 1 to 8 (CLOCK_UPTIME_RAW for true nanosecond precision)
+  - Root cause: Using wrong constants caused clock_gettime to fail silently, returning garbage values
+  - Note: macOS CLOCK_REALTIME only provides microsecond precision, but CLOCK_UPTIME_RAW provides true nanosecond precision
+- **Note**: Previously marked resolved on 2025-01-17 but test only checked `t > 0` which passed with garbage. Re-opened and truly fixed 2026-01-19.
 
 ### BUG-006: Channel<[int]> receive() returns unknown type
 - **Discovered**: 2025-01-17, during codebase scan
@@ -434,6 +586,21 @@
   4. Changed `coex_scheduler_first_wait` to wait until all tasks complete, ensuring the lowest-indexed task's value is stored before returning
 - **Root Cause**: When parent tasks (`__first_body_1`) completed around the same time, whichever called `handle_first_completion` first would win, regardless of element index. Additionally, the winner_value update could be overwritten by a higher-indexed task that got the mutex later.
 
+### BUG-046: Thread-based first returns temporally first result instead of index-0 result
+- **Discovered**: 2026-01-19, during GitHub CI failure on Linux
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: `result = first x in [1,2,3] compute(x) ~` where `compute` is a `thread`
+- **Observed**: Returns 6 (3*2) on Linux when thread 2 completes first temporally
+- **Expected**: Should return 2 (1*2) - the first element's result, for deterministic behavior
+- **Files**: `codegen/loops.py`
+- **Status**: Fixed (2026-01-19)
+- **Resolution**: The scheduler-based `first` (for `task`) was fixed in BUG-027 to use priority-based winner selection (lowest index wins). However, the thread-based `first` (for `thread`) still used `task_wait_any` to determine the winner based on temporal completion order. Fixed by:
+  1. Changed result extraction to always use index 0 instead of the `wait_any` winner
+  2. Changed cancel logic to never cancel index 0 (always let it complete)
+  3. All threads are joined, so index 0's result is always available
+- **Root Cause**: Thread-based and scheduler-based `first` implementations had divergent semantics. Thread path used temporal winner selection while scheduler path used priority-based selection.
+
 ---
 
 ## Notes
@@ -448,5 +615,36 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-18)
-- **Open**: 4 bugs (BUG-004, BUG-015, BUG-016, BUG-023)
-- **Resolved**: 29 bugs
+- **Open**: 10 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044)
+- **Resolved**: 36 bugs (including BUG-045: Metal double type fix)
+
+### Lock Audit Bugs (BUG-033 to BUG-044)
+- **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX
+- **Open (under review)**: BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044 - data structure protection locks
+
+### BUG-033: Float list values corrupted when returned from function
+- **Discovered**: 2025-01-18, during GEMM benchmark development
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**: 
+  ```coex
+  func gemm(a: [float], b: [float]) -> [float]
+      result: [float] = []
+      for i in 0..2
+          val: float = compute(a, b, i)  # val prints correctly here
+          result = result.append(val)
+      ~
+      return result
+  ~
+  
+  func main() -> int
+      c = gemm(a, b)
+      v: float = c.get(0)  # v is corrupted (e.g., 4620706744243609600.0)
+      return 0
+  ~
+  ```
+- **Observed**: Float values computed correctly inside function but read as corrupted values (appear to be bit-reinterpreted) after function returns
+- **Expected**: Float list values should maintain integrity across function boundaries
+- **Hypothesis**: Type confusion between float32/float64 or handle/pointer in list return path
+- **Files**: `codegen/core.py`, `codegen/collections.py`
+- **Status**: Open

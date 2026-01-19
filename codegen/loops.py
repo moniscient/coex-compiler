@@ -2311,15 +2311,16 @@ class LoopGenerator:
 
         cg.builder.position_at_end(cancel_body)
         c_idx_i32 = cg.builder.trunc(c_idx, i32)
-        winner_idx_i64 = cg.builder.sext(winner_idx, i64)
-        is_winner = cg.builder.icmp_signed("==", c_idx, winner_idx_i64)
+        # For deterministic behavior (BUG-027), never cancel index 0 - we always
+        # want its result. Cancel all tasks with index > 0.
+        is_first = cg.builder.icmp_signed("==", c_idx, ir.Constant(i64, 0))
 
         cancel_this = func.append_basic_block("first_cancel_this")
         skip_cancel = func.append_basic_block("first_skip_cancel")
 
-        cg.builder.cbranch(is_winner, skip_cancel, cancel_this)
+        cg.builder.cbranch(is_first, skip_cancel, cancel_this)
 
-        # Cancel non-winners
+        # Cancel non-first tasks (index > 0)
         cg.builder.position_at_end(cancel_this)
         cancel_closure_slot = cg.builder.gep(
             closure_ptr_arr,
@@ -2366,14 +2367,16 @@ class LoopGenerator:
 
         cg.builder.position_at_end(join_done)
 
-        # Extract winner's result
-        winner_idx_i32 = winner_idx
-        winner_closure_slot = cg.builder.gep(
+        # Extract result from first element (index 0) for deterministic behavior
+        # The BUG-027 fix established that 'first' uses priority-based semantics:
+        # the lowest-indexed task always wins, regardless of completion order.
+        # Since all threads are joined at this point, task 0's result is available.
+        first_closure_slot = cg.builder.gep(
             closure_ptr_arr,
-            [ir.Constant(i32, 0), winner_idx_i32],
+            [ir.Constant(i32, 0), ir.Constant(i32, 0)],  # Always index 0
             inbounds=True
         )
-        winner_closure = cg.builder.load(winner_closure_slot)
+        winner_closure = cg.builder.load(first_closure_slot)
         result_field = cg.builder.gep(
             winner_closure,
             [ir.Constant(i32, 0), ir.Constant(i32, 1)],
