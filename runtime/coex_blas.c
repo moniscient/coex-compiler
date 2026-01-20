@@ -614,3 +614,86 @@ double coex_linalg_norm(const CoexArray* x) {
     const double* x_data = (const double*)COEX_ARRAY_DATA_PTR(x);
     return coex_blas_dnrm2(x->shape[0], x_data);
 }
+
+/**
+ * Native float32 matrix multiply for 2D Arrays: C = A @ B
+ *
+ * Works directly with Array<float32> - no type conversion needed.
+ * Uses SGEMM which is ~4x faster than DGEMM on Apple AMX.
+ *
+ * Parameters:
+ *   a - pointer to Array struct (2D, float32 elements, elem_size=4)
+ *   b - pointer to Array struct (2D, float32 elements, elem_size=4)
+ *
+ * Returns pointer to newly allocated Array (2D, float32), or NULL on error.
+ */
+CoexArray* coex_linalg_matmul_f32_native(const CoexArray* a, const CoexArray* b) {
+    /* Validate inputs */
+    if (!a || !b) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: null input array\n");
+        return NULL;
+    }
+
+    if (a->ndim != 2 || b->ndim != 2) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: requires 2D arrays, got %lldD and %lldD\n",
+                (long long)a->ndim, (long long)b->ndim);
+        return NULL;
+    }
+
+    /* Verify inputs are float32 (elem_size = 4) */
+    if (a->elem_size != 4 || b->elem_size != 4) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: requires float32 arrays (elem_size=4), got %lld and %lld\n",
+                (long long)a->elem_size, (long long)b->elem_size);
+        return NULL;
+    }
+
+    int64_t m = a->shape[0];  /* rows of A */
+    int64_t k = a->shape[1];  /* cols of A */
+    int64_t k2 = b->shape[0]; /* rows of B */
+    int64_t n = b->shape[1];  /* cols of B */
+
+    if (k != k2) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: dimension mismatch: %lld x %lld cannot multiply %lld x %lld\n",
+                (long long)m, (long long)k, (long long)k2, (long long)n);
+        return NULL;
+    }
+
+    /* Get data pointers (native float32) */
+    const float* a_data = (const float*)COEX_ARRAY_DATA_PTR(a);
+    const float* b_data = (const float*)COEX_ARRAY_DATA_PTR(b);
+
+    /* Allocate result array via GC */
+    CoexArray* c = (CoexArray*)GC_ALLOC(sizeof(CoexArray), GC_TYPE_ARRAY);
+    if (!c) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: failed to allocate result array\n");
+        return NULL;
+    }
+
+    /* Allocate data buffer via GC (float32) */
+    int64_t c_size = m * n * sizeof(float);
+    float* c_data = (float*)GC_ALLOC(c_size, GC_TYPE_ARRAY_DATA);
+    if (!c_data) {
+        fprintf(stderr, "coex_linalg_matmul_f32_native: failed to allocate result data\n");
+        return NULL;
+    }
+
+    /* Initialize result array struct (native float32) */
+    c->handle = (int64_t)c_data;
+    c->ndim = 2;
+    c->shape[0] = m;
+    c->shape[1] = n;
+    c->shape[2] = 0;
+    c->shape[3] = 0;
+    c->strides[0] = n * sizeof(float);
+    c->strides[1] = sizeof(float);
+    c->strides[2] = 0;
+    c->strides[3] = 0;
+    c->offset = 0;
+    c->elem_size = sizeof(float);
+    c->type_id = COEX_TYPE_FLOAT32;
+
+    /* Perform SGEMM: C = 1.0 * A * B + 0.0 * C */
+    coex_blas_sgemm(m, n, k, 1.0f, a_data, b_data, 0.0f, c_data);
+
+    return c;
+}

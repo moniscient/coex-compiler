@@ -893,6 +893,7 @@ class CodeGenerator:
         if not hasattr(self, 'extern_function_decls'):
             return False
         blas_funcs = {'coex_linalg_matmul', 'coex_linalg_matmul32',
+                      'coex_linalg_matmul_f32_native',
                       'coex_linalg_dot', 'coex_linalg_norm'}
         return any(fn in self.extern_function_decls for fn in blas_funcs)
 
