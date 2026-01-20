@@ -2,7 +2,11 @@
 
 CC = clang
 CFLAGS = -O2 -fPIC -Wall -Wextra -std=c11
+OBJCFLAGS = -O2 -fPIC -Wall -Wextra -fobjc-arc
 AR = ar
+
+# Detect macOS for Metal support
+UNAME_S := $(shell uname -s)
 
 # FFI Runtime
 FFI_LIB = libcoex_ffi.a
@@ -20,12 +24,31 @@ SCHEDULER_OBJ = coex_scheduler.o
 CHANNEL_LIB = libcoex_channel.a
 CHANNEL_OBJ = coex_channel.o
 
-# Metal GPU Dispatch Stub
+# Metal GPU Dispatch - native on macOS, stub on other platforms
 METAL_LIB = libcoex_metal.a
-METAL_OBJ = coex_metal_stub.o
+ifeq ($(UNAME_S),Darwin)
+    METAL_OBJ = coex_metal.o
+    METAL_FRAMEWORKS = -framework Metal -framework Foundation
+else
+    METAL_OBJ = coex_metal_stub.o
+    METAL_FRAMEWORKS =
+endif
+
+# BLAS Library - Accelerate on macOS, OpenBLAS on Linux, reference fallback
+BLAS_LIB = libcoex_blas.a
+BLAS_OBJ = coex_blas.o
+ifeq ($(UNAME_S),Darwin)
+    # Use new LAPACK interface to avoid deprecation warnings
+    BLAS_CFLAGS = -DACCELERATE_NEW_LAPACK
+    BLAS_FRAMEWORKS = -framework Accelerate
+else
+    # Try OpenBLAS on Linux, fall back to reference implementation
+    BLAS_CFLAGS = $(shell pkg-config --cflags openblas 2>/dev/null && echo -DHAVE_OPENBLAS)
+    BLAS_FRAMEWORKS = $(shell pkg-config --libs openblas 2>/dev/null)
+endif
 
 # All libraries
-LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB) $(METAL_LIB)
+LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB) $(METAL_LIB) $(BLAS_LIB)
 
 all: $(LIBS)
 
@@ -57,12 +80,24 @@ $(CHANNEL_LIB): $(CHANNEL_OBJ)
 coex_channel.o: coex_channel.c coex_channel.h coex_scheduler.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Metal Stub Library
+# Metal Library - native implementation on macOS
 $(METAL_LIB): $(METAL_OBJ)
 	$(AR) rcs $@ $^
 
+ifeq ($(UNAME_S),Darwin)
+coex_metal.o: coex_metal.m coex_metal_stub.h
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+else
 coex_metal_stub.o: coex_metal_stub.c coex_metal_stub.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+endif
+
+# BLAS Library
+$(BLAS_LIB): $(BLAS_OBJ)
+	$(AR) rcs $@ $^
+
+coex_blas.o: coex_blas.c
+	$(CC) $(CFLAGS) $(BLAS_CFLAGS) -c -o $@ $<
 
 # Test targets
 test_task: test_coex_task.c coex_task.c coex_task.h
@@ -71,7 +106,14 @@ test_task: test_coex_task.c coex_task.c coex_task.h
 test: test_task
 	./test_task
 
-clean:
-	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) $(METAL_OBJ) $(LIBS) test_task
+# Metal test (macOS only)
+ifeq ($(UNAME_S),Darwin)
+test_metal: coex_metal.m
+	$(CC) $(OBJCFLAGS) -DTEST_METAL_MAIN -o $@ $< $(METAL_FRAMEWORKS)
+	./test_metal
+endif
 
-.PHONY: all test clean
+clean:
+	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) coex_metal.o coex_metal_stub.o $(BLAS_OBJ) $(LIBS) test_task test_metal
+
+.PHONY: all test clean test_metal

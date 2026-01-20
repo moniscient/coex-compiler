@@ -882,6 +882,18 @@ class CodeGenerator:
         """
         return self._channel.uses_channels()
 
+    def uses_blas(self) -> bool:
+        """Check if the compiled program uses BLAS functions.
+
+        Returns True if any coex_linalg_* extern functions are declared,
+        which requires linking the BLAS runtime library.
+        """
+        if not hasattr(self, 'extern_function_decls'):
+            return False
+        blas_funcs = {'coex_linalg_matmul', 'coex_linalg_matmul32',
+                      'coex_linalg_dot', 'coex_linalg_norm'}
+        return any(fn in self.extern_function_decls for fn in blas_funcs)
+
     # Trait helpers moved to codegen/traits.py - TraitGenerator class
 
     def _register_trait(self, trait_decl: 'TraitDecl'):

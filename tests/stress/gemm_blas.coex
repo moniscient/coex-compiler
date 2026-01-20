@@ -1,0 +1,123 @@
+# GEMM Benchmark using BLAS
+# ==========================
+# Tests matrix multiplication performance using platform-native BLAS
+# (Apple Accelerate on macOS, OpenBLAS on Linux)
+#
+# Usage:
+#   python3 coexc.py tests/stress/gemm_blas.coex -o /tmp/gemm_blas && /tmp/gemm_blas
+
+import linalg
+
+func create_matrix(rows: int, cols: int, seed: float) -> Array<float>
+    # Create a matrix and fill with deterministic values
+    arr: Array<float> = Array.zeros_2d(rows, cols)
+    flat: Array<float> = arr.flatten()
+
+    i: int = 0
+    size: int = rows * cols
+    while i < size
+        # Simple deterministic fill: value = seed + (i * 0.001)
+        flat = flat.set(i, seed + (i * 0.001))
+        i = i + 1
+    ~
+
+    return flat.reshape(rows, cols)
+~
+
+func main() -> int
+    print("===========================================")
+    print("GEMM Benchmark (BLAS-backed)")
+    print("===========================================")
+    print("")
+
+    # Configuration - various matrix sizes
+    sizes: List<int> = [64, 128, 256, 512, 1024]
+    iterations: int = 3
+
+    i: int = 0
+    while i < sizes.len()
+        n: int = sizes.get(i)
+
+        print("Matrix size: ")
+        print(n)
+        print(" x ")
+        print(n)
+        print("")
+
+        # Create test matrices
+        print("  Creating matrices...")
+        a: Array<float> = create_matrix(n, n, 1.0)
+        b: Array<float> = create_matrix(n, n, 2.0)
+
+        # Warmup run
+        print("  Warmup run...")
+        warmup: Array<float> = linalg.matmul_f64(a, b)
+        checksum: float = warmup[0, 0]
+
+        # Benchmark 64-bit GEMM
+        print("  Running DGEMM (64-bit)...")
+        t1: int = posix.time_ns()
+
+        iter: int = 0
+        while iter < iterations
+            c: Array<float> = linalg.matmul_f64(a, b)
+            checksum = checksum + c[0, 0]
+            iter = iter + 1
+        ~
+
+        t2: int = posix.time_ns()
+        f64_ns: int = t2 - t1
+        f64_ms: int = f64_ns / 1000000
+
+        # Benchmark 32-bit GEMM
+        print("  Running SGEMM (32-bit)...")
+        t3: int = posix.time_ns()
+
+        iter = 0
+        while iter < iterations
+            c: Array<float> = linalg.matmul_f32(a, b)
+            checksum = checksum + c[0, 0]
+            iter = iter + 1
+        ~
+
+        t4: int = posix.time_ns()
+        f32_ns: int = t4 - t3
+        f32_ms: int = f32_ns / 1000000
+
+        # Calculate GFLOPS
+        # GEMM: 2 * n^3 FLOPs per multiply (multiply and add)
+        ops_per_gemm: int = 2 * n * n * n
+        total_ops: int = ops_per_gemm * iterations
+
+        print("  Results:")
+        print("    DGEMM time (ms): ")
+        print(f64_ms)
+
+        if f64_ms > 0
+            gflops_f64: float = (total_ops * 1.0) / (f64_ns * 1.0)  # ns -> s cancels with G
+            print("    DGEMM GFLOPS: ")
+            print(gflops_f64)
+        ~
+
+        print("    SGEMM time (ms): ")
+        print(f32_ms)
+
+        if f32_ms > 0
+            gflops_f32: float = (total_ops * 1.0) / (f32_ns * 1.0)
+            print("    SGEMM GFLOPS: ")
+            print(gflops_f32)
+        ~
+
+        print("    Checksum: ")
+        print(checksum)
+        print("")
+
+        i = i + 1
+    ~
+
+    print("===========================================")
+    print("Benchmark complete")
+    print("===========================================")
+
+    return 0
+~

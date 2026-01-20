@@ -1,12 +1,55 @@
 # Linear algebra module for Coex standard library
 #
 # Provides matrix operations for Array<T> types:
-# - matmul(a, b) - Matrix multiplication
+# - matmul(a, b) - Matrix multiplication (BLAS-backed for float)
 # - matvec(a, x) - Matrix-vector multiplication
-# - dot(a, b) - Dot product of 1D arrays
+# - dot(a, b) - Dot product of 1D arrays (BLAS-backed for float)
 #
-# Note: These use 'func' instead of 'formula' because they need loops with
-# rebindable counters. They are functionally pure (no external side effects).
+# On macOS, float operations use Apple Accelerate framework (BLAS).
+# On Linux, OpenBLAS is used if available.
+# Falls back to pure Coex implementation if no BLAS is available.
+#
+# Note: These use 'func' instead of 'formula' because they need either
+# loops with rebindable counters or extern FFI calls.
+
+# ========================================================================
+# FFI declarations for C BLAS wrappers (float only)
+# ========================================================================
+
+extern coex_linalg_matmul(a: Array<float>, b: Array<float>) -> Array<float> ~
+extern coex_linalg_matmul32(a: Array<float>, b: Array<float>) -> Array<float> ~
+extern coex_linalg_dot(x: Array<float>, y: Array<float>) -> float ~
+extern coex_linalg_norm(x: Array<float>) -> float ~
+
+# ========================================================================
+# BLAS-backed float operations
+# ========================================================================
+
+# Matrix multiplication using BLAS (64-bit precision)
+# A is m x k, B is k x n, result is m x n
+func matmul_f64(_ a: Array<float>, _ b: Array<float>) -> Array<float>
+    return coex_linalg_matmul(a, b)
+~
+
+# Matrix multiplication using BLAS (32-bit precision)
+# Faster on GPU-backed BLAS (Accelerate on macOS)
+func matmul_f32(_ a: Array<float>, _ b: Array<float>) -> Array<float>
+    return coex_linalg_matmul32(a, b)
+~
+
+# Dot product using BLAS
+func dot_f64(_ x: Array<float>, _ y: Array<float>) -> float
+    return coex_linalg_dot(x, y)
+~
+
+# Euclidean norm using BLAS
+func norm_f64(_ x: Array<float>) -> float
+    return coex_linalg_norm(x)
+~
+
+# ========================================================================
+# Pure Coex implementations (int arrays, fallback)
+# ========================================================================
 
 # Dot product of two 1D arrays
 func dot(_ a: Array<int>, _ b: Array<int>) -> int

@@ -41,6 +41,9 @@ from commentary import (
 )
 from commentary_analyzer import run_all_analyzers
 
+# Import GPU offload tracking
+from codegen.formula import gpu_offload_used
+
 
 class CompileError(Exception):
     """Compilation error"""
@@ -297,6 +300,33 @@ def compile_coex(source_path: str, output_path: str = None,
         else:
             print(f"Warning: Task runtime library not found at {task_runtime}")
             print("Build it with: cd runtime && make")
+
+        # Add Metal GPU runtime when GPU offload is used (macOS only)
+        if gpu_offload_used():
+            metal_runtime = os.path.join(runtime_dir, "libcoex_metal.a")
+            if os.path.exists(metal_runtime):
+                link_cmd.append(metal_runtime)
+                # Add Metal and Foundation frameworks (macOS)
+                if sys.platform == "darwin":
+                    link_cmd.extend(["-framework", "Metal", "-framework", "Foundation"])
+            else:
+                print(f"Warning: Metal runtime library not found at {metal_runtime}")
+                print("Build it with: cd runtime && make")
+
+        # Add BLAS runtime when linalg functions are used
+        if codegen.uses_blas():
+            blas_runtime = os.path.join(runtime_dir, "libcoex_blas.a")
+            if os.path.exists(blas_runtime):
+                link_cmd.append(blas_runtime)
+                # Add Accelerate framework (macOS) or OpenBLAS (Linux)
+                if sys.platform == "darwin":
+                    link_cmd.extend(["-framework", "Accelerate"])
+                else:
+                    # Try OpenBLAS on Linux
+                    link_cmd.append("-lopenblas")
+            else:
+                print(f"Warning: BLAS runtime library not found at {blas_runtime}")
+                print("Build it with: cd runtime && make")
 
         result = subprocess.run(
             link_cmd,
