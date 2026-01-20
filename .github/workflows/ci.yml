@@ -30,10 +30,12 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm
+        sudo apt-get install -y clang llvm libopenblas-dev
         echo "=== System versions ==="
         clang --version
         llvm-config --version || echo "llvm-config not found"
+        echo "=== OpenBLAS info ==="
+        pkg-config --libs openblas || echo "OpenBLAS pkg-config not found (will use -lopenblas directly)"
         echo "=== Python llvmlite info ==="
         python -c "import llvmlite; print(f'llvmlite version: {llvmlite.__version__}')" || echo "llvmlite not yet installed"
 
