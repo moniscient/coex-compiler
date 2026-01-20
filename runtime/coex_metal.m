@@ -36,6 +36,144 @@ typedef struct {
 static CachedKernel _kernel_cache[KERNEL_CACHE_SIZE];
 static int _cache_count = 0;
 
+/* ========================================================================
+ * Persistent Buffer Pool for GPU GEMM
+ * Avoids per-call allocation overhead by reusing buffers
+ * ======================================================================== */
+
+#define GEMM_BUFFER_POOL_SIZE 4
+
+typedef struct {
+    id<MTLBuffer> a_buffer;
+    id<MTLBuffer> b_buffer;
+    id<MTLBuffer> c_buffer;
+    int64_t m, k, n;  /* Dimensions this buffer set was allocated for */
+    int64_t a_cols_padded, b_cols_padded, c_cols_padded;
+    MPSMatrixMultiplication* matmul_kernel;
+    int in_use;
+} GemmBufferSet;
+
+static GemmBufferSet _gemm_pool[GEMM_BUFFER_POOL_SIZE];
+static int _gemm_pool_initialized = 0;
+
+/**
+ * Find or allocate a buffer set for the given dimensions.
+ * Returns NULL if pool is exhausted.
+ */
+static GemmBufferSet* get_gemm_buffers(int64_t m, int64_t k, int64_t n) {
+    /* Calculate padded dimensions (MPS requires 16-byte alignment) */
+    int64_t a_cols_padded = ((k + 3) / 4) * 4;
+    int64_t b_cols_padded = ((n + 3) / 4) * 4;
+    int64_t c_cols_padded = b_cols_padded;
+
+    /* Initialize pool if needed */
+    if (!_gemm_pool_initialized) {
+        memset(_gemm_pool, 0, sizeof(_gemm_pool));
+        _gemm_pool_initialized = 1;
+    }
+
+    /* Look for existing buffer set with matching dimensions */
+    for (int i = 0; i < GEMM_BUFFER_POOL_SIZE; i++) {
+        if (!_gemm_pool[i].in_use &&
+            _gemm_pool[i].m == m &&
+            _gemm_pool[i].k == k &&
+            _gemm_pool[i].n == n &&
+            _gemm_pool[i].a_buffer != nil) {
+            _gemm_pool[i].in_use = 1;
+            return &_gemm_pool[i];
+        }
+    }
+
+    /* Look for empty slot to allocate new buffers */
+    for (int i = 0; i < GEMM_BUFFER_POOL_SIZE; i++) {
+        if (_gemm_pool[i].a_buffer == nil) {
+            /* Allocate new buffer set */
+            size_t a_size = m * a_cols_padded * sizeof(float);
+            size_t b_size = k * b_cols_padded * sizeof(float);
+            size_t c_size = m * c_cols_padded * sizeof(float);
+
+            _gemm_pool[i].a_buffer = [_device newBufferWithLength:a_size
+                                                          options:MTLResourceStorageModeShared];
+            _gemm_pool[i].b_buffer = [_device newBufferWithLength:b_size
+                                                          options:MTLResourceStorageModeShared];
+            _gemm_pool[i].c_buffer = [_device newBufferWithLength:c_size
+                                                          options:MTLResourceStorageModeShared];
+
+            if (!_gemm_pool[i].a_buffer || !_gemm_pool[i].b_buffer || !_gemm_pool[i].c_buffer) {
+                return NULL;
+            }
+
+            /* Create reusable matmul kernel */
+            _gemm_pool[i].matmul_kernel = [[MPSMatrixMultiplication alloc]
+                initWithDevice:_device
+                   resultRows:m
+                resultColumns:n
+              interiorColumns:k];
+
+            _gemm_pool[i].m = m;
+            _gemm_pool[i].k = k;
+            _gemm_pool[i].n = n;
+            _gemm_pool[i].a_cols_padded = a_cols_padded;
+            _gemm_pool[i].b_cols_padded = b_cols_padded;
+            _gemm_pool[i].c_cols_padded = c_cols_padded;
+            _gemm_pool[i].in_use = 1;
+
+            return &_gemm_pool[i];
+        }
+    }
+
+    /* Pool exhausted - find least recently used slot and reallocate */
+    /* For simplicity, just use slot 0 */
+    GemmBufferSet* slot = &_gemm_pool[0];
+
+    /* Release old buffers */
+    slot->a_buffer = nil;
+    slot->b_buffer = nil;
+    slot->c_buffer = nil;
+    slot->matmul_kernel = nil;
+
+    /* Allocate new buffer set */
+    size_t a_size = m * a_cols_padded * sizeof(float);
+    size_t b_size = k * b_cols_padded * sizeof(float);
+    size_t c_size = m * c_cols_padded * sizeof(float);
+
+    slot->a_buffer = [_device newBufferWithLength:a_size
+                                          options:MTLResourceStorageModeShared];
+    slot->b_buffer = [_device newBufferWithLength:b_size
+                                          options:MTLResourceStorageModeShared];
+    slot->c_buffer = [_device newBufferWithLength:c_size
+                                          options:MTLResourceStorageModeShared];
+
+    if (!slot->a_buffer || !slot->b_buffer || !slot->c_buffer) {
+        return NULL;
+    }
+
+    slot->matmul_kernel = [[MPSMatrixMultiplication alloc]
+        initWithDevice:_device
+           resultRows:m
+        resultColumns:n
+      interiorColumns:k];
+
+    slot->m = m;
+    slot->k = k;
+    slot->n = n;
+    slot->a_cols_padded = a_cols_padded;
+    slot->b_cols_padded = b_cols_padded;
+    slot->c_cols_padded = c_cols_padded;
+    slot->in_use = 1;
+
+    return slot;
+}
+
+/**
+ * Release a buffer set back to the pool.
+ */
+static void release_gemm_buffers(GemmBufferSet* buffers) {
+    if (buffers) {
+        buffers->in_use = 0;
+    }
+}
+
 /**
  * Simple hash function for kernel source.
  */
@@ -559,7 +697,7 @@ CoexArray* coex_metal_matmul(const CoexArray* a, const CoexArray* b) {
  * GPU-accelerated matrix multiplication for native FP32 data.
  *
  * Works directly with float32 arrays - no FP64<->FP32 conversion overhead.
- * This achieves the full ~7-8 TFLOPS on M1 Max since there's no data conversion.
+ * Uses persistent buffer pool to avoid per-call allocation overhead.
  *
  * @param a  Input matrix A (2D Array<float32>, m x k, elem_size=4)
  * @param b  Input matrix B (2D Array<float32>, k x n, elem_size=4)
@@ -603,57 +741,35 @@ CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) 
     }
 
     @autoreleasepool {
+        /* Get persistent buffer set from pool */
+        GemmBufferSet* buffers = get_gemm_buffers(m, k, n);
+        if (!buffers) {
+            fprintf(stderr, "coex_metal_matmul_f32_native: failed to get buffer set\n");
+            return NULL;
+        }
+
         /* Get source data (native 32-bit floats) */
         const float* a_f32 = (const float*)COEX_ARRAY_DATA_PTR(a);
         const float* b_f32 = (const float*)COEX_ARRAY_DATA_PTR(b);
 
-        /*
-         * MPS requires row stride to be multiple of 16 bytes (4 floats).
-         * We pad columns to the next multiple of 4 for optimal performance.
-         */
-        NSUInteger a_cols_padded = ((k + 3) / 4) * 4;
-        NSUInteger b_cols_padded = ((n + 3) / 4) * 4;
-        NSUInteger c_cols_padded = b_cols_padded;
-
-        /* Allocate padded buffers for MPS */
-        size_t a_buffer_size = m * a_cols_padded * sizeof(float);
-        size_t b_buffer_size = k * b_cols_padded * sizeof(float);
-        size_t c_buffer_size = m * c_cols_padded * sizeof(float);
-
-        /* Create Metal buffers with shared storage (Apple Silicon unified memory) */
-        id<MTLBuffer> a_metal = [_device newBufferWithLength:a_buffer_size
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_metal = [_device newBufferWithLength:b_buffer_size
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> c_metal = [_device newBufferWithLength:c_buffer_size
-                                                     options:MTLResourceStorageModeShared];
-
-        if (!a_metal || !b_metal || !c_metal) {
-            fprintf(stderr, "coex_metal_matmul_f32_native: failed to allocate GPU buffers\n");
-            return NULL;
-        }
+        int64_t a_cols_padded = buffers->a_cols_padded;
+        int64_t b_cols_padded = buffers->b_cols_padded;
+        int64_t c_cols_padded = buffers->c_cols_padded;
 
         /* Copy A to padded buffer (no type conversion needed) */
-        float* a_padded = (float*)[a_metal contents];
+        float* a_padded = (float*)[buffers->a_buffer contents];
         for (int64_t i = 0; i < m; i++) {
             memcpy(&a_padded[i * a_cols_padded], &a_f32[i * k], k * sizeof(float));
-            /* Zero padding */
-            for (NSUInteger j = k; j < a_cols_padded; j++) {
-                a_padded[i * a_cols_padded + j] = 0.0f;
-            }
+            /* Zero padding only needed on first use - skip for speed */
         }
 
         /* Copy B to padded buffer (no type conversion needed) */
-        float* b_padded = (float*)[b_metal contents];
+        float* b_padded = (float*)[buffers->b_buffer contents];
         for (int64_t i = 0; i < k; i++) {
             memcpy(&b_padded[i * b_cols_padded], &b_f32[i * n], n * sizeof(float));
-            /* Zero padding */
-            for (NSUInteger j = n; j < b_cols_padded; j++) {
-                b_padded[i * b_cols_padded + j] = 0.0f;
-            }
         }
 
-        /* Create MPS matrix descriptors */
+        /* Create MPS matrix descriptors (lightweight, not cached) */
         MPSMatrixDescriptor* a_desc = [MPSMatrixDescriptor
             matrixDescriptorWithRows:m
                              columns:k
@@ -672,24 +788,17 @@ CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) 
                             rowBytes:c_cols_padded * sizeof(float)
                             dataType:MPSDataTypeFloat32];
 
-        /* Create MPS matrices */
-        MPSMatrix* mps_a = [[MPSMatrix alloc] initWithBuffer:a_metal descriptor:a_desc];
-        MPSMatrix* mps_b = [[MPSMatrix alloc] initWithBuffer:b_metal descriptor:b_desc];
-        MPSMatrix* mps_c = [[MPSMatrix alloc] initWithBuffer:c_metal descriptor:c_desc];
+        /* Create MPS matrices wrapping our persistent buffers */
+        MPSMatrix* mps_a = [[MPSMatrix alloc] initWithBuffer:buffers->a_buffer descriptor:a_desc];
+        MPSMatrix* mps_b = [[MPSMatrix alloc] initWithBuffer:buffers->b_buffer descriptor:b_desc];
+        MPSMatrix* mps_c = [[MPSMatrix alloc] initWithBuffer:buffers->c_buffer descriptor:c_desc];
 
-        /* Create matrix multiplication kernel: C = alpha * A * B + beta * C */
-        MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:_device
-               resultRows:m
-            resultColumns:n
-          interiorColumns:k];
-
-        /* Execute on GPU */
+        /* Execute on GPU using cached matmul kernel */
         id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
-        [matmul encodeToCommandBuffer:commandBuffer
-                           leftMatrix:mps_a
-                          rightMatrix:mps_b
-                         resultMatrix:mps_c];
+        [buffers->matmul_kernel encodeToCommandBuffer:commandBuffer
+                                           leftMatrix:mps_a
+                                          rightMatrix:mps_b
+                                         resultMatrix:mps_c];
 
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
@@ -698,6 +807,7 @@ CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) 
         if (commandBuffer.status == MTLCommandBufferStatusError) {
             fprintf(stderr, "coex_metal_matmul_f32_native: GPU execution failed: %s\n",
                     [[commandBuffer.error localizedDescription] UTF8String]);
+            release_gemm_buffers(buffers);
             return NULL;
         }
 
@@ -708,6 +818,7 @@ CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) 
 
         if (!c || !c_data) {
             fprintf(stderr, "coex_metal_matmul_f32_native: failed to allocate result\n");
+            release_gemm_buffers(buffers);
             return NULL;
         }
 
@@ -727,10 +838,13 @@ CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) 
         c->type_id = COEX_TYPE_FLOAT32;
 
         /* Copy result from padded buffer (no type conversion needed) */
-        float* c_f32 = (float*)[c_metal contents];
+        float* c_f32 = (float*)[buffers->c_buffer contents];
         for (int64_t i = 0; i < m; i++) {
             memcpy(&c_data[i * n], &c_f32[i * c_cols_padded], n * sizeof(float));
         }
+
+        /* Release buffer set back to pool for reuse */
+        release_gemm_buffers(buffers);
 
         return c;
     }
