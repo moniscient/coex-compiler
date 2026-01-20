@@ -71,7 +71,6 @@ functionDecl
 
 functionKind
     : FORMULA
-    | FORMULA32
     | TASK
     | THREAD
     | FUNC
@@ -646,8 +645,7 @@ typeList
 // ----------------------------------------------------------------------------
 
 // Function kinds
-FORMULA32   : 'formula32' ;  // 32-bit precision formula (for GPU)
-FORMULA     : 'formula' ;
+FORMULA     : 'formula' ;  // Pure function (no side effects)
 THREAD      : 'thread' ;
 FUNC        : 'func' ;
 TASK        : 'task' ;    // Reserved for future coroutine system

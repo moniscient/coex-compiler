@@ -41,10 +41,6 @@ from commentary import (
 )
 from commentary_analyzer import run_all_analyzers
 
-# Import GPU offload tracking
-from codegen.formula import gpu_offload_used
-
-
 class CompileError(Exception):
     """Compilation error"""
     pass
@@ -301,8 +297,8 @@ def compile_coex(source_path: str, output_path: str = None,
             print(f"Warning: Task runtime library not found at {task_runtime}")
             print("Build it with: cd runtime && make")
 
-        # Add Metal GPU runtime when GPU offload or GPU linalg is used (macOS only)
-        if gpu_offload_used() or codegen.uses_gpu_linalg():
+        # Add Metal GPU runtime when GPU linalg is used (macOS only)
+        if codegen.uses_gpu_linalg():
             metal_runtime = os.path.join(runtime_dir, "libcoex_metal.a")
             if os.path.exists(metal_runtime):
                 link_cmd.append(metal_runtime)

@@ -202,7 +202,7 @@ class FunctionGenerator:
         # task and formula cannot call extern (they must be non-blocking)
         if hasattr(cg, 'current_function') and cg.current_function:
             caller_kind = cg.current_function.kind
-            if caller_kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+            if caller_kind == FunctionKind.FORMULA:
                 raise RuntimeError(
                     f"Cannot call extern function '{name}' from formula "
                     f"'{cg.current_function.name}'. Extern functions can only "
@@ -533,7 +533,7 @@ class FunctionGenerator:
         # the arena, which is bulk-freed on return. This provides ~10x faster
         # allocation for temporaries that don't escape.
         cg.arena_start = None
-        if func.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32) and cg.gc is not None:
+        if func.kind == FunctionKind.FORMULA and cg.gc is not None:
             # Push arena scope - saves TLAB cursor as arena start
             cg.arena_start = cg.builder.call(cg.gc.gc_arena_push, [])
             cg.use_arena_allocation = True
@@ -572,11 +572,6 @@ class FunctionGenerator:
             param_value = llvm_param
             if cg._needs_parameter_copy(param.type_annotation):
                 param_value = cg._generate_deep_copy(llvm_param, param.type_annotation)
-
-            # Formula32: narrow parameters to 32-bit precision
-            # This ensures 32-bit overflow/precision semantics on CPU
-            if func.kind == FunctionKind.FORMULA32:
-                param_value = self.narrow_to_32bit(cg.builder, param_value, param.type_annotation)
 
             # Allocate on stack and store the value
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
@@ -743,10 +738,6 @@ class FunctionGenerator:
             param_value = llvm_param
             if cg._needs_parameter_copy(param_type):
                 param_value = cg._generate_deep_copy(llvm_param, param_type)
-
-            # Formula32: narrow parameters to 32-bit precision
-            if func_decl.kind == FunctionKind.FORMULA32:
-                param_value = self.narrow_to_32bit(cg.builder, param_value, param_type)
 
             alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.builder.store(param_value, alloca)

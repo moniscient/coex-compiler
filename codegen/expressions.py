@@ -1496,13 +1496,11 @@ class ExpressionGenerator:
 
         # Define what each kind can call
         # Key = caller kind, Value = set of allowed callee kinds
-        # formula32 has same purity constraints as formula (can call formula or formula32)
         allowed = {
-            FunctionKind.FORMULA: {FunctionKind.FORMULA, FunctionKind.FORMULA32},
-            FunctionKind.FORMULA32: {FunctionKind.FORMULA, FunctionKind.FORMULA32},
-            FunctionKind.TASK: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK},
-            FunctionKind.THREAD: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK, FunctionKind.THREAD},
-            FunctionKind.FUNC: {FunctionKind.FORMULA, FunctionKind.FORMULA32, FunctionKind.TASK, FunctionKind.THREAD, FunctionKind.FUNC},
+            FunctionKind.FORMULA: {FunctionKind.FORMULA},
+            FunctionKind.TASK: {FunctionKind.FORMULA, FunctionKind.TASK},
+            FunctionKind.THREAD: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD},
+            FunctionKind.FUNC: {FunctionKind.FORMULA, FunctionKind.TASK, FunctionKind.THREAD, FunctionKind.FUNC},
             FunctionKind.EXTERN: set(),  # extern can't call anything (it's a declaration)
         }
 
@@ -1883,7 +1881,7 @@ class ExpressionGenerator:
                 if isinstance(coex_type, AtomicType):
                     # Formula purity check: formulas cannot use atomic operations
                     if hasattr(cg, 'current_function') and cg.current_function:
-                        if cg.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+                        if cg.current_function.kind == FunctionKind.FORMULA:
                             raise RuntimeError(
                                 f"Cannot use atomic operations in formula '{cg.current_function.name}'. "
                                 f"Formulas must be pure and cannot use mutable atomic state."

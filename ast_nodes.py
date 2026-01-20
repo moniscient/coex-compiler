@@ -15,12 +15,11 @@ from enum import Enum, auto
 # ============================================================================
 
 class FunctionKind(Enum):
-    FORMULA = auto()
-    FORMULA32 = auto()  # 32-bit precision formula (for GPU)
-    TASK = auto()    # Lightweight coroutine (stackless)
-    THREAD = auto()  # OS-level concurrency (pthreads)
+    FORMULA = auto()  # Pure function (no side effects)
+    TASK = auto()     # Lightweight coroutine (stackless)
+    THREAD = auto()   # OS-level concurrency (pthreads)
     FUNC = auto()
-    EXTERN = auto()  # FFI to C functions
+    EXTERN = auto()   # FFI to C functions
 
 
 class BinaryOp(Enum):

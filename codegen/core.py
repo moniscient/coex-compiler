@@ -75,9 +75,6 @@ from codegen.statements import StatementGenerator
 # Import Conversion generator module
 from codegen.conversions import ConversionGenerator
 
-# Import Formula GPU offload module
-from codegen.formula import try_offload
-
 # Import Trait generator module
 from codegen.traits import TraitGenerator
 
@@ -1302,7 +1299,7 @@ class CodeGenerator:
 
         # Formulas require const bindings for purity
         if not stmt.is_const and self.current_function is not None:
-            if self.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+            if self.current_function.kind == FunctionKind.FORMULA:
                 raise RuntimeError(
                     f"Formula '{self.current_function.name}' requires const bindings. "
                     f"Use 'const {stmt.name} = ...' instead of '{stmt.name} = ...'."
@@ -2460,38 +2457,21 @@ class CodeGenerator:
         return self._loops.generate_set_for(stmt, set_ptr)
 
     def _generate_for_assign(self, stmt: ForAssignStmt):
-        """Generate results = for item in items expr - delegated to LoopGenerator
-
-        Attempts GPU offload first if body is a formula expression.
-        """
-        # Try GPU offload for formula-based operations
-        result = try_offload(stmt, self)
-        if result is not None and result.handled:
-            return result.value
+        """Generate results = for item in items expr - delegated to LoopGenerator"""
         return self._loops.generate_for_assign(stmt)
 
     def _generate_first_assign(self, stmt):
         """Generate result = first item in items expr - delegated to LoopGenerator
 
         Returns first successful result, cancels remaining tasks.
-        Attempts GPU offload first if predicate is a formula expression.
         """
-        # Try GPU offload for formula-based operations
-        result = try_offload(stmt, self)
-        if result is not None and result.handled:
-            return result.value
         return self._loops.generate_first_assign(stmt)
 
     def _generate_most_assign(self, stmt):
         """Generate (results, errors) = most item in items expr - delegated to LoopGenerator
 
         Returns tuple of (successful_results, errors), no cancellation.
-        Attempts GPU offload first if body is a formula expression.
         """
-        # Try GPU offload for formula-based operations
-        result = try_offload(stmt, self)
-        if result is not None and result.handled:
-            return result.value
         return self._loops.generate_most_assign(stmt)
 
     def _generate_break(self):
@@ -3773,36 +3753,15 @@ class CodeGenerator:
         return self._json.convert_to_json(value, expr)
 
     def _generate_list_comprehension(self, expr: ListComprehension) -> ir.Value:
-        """Generate code for list comprehension - delegated to ComprehensionGenerator
-
-        Attempts GPU offload first if body is a formula expression.
-        """
-        # Try GPU offload for formula-based operations
-        result = try_offload(expr, self)
-        if result is not None and result.handled:
-            return result.value
+        """Generate code for list comprehension - delegated to ComprehensionGenerator"""
         return self._comprehensions.generate_list_comprehension(expr)
 
     def _generate_set_comprehension(self, expr: SetComprehension) -> ir.Value:
-        """Generate code for set comprehension - delegated to ComprehensionGenerator
-
-        Attempts GPU offload first if body is a formula expression.
-        """
-        # Try GPU offload for formula-based operations
-        result = try_offload(expr, self)
-        if result is not None and result.handled:
-            return result.value
+        """Generate code for set comprehension - delegated to ComprehensionGenerator"""
         return self._comprehensions.generate_set_comprehension(expr)
 
     def _generate_map_comprehension(self, expr: MapComprehension) -> ir.Value:
-        """Generate code for map comprehension - delegated to ComprehensionGenerator
-
-        Attempts GPU offload first if body is a formula expression.
-        """
-        # Try GPU offload for formula-based operations
-        result = try_offload(expr, self)
-        if result is not None and result.handled:
-            return result.value
+        """Generate code for map comprehension - delegated to ComprehensionGenerator"""
         return self._comprehensions.generate_map_comprehension(expr)
 
     def _generate_lambda(self, expr: 'LambdaExpr') -> ir.Value:

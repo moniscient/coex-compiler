@@ -374,7 +374,7 @@ class StatementGenerator:
 
         # Formulas require const bindings for purity
         if not stmt.is_const and cg.current_function is not None:
-            if cg.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+            if cg.current_function.kind == FunctionKind.FORMULA:
                 raise RuntimeError(
                     f"Formula '{cg.current_function.name}' requires const bindings. "
                     f"Use 'const {stmt.name} = ...' instead of '{stmt.name} = ...'."
@@ -1177,7 +1177,7 @@ class StatementGenerator:
 
         # Formula purity check: formulas cannot perform I/O
         if hasattr(cg, 'current_function') and cg.current_function:
-            if cg.current_function.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
+            if cg.current_function.kind == FunctionKind.FORMULA:
                 raise RuntimeError(
                     f"Cannot use print() in formula '{cg.current_function.name}'. "
                     f"Formulas must be pure and cannot perform I/O."
