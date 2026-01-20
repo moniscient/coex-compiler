@@ -883,7 +883,7 @@ class CodeGenerator:
         return self._channel.uses_channels()
 
     def uses_blas(self) -> bool:
-        """Check if the compiled program uses BLAS functions.
+        """Check if the compiled program uses CPU BLAS functions.
 
         Returns True if any coex_linalg_* extern functions are declared,
         which requires linking the BLAS runtime library.
@@ -893,6 +893,17 @@ class CodeGenerator:
         blas_funcs = {'coex_linalg_matmul', 'coex_linalg_matmul32',
                       'coex_linalg_dot', 'coex_linalg_norm'}
         return any(fn in self.extern_function_decls for fn in blas_funcs)
+
+    def uses_gpu_linalg(self) -> bool:
+        """Check if the compiled program uses GPU linear algebra functions.
+
+        Returns True if coex_metal_matmul is used, which requires linking
+        the Metal runtime library with MetalPerformanceShaders.
+        """
+        if not hasattr(self, 'extern_function_decls'):
+            return False
+        gpu_funcs = {'coex_metal_matmul', 'coex_metal_matmul_f32_native'}
+        return any(fn in self.extern_function_decls for fn in gpu_funcs)
 
     # Trait helpers moved to codegen/traits.py - TraitGenerator class
 

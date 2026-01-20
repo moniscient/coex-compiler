@@ -28,7 +28,7 @@ CHANNEL_OBJ = coex_channel.o
 METAL_LIB = libcoex_metal.a
 ifeq ($(UNAME_S),Darwin)
     METAL_OBJ = coex_metal.o
-    METAL_FRAMEWORKS = -framework Metal -framework Foundation
+    METAL_FRAMEWORKS = -framework Metal -framework Foundation -framework MetalPerformanceShaders
 else
     METAL_OBJ = coex_metal_stub.o
     METAL_FRAMEWORKS =

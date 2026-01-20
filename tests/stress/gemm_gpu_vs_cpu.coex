@@ -1,0 +1,151 @@
+# GEMM Benchmark: GPU (MPS) vs CPU (BLAS)
+# =========================================
+# Compares matrix multiplication performance between:
+# - GPU: Metal Performance Shaders (MPSMatrixMultiplication) - target ~7-8 TFLOPS
+# - CPU: Apple Accelerate BLAS (AMX coprocessor) - target ~2-3 TFLOPS
+#
+# Usage:
+#   python3 coexc.py tests/stress/gemm_gpu_vs_cpu.coex -o /tmp/gemm_gpu_vs_cpu && /tmp/gemm_gpu_vs_cpu
+
+import linalg
+
+func create_matrix(rows: int, cols: int, seed: float) -> Array<float>
+    arr: Array<float> = Array.zeros_2d(rows, cols)
+    flat: Array<float> = arr.flatten()
+    i: int = 0
+    size: int = rows * cols
+    while i < size
+        flat = flat.set(i, seed + (i * 0.001))
+        i = i + 1
+    ~
+    return flat.reshape(rows, cols)
+~
+
+func main() -> int
+    print("===========================================")
+    print("GEMM Benchmark: GPU (MPS) vs CPU (BLAS)")
+    print("===========================================")
+    print("")
+
+    # Test various matrix sizes
+    sizes: List<int> = [256, 512, 1024, 2048]
+    iterations: int = 3
+
+    i: int = 0
+    while i < sizes.len()
+        n: int = sizes.get(i)
+
+        print("Matrix size: ")
+        print(n)
+        print(" x ")
+        print(n)
+        print("")
+
+        # Create test matrices
+        print("  Creating matrices...")
+        a: Array<float> = create_matrix(n, n, 1.0)
+        b: Array<float> = create_matrix(n, n, 2.0)
+
+        # ====== GPU BENCHMARK (Metal Performance Shaders) ======
+        print("  GPU (Metal Performance Shaders)...")
+
+        # Warmup
+        warmup_gpu: Array<float> = linalg.matmul_gpu(a, b)
+        checksum_gpu: float = warmup_gpu[0, 0]
+
+        t1: int = posix.time_ns()
+        iter: int = 0
+        while iter < iterations
+            c: Array<float> = linalg.matmul_gpu(a, b)
+            checksum_gpu = checksum_gpu + c[0, 0]
+            iter = iter + 1
+        ~
+        t2: int = posix.time_ns()
+        gpu_ns: int = t2 - t1
+        gpu_ms: int = gpu_ns / 1000000
+
+        # ====== CPU BENCHMARK (BLAS DGEMM) ======
+        print("  CPU (BLAS DGEMM 64-bit)...")
+
+        # Warmup
+        warmup_cpu: Array<float> = linalg.matmul_f64(a, b)
+        checksum_cpu: float = warmup_cpu[0, 0]
+
+        t3: int = posix.time_ns()
+        iter = 0
+        while iter < iterations
+            c: Array<float> = linalg.matmul_f64(a, b)
+            checksum_cpu = checksum_cpu + c[0, 0]
+            iter = iter + 1
+        ~
+        t4: int = posix.time_ns()
+        cpu_ns: int = t4 - t3
+        cpu_ms: int = cpu_ns / 1000000
+
+        # ====== CPU BENCHMARK (BLAS SGEMM) ======
+        print("  CPU (BLAS SGEMM 32-bit)...")
+
+        t5: int = posix.time_ns()
+        iter = 0
+        while iter < iterations
+            c: Array<float> = linalg.matmul_f32(a, b)
+            checksum_cpu = checksum_cpu + c[0, 0]
+            iter = iter + 1
+        ~
+        t6: int = posix.time_ns()
+        cpu32_ns: int = t6 - t5
+        cpu32_ms: int = cpu32_ns / 1000000
+
+        # Calculate GFLOPS (2 * n^3 FLOPs per GEMM)
+        ops_per_gemm: int = 2 * n * n * n
+        total_ops: int = ops_per_gemm * iterations
+
+        print("")
+        print("  Results:")
+
+        print("    GPU (MPS) time (ms): ")
+        print(gpu_ms)
+        if gpu_ms > 0
+            gflops_gpu: float = (total_ops * 1.0) / (gpu_ns * 1.0)
+            print("    GPU GFLOPS: ")
+            print(gflops_gpu)
+        ~
+
+        print("    CPU DGEMM time (ms): ")
+        print(cpu_ms)
+        if cpu_ms > 0
+            gflops_cpu: float = (total_ops * 1.0) / (cpu_ns * 1.0)
+            print("    CPU DGEMM GFLOPS: ")
+            print(gflops_cpu)
+        ~
+
+        print("    CPU SGEMM time (ms): ")
+        print(cpu32_ms)
+        if cpu32_ms > 0
+            gflops_cpu32: float = (total_ops * 1.0) / (cpu32_ns * 1.0)
+            print("    CPU SGEMM GFLOPS: ")
+            print(gflops_cpu32)
+        ~
+
+        if gpu_ms > 0 and cpu_ms > 0
+            speedup: float = (cpu_ms * 1.0) / (gpu_ms * 1.0)
+            print("    GPU speedup over CPU DGEMM: ")
+            print(speedup)
+            print("x")
+        ~
+
+        print("    Checksum GPU: ")
+        print(checksum_gpu)
+        print("    Checksum CPU: ")
+        print(checksum_cpu)
+        print("")
+
+        i = i + 1
+    ~
+
+    print("===========================================")
+    print("Benchmark complete")
+    print("===========================================")
+
+    return 0
+~
