@@ -214,10 +214,21 @@ class ExpressionGenerator:
 
         # Promote types if needed
         if left.type != right.type:
+            # Int + float64 -> float64
             if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.DoubleType):
                 left = cg.builder.sitofp(left, ir.DoubleType())
             elif isinstance(left.type, ir.DoubleType) and isinstance(right.type, ir.IntType):
                 right = cg.builder.sitofp(right, ir.DoubleType())
+            # Int + float32 -> float32
+            elif isinstance(left.type, ir.IntType) and isinstance(right.type, ir.FloatType):
+                left = cg.builder.sitofp(left, ir.FloatType())
+            elif isinstance(left.type, ir.FloatType) and isinstance(right.type, ir.IntType):
+                right = cg.builder.sitofp(right, ir.FloatType())
+            # Float32 + float64 -> float64
+            elif isinstance(left.type, ir.FloatType) and isinstance(right.type, ir.DoubleType):
+                left = cg.builder.fpext(left, ir.DoubleType())
+            elif isinstance(left.type, ir.DoubleType) and isinstance(right.type, ir.FloatType):
+                right = cg.builder.fpext(right, ir.DoubleType())
             elif isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
                 # Promote smaller to larger
                 if left.type.width < right.type.width:
@@ -225,7 +236,7 @@ class ExpressionGenerator:
                 elif right.type.width < left.type.width:
                     right = cg.builder.sext(right, left.type)
 
-        is_float = isinstance(left.type, ir.DoubleType)
+        is_float = isinstance(left.type, (ir.DoubleType, ir.FloatType))
 
         if expr.op == BinaryOp.ADD:
             return cg.builder.fadd(left, right) if is_float else cg.builder.add(left, right)
@@ -1131,6 +1142,26 @@ class ExpressionGenerator:
                     return val
                 return ir.Constant(ir.DoubleType(), 0.0)
 
+            if name == "int32":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    if isinstance(val.type, ir.DoubleType):
+                        return cg.builder.fptosi(val, ir.IntType(32))
+                    if isinstance(val.type, ir.FloatType):
+                        return cg.builder.fptosi(val, ir.IntType(32))
+                    return cg._cast_value(val, ir.IntType(32))
+                return ir.Constant(ir.IntType(32), 0)
+
+            if name == "float32":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    if isinstance(val.type, ir.IntType):
+                        return cg.builder.sitofp(val, ir.FloatType())
+                    if isinstance(val.type, ir.DoubleType):
+                        return cg.builder.fptrunc(val, ir.FloatType())
+                    return val
+                return ir.Constant(ir.FloatType(), 0.0)
+
             if name == "sqrt":
                 if expr.args:
                     val = self.generate_expression(expr.args[0])
@@ -1220,6 +1251,12 @@ class ExpressionGenerator:
                     elif isinstance(value.type, ir.DoubleType):
                         fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
                         cg.builder.call(cg.printf, [fmt_ptr, value])
+
+                    elif isinstance(value.type, ir.FloatType):
+                        # float32 - extend to double for printf
+                        value64 = cg.builder.fpext(value, ir.DoubleType())
+                        fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
+                        cg.builder.call(cg.printf, [fmt_ptr, value64])
 
                     elif isinstance(value.type, ir.PointerType):
                         pointee = value.type.pointee
@@ -1639,8 +1676,12 @@ class ExpressionGenerator:
                     if isinstance(fill_val.type, ir.IntType):
                         if fill_val.type.width == 1:
                             elem_size = ir.Constant(ir.IntType(64), 1)  # bool = 1 byte
+                        elif fill_val.type.width == 32:
+                            elem_size = ir.Constant(ir.IntType(64), 4)  # int32 = 4 bytes
                         else:
                             elem_size = ir.Constant(ir.IntType(64), 8)  # int = 8 bytes
+                    elif isinstance(fill_val.type, ir.FloatType):
+                        elem_size = ir.Constant(ir.IntType(64), 4)  # float32 = 4 bytes
                     elif isinstance(fill_val.type, ir.DoubleType):
                         elem_size = ir.Constant(ir.IntType(64), 8)  # float = 8 bytes
                     elif isinstance(fill_val.type, ir.PointerType):
@@ -1689,6 +1730,9 @@ class ExpressionGenerator:
                     # Store value based on type
                     if isinstance(fill_val.type, ir.IntType):
                         typed_ptr = cg.builder.bitcast(elem_ptr, fill_val.type.as_pointer())
+                        cg.builder.store(fill_val, typed_ptr)
+                    elif isinstance(fill_val.type, ir.FloatType):
+                        typed_ptr = cg.builder.bitcast(elem_ptr, ir.FloatType().as_pointer())
                         cg.builder.store(fill_val, typed_ptr)
                     elif isinstance(fill_val.type, ir.DoubleType):
                         typed_ptr = cg.builder.bitcast(elem_ptr, ir.DoubleType().as_pointer())
@@ -2195,6 +2239,43 @@ class ExpressionGenerator:
                     return cg._list_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
+        # Type conversion methods: .int(), .float(), .int32(), .float32()
+        if method == "int":
+            if isinstance(obj.type, ir.DoubleType):
+                return cg.builder.fptosi(obj, ir.IntType(64))
+            if isinstance(obj.type, ir.FloatType):
+                return cg.builder.fptosi(obj, ir.IntType(64))
+            if isinstance(obj.type, ir.IntType):
+                return cg._cast_value(obj, ir.IntType(64))
+            return obj
+
+        if method == "int32":
+            if isinstance(obj.type, ir.DoubleType):
+                return cg.builder.fptosi(obj, ir.IntType(32))
+            if isinstance(obj.type, ir.FloatType):
+                return cg.builder.fptosi(obj, ir.IntType(32))
+            if isinstance(obj.type, ir.IntType):
+                return cg._cast_value(obj, ir.IntType(32))
+            return obj
+
+        if method == "float":
+            if isinstance(obj.type, ir.IntType):
+                return cg.builder.sitofp(obj, ir.DoubleType())
+            if isinstance(obj.type, ir.FloatType):
+                return cg.builder.fpext(obj, ir.DoubleType())
+            if isinstance(obj.type, ir.DoubleType):
+                return obj
+            return obj
+
+        if method == "float32":
+            if isinstance(obj.type, ir.IntType):
+                return cg.builder.sitofp(obj, ir.FloatType())
+            if isinstance(obj.type, ir.DoubleType):
+                return cg.builder.fptrunc(obj, ir.FloatType())
+            if isinstance(obj.type, ir.FloatType):
+                return obj
+            return obj
+
         # Array element-wise operations and reductions
         if isinstance(obj.type, ir.PointerType):
             pointee = obj.type.pointee
@@ -2232,7 +2313,12 @@ class ExpressionGenerator:
 
         # Get total element count
         total_elements = builder.call(cg.array_total_size, [array_ptr])
-        elem_size = ir.Constant(i64, 8)  # Assume 64-bit elements
+
+        # Read elem_size from the array struct (field 5)
+        elem_size_ptr = builder.gep(array_ptr, [
+            ir.Constant(i32, 0), ir.Constant(i32, 5)  # ARRAY_FIELD_ELEM_SIZE
+        ], inbounds=True)
+        elem_size = builder.load(elem_size_ptr, name="elem_size")
 
         # Get source data pointer
         src_data = builder.call(cg.array_get, [array_ptr, zero])

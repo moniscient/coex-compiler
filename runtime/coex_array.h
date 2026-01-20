@@ -51,9 +51,11 @@ _Static_assert(sizeof(CoexArray) == 104, "CoexArray struct must be 104 bytes");
 #define COEX_ARRAY_COLS(arr) ((arr)->shape[1])
 
 /* Element type IDs (must match codegen constants) */
-#define COEX_TYPE_INT     1
-#define COEX_TYPE_FLOAT   2
-#define COEX_TYPE_BOOL    3
-#define COEX_TYPE_BYTE    4
+#define COEX_TYPE_INT       1   /* 64-bit integer (i64) */
+#define COEX_TYPE_FLOAT     2   /* 64-bit float (f64) */
+#define COEX_TYPE_BOOL      3   /* boolean (i8) */
+#define COEX_TYPE_BYTE      4   /* byte (i8) */
+#define COEX_TYPE_INT32     5   /* 32-bit integer (i32) */
+#define COEX_TYPE_FLOAT32   6   /* 32-bit float (f32) */
 
 #endif /* COEX_ARRAY_H */

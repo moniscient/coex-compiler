@@ -633,7 +633,9 @@ class CodeGenerator:
         if isinstance(coex_type, PrimitiveType):
             type_map = {
                 "int": ir.IntType(64),
+                "int32": ir.IntType(32),
                 "float": ir.DoubleType(),
+                "float32": ir.FloatType(),
                 "bool": ir.IntType(1),
                 "string": self.string_struct.as_pointer(),
                 "byte": ir.IntType(8),
@@ -1740,13 +1742,21 @@ class CodeGenerator:
             elif target_type.width < value.type.width:
                 return self.builder.trunc(value, target_type)
 
-        # Int to float
-        if isinstance(value.type, ir.IntType) and isinstance(target_type, ir.DoubleType):
+        # Int to float (f64 or f32)
+        if isinstance(value.type, ir.IntType) and isinstance(target_type, (ir.DoubleType, ir.FloatType)):
             return self.builder.sitofp(value, target_type)
 
-        # Float to int
-        if isinstance(value.type, ir.DoubleType) and isinstance(target_type, ir.IntType):
+        # Float to int (f64 or f32 to int)
+        if isinstance(value.type, (ir.DoubleType, ir.FloatType)) and isinstance(target_type, ir.IntType):
             return self.builder.fptosi(value, target_type)
+
+        # Float64 to float32
+        if isinstance(value.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.fptrunc(value, target_type)
+
+        # Float32 to float64
+        if isinstance(value.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
+            return self.builder.fpext(value, target_type)
 
         # Pointer to int (for storing pointers in i64 collections)
         if isinstance(value.type, ir.PointerType) and isinstance(target_type, ir.IntType):

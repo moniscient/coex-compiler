@@ -29,12 +29,14 @@ if TYPE_CHECKING:
 
 # Coex type to byte size mapping
 ELEMENT_SIZES = {
-    'int': 8,      # i64
-    'int64': 8,    # i64
-    'float': 8,    # f64 (Coex floats are 64-bit)
-    'float64': 8,  # f64
-    'bool': 1,     # i8 (stored as byte)
-    'byte': 1,     # i8
+    'int': 8,        # i64
+    'int64': 8,      # i64
+    'int32': 4,      # i32
+    'float': 8,      # f64 (Coex floats are 64-bit)
+    'float64': 8,    # f64
+    'float32': 4,    # f32
+    'bool': 1,       # i8 (stored as byte)
+    'byte': 1,       # i8
 }
 
 

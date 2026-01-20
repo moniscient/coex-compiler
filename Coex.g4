@@ -460,11 +460,13 @@ relativeIndex
     : expression (COMMA expression)*                          // Single or multi-dimensional offset
     ;
 
-// Method names can be identifiers or type keywords (for .int(), .float(), .string(), .bool())
+// Method names can be identifiers or type keywords (for .int(), .float(), .string(), .bool(), .int32(), .float32())
 methodName
     : IDENTIFIER
     | INT_TYPE
+    | INT32_TYPE
     | FLOAT_TYPE
+    | FLOAT32_TYPE
     | BOOL_TYPE
     | STRING_TYPE
     | BYTE_TYPE
@@ -606,7 +608,9 @@ baseType
 
 primitiveType
     : INT_TYPE
+    | INT32_TYPE
     | FLOAT_TYPE
+    | FLOAT32_TYPE
     | BOOL_TYPE
     | STRING_TYPE
     | BYTE_TYPE
@@ -723,7 +727,9 @@ TILDE       : '~' ;
 // Special identifiers
 SELF        : 'self' ;
 
-// Primitive type keywords
+// Primitive type keywords (32-bit variants must come before base types for ANTLR precedence)
+INT32_TYPE      : 'int32' ;
+FLOAT32_TYPE    : 'float32' ;
 INT_TYPE        : 'int' ;
 FLOAT_TYPE      : 'float' ;
 BOOL_TYPE       : 'bool' ;

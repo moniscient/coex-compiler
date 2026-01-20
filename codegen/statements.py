@@ -1217,6 +1217,12 @@ class StatementGenerator:
             fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
             cg.builder.call(cg.printf, [fmt_ptr, value])
 
+        elif isinstance(value.type, ir.FloatType):
+            # float32 - extend to double for printf
+            value64 = cg.builder.fpext(value, ir.DoubleType())
+            fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
+            cg.builder.call(cg.printf, [fmt_ptr, value64])
+
         elif isinstance(value.type, ir.PointerType):
             pointee = value.type.pointee
             if hasattr(pointee, 'name') and pointee.name == "struct.String":
@@ -1266,6 +1272,12 @@ class StatementGenerator:
         elif isinstance(value.type, ir.DoubleType):
             fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
             cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value])
+
+        elif isinstance(value.type, ir.FloatType):
+            # float32 - extend to double for dprintf
+            value64 = cg.builder.fpext(value, ir.DoubleType())
+            fmt_ptr = cg.builder.bitcast(cg._float_fmt, ir.IntType(8).as_pointer())
+            cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value64])
 
         elif isinstance(value.type, ir.PointerType):
             pointee = value.type.pointee

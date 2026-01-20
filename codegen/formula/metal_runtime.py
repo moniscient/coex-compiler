@@ -1,6 +1,19 @@
 """
 Metal Runtime Dispatch for Coex GPU Offload.
 
+DEPRECATED: This Python-based dispatch is no longer used in production.
+The native Objective-C implementation (runtime/coex_metal.m) is now used
+instead, which is linked directly into compiled binaries at compile time.
+
+This file is kept for:
+1. Testing purposes (unit tests that don't link full binaries)
+2. Reference implementation
+3. Backwards compatibility with any code that imports this module
+
+For production GPU execution, compiled binaries link against libcoex_metal.a
+which contains the native Metal implementation with no Python dependency.
+
+Original design:
 This module provides a Python callback that can be called from compiled Coex
 binaries to execute Metal compute kernels. The callback is registered via
 ctypes and invoked by the C stub at runtime.
