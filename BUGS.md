@@ -648,3 +648,15 @@
 - **Hypothesis**: Type confusion between float32/float64 or handle/pointer in list return path
 - **Files**: `codegen/core.py`, `codegen/collections.py`
 - **Status**: Open
+
+### BUG-047: Parenthesized expression parsing fails
+- **Discovered**: 2026-01-19, during Array<T> implementation testing
+- **Category**: Parser/AST Builder
+- **Severity**: Medium
+- **Reproduction**: Test `test_parentheses_override_precedence` in test_basic.py
+- **Observed**: `TypeError: 'ExpressionContext' object is not subscriptable` in ast_builder.py:1121
+- **Expected**: Parenthesized expressions like `(1 + 2) * 3` should parse correctly
+- **Hypothesis**: `ctx.expression()` returns ExpressionContext directly when single expression, not a list. Need to check for this case.
+- **Files**: ast_builder.py:1121
+- **Fix**: Changed `exprs = ctx.expression(); return self.visit_expression(exprs[0])` to `expr = ctx.expression(); return self.visit_expression(expr)` - grammar rule `LPAREN expression RPAREN` has single expression, not list
+- **Status**: Fixed (2026-01-19)
