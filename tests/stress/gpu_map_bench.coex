@@ -1,0 +1,165 @@
+#@ [MOVE] Variable 'size' is not used after this assignment. Consider: ops_per_iter := size (move instead of copy)
+#@ [PERF] Loop modifies 'data_list' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# GPU Map Benchmark
+# ==================
+# Tests GPU offload with element-wise formula32 operations
+# This pattern DOES trigger GPU execution via Metal
+#
+# Usage:
+#   python3 coexc.py tests/stress/gpu_map_bench.coex -o /tmp/gpu_map && /tmp/gpu_map
+
+# Pure element-wise formula (GPU-offloadable)
+# Only uses the input value x - no array indexing
+formula32 compute_f32(x: float) -> float
+    return sqrt(x * x + 1.0) * sin(x) + cos(x * 0.5)
+~
+
+# Same formula at 64-bit precision
+formula compute_f64(x: float) -> float
+    return sqrt(x * x + 1.0) * sin(x) + cos(x * 0.5)
+~
+
+# More complex formula (multiple operations)
+formula32 heavy_compute(x: float) -> float
+    return sin(x) * cos(x) + tan(x * 0.1) * exp(0.0 - x * 0.001) + sqrt(x + 1.0) * log(x + 1.0)
+~
+
+func main() -> int
+    print("===========================================")
+    print("GPU Map Benchmark (formula32 element-wise)")
+    print("===========================================")
+    print("")
+
+    # Configuration
+    size = 2000000   # 2 million elements
+    iterations = 5
+
+    print("Size: ")
+    print(size)
+    print("Iterations: ")
+    print(iterations)
+    print("")
+
+    # Create input data as Array (required for GPU offload)
+    print("Initializing Array data...")
+    data_list: List<float> = []
+    for i in 0..size
+        data_list = data_list.append(i * 0.001)
+    ~
+    data: Array<float> = data_list.toArray()
+    print("  Array size: ")
+    print(data.len())
+    print("")
+
+    # Test formula32 with comprehension (should trigger GPU offload)
+    print("Running formula32 comprehension (GPU target)...")
+    t1 = posix.time_ns()
+
+    sum_f32 = 0.0
+    for iter in 0..iterations
+        # This comprehension should trigger GPU offload via Metal
+        result: Array<float> = [compute_f32(x) for x in data]
+        # Sum first and last element for checksum
+        sum_f32 = sum_f32 + result.get(0) + result.get(result.len() - 1)
+    ~
+
+    t2 = posix.time_ns()
+    f32_ns = t2 - t1
+    f32_ms = f32_ns / 1000000
+    print("  Time (ms): ")
+    print(f32_ms)
+    print("  Checksum: ")
+    print(sum_f32)
+    print("")
+
+    # Test formula (64-bit) with comprehension
+    print("Running formula64 comprehension (GPU target)...")
+    t3 = posix.time_ns()
+
+    sum_f64 = 0.0
+    for iter in 0..iterations
+        result: Array<float> = [compute_f64(x) for x in data]
+        sum_f64 = sum_f64 + result.get(0) + result.get(result.len() - 1)
+    ~
+
+    t4 = posix.time_ns()
+    f64_ns = t4 - t3
+    f64_ms = f64_ns / 1000000
+    print("  Time (ms): ")
+    print(f64_ms)
+    print("  Checksum: ")
+    print(sum_f64)
+    print("")
+
+    # Test heavy formula32 with comprehension
+    print("Running heavy formula32 comprehension (GPU target)...")
+    t5 = posix.time_ns()
+
+    sum_heavy = 0.0
+    for iter in 0..iterations
+        result: Array<float> = [heavy_compute(x) for x in data]
+        sum_heavy = sum_heavy + result.get(0) + result.get(result.len() - 1)
+    ~
+
+    t6 = posix.time_ns()
+    heavy_ns = t6 - t5
+    heavy_ms = heavy_ns / 1000000
+    print("  Time (ms): ")
+    print(heavy_ms)
+    print("  Checksum: ")
+    print(sum_heavy)
+    print("")
+
+    # CPU baseline (loop, no comprehension)
+    print("Running CPU loop baseline (no GPU)...")
+    t7 = posix.time_ns()
+
+    sum_cpu = 0.0
+    for iter in 0..iterations
+        first_val: float = compute_f32(data.get(0))
+        last_val: float = compute_f32(data.get(data.len() - 1))
+        sum_cpu = sum_cpu + first_val + last_val
+    ~
+
+    t8 = posix.time_ns()
+    cpu_ns = t8 - t7
+    cpu_ms = cpu_ns / 1000000
+    print("  Time (ms): ")
+    print(cpu_ms)
+    print("  Checksum: ")
+    print(sum_cpu)
+    print("")
+
+    # Summary
+    print("===========================================")
+    print("Summary")
+    print("===========================================")
+    print("formula32 time (ms): ")
+    print(f32_ms)
+    print("formula64 time (ms): ")
+    print(f64_ms)
+    print("heavy formula32 time (ms): ")
+    print(heavy_ms)
+    print("")
+
+    ops_per_iter = size
+    total_ops = ops_per_iter * iterations
+    print("Total elements processed per test: ")
+    print(total_ops)
+
+    if f32_ms > 0
+        throughput_f32 = (total_ops * 1000) / f32_ms
+        print("formula32 throughput (elements/sec): ")
+        print(throughput_f32)
+    ~
+
+    if f64_ms > 0
+        throughput_f64 = (total_ops * 1000) / f64_ms
+        print("formula64 throughput (elements/sec): ")
+        print(throughput_f64)
+    ~
+
+    print("")
+    print("Benchmark complete")
+    return 0
+~

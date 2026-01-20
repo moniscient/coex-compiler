@@ -5,12 +5,19 @@ This module generates LLVM IR to convert between Coex Arrays and contiguous
 GPU buffers. The Array type is the only collection type supported for GPU
 offload - Lists/Maps/Sets must be implicitly cast to Array first.
 
-Array struct layout (5 fields, all i64):
-    Field 0: owner_handle (i64) - handle to data buffer
-    Field 1: offset (i64) - byte offset into owner buffer (for slice views)
-    Field 2: len (i64) - number of elements
-    Field 3: cap (i64) - capacity
-    Field 4: elem_size (i64) - size of each element in bytes
+N-D Array struct layout (104 bytes = 13 i64 fields):
+    Field 0: handle (i64) - GC handle for data buffer
+    Field 1: ndim (i64) - number of dimensions (1, 2, ...)
+    Field 2: shape [4 x i64] - dimensions [dim0, dim1, dim2, dim3]
+    Field 3: strides [4 x i64] - byte strides per dimension
+    Field 4: offset (i64) - byte offset into buffer (for views)
+    Field 5: elem_size (i64) - 8 for int/float, 1 for byte
+    Field 6: type_id (i64) - element type identifier
+
+For 1D arrays:
+    - ndim = 1
+    - shape[0] = len (number of elements)
+    - shape[1..3] = 0 (unused)
 """
 
 from typing import TYPE_CHECKING, Tuple
@@ -58,7 +65,14 @@ class MarshalingGenerator:
     def array_to_buffer(self, builder: ir.IRBuilder, array_ptr: ir.Value) -> Tuple[ir.Value, ir.Value, ir.Value]:
         """Extract contiguous buffer from Array - ZERO-COPY!
 
-        Array layout: { i64 owner_handle, i64 offset, i64 len, i64 cap, i64 elem_size }
+        N-D Array layout:
+            Field 0: handle (i64)
+            Field 1: ndim (i64)
+            Field 2: shape [4 x i64]
+            Field 3: strides [4 x i64]
+            Field 4: offset (i64)
+            Field 5: elem_size (i64)
+            Field 6: type_id (i64)
 
         This is a zero-copy operation - we return a pointer directly into the
         Array's data buffer. The caller must ensure the Array remains live
@@ -75,40 +89,41 @@ class MarshalingGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Load owner_handle (field 0)
-        owner_handle_ptr = builder.gep(
+        # Load handle (field 0) - this is a raw pointer stored as i64 (ptrtoint)
+        handle_ptr = builder.gep(
             array_ptr,
             [ir.Constant(i32, 0), ir.Constant(i32, 0)],
             inbounds=True
         )
-        owner_handle = builder.load(owner_handle_ptr)
+        handle = builder.load(handle_ptr)
 
-        # Convert handle to pointer
-        owner_ptr = builder.inttoptr(owner_handle, i8_ptr)
+        # Convert i64 back to pointer via inttoptr
+        buffer_ptr = builder.inttoptr(handle, i8_ptr)
 
-        # Load offset (field 1)
+        # Load offset (field 4)
         offset_ptr = builder.gep(
             array_ptr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
+            [ir.Constant(i32, 0), ir.Constant(i32, 4)],
             inbounds=True
         )
         offset = builder.load(offset_ptr)
 
-        # Compute data_ptr = owner + offset
-        data_ptr = builder.gep(owner_ptr, [offset])
+        # Compute data_ptr = buffer + offset
+        data_ptr = builder.gep(buffer_ptr, [offset])
 
-        # Load len (field 2)
-        len_ptr = builder.gep(
+        # Load element count from shape[0] (field 2, element 0)
+        # For 1D arrays, shape[0] is the length
+        shape_ptr = builder.gep(
             array_ptr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 2)],
+            [ir.Constant(i32, 0), ir.Constant(i32, 2), ir.Constant(i32, 0)],
             inbounds=True
         )
-        count = builder.load(len_ptr)
+        count = builder.load(shape_ptr)
 
-        # Load elem_size (field 4)
+        # Load elem_size (field 5)
         elem_size_ptr = builder.gep(
             array_ptr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 4)],
+            [ir.Constant(i32, 0), ir.Constant(i32, 5)],
             inbounds=True
         )
         elem_size = builder.load(elem_size_ptr)
@@ -142,14 +157,15 @@ class MarshalingGenerator:
         # Call array_filled(count, elem_size) to allocate with len=count
         array_ptr = builder.call(self.cg.array_filled, [count, elem_size])
 
-        # Get the array's data pointer: owner + offset (offset should be 0 for new array)
-        owner_handle_ptr = builder.gep(
+        # Get the array's data pointer
+        # Field 0 is a raw pointer stored as i64 (ptrtoint), convert back to pointer
+        handle_ptr = builder.gep(
             array_ptr,
             [ir.Constant(i32, 0), ir.Constant(i32, 0)],
             inbounds=True
         )
-        owner_handle = builder.load(owner_handle_ptr)
-        dest_ptr = builder.inttoptr(owner_handle, i8_ptr)
+        handle = builder.load(handle_ptr)
+        dest_ptr = builder.inttoptr(handle, i8_ptr)
 
         # Compute copy size: count * elem_size
         copy_size = builder.mul(count, elem_size)

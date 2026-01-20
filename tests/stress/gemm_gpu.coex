@@ -1,0 +1,186 @@
+#@ [PERF] Loop modifies 'indices_list' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+#@ [PERF] Loop modifies 'data' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# GPU GEMM Benchmark
+# ===================
+# Matrix multiplication C = A * B using GPU offload via comprehensions
+#
+# This benchmark uses list comprehensions with formula32 to trigger GPU offload.
+# Each output element C[i,j] = sum(A[i,k] * B[k,j]) is computed in parallel.
+#
+# Usage:
+#   python3 coexc.py tests/stress/gemm_gpu.coex -o /tmp/gemm_gpu && /tmp/gemm_gpu
+
+# Compute single output element C[out_idx] where out_idx = row * n + col
+# A is m x k, B is k x n, C is m x n (all stored row-major as 1D arrays)
+formula32 gemm_element(a: Array<float>, b: Array<float>, out_idx: int, m: int, k: int, n: int) -> float
+    const row = out_idx / n
+    const col = out_idx % n
+    # Dot product of row 'row' of A with column 'col' of B
+    # Unrolled for k=4 (common tile size)
+    const a_base = row * k
+    return a.get(a_base + 0) * b.get(0 * n + col) + a.get(a_base + 1) * b.get(1 * n + col) + a.get(a_base + 2) * b.get(2 * n + col) + a.get(a_base + 3) * b.get(3 * n + col)
+~
+
+# Larger K dimension support (k=8 unrolled)
+formula32 gemm_element_k8(a: Array<float>, b: Array<float>, out_idx: int, m: int, k: int, n: int) -> float
+    const row = out_idx / n
+    const col = out_idx % n
+    const a_base = row * k
+    return a.get(a_base + 0) * b.get(0 * n + col) + a.get(a_base + 1) * b.get(1 * n + col) + a.get(a_base + 2) * b.get(2 * n + col) + a.get(a_base + 3) * b.get(3 * n + col) + a.get(a_base + 4) * b.get(4 * n + col) + a.get(a_base + 5) * b.get(5 * n + col) + a.get(a_base + 6) * b.get(6 * n + col) + a.get(a_base + 7) * b.get(7 * n + col)
+~
+
+# Initialize matrix with predictable values
+func init_array(rows: int, cols: int, seed: float) -> Array<float>
+    data: List<float> = []
+    for i in 0..rows
+        for j in 0..cols
+            data = data.append(seed + (i * cols + j) * 0.0001)
+        ~
+    ~
+    return data.toArray()
+~
+
+func main() -> int
+    print("===========================================")
+    print("GPU GEMM Benchmark (formula32 + comprehension)")
+    print("===========================================")
+    print("")
+
+    # Configuration
+    # M x K * K x N = M x N
+    # Total output elements = M * N
+    # FLOPs = M * N * K * 2
+    m = 512    # Output rows
+    n = 512    # Output columns
+    k = 4      # Inner dimension (must match unroll in formula)
+    iterations = 3
+
+    print("Matrix dimensions: MxK * KxN = MxN")
+    print("  M = ")
+    print(m)
+    print("  K = ")
+    print(k)
+    print("  N = ")
+    print(n)
+    output_elements = m * n
+    print("Output elements: ")
+    print(output_elements)
+    total_flops = m * n * k * 2
+    print("FLOPs per iteration: ")
+    print(total_flops)
+    print("Iterations: ")
+    print(iterations)
+    print("")
+
+    # Initialize matrices as Arrays (required for GPU offload)
+    print("Initializing matrices as Arrays...")
+    a = init_array(m, k, 1.0)
+    b = init_array(k, n, 2.0)
+    print("  A size: ")
+    print(a.size())
+    print("  B size: ")
+    print(b.size())
+    print("")
+
+    # Create output index array [0, 1, 2, ..., m*n-1]
+    print("Creating output index array...")
+    indices_list: List<int> = []
+    for i in 0..(m * n)
+        indices_list = indices_list.append(i)
+    ~
+    indices: Array<int> = indices_list.toArray()
+    print("  Indices size: ")
+    print(indices.size())
+    print("")
+
+    # Correctness test with small matrix
+    print("Correctness test...")
+    test_idx = 0
+    test_val: float = gemm_element(a, b, test_idx, m, k, n)
+    print("  C[0,0] = ")
+    print(test_val)
+    # Expected: row 0 of A dot col 0 of B
+    # A[0,0..3] = [1.0, 1.0001, 1.0002, 1.0003]
+    # B[0..3,0] = [2.0, 2.0+n*0.0001, 2.0+2n*0.0001, 2.0+3n*0.0001]
+    print("")
+
+    # Run GPU GEMM (using comprehension for offload)
+    print("Running GPU GEMM (formula32 comprehension)...")
+    t1 = posix.time_ns()
+
+    sum_gpu = 0.0
+    for iter in 0..iterations
+        # This comprehension should trigger GPU offload via Metal
+        # Each thread computes one output element
+        c: Array<float> = [gemm_element(a, b, idx, m, k, n) for idx in indices]
+
+        # Sum results for checksum
+        for i in 0..c.size()
+            sum_gpu = sum_gpu + c.get(i)
+        ~
+    ~
+
+    t2 = posix.time_ns()
+    gpu_ns = t2 - t1
+    gpu_ms = gpu_ns / 1000000
+    print("  Time (ms): ")
+    print(gpu_ms)
+    print("  Checksum: ")
+    print(sum_gpu)
+    print("")
+
+    # Run CPU GEMM for comparison (no comprehension, just loops)
+    print("Running CPU GEMM (loop baseline)...")
+    t3 = posix.time_ns()
+
+    sum_cpu = 0.0
+    for iter in 0..iterations
+        for idx in 0..(m * n)
+            val: float = gemm_element(a, b, idx, m, k, n)
+            sum_cpu = sum_cpu + val
+        ~
+    ~
+
+    t4 = posix.time_ns()
+    cpu_ns = t4 - t3
+    cpu_ms = cpu_ns / 1000000
+    print("  Time (ms): ")
+    print(cpu_ms)
+    print("  Checksum: ")
+    print(sum_cpu)
+    print("")
+
+    # Summary
+    print("===========================================")
+    print("Summary")
+    print("===========================================")
+    print("GPU time (ms): ")
+    print(gpu_ms)
+    print("CPU time (ms): ")
+    print(cpu_ms)
+
+    if cpu_ms > 0 and gpu_ms > 0
+        speedup = cpu_ms / gpu_ms
+        print("Speedup (CPU/GPU): ")
+        print(speedup)
+    ~
+
+    # Verify checksums match
+    checksum_diff = sum_gpu - sum_cpu
+    if checksum_diff < 0.0
+        checksum_diff = 0.0 - checksum_diff
+    ~
+    print("Checksum difference: ")
+    print(checksum_diff)
+
+    if checksum_diff < 1.0
+        print("PASS - checksums match within tolerance")
+    else
+        print("FAIL - checksum mismatch")
+        return 1
+    ~
+
+    print("")
+    print("Benchmark complete")
+    return 0
+~

@@ -204,7 +204,7 @@ class FormulaTranspiler:
         if self.codegen and func_name in self.codegen.func_decls:
             from ast_nodes import FunctionKind
             decl = self.codegen.func_decls[func_name]
-            if decl.kind == FunctionKind.FORMULA:
+            if decl.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32):
                 return self._inline_formula_call(func_name, decl, expr.args)
 
         raise TranspileError(f"Cannot transpile call to '{func_name}' for GPU")
