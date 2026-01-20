@@ -660,3 +660,27 @@
 - **Files**: ast_builder.py:1121
 - **Fix**: Changed `exprs = ctx.expression(); return self.visit_expression(exprs[0])` to `expr = ctx.expression(); return self.visit_expression(expr)` - grammar rule `LPAREN expression RPAREN` has single expression, not list
 - **Status**: Fixed (2026-01-19)
+
+### BUG-048: GPU offload marshaling used old Array layout
+- **Discovered**: 2026-01-19, during GPU GEMM benchmark development
+- **Category**: Codegen/GPU
+- **Severity**: High
+- **Reproduction**: Any formula comprehension over Array type with GPU offload enabled
+- **Observed**: Segmentation fault during GPU dispatch; marshaling code tried to call `gc_handle_deref` on raw pointer
+- **Expected**: GPU offload should work correctly with Arrays
+- **Hypothesis**: Marshaling code in `codegen/formula/marshaling.py` was using old 5-field Array layout instead of new 13-field N-D layout
+- **Files**: codegen/formula/marshaling.py
+- **Fix**: Updated field indices for new layout (handle=0, ndim=1, shape=2[4], strides=3[4], offset=4, elem_size=5, type_id=6). Fixed handle field to use `inttoptr` (raw pointer stored as i64) instead of `gc_handle_deref`.
+- **Status**: Fixed (2026-01-19)
+
+### BUG-049: GPU transpiler only handled FORMULA, not FORMULA32
+- **Discovered**: 2026-01-19, during GPU benchmark development
+- **Category**: Codegen/GPU
+- **Severity**: Medium
+- **Reproduction**: Use `formula32` in a list comprehension that should GPU-offload
+- **Observed**: "Cannot transpile call to 'func_name' for GPU" error, falls back to CPU
+- **Expected**: Both `formula` and `formula32` should be inlinable for GPU
+- **Hypothesis**: Transpiler check at line 207 only checked `FunctionKind.FORMULA`
+- **Files**: codegen/formula/transpiler.py
+- **Fix**: Changed check to `decl.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32)`
+- **Status**: Fixed (2026-01-19)
