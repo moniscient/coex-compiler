@@ -529,11 +529,6 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by CoexParser#listType.
-    def visitListType(self, ctx:CoexParser.ListTypeContext):
-        return self.visitChildren(ctx)
-
-
     # Visit a parse tree produced by CoexParser#primitiveType.
     def visitPrimitiveType(self, ctx:CoexParser.PrimitiveTypeContext):
         return self.visitChildren(ctx)

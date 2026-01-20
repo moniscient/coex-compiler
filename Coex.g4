@@ -450,7 +450,7 @@ postfixOp
     | DOT INTEGER_LITERAL                                     // Tuple index access: t.0, t.1
     | DOT methodName genericArgs? LPAREN argumentList? RPAREN
     | LBRACKET sliceOrIndex RBRACKET                          // Index or slice
-    | AT LBRACKET relativeIndex RBRACKET                      // Relative index: arr@[offset] or arr@[i, j]
+    | DOUBLE_LBRACKET relativeIndex DOUBLE_RBRACKET           // Relative index: arr[[offset]] or arr[[i, j]]
     | LPAREN argumentList? RPAREN
     | AS typeExpr                                             // Type cast: j as Person, j as int?
     ;
@@ -602,11 +602,6 @@ baseType
     | IDENTIFIER genericArgs?
     | tupleType
     | functionType
-    | listType
-    ;
-
-listType
-    : LBRACKET typeExpr RBRACKET
     ;
 
 primitiveType
@@ -789,6 +784,8 @@ BANG        : '!' ;  // Exit variant separator for ternary (NEQ != matches first
 // Delimiters
 LPAREN      : '(' ;
 RPAREN      : ')' ;
+DOUBLE_LBRACKET : '[[' ;  // Relative indexing (must come before single brackets)
+DOUBLE_RBRACKET : ']]' ;
 LBRACKET    : '[' ;
 RBRACKET    : ']' ;
 LBRACE      : '{' ;

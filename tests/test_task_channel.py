@@ -148,21 +148,21 @@ func main() -> int
 class TestTaskChannelTypes:
     """Tests for different value types"""
 
-    @pytest.mark.xfail(reason="BUG-006: Channel<[int]> receive() returns unknown type")
+    @pytest.mark.xfail(reason="BUG-006: Channel<List<int>> receive() returns unknown type")
     def test_list_through_channel(self, expect_output):
         """List values through channel"""
         expect_output('''
-task send_list(ch: Channel<[int]>) -> void
+task send_list(ch: Channel<List<int>>) -> void
     ch.send([1, 2, 3])
 ~
 
-task recv_list(ch: Channel<[int]>) -> int
+task recv_list(ch: Channel<List<int>>) -> int
     data = ch.receive()
     return data.len()
 ~
 
 task test() -> int
-    ch: Channel<[int]> = Channel.new()
+    ch: Channel<List<int>> = Channel.new()
     send_list(ch)
     return recv_list(ch)
 ~

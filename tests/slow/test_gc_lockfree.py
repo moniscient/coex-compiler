@@ -48,7 +48,7 @@ func main() -> int
     count = 0
     i = 0
     while i < 10000
-        arr: [int] = []
+        arr: List<int> = []
         arr = arr.append(i)
         arr = arr.append(i + 1)
         count = count + 1
@@ -83,7 +83,7 @@ thread parallel_work(thread_id: int, iterations: int) -> int
     count = 0
     i = 0
     while i < iterations
-        arr: [int] = []
+        arr: List<int> = []
         j = 0
         while j < 10
             arr = arr.append(i * 10 + j)
@@ -99,7 +99,7 @@ func sequential_work(iterations: int) -> int
     count = 0
     i = 0
     while i < iterations
-        arr: [int] = []
+        arr: List<int> = []
         j = 0
         while j < 10
             arr = arr.append(i * 10 + j)
@@ -127,7 +127,7 @@ func main() -> int
     seq_time = seq_end - seq_start
 
     # Measure parallel time
-    thread_ids: [int] = []
+    thread_ids: List<int> = []
     for i in 0..num_threads
         thread_ids = thread_ids.append(i)
     ~
@@ -252,7 +252,7 @@ func main() -> int
     seq_time = seq_end - seq_start
 
     # Measure parallel time
-    thread_ids: [int] = []
+    thread_ids: List<int> = []
     for i in 0..num_threads
         thread_ids = thread_ids.append(i)
     ~
@@ -353,7 +353,7 @@ func main() -> int
     seq_end = posix.time()
     seq_time = seq_end - seq_start
 
-    thread_ids: [int] = []
+    thread_ids: List<int> = []
     for i in 0..num_threads
         thread_ids = thread_ids.append(i)
     ~
@@ -431,7 +431,7 @@ thread contention_work(thread_id: int, barrier: atomic_int, num_threads: int, it
     count = 0
     i = 0
     while i < iterations
-        arr: [int] = []
+        arr: List<int> = []
         j = 0
         while j < 10
             arr = arr.append(thread_id * 1000000 + i * 10 + j)
@@ -447,7 +447,7 @@ func sequential_work(iterations: int) -> int
     count = 0
     i = 0
     while i < iterations
-        arr: [int] = []
+        arr: List<int> = []
         j = 0
         while j < 10
             arr = arr.append(i * 10 + j)
@@ -476,7 +476,7 @@ func main() -> int
     seq_time = seq_end - seq_start
 
     # Parallel with synchronized start
-    thread_ids: [int] = []
+    thread_ids: List<int> = []
     for i in 0..num_threads
         thread_ids = thread_ids.append(i)
     ~

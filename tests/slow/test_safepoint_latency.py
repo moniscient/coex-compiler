@@ -50,7 +50,7 @@ class TestSafepointLatencyBound:
         result = compile_coex('''
 func main() -> int
     # Build a large heap: 100K arrays with 4 elements each
-    heap: [[int]] = []
+    heap: List<List<int>> = []
     j = 0
     while j < 100000
         heap = heap.append([j, j * 2, j * 3, j * 4])
@@ -125,7 +125,7 @@ func main() -> int
         result = compile_coex('''
 func measure_allocation_latency(heap_size: int) -> int
     # Build heap
-    heap: [[int]] = []
+    heap: List<List<int>> = []
     j = 0
     while j < heap_size
         heap = heap.append([j])
@@ -215,7 +215,7 @@ thread gc_heavy_worker(iterations: int) -> int
     i = 0
     while i < iterations
         # Build small heap
-        temp: [int] = []
+        temp: List<int> = []
         j = 0
         while j < 50
             temp = temp.append(j)
@@ -246,7 +246,7 @@ func main() -> int
     ~
 
     # Second: measure 8 parallel workers
-    indices: [int] = []
+    indices: List<int> = []
     for i in 0..8
         indices = indices.append(i)
     ~
@@ -329,7 +329,7 @@ class TestSafepointLatencyWithGCTrigger:
         result = compile_coex('''
 func main() -> int
     # Build large heap
-    heap: [[int]] = []
+    heap: List<List<int>> = []
     j = 0
     while j < 50000
         heap = heap.append([j, j * 2])

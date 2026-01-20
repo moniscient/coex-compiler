@@ -3,9 +3,9 @@ Tests for flexible main() function signatures.
 
 Supported signatures:
 1. func main() -> int                                              - basic
-2. func main(args: [string]) -> int                                - with args
+2. func main(args: List<string>) -> int                                - with args
 3. func main(stdin: posix, stdout: posix, stderr: posix) -> int   - with stdio
-4. func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int - full
+4. func main(args: List<string>, stdin: posix, stdout: posix, stderr: posix) -> int - full
 """
 
 import pytest
@@ -37,12 +37,12 @@ func main() -> int
 
 @pytest.mark.skip(reason="Tests block on stdin in CI environment")
 class TestMainWithArgs:
-    """Test main(args: [string]) -> int signature."""
+    """Test main(args: List<string>) -> int signature."""
 
     def test_main_with_args_count(self, compile_binary):
         """Main receives command line arguments."""
         binary = compile_binary('''
-func main(args: [string]) -> int
+func main(args: List<string>) -> int
     print(args.len())
     return 0
 ~
@@ -56,7 +56,7 @@ func main(args: [string]) -> int
     def test_main_with_args_access(self, compile_binary):
         """Main can access individual arguments via .get() method."""
         binary = compile_binary('''
-func main(args: [string]) -> int
+func main(args: List<string>) -> int
     if args.len() > 1
         print(args.get(1))
     ~
@@ -70,7 +70,7 @@ func main(args: [string]) -> int
     def test_main_with_args_index_access(self, compile_binary):
         """Main can access individual arguments via [] indexing."""
         binary = compile_binary('''
-func main(args: [string]) -> int
+func main(args: List<string>) -> int
     if args.len() > 1
         print(args[1])
     ~
@@ -84,7 +84,7 @@ func main(args: [string]) -> int
     def test_main_with_args_loop(self, compile_binary):
         """Main can iterate over arguments using index and print them."""
         binary = compile_binary('''
-func main(args: [string]) -> int
+func main(args: List<string>) -> int
     for i in 1..args.len()
         print(args[i])
     ~
@@ -128,12 +128,12 @@ func main(stdin: posix, stdout: posix, stderr: posix) -> int
 
 @pytest.mark.skip(reason="Tests block on stdin in CI environment")
 class TestMainFull:
-    """Test main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int signature."""
+    """Test main(args: List<string>, stdin: posix, stdout: posix, stderr: posix) -> int signature."""
 
     def test_main_full_signature(self, compile_binary):
         """Main with both args and stdio."""
         binary = compile_binary('''
-func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
+func main(args: List<string>, stdin: posix, stdout: posix, stderr: posix) -> int
     stdout.writeln("arg count:")
     print(args.len())
     return 0

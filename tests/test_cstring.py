@@ -8,7 +8,7 @@ a string slice to a C function (via extern), the null terminator may not be at
 the expected position, causing buffer overruns or incorrect behavior in C code.
 
 The fix:
-1. Add cstring() method that returns [byte] with null terminator
+1. Add cstring() method that returns List<byte> with null terminator
 2. Automatic marshaling at extern boundaries ensures null termination
 """
 
@@ -46,12 +46,12 @@ func main() -> int
 
     def test_cstring_slice(self, expect_output):
         """cstring() on string slice produces correct null-terminated array."""
-        # Note: We use explicit type annotation [byte] to ensure proper element type tracking
+        # Note: We use explicit type annotation List<byte> to ensure proper element type tracking
         expect_output('''
 func main() -> int
     s = "hello world"
     slice = s[6:11]  # "world"
-    bytes: [byte] = slice.cstring()
+    bytes: List<byte> = slice.cstring()
     # Length should be 6 (5 chars + null)
     print(bytes.len())
     # Verify content

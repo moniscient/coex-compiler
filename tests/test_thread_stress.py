@@ -46,7 +46,7 @@ thread compute_sum(start: int, count: int) -> int
 
 func main() -> int
     # Compute sum of 0..2400000 using 24 threads
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..24
         thread_indices = thread_indices.append(i)
     ~
@@ -69,7 +69,7 @@ func main() -> int
     def test_24_tasks_with_list_iteration(self, expect_output):
         """24 parallel threads iterating over shared list data."""
         expect_output('''
-thread process_list(idx: int, data: [int], multiplier: int) -> int
+thread process_list(idx: int, data: List<int>, multiplier: int) -> int
     total = 0
     for item in data
         total = total + (item * multiplier) + idx
@@ -79,12 +79,12 @@ thread process_list(idx: int, data: [int], multiplier: int) -> int
 
 func main() -> int
     # Shared data all tasks will iterate over
-    data: [int] = []
+    data: List<int> = []
     for i in 0..100
         data = data.append(i)
     ~
 
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..24
         thread_indices = thread_indices.append(i)
     ~
@@ -118,7 +118,7 @@ thread compute_partial_sum(start: int, count: int) -> int
 
 func main() -> int
     # Compute sum of 0..1000 using 8 parallel threads
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..8
         thread_indices = thread_indices.append(i)
     ~
@@ -144,7 +144,7 @@ thread double(x: int) -> int
 ~
 
 func main() -> int
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..24
         thread_indices = thread_indices.append(i)
     ~
@@ -165,7 +165,7 @@ func main() -> int
     def test_parallel_tasks_with_list_params(self, expect_output):
         """Test passing lists to parallel threads."""
         expect_output('''
-thread sum_list(items: [int]) -> int
+thread sum_list(items: List<int>) -> int
     total = 0
     for item in items
         total = total + item
@@ -174,7 +174,7 @@ thread sum_list(items: [int]) -> int
 ~
 
 func main() -> int
-    lists: [[int]] = []
+    lists: List<List<int>> = []
     lists = lists.append([1, 2, 3])
     lists = lists.append([10, 20, 30])
     lists = lists.append([100, 200, 300])
@@ -200,7 +200,7 @@ class TestParallelSieveSmall:
     def test_parallel_sieve_100_2_tasks(self, expect_output):
         """Test parallel sieve to 100 with 2 tasks."""
         expect_output('''
-thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: List<int>) -> int
     composites: Set<int> = {}
     idx = 0
     while idx < small_primes.len()
@@ -230,7 +230,7 @@ thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     return count
 ~
 
-func find_small_primes(limit: int) -> [int]
+func find_small_primes(limit: int) -> List<int>
     composites: Set<int> = {}
     i = 2
     while i * i <= limit
@@ -243,7 +243,7 @@ func find_small_primes(limit: int) -> [int]
         ~
         i = i + 1
     ~
-    primes: [int] = []
+    primes: List<int> = []
     k = 2
     while k <= limit
         if not composites.has(k)
@@ -256,7 +256,7 @@ func find_small_primes(limit: int) -> [int]
 
 func main() -> int
     small_primes = find_small_primes(10)
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     thread_indices = thread_indices.append(0)
     thread_indices = thread_indices.append(1)
     segment_size = 50
@@ -279,7 +279,7 @@ class TestParallelSieve:
     def test_parallel_sieve_1000(self, expect_output):
         """Test parallel sieve to 1000 with 4 tasks."""
         expect_output('''
-thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: List<int>) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -311,7 +311,7 @@ thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     return count
 ~
 
-func find_small_primes(limit: int) -> [int]
+func find_small_primes(limit: int) -> List<int>
     composites: Set<int> = {}
     i = 2
     while i * i <= limit
@@ -324,7 +324,7 @@ func find_small_primes(limit: int) -> [int]
         ~
         i = i + 1
     ~
-    primes: [int] = []
+    primes: List<int> = []
     k = 2
     while k <= limit
         if not composites.has(k)
@@ -338,7 +338,7 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(32)  # sqrt(1000) ~ 32
 
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..4
         thread_indices = thread_indices.append(i)
     ~
@@ -361,7 +361,7 @@ func main() -> int
     def test_parallel_sieve_10000_8_tasks(self, expect_output):
         """Test parallel sieve to 10000 with 8 tasks."""
         expect_output('''
-thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: List<int>) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -393,7 +393,7 @@ thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     return count
 ~
 
-func find_small_primes(limit: int) -> [int]
+func find_small_primes(limit: int) -> List<int>
     composites: Set<int> = {}
     i = 2
     while i * i <= limit
@@ -406,7 +406,7 @@ func find_small_primes(limit: int) -> [int]
         ~
         i = i + 1
     ~
-    primes: [int] = []
+    primes: List<int> = []
     k = 2
     while k <= limit
         if not composites.has(k)
@@ -420,7 +420,7 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(100)  # sqrt(10000) = 100
 
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..8
         thread_indices = thread_indices.append(i)
     ~
@@ -448,7 +448,7 @@ class TestParallelSieveStress:
     def test_parallel_sieve_100k_24_tasks(self, compiler_root):
         """Test parallel sieve to 100K with 24 tasks."""
         source = '''
-thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: List<int>) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -480,7 +480,7 @@ thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     return count
 ~
 
-func find_small_primes(limit: int) -> [int]
+func find_small_primes(limit: int) -> List<int>
     composites: Set<int> = {}
     i = 2
     while i * i <= limit
@@ -493,7 +493,7 @@ func find_small_primes(limit: int) -> [int]
         ~
         i = i + 1
     ~
-    primes: [int] = []
+    primes: List<int> = []
     k = 2
     while k <= limit
         if not composites.has(k)
@@ -507,7 +507,7 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(317)  # sqrt(100000) ~ 317
 
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..24
         thread_indices = thread_indices.append(i)
     ~
@@ -557,7 +557,7 @@ func main() -> int
     def test_parallel_sieve_1m_24_tasks(self, compiler_root):
         """Test parallel sieve to 1M with 24 tasks."""
         source = '''
-thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
+thread sieve_segment(start: int, end_val: int, small_primes: List<int>) -> int
     composites: Set<int> = {}
 
     idx = 0
@@ -589,7 +589,7 @@ thread sieve_segment(start: int, end_val: int, small_primes: [int]) -> int
     return count
 ~
 
-func find_small_primes(limit: int) -> [int]
+func find_small_primes(limit: int) -> List<int>
     composites: Set<int> = {}
     i = 2
     while i * i <= limit
@@ -602,7 +602,7 @@ func find_small_primes(limit: int) -> [int]
         ~
         i = i + 1
     ~
-    primes: [int] = []
+    primes: List<int> = []
     k = 2
     while k <= limit
         if not composites.has(k)
@@ -616,7 +616,7 @@ func find_small_primes(limit: int) -> [int]
 func main() -> int
     small_primes = find_small_primes(1000)  # sqrt(1000000) = 1000
 
-    thread_indices: [int] = []
+    thread_indices: List<int> = []
     for i in 0..24
         thread_indices = thread_indices.append(i)
     ~

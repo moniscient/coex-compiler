@@ -103,7 +103,7 @@ class TestUndefinedMethodErrors:
     def test_undefined_method_on_posix(self, expect_compile_error):
         """Test error when calling non-existent method on posix"""
         expect_compile_error('''
-func main(args: [string], stdin: posix, stdout: posix, stderr: posix) -> int
+func main(args: List<string>, stdin: posix, stdout: posix, stderr: posix) -> int
     src: Result<posix, string> = posix.open("test.txt", "r")
     handle: posix = src.unwrap()
     chunk: Result<string, string> = handle.readall()

@@ -51,7 +51,7 @@ thread allocate_lists(count: int) -> int
 
 func main() -> int
     # 8 threads, each allocating 100 lists = 800 allocations minimum
-    indices: [int] = [0, 1, 2, 3, 4, 5, 6, 7]
+    indices: List<int> = [0, 1, 2, 3, 4, 5, 6, 7]
 
     results = for idx in indices allocate_lists(100) ~
 
@@ -95,7 +95,7 @@ thread allocate_many(id: int, count: int) -> int
 
 func main() -> int
     # 16 threads, each allocating 500 lists = 8000 allocations minimum
-    indices: [int] = []
+    indices: List<int> = []
     for i in 0..16
         indices = indices.append(i)
     ~

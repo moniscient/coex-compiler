@@ -72,7 +72,7 @@ func outer() -> int
     return inner(x)
 ~
 
-func inner(list: [int]) -> int
+func inner(list: List<int>) -> int
     gc()
     return list.len()
 ~
@@ -87,7 +87,7 @@ func main() -> int
     def test_recursive_function_with_registry(self, expect_output):
         """Test recursive functions work with thread registry."""
         expect_output('''
-func sum_list(list: [int], idx: int, acc: int) -> int
+func sum_list(list: List<int>, idx: int, acc: int) -> int
     if idx >= list.len()
         return acc
     ~

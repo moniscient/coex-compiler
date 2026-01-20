@@ -944,15 +944,6 @@ class CoexListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by CoexParser#listType.
-    def enterListType(self, ctx:CoexParser.ListTypeContext):
-        pass
-
-    # Exit a parse tree produced by CoexParser#listType.
-    def exitListType(self, ctx:CoexParser.ListTypeContext):
-        pass
-
-
     # Enter a parse tree produced by CoexParser#primitiveType.
     def enterPrimitiveType(self, ctx:CoexParser.PrimitiveTypeContext):
         pass

@@ -1,9 +1,9 @@
 """
-Tests for Array<T> cellular automata support with @[] relative indexing.
+Tests for Array<T> cellular automata support with [[]] relative indexing.
 
 Tests include:
-- 1D relative indexing: arr@[offset]
-- 2D relative indexing: arr@[row_off, col_off]
+- 1D relative indexing: arr[[offset]]
+- 2D relative indexing: arr[[row_off, col_off]]
 - Neighbor access patterns for Game of Life style automata
 """
 
@@ -11,10 +11,10 @@ import pytest
 
 
 class TestRelativeIndex1D:
-    """Tests for 1D relative indexing with @[]."""
+    """Tests for 1D relative indexing with [[]]."""
 
     def test_relative_index_1d_basic(self, expect_output):
-        """Access neighbors using @[] syntax in 1D array."""
+        """Access neighbors using [[]] syntax in 1D array."""
         expect_output('''
 func main() -> int
     list: List<int> = [10, 20, 30, 40, 50]
@@ -24,13 +24,13 @@ func main() -> int
     __ca_pos__: int = 2
 
     # Access element at position 2 (center)
-    print(arr@[0])
+    print(arr[[0]])
 
     # Access left neighbor (position 1)
-    print(arr@[-1])
+    print(arr[[-1]])
 
     # Access right neighbor (position 3)
-    print(arr@[1])
+    print(arr[[1]])
 
     return 0
 ~
@@ -45,7 +45,7 @@ func main() -> int
 
     # Compute sum of (left + center + right) for position 2
     __ca_pos__: int = 2
-    sum: int = arr@[-1] + arr@[0] + arr@[1]
+    sum: int = arr[[-1]] + arr[[0]] + arr[[1]]
     print(sum)
 
     return 0
@@ -54,10 +54,10 @@ func main() -> int
 
 
 class TestRelativeIndex2D:
-    """Tests for 2D relative indexing with @[row, col]."""
+    """Tests for 2D relative indexing with [[row, col]]."""
 
     def test_relative_index_2d_basic(self, expect_output):
-        """Access neighbors using @[r, c] syntax in 2D array."""
+        """Access neighbors using [[r, c]] syntax in 2D array."""
         expect_output('''
 func main() -> int
     # Create 3x3 identity matrix
@@ -68,16 +68,16 @@ func main() -> int
     __ca_col__: int = 1
 
     # Access center element (1,1) - should be 1 (diagonal)
-    print(arr@[0, 0])
+    print(arr[[0, 0]])
 
     # Access top-left (0,0) - should be 1 (diagonal)
-    print(arr@[-1, -1])
+    print(arr[[-1, -1]])
 
     # Access top-center (0,1) - should be 0
-    print(arr@[-1, 0])
+    print(arr[[-1, 0]])
 
     # Access bottom-right (2,2) - should be 1 (diagonal)
-    print(arr@[1, 1])
+    print(arr[[1, 1]])
 
     return 0
 ~
@@ -102,7 +102,7 @@ func main() -> int
     __ca_col__: int = 1
 
     # 8-neighborhood sum (all corners should be 1)
-    neighbors: int = arr@[-1, -1] + arr@[-1, 0] + arr@[-1, 1] + arr@[0, -1] + arr@[0, 1] + arr@[1, -1] + arr@[1, 0] + arr@[1, 1]
+    neighbors: int = arr[[-1, -1]] + arr[[-1, 0]] + arr[[-1, 1]] + arr[[0, -1]] + arr[[0, 1]] + arr[[1, -1]] + arr[[1, 0]] + arr[[1, 1]]
     print(neighbors)
 
     return 0

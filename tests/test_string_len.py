@@ -183,7 +183,7 @@ func main() -> int
     def test_string_to_int_from_list_element(self, compile_binary):
         """.int() on a string element from a list (original use case)"""
         binary = compile_binary('''
-func main(args:[string]) -> int
+func main(args:List<string>) -> int
     num = args[1].int() ?? 0
     print(num)
     return 0
@@ -357,7 +357,7 @@ func main() -> int
         """String.from_bytes converts byte array to string"""
         expect_output('''
 func main() -> int
-    bytes: [byte] = [72, 101, 108, 108, 111]
+    bytes: List<byte> = [72, 101, 108, 108, 111]
     s = String.from_bytes(bytes)
     print(s)
     return 0
@@ -368,7 +368,7 @@ func main() -> int
         """String.from_bytes handles empty byte array"""
         expect_output('''
 func main() -> int
-    bytes: [byte] = []
+    bytes: List<byte> = []
     s = String.from_bytes(bytes)
     print("len=" + String.from(s.len()))
     return 0

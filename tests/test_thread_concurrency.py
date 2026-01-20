@@ -288,7 +288,7 @@ thread double(x: int) -> int
 ~
 
 func main() -> int
-    items: [int] = []
+    items: List<int> = []
     results = for x in items double(x) ~
     print(results.len())
     return 0
@@ -409,7 +409,7 @@ thread double(x: int) -> int
 ~
 
 func main() -> int
-    items: [int] = []
+    items: List<int> = []
     result = first x in items double(x) ~
     print(result)
     return 0
@@ -444,7 +444,7 @@ thread compute(x: int) -> int
 ~
 
 func main() -> int
-    items: [int] = []
+    items: List<int> = []
     (results, errors) = most x in items compute(x) ~
     print(results.len())
     print(errors.len())
@@ -568,7 +568,7 @@ func main() -> int
     def test_thread_with_list_iteration(self, expect_output):
         """Test thread iterating over list has safepoints."""
         expect_output('''
-thread sum_list(items: [int]) -> int
+thread sum_list(items: List<int>) -> int
     total = 0
     for item in items
         total = total + item

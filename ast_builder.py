@@ -401,10 +401,6 @@ class ASTBuilder:
             return self.visit_tuple_type(ctx.tupleType())
         elif ctx.functionType():
             return self.visit_function_type(ctx.functionType())
-        elif ctx.listType():
-            # [T] syntax for list types
-            elem_type = self.visit_type_expr(ctx.listType().typeExpr())
-            return ListType(elem_type)
 
         return PrimitiveType("int")  # fallback
     
@@ -1015,9 +1011,8 @@ class ASTBuilder:
             else:
                 # Member access: obj.field
                 return MemberExpr(base, member)
-        elif ctx.relativeIndex():
-            # Relative indexing for cellular automata: arr@[offset] or arr@[i, j]
-            # Must check before LBRACKET since @[ contains [
+        elif ctx.DOUBLE_LBRACKET():
+            # Relative indexing for cellular automata: arr[[offset]] or arr[[i, j]]
             relative_index = ctx.relativeIndex()
             offsets = []
             for expr in relative_index.expression():
@@ -1123,10 +1118,10 @@ class ASTBuilder:
         elif ctx.SELF():
             return SelfExpr()
         elif ctx.LPAREN():
-            exprs = ctx.expression()
-            if exprs:
-                # Parenthesized expression - get first (and only) one
-                return self.visit_expression(exprs[0])
+            expr = ctx.expression()
+            if expr:
+                # Parenthesized expression - single expression, not a list
+                return self.visit_expression(expr)
             elif ctx.tupleElements():
                 # Tuple literal
                 return self.visit_tuple_elements(ctx.tupleElements())

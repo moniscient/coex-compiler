@@ -3,7 +3,7 @@ Tests for built-in posix type - platform type wrapping POSIX file operations.
 
 posix is a platform type that provides:
 - posix.open(path, mode) -> Result<posix, string>
-- handle.read(count) -> Result<[byte], string>
+- handle.read(count) -> Result<List<byte>, string>
 - handle.read_all() -> Result<string, string>
 - handle.write(data) -> Result<int, string>
 - handle.writeln(text) -> Result<(), string>
@@ -133,9 +133,9 @@ func main() -> int
     f: Result<posix, string> = posix.open("{test_file}", "r")
     if f.is_ok()
         handle: posix = f.unwrap()
-        data: Result<[byte], string> = handle.read(5)
+        data: Result<List<byte>, string> = handle.read(5)
         if data.is_ok()
-            bytes: [byte] = data.unwrap()
+            bytes: List<byte> = data.unwrap()
             print(bytes.len())
         ~
         handle.close()
@@ -183,9 +183,9 @@ func main() -> int
         # Seek to position 6 (SEEK_SET = 0)
         handle.seek(6, 0)
         # Read 5 bytes - should be "world"
-        data: Result<[byte], string> = handle.read(5)
+        data: Result<List<byte>, string> = handle.read(5)
         if data.is_ok()
-            bytes: [byte] = data.unwrap()
+            bytes: List<byte> = data.unwrap()
             print(bytes.len())
         ~
         handle.close()
@@ -283,7 +283,7 @@ func main() -> int
         """posix.urandom(n) returns n bytes."""
         expect_output('''
 func main() -> int
-    bytes: [byte] = posix.urandom(16)
+    bytes: List<byte> = posix.urandom(16)
     print(bytes.len())
     return 0
 ~

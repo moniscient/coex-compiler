@@ -311,7 +311,7 @@ class TestMoveAnalyzer:
     def test_suggests_move_for_last_use(self):
         """Suggests move when variable not used after assignment."""
         source = '''
-func process(data: [int]) -> [int]
+func process(data: List<int>) -> List<int>
     result = data
     return result
 ~
