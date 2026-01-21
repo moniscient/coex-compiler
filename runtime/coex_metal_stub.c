@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "coex_array.h"
+
 /* Dispatch function signature */
 typedef void (*coex_metal_dispatch_fn)(
     const char* kernel_source,
@@ -104,4 +106,53 @@ void coex_metal_dispatch(
 void coex_metal_dispatch_clear(void) {
     _dispatch_impl = NULL;
     _warned_no_dispatch = 0;
+}
+
+/* ========================================================================
+ * Metal matmul stubs (non-macOS platforms)
+ * ========================================================================
+ * These functions are declared as extern in linalg.coex but are only
+ * implemented in coex_metal.m (Objective-C) on macOS. On Linux and other
+ * platforms, we provide these stub implementations that return NULL to
+ * indicate GPU acceleration is not available.
+ * ======================================================================== */
+
+static int _warned_no_metal_matmul = 0;
+
+/**
+ * Stub for GPU matrix multiplication (float64 arrays).
+ * On non-macOS platforms, Metal is not available.
+ *
+ * @param a  Input matrix A (unused)
+ * @param b  Input matrix B (unused)
+ * @return   Always returns NULL (GPU not available)
+ */
+CoexArray* coex_metal_matmul(const CoexArray* a, const CoexArray* b) {
+    (void)a;  /* Suppress unused parameter warning */
+    (void)b;
+    if (!_warned_no_metal_matmul) {
+        fprintf(stderr, "Warning: coex_metal_matmul called but Metal is not available on this platform\n");
+        fprintf(stderr, "         Use matmul_f64() or matmul_f32() for CPU-based matrix multiplication\n");
+        _warned_no_metal_matmul = 1;
+    }
+    return NULL;
+}
+
+/**
+ * Stub for GPU matrix multiplication (native float32 arrays).
+ * On non-macOS platforms, Metal is not available.
+ *
+ * @param a  Input matrix A (unused)
+ * @param b  Input matrix B (unused)
+ * @return   Always returns NULL (GPU not available)
+ */
+CoexArray* coex_metal_matmul_f32_native(const CoexArray* a, const CoexArray* b) {
+    (void)a;  /* Suppress unused parameter warning */
+    (void)b;
+    if (!_warned_no_metal_matmul) {
+        fprintf(stderr, "Warning: coex_metal_matmul_f32_native called but Metal is not available on this platform\n");
+        fprintf(stderr, "         Use matmul_cpu_f32() for CPU-based float32 matrix multiplication\n");
+        _warned_no_metal_matmul = 1;
+    }
+    return NULL;
 }

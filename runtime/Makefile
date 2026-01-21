@@ -88,7 +88,7 @@ ifeq ($(UNAME_S),Darwin)
 coex_metal.o: coex_metal.m coex_metal_stub.h
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 else
-coex_metal_stub.o: coex_metal_stub.c coex_metal_stub.h
+coex_metal_stub.o: coex_metal_stub.c coex_metal_stub.h coex_array.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 endif
 
