@@ -201,13 +201,17 @@ class FunctionGenerator:
         """
         cg = self.cg
 
-        # Get the kind declaration
-        if func.kind_name not in cg.kind_registry:
-            raise RuntimeError(
-                f"Unknown kind '{func.kind_name}'. Did you forget "
-                f"'kind {func.kind_name} -> TYPE via HANDLER'?"
-            )
-        kind_decl = cg.kind_registry[func.kind_name]
+        # Get the pre-resolved kind declaration from _declare_function
+        # This handles local, qualified, and aliased kinds
+        kind_decl = cg.func_kind_decls.get(func.name)
+        if kind_decl is None:
+            # Fallback for backward compatibility (shouldn't normally happen)
+            kind_decl = cg.kind_registry.get(func.kind_name)
+            if kind_decl is None:
+                raise RuntimeError(
+                    f"Unknown kind '{func.kind_name}'. Did you forget "
+                    f"'kind {func.kind_name} -> TYPE via HANDLER'?"
+                )
 
         # Build parameter types
         param_types = []
@@ -232,8 +236,11 @@ class FunctionGenerator:
         """
         cg = self.cg
 
-        # Get the kind declaration
-        kind_decl = cg.kind_registry[func.kind_name]
+        # Get the pre-resolved kind declaration
+        kind_decl = cg.func_kind_decls.get(func.name)
+        if kind_decl is None:
+            # Fallback for backward compatibility
+            kind_decl = cg.kind_registry.get(func.kind_name)
 
         # Verify handler exists
         if kind_decl.handler not in cg.functions:

@@ -92,7 +92,7 @@ class ModuleGenerator:
         tree = parser.program()
 
         builder = ASTBuilder()
-        program = builder.build(tree)
+        program = builder.build(tree, token_stream)
 
         # Create module info
         module_info = ModuleInfo(
@@ -162,6 +162,32 @@ class ModuleGenerator:
                     unqualified_method = f"{type_decl.name}_{method_name}"
                     if mangled_method in cg.functions and unqualified_method not in cg.functions:
                         cg.functions[unqualified_method] = cg.functions[mangled_method]
+
+        # Register user-defined kinds with mangled names
+        from ast_nodes import KindDecl
+        for kind_decl in program.kinds:
+            mangled_kind = f"{prefix}{kind_decl.name}"
+
+            # Mangle handler name if it's a local function in this module
+            handler_name = kind_decl.handler
+            if handler_name in module_info.functions:
+                mangled_handler = module_info.functions[handler_name]
+            else:
+                # Handler might be defined later, or is an external function
+                mangled_handler = f"{prefix}{handler_name}"
+
+            # Create mangled kind declaration
+            mangled_kind_decl = KindDecl(
+                name=mangled_kind,
+                return_type=kind_decl.return_type,
+                handler=mangled_handler
+            )
+
+            # Register in global kind registry
+            cg.kind_registry[mangled_kind] = mangled_kind_decl
+
+            # Store mapping in module info for qualified access
+            module_info.kinds[kind_decl.name] = mangled_kind
 
         # Declare and generate functions with mangled names
         for func in program.functions:
@@ -275,7 +301,7 @@ class ModuleGenerator:
             tree = parser.program()
 
             builder = ASTBuilder()
-            program = builder.build(tree)
+            program = builder.build(tree, token_stream)
 
             # Create a pseudo-module for this library source
             module_info = ModuleInfo(

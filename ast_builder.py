@@ -46,6 +46,10 @@ class ASTBuilder:
                 rep = self.visit_replace_decl(child)
                 if rep:
                     program.replaces.append(rep)
+            elif hasattr(CoexParser, 'ReplaceKindDeclContext') and isinstance(child, CoexParser.ReplaceKindDeclContext):
+                rep_kind = self.visit_replace_kind_decl(child)
+                if rep_kind:
+                    program.kind_replaces.append(rep_kind)
             elif isinstance(child, CoexParser.DirectiveDeclContext):
                 directive = self.visit_directive_decl(child)
                 if directive:
@@ -101,6 +105,15 @@ class ASTBuilder:
         module = identifiers[0].getText()
         qualified_name = identifiers[1].getText()
         return ReplaceDecl(shortname=shortname, module=module, qualified_name=qualified_name)
+
+    def visit_replace_kind_decl(self, ctx) -> Optional[ReplaceKindDecl]:
+        """Visit a replace kind declaration: replace kind shortname with module.kindname"""
+        shortname = ctx.IDENTIFIER().getText()
+        qualified = ctx.qualifiedName()
+        identifiers = qualified.IDENTIFIER()
+        module = identifiers[0].getText()
+        qualified_name = identifiers[1].getText()
+        return ReplaceKindDecl(shortname=shortname, module=module, qualified_name=qualified_name)
 
     def visit_directive_decl(self, ctx: CoexParser.DirectiveDeclContext) -> Optional[DirectiveDecl]:
         """Visit a directive declaration: printing/debugging [on/off]"""
@@ -188,7 +201,14 @@ class ASTBuilder:
         kind_ctx = ctx.functionKind()
         kind_text = kind_ctx.getText()
 
-        # Check if this is a user-defined kind
+        # Check for qualified kind (module.kindname)
+        if '.' in kind_text:
+            parts = kind_text.split('.', 1)
+            kind_module, kind_name = parts[0], parts[1]
+            # This is a qualified kind reference - defer resolution to codegen
+            return self._visit_kind_function(ctx, kind_name, annotations, kind_module=kind_module)
+
+        # Check if this is a local user-defined kind
         if kind_text in self.kind_registry:
             return self._visit_kind_function(ctx, kind_text, annotations)
 
@@ -203,8 +223,9 @@ class ASTBuilder:
         elif kind_text == "func":
             kind = FunctionKind.FUNC
         else:
-            # Unknown function kind - raise error
-            raise RuntimeError(f"Unknown function kind '{kind_text}'. Did you forget 'kind {kind_text} -> TYPE via HANDLER'?")
+            # Unknown function kind - might be a kind replace alias or imported kind
+            # Defer to codegen for resolution (it will error if truly unknown)
+            return self._visit_kind_function(ctx, kind_text, annotations)
 
         # Get function name
         name = ctx.IDENTIFIER().getText()
@@ -243,10 +264,17 @@ class ASTBuilder:
             argument = self._get_string_value(ctx.stringLiteral())
         return Annotation(name, argument)
 
-    def _visit_kind_function(self, ctx, kind_name: str, annotations: PyList[Annotation]) -> KindFunctionDecl:
+    def _visit_kind_function(self, ctx, kind_name: str, annotations: PyList[Annotation],
+                             kind_module: Optional[str] = None) -> KindFunctionDecl:
         """Visit a function using a user-defined kind.
 
         The body is captured as raw text rather than parsed statements.
+
+        Args:
+            ctx: The function declaration context
+            kind_name: The kind name (e.g., "sqlquery")
+            annotations: List of annotations on the function
+            kind_module: Optional module name for qualified kinds (e.g., "postgresql")
         """
         # Get function name
         name = ctx.IDENTIFIER().getText()
@@ -256,14 +284,15 @@ class ASTBuilder:
         if ctx.parameterList():
             params = self.visit_param_list(ctx.parameterList())
 
-        # Get return type (or use the kind's default return type)
+        # Get return type (or use the kind's default return type if local kind)
         return_type = None
         if ctx.returnType():
             return_type = self.visit_type_expr(ctx.returnType().typeExpr())
-        else:
-            # Default to the kind's declared return type
+        elif kind_module is None and kind_name in self.kind_registry:
+            # Default to the local kind's declared return type
             kind_decl = self.kind_registry[kind_name]
             return_type = kind_decl.return_type
+        # For qualified kinds, return type resolution is deferred to codegen
 
         # Capture raw body text - prefer rawBlock if present, fall back to block
         if ctx.rawBlock():
@@ -279,7 +308,8 @@ class ASTBuilder:
             params=params,
             return_type=return_type,
             body=body,
-            annotations=annotations
+            annotations=annotations,
+            kind_module=kind_module
         )
 
     def _capture_raw_block(self, raw_block_ctx) -> str:

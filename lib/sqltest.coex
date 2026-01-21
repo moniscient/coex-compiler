@@ -1,0 +1,20 @@
+# Test module for user-defined kind imports
+# This module exports a simple SQL query kind for testing
+
+type KindCall:
+    name: string
+    param_names: [string]
+    param_values: [json]
+    body: string
+~
+
+type SqlResult:
+    query: string
+    param_count: int
+~
+
+func sql_handler(call: KindCall) -> SqlResult
+    return SqlResult(query: call.body, param_count: call.param_values.len())
+~
+
+kind sqlquery -> SqlResult via sql_handler

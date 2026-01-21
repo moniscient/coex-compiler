@@ -35,6 +35,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#replaceKindDecl.
+    def enterReplaceKindDecl(self, ctx:CoexParser.ReplaceKindDeclContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#replaceKindDecl.
+    def exitReplaceKindDecl(self, ctx:CoexParser.ReplaceKindDeclContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#directiveDecl.
     def enterDirectiveDecl(self, ctx:CoexParser.DirectiveDeclContext):
         pass

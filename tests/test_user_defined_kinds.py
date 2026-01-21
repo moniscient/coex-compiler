@@ -615,15 +615,71 @@ func main() -> int
 
 
 class TestKindImportScenarios:
-    """Tests for kind import scenarios (future - may be xfail initially)."""
+    """Tests for kind import scenarios."""
 
-    @pytest.mark.skip(reason="Module import of kinds not yet implemented")
     def test_kind_from_module(self, expect_output):
-        """Kind can be imported from a module."""
-        # This would require creating a lib file with the kind
-        pass
+        """Kind can be imported from a module and used with qualified name."""
+        expect_output('''
+import sqltest
 
-    @pytest.mark.skip(reason="Qualified kinds not yet implemented")
+sqltest.sqlquery get_users(min_age: int) -> SqlResult:
+    SELECT * FROM users WHERE age > $1
+~
+
+func main() -> int
+    result = get_users(25)
+    print(result.query)
+    print(result.param_count)
+    return 0
+~
+''', "SELECT * FROM users WHERE age > $1\n1\n")
+
     def test_qualified_kind_usage(self, expect_output):
         """Qualified kind usage like module.kindname."""
-        pass
+        expect_output('''
+import sqltest
+
+sqltest.sqlquery find_products(category: string, limit: int) -> SqlResult:
+    SELECT * FROM products WHERE category = $1 LIMIT $2
+~
+
+func main() -> int
+    result = find_products("electronics", 10)
+    print(result.param_count)
+    return 0
+~
+''', "2\n")
+
+    def test_kind_replace_alias(self, expect_output):
+        """Replace alias for kind: replace kind sql with sqltest.sqlquery"""
+        expect_output('''
+import sqltest
+replace kind sql with sqltest.sqlquery
+
+sql query_items(id: int) -> SqlResult:
+    SELECT * FROM items WHERE id = $1
+~
+
+func main() -> int
+    result = query_items(42)
+    print(result.param_count)
+    return 0
+~
+''', "1\n")
+
+    def test_kind_conflict_detection(self, compile_coex):
+        """Error when using unqualified kind name that doesn't exist locally."""
+        result = compile_coex('''
+import sqltest
+
+# This should error - sqlquery is only available as sqltest.sqlquery
+sqlquery get_data() -> SqlResult:
+    SELECT 1
+~
+
+func main() -> int
+    return 0
+~
+''')
+        assert not result.compile_success
+        # Should have error about unknown kind

@@ -853,6 +853,15 @@ class KindFunctionDecl:
     return_type: Optional[Type] = None
     body: str = ""                                  # Raw text body (not parsed)
     annotations: List[Annotation] = field(default_factory=list)
+    kind_module: Optional[str] = None               # Module if qualified (e.g., postgresql.sqlquery)
+
+
+@dataclass
+class ReplaceKindDecl:
+    """Replace declaration for kind aliases: replace kind shortname with module.kindname"""
+    shortname: str       # e.g., "sql"
+    module: str          # e.g., "postgresql"
+    qualified_name: str  # e.g., "sqlquery" (the kind name in the module)
 
 
 # ============================================================================
@@ -863,6 +872,7 @@ class KindFunctionDecl:
 class Program:
     imports: List[ImportDecl] = field(default_factory=list)
     replaces: List['ReplaceDecl'] = field(default_factory=list)
+    kind_replaces: List['ReplaceKindDecl'] = field(default_factory=list)
     directives: List['DirectiveDecl'] = field(default_factory=list)
     kinds: List['KindDecl'] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)

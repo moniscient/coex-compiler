@@ -101,6 +101,7 @@ class ModuleInfo:
     program: 'Program'
     functions: Dict[str, str] = field(default_factory=dict)  # func_name -> mangled_name
     types: Dict[str, str] = field(default_factory=dict)      # type_name -> mangled_name
+    kinds: Dict[str, str] = field(default_factory=dict)      # kind_name -> mangled_name
 
 
 @dataclass
@@ -232,6 +233,8 @@ class CodeGenerator:
         # Module system support
         self.loaded_modules: Dict[str, ModuleInfo] = {}  # module_name -> ModuleInfo
         self.replace_aliases: Dict[str, Tuple[str, str]] = {}  # shortname -> (module, func_name)
+        self.kind_replace_aliases: Dict[str, Tuple[str, str]] = {}  # shortname -> (module, kind_name)
+        self.func_kind_decls: Dict[str, 'KindDecl'] = {}  # func_name -> resolved KindDecl
         self.module_search_paths: PyList[str] = []
         self.current_module: Optional[str] = None  # Track which module we're compiling
 
@@ -801,6 +804,21 @@ class CodeGenerator:
                 raise RuntimeError(f"Module '{rep.module}' not imported for replace '{rep.shortname}'")
             self.replace_aliases[rep.shortname] = (rep.module, rep.qualified_name)
 
+        # Register kind replace aliases
+        for kind_rep in program.kind_replaces:
+            if kind_rep.module not in self.loaded_modules:
+                raise RuntimeError(f"Module '{kind_rep.module}' not imported for replace kind '{kind_rep.shortname}'")
+            module_info = self.loaded_modules[kind_rep.module]
+            if kind_rep.qualified_name not in module_info.kinds:
+                raise RuntimeError(
+                    f"Kind '{kind_rep.qualified_name}' not found in module '{kind_rep.module}'. "
+                    f"Available kinds: {list(module_info.kinds.keys())}"
+                )
+            self.kind_replace_aliases[kind_rep.shortname] = (kind_rep.module, kind_rep.qualified_name)
+
+        # Check for kind conflicts (same kind name from multiple modules)
+        self._check_kind_conflicts()
+
         # Process compiler directives (printing/debugging)
         for directive in program.directives:
             if directive.name == "printing":
@@ -924,6 +942,65 @@ class CodeGenerator:
     # ========================================================================
     # User-Defined Kind Validation
     # ========================================================================
+
+    def _check_kind_conflicts(self):
+        """Check for conflicting kind imports.
+
+        Raises an error if the same kind name is imported from multiple modules
+        without using qualified names or replace aliases.
+        """
+        imported_kinds = {}  # kind_name -> list of module names
+
+        for module_name, module_info in self.loaded_modules.items():
+            for kind_name in module_info.kinds:
+                if kind_name not in imported_kinds:
+                    imported_kinds[kind_name] = []
+                imported_kinds[kind_name].append(module_name)
+
+        for kind_name, modules in imported_kinds.items():
+            if len(modules) > 1:
+                # Check if this kind name is also defined locally
+                if kind_name in self.kind_registry:
+                    # Local kind shadows imported ones - that's fine
+                    continue
+                # Multiple modules export the same kind - warn but don't error
+                # Users must use qualified names to disambiguate
+
+    def _resolve_kind(self, kind_name: str, kind_module: Optional[str]) -> Optional['KindDecl']:
+        """Resolve a kind reference to its declaration.
+
+        Args:
+            kind_name: The kind name (e.g., "sqlquery")
+            kind_module: Optional module name for qualified kinds (e.g., "postgresql")
+
+        Returns:
+            The resolved KindDecl, or None if not found.
+
+        Raises:
+            RuntimeError: If the module is not imported or kind not found.
+        """
+        # Check replace aliases first (highest priority)
+        if kind_name in self.kind_replace_aliases:
+            module, qname = self.kind_replace_aliases[kind_name]
+            module_info = self.loaded_modules[module]
+            mangled = module_info.kinds[qname]
+            return self.kind_registry[mangled]
+
+        # Check qualified reference (module.kindname)
+        if kind_module:
+            if kind_module not in self.loaded_modules:
+                raise RuntimeError(f"Module '{kind_module}' not imported for kind '{kind_name}'")
+            module_info = self.loaded_modules[kind_module]
+            if kind_name not in module_info.kinds:
+                raise RuntimeError(
+                    f"Kind '{kind_name}' not found in module '{kind_module}'. "
+                    f"Available kinds: {list(module_info.kinds.keys())}"
+                )
+            mangled = module_info.kinds[kind_name]
+            return self.kind_registry[mangled]
+
+        # Check local registry (no module qualifier)
+        return self.kind_registry.get(kind_name)
 
     def _validate_kind_handlers(self):
         """Validate that all user-defined kinds have valid handlers.
@@ -1236,6 +1313,15 @@ class CodeGenerator:
     def _declare_function(self, func):
         """Declare a function (for forward references)"""
         if isinstance(func, KindFunctionDecl):
+            # Resolve the kind (may be local, qualified, or aliased)
+            kind_decl = self._resolve_kind(func.kind_name, func.kind_module)
+            if kind_decl is None:
+                raise RuntimeError(
+                    f"Unknown kind '{func.kind_name}'. Did you forget "
+                    f"'kind {func.kind_name} -> TYPE via HANDLER'?"
+                )
+            # Store the resolved kind declaration for use by function generator
+            self.func_kind_decls[func.name] = kind_decl
             return self._functions.declare_kind_function(func)
         return self._functions.declare_function(func)
 

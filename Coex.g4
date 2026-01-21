@@ -25,7 +25,7 @@ grammar Coex;
 // ----------------------------------------------------------------------------
 
 program
-    : NEWLINE* ((importDecl | replaceDecl | directiveDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
+    : NEWLINE* ((importDecl | replaceDecl | replaceKindDecl | directiveDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
     ;
 
 // Module imports: import module_name or import "path/to/library.cxz"
@@ -37,6 +37,11 @@ importDecl
 // Local alias: replace shortname with module.function
 replaceDecl
     : REPLACE IDENTIFIER WITH qualifiedName
+    ;
+
+// Local alias for kinds: replace kind shortname with module.kindname
+replaceKindDecl
+    : REPLACE KIND IDENTIFIER WITH qualifiedName
     ;
 
 // Compiler directives: printing/debugging [on/off]
@@ -92,7 +97,8 @@ functionKind
     | THREAD
     | FUNC
     | EXTERN
-    | IDENTIFIER    // User-defined kind name
+    | IDENTIFIER DOT IDENTIFIER    // Qualified user-defined kind (module.kindname)
+    | IDENTIFIER                   // Local user-defined kind name
     ;
 
 genericParams
