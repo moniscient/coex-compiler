@@ -684,3 +684,4 @@
 - **Files**: codegen/formula/transpiler.py
 - **Fix**: Changed check to `decl.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32)`
 - **Status**: Fixed (2026-01-19)
+
