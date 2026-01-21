@@ -49,10 +49,16 @@ qualifiedName
     : IDENTIFIER (DOT IDENTIFIER)+
     ;
 
+// Kind declaration for user-defined function kinds: kind NAME -> RETURN_TYPE via HANDLER
+kindDecl
+    : KIND IDENTIFIER ARROW typeExpr VIA IDENTIFIER NEWLINE*
+    ;
+
 declaration
     : functionDecl
     | typeDecl
     | traitDecl
+    | kindDecl
     ;
 
 // ----------------------------------------------------------------------------
@@ -65,8 +71,19 @@ annotation
     ;
 
 functionDecl
-    : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* block
+    : annotation* functionKind IDENTIFIER genericParams? LPAREN parameterList? RPAREN returnType? COLON? NEWLINE* (block | rawBlock)
     | EXTERN IDENTIFIER LPAREN parameterList? RPAREN returnType? NEWLINE* blockTerminator  // extern has no body
+    ;
+
+// Raw block for user-defined kind functions - captures any tokens until terminator
+// This allows DSL bodies that don't conform to Coex syntax
+rawBlock
+    : rawBlockContent* blockTerminator
+    ;
+
+// Any single token that isn't a terminator
+rawBlockContent
+    : ~(END | TILDE)
     ;
 
 functionKind
@@ -75,6 +92,7 @@ functionKind
     | THREAD
     | FUNC
     | EXTERN
+    | IDENTIFIER    // User-defined kind name
     ;
 
 genericParams
@@ -488,6 +506,7 @@ primaryExpr
     : literal
     | IDENTIFIER genericArgs                                // Generic type: List<int>
     | IDENTIFIER
+    | JSON_TYPE                                             // Allow 'json' as expression for json.method() calls
     | SELF
     | LPAREN expression RPAREN
     | LPAREN tupleElements RPAREN
@@ -601,8 +620,14 @@ typeExpr
 baseType
     : primitiveType
     | IDENTIFIER genericArgs?
+    | listType
     | tupleType
     | functionType
+    ;
+
+// List type shorthand: [T] means List<T>
+listType
+    : LBRACKET typeExpr RBRACKET
     ;
 
 primitiveType
@@ -717,6 +742,10 @@ OFF         : 'off' ;
 
 // Inline LLVM IR
 LLVM_IR     : 'llvm_ir' ;
+
+// User-defined kinds
+KIND        : 'kind' ;
+VIA         : 'via' ;
 
 // Block terminators
 END         : 'end' ;

@@ -53,6 +53,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#kindDecl.
+    def enterKindDecl(self, ctx:CoexParser.KindDeclContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#kindDecl.
+    def exitKindDecl(self, ctx:CoexParser.KindDeclContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#declaration.
     def enterDeclaration(self, ctx:CoexParser.DeclarationContext):
         pass
@@ -77,6 +86,24 @@ class CoexListener(ParseTreeListener):
 
     # Exit a parse tree produced by CoexParser#functionDecl.
     def exitFunctionDecl(self, ctx:CoexParser.FunctionDeclContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#rawBlock.
+    def enterRawBlock(self, ctx:CoexParser.RawBlockContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#rawBlock.
+    def exitRawBlock(self, ctx:CoexParser.RawBlockContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#rawBlockContent.
+    def enterRawBlockContent(self, ctx:CoexParser.RawBlockContentContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#rawBlockContent.
+    def exitRawBlockContent(self, ctx:CoexParser.RawBlockContentContext):
         pass
 
 
@@ -941,6 +968,15 @@ class CoexListener(ParseTreeListener):
 
     # Exit a parse tree produced by CoexParser#baseType.
     def exitBaseType(self, ctx:CoexParser.BaseTypeContext):
+        pass
+
+
+    # Enter a parse tree produced by CoexParser#listType.
+    def enterListType(self, ctx:CoexParser.ListTypeContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#listType.
+    def exitListType(self, ctx:CoexParser.ListTypeContext):
         pass
 
 

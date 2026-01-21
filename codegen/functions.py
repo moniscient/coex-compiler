@@ -18,7 +18,7 @@ from ast_nodes import (
     Identifier, TupleType, TypeDecl, PrimitiveType, MemberExpr, MethodCallExpr,
     Assignment, ReturnStmt, BinaryExpr, UnaryExpr, TernaryExpr, IndexExpr,
     TupleExpr, ListExpr, MapExpr, SetExpr, LambdaExpr, SelectStmt, WithinStmt,
-    SelfExpr
+    SelfExpr, KindFunctionDecl, KindDecl
 )
 from task_analysis import analyze_task
 
@@ -188,6 +188,250 @@ class FunctionGenerator:
         llvm_func = ir.Function(cg.module, func_type, name=func.name)
         llvm_func.linkage = 'external'
         cg.functions[func.name] = llvm_func
+
+    # ========================================================================
+    # User-Defined Kind Function Handling
+    # ========================================================================
+
+    def declare_kind_function(self, func: KindFunctionDecl):
+        """Declare a user-defined kind function.
+
+        Kind functions have the same external signature as regular functions,
+        but their body is raw text that gets passed to a handler.
+        """
+        cg = self.cg
+
+        # Get the kind declaration
+        if func.kind_name not in cg.kind_registry:
+            raise RuntimeError(
+                f"Unknown kind '{func.kind_name}'. Did you forget "
+                f"'kind {func.kind_name} -> TYPE via HANDLER'?"
+            )
+        kind_decl = cg.kind_registry[func.kind_name]
+
+        # Build parameter types
+        param_types = []
+        for param in func.params:
+            param_types.append(cg._get_llvm_type(param.type_annotation))
+
+        # Build return type from the kind declaration
+        return_type = cg._get_llvm_type(kind_decl.return_type)
+
+        # Create function
+        fn_type = ir.FunctionType(return_type, param_types)
+        llvm_func = ir.Function(cg.module, fn_type, name=func.name)
+        cg.functions[func.name] = llvm_func
+
+    def generate_kind_function(self, func: KindFunctionDecl):
+        """Generate a user-defined kind function body.
+
+        The generated code:
+        1. Creates a KindCall struct with: name, param_names, param_values, body
+        2. Calls the handler function with the KindCall
+        3. Returns the handler's result
+        """
+        cg = self.cg
+
+        # Get the kind declaration
+        kind_decl = cg.kind_registry[func.kind_name]
+
+        # Verify handler exists
+        if kind_decl.handler not in cg.functions:
+            raise RuntimeError(
+                f"Handler function '{kind_decl.handler}' not found for kind "
+                f"'{func.kind_name}'. Make sure the handler is declared before use."
+            )
+
+        # Verify KindCall type exists
+        if 'KindCall' not in cg.type_registry:
+            raise RuntimeError(
+                "KindCall type not defined. Add:\n"
+                "type KindCall:\n"
+                "    name: string\n"
+                "    param_names: [string]\n"
+                "    param_values: [json]\n"
+                "    body: string\n"
+                "~"
+            )
+
+        llvm_func = cg.functions[func.name]
+        entry = llvm_func.append_basic_block("entry")
+        cg.builder = ir.IRBuilder(entry)
+
+        # Calculate number of GC roots needed:
+        # - 4 for KindCall struct fields (name, param_names, param_values, body)
+        # - 1 for each heap-allocated parameter
+        num_roots = 4
+        for param in func.params:
+            if cg._is_heap_type(param.type_annotation):
+                num_roots += 1
+
+        # Set up GC shadow stack for this function
+        cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
+
+        # Clear locals for this function
+        cg.locals = {}
+        cg.var_coex_types = {}
+        cg.moved_vars = set()
+        cg.const_bindings = set()
+
+        # Store parameters as locals
+        for i, param in enumerate(func.params):
+            arg = llvm_func.args[i]
+            alloca = cg.builder.alloca(arg.type, name=param.name)
+            cg.builder.store(arg, alloca)
+            cg.locals[param.name] = alloca
+            cg.var_coex_types[param.name] = param.type_annotation
+
+        # Build the KindCall struct (returns i64 handle)
+        kind_call_handle = self._build_kind_call(func, kind_decl)
+
+        # Call the handler function - dereference handle to get pointer
+        handler_func = cg.functions[kind_decl.handler]
+        kind_call_i8 = cg.builder.call(cg.gc.gc_handle_deref, [kind_call_handle])
+        kind_call_ptr = cg.builder.bitcast(kind_call_i8, cg.type_registry['KindCall'].as_pointer())
+        result = cg.builder.call(handler_func, [kind_call_ptr])
+
+        # Pop GC frame and return
+        cg.gc.pop_frame(cg.builder, cg.gc_frame)
+        cg.builder.ret(result)
+
+    def _build_kind_call(self, func: KindFunctionDecl, kind_decl: KindDecl) -> ir.Value:
+        """Build a KindCall struct with the function's metadata.
+
+        KindCall has:
+        - name: string (function name)
+        - param_names: [string] (parameter names)
+        - param_values: [json] (parameter values wrapped in json)
+        - body: string (raw body text)
+        """
+        cg = self.cg
+
+        # Allocate KindCall via GC
+        kind_call_type = cg.type_registry['KindCall']
+        field_info = cg.type_fields.get('KindCall', [])
+
+        # Calculate size (8 bytes per field)
+        size = len(field_info) * 8 if field_info else 32  # At least 4 fields * 8 bytes
+        size_val = ir.Constant(ir.IntType(64), size)
+
+        # Get type ID for GC
+        type_id = ir.Constant(ir.IntType(32), cg.gc.get_type_id('KindCall'))
+
+        # Allocate the struct
+        raw_ptr = cg.gc.alloc_arena_or_gc(cg.builder, size_val, type_id)
+        kind_call_struct_ptr = cg.builder.bitcast(raw_ptr, kind_call_type.as_pointer())
+
+        # Set field 0: name (string) - convert pointer to handle
+        name_str_ptr = cg._get_string_ptr(func.name)
+        name_i8 = cg.builder.bitcast(name_str_ptr, ir.IntType(8).as_pointer())
+        name_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [name_i8])
+        name_field_ptr = cg.builder.gep(
+            kind_call_struct_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
+            inbounds=True
+        )
+        cg.builder.store(name_handle, name_field_ptr)
+
+        # Set field 1: param_names ([string])
+        param_names_list_ptr = self._build_string_list([p.name for p in func.params])
+        param_names_i8 = cg.builder.bitcast(param_names_list_ptr, ir.IntType(8).as_pointer())
+        param_names_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [param_names_i8])
+        param_names_field_ptr = cg.builder.gep(
+            kind_call_struct_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)],
+            inbounds=True
+        )
+        cg.builder.store(param_names_handle, param_names_field_ptr)
+
+        # Set field 2: param_values ([json])
+        param_values_list_ptr = self._build_json_list(func.params)
+        param_values_i8 = cg.builder.bitcast(param_values_list_ptr, ir.IntType(8).as_pointer())
+        param_values_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [param_values_i8])
+        param_values_field_ptr = cg.builder.gep(
+            kind_call_struct_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)],
+            inbounds=True
+        )
+        cg.builder.store(param_values_handle, param_values_field_ptr)
+
+        # Set field 3: body (string) - convert pointer to handle
+        body_str_ptr = cg._get_string_ptr(func.body)
+        body_i8 = cg.builder.bitcast(body_str_ptr, ir.IntType(8).as_pointer())
+        body_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [body_i8])
+        body_field_ptr = cg.builder.gep(
+            kind_call_struct_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)],
+            inbounds=True
+        )
+        cg.builder.store(body_handle, body_field_ptr)
+
+        # Convert pointer to handle for passing to handler function
+        ptr_i8 = cg.builder.bitcast(kind_call_struct_ptr, ir.IntType(8).as_pointer())
+        kind_call_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [ptr_i8])
+
+        return kind_call_handle
+
+    def _build_string_list(self, strings: PyList[str]) -> ir.Value:
+        """Build a [string] list from Python strings.
+
+        Returns a List* pointer containing string pointers (String*).
+        Consistent with split() and other list operations that store pointers.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Create empty list with element size 8 (for String* pointers)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8)])
+
+        # Append each string pointer
+        for s in strings:
+            # Create string and store its pointer
+            string_ptr = cg._get_string_ptr(s)
+
+            # Allocate temp storage for the pointer
+            ptr_alloca = cg.builder.alloca(cg.string_struct.as_pointer())
+            cg.builder.store(string_ptr, ptr_alloca)
+            ptr_i8 = cg.builder.bitcast(ptr_alloca, i8_ptr)
+
+            # Append to list (8 bytes = size of pointer)
+            list_ptr = cg.builder.call(cg.list_append, [list_ptr, ptr_i8, ir.Constant(i64, 8)])
+
+        return list_ptr
+
+    def _build_json_list(self, params) -> ir.Value:
+        """Build a [json] list from parameter values, wrapping each in json.
+
+        Each parameter is accessed from locals and converted to a json value.
+        Returns a List* pointer containing json pointers (Json*).
+        Consistent with split() and other list operations that store pointers.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Create empty list with element size 8 (for Json* pointers)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8)])
+
+        # Wrap each parameter value in json and append
+        for param in params:
+            # Load the parameter value
+            param_alloca = cg.locals[param.name]
+            param_val = cg.builder.load(param_alloca)
+
+            # Convert to json based on type
+            json_ptr = cg._json.wrap_value_as_json(param_val, param.type_annotation)
+
+            # Allocate temp storage for the pointer
+            ptr_alloca = cg.builder.alloca(cg.json_struct.as_pointer())
+            cg.builder.store(json_ptr, ptr_alloca)
+            ptr_i8 = cg.builder.bitcast(ptr_alloca, i8_ptr)
+
+            # Append to list (8 bytes = size of pointer)
+            list_ptr = cg.builder.call(cg.list_append, [list_ptr, ptr_i8, ir.Constant(i64, 8)])
+
+        return list_ptr
 
     def generate_extern_call(self, name: str, args: list, func_decl: FunctionDecl) -> ir.Value:
         """Generate a call to an extern function with C ABI type conversion.

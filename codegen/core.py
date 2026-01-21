@@ -128,7 +128,13 @@ class CodeGenerator:
         # Create module
         self.module = ir.Module(name="coex_module")
         self.module.triple = binding.get_default_triple()
-        
+
+        # Set data layout from target machine for proper struct alignment
+        # This is critical for structs with mixed-size fields (e.g., {i1, i64})
+        target = binding.Target.from_default_triple()
+        tm = target.create_target_machine()
+        self.module.data_layout = str(tm.target_data)
+
         # Builder for current function
         self.builder: Optional[ir.IRBuilder] = None
         
@@ -157,7 +163,10 @@ class CodeGenerator:
         # Trait registry
         self.traits: Dict[str, 'TraitDecl'] = {}  # trait_name -> TraitDecl
         self.type_implements: Dict[str, PyList[str]] = {}  # type_name -> [trait_names]
-        
+
+        # User-defined kind registry
+        self.kind_registry: Dict[str, 'KindDecl'] = {}  # kind_name -> KindDecl
+
         # Current type substitution map for monomorphization
         self.type_substitutions: Dict[str, Type] = {}  # T -> int, U -> float, etc.
         
@@ -721,8 +730,8 @@ class CodeGenerator:
     def _is_reference_type(self, coex_type: Type) -> bool:
         """Check if a Coex type is a reference (pointer) type for GC tracking."""
         if isinstance(coex_type, PrimitiveType):
-            # Only string is a reference among primitives
-            return coex_type.name == "string"
+            # string and json are references among primitives
+            return coex_type.name in ("string", "json")
         elif isinstance(coex_type, (ListType, MapType, SetType, ResultType)):
             return True
         elif isinstance(coex_type, NamedType):
@@ -805,10 +814,14 @@ class CodeGenerator:
         if self.cli_debugging is not None:
             self.debugging_enabled = self.cli_debugging
 
+        # Register user-defined kinds (needed before function processing)
+        for kind_decl in program.kinds:
+            self.kind_registry[kind_decl.name] = kind_decl
+
         # Register all traits first (they define interfaces)
         for trait_decl in program.traits:
             self._register_trait(trait_decl)
-        
+
         # First pass: register all types (struct layouts)
         for type_decl in program.types:
             self._register_type(type_decl)
@@ -829,6 +842,9 @@ class CodeGenerator:
         # Declare methods for all types
         for type_decl in program.types:
             self._declare_type_methods(type_decl)
+
+        # Validate user-defined kinds after all functions are declared
+        self._validate_kind_handlers()
 
         # Prepare all task functions for mutual recursion support
         # This creates frame types and declares step functions for ALL tasks
@@ -904,6 +920,47 @@ class CodeGenerator:
             return False
         gpu_funcs = {'coex_metal_matmul', 'coex_metal_matmul_f32_native'}
         return any(fn in self.extern_function_decls for fn in gpu_funcs)
+
+    # ========================================================================
+    # User-Defined Kind Validation
+    # ========================================================================
+
+    def _validate_kind_handlers(self):
+        """Validate that all user-defined kinds have valid handlers.
+
+        Checks:
+        1. Handler function exists
+        2. Handler takes exactly one parameter of type KindCall
+        """
+        for kind_name, kind_decl in self.kind_registry.items():
+            handler_name = kind_decl.handler
+
+            # Check handler exists
+            if handler_name not in self.functions:
+                raise RuntimeError(
+                    f"Handler function '{handler_name}' not found for kind "
+                    f"'{kind_name}'. Make sure the handler is declared."
+                )
+
+            # Check handler signature - must take KindCall as parameter
+            # Look up the function declaration to check its signature
+            if handler_name in self.func_decls:
+                func_decl = self.func_decls[handler_name]
+                if len(func_decl.params) != 1:
+                    raise RuntimeError(
+                        f"Handler function '{handler_name}' for kind '{kind_name}' "
+                        f"must take exactly one parameter (KindCall), "
+                        f"but takes {len(func_decl.params)}."
+                    )
+                param = func_decl.params[0]
+                param_type = param.type_annotation
+                # Check if parameter type is KindCall
+                if not (hasattr(param_type, 'name') and param_type.name == 'KindCall'):
+                    type_name = getattr(param_type, 'name', str(param_type))
+                    raise RuntimeError(
+                        f"Handler function '{handler_name}' for kind '{kind_name}' "
+                        f"must take KindCall as parameter, but takes '{type_name}'."
+                    )
 
     # Trait helpers moved to codegen/traits.py - TraitGenerator class
 
@@ -1176,8 +1233,10 @@ class CodeGenerator:
         # No conversion needed - types match between Coex and C ABI
         return value
 
-    def _declare_function(self, func: FunctionDecl):
+    def _declare_function(self, func):
         """Declare a function (for forward references)"""
+        if isinstance(func, KindFunctionDecl):
+            return self._functions.declare_kind_function(func)
         return self._functions.declare_function(func)
 
     def _declare_extern_function(self, func: FunctionDecl):
@@ -1196,8 +1255,10 @@ class CodeGenerator:
         """Collect names of heap-typed variable declarations from function body."""
         return self._functions.collect_heap_vars_from_body(stmts)
 
-    def _generate_function(self, func: FunctionDecl):
+    def _generate_function(self, func):
         """Generate a function body"""
+        if isinstance(func, KindFunctionDecl):
+            return self._functions.generate_kind_function(func)
         return self._functions.generate_function(func)
 
     # ========================================================================

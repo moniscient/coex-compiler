@@ -24,7 +24,7 @@ from ast_nodes import (
     SelfExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
-    AtomicType, ListType, ArrayType, SetType, FunctionDecl
+    AtomicType, ListType, ArrayType, SetType, FunctionDecl, KindFunctionDecl
 )
 
 if TYPE_CHECKING:
@@ -786,13 +786,30 @@ class ExpressionGenerator:
                 if type_name == "List" or type_name == "Array":
                     # Get element type from Coex type tracking
                     elem_llvm_type = ir.IntType(64)  # default
+                    elem_coex_type = None
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in cg.var_coex_types:
                             from ast_nodes import ListType, ArrayType
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
-                                elem_llvm_type = cg._get_llvm_type(coex_type.element_type)
+                                elem_coex_type = coex_type.element_type
+                                elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+                    elif isinstance(expr.object, MemberExpr):
+                        # Field access: obj.field[i] - look up field type
+                        if isinstance(expr.object.object, Identifier):
+                            obj_name = expr.object.object.name
+                            if obj_name in cg.var_coex_types:
+                                from ast_nodes import NamedType, ListType, ArrayType
+                                obj_type = cg.var_coex_types[obj_name]
+                                if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                                    for field_name, field_type in cg.type_fields[obj_type.name]:
+                                        if field_name == expr.object.member:
+                                            if isinstance(field_type, (ListType, ArrayType)):
+                                                elem_coex_type = field_type.element_type
+                                                elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+                                            break
+                    # Lists store values/pointers directly (not handles)
                     typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
                     return cg.builder.load(typed_ptr)
 
@@ -866,16 +883,41 @@ class ExpressionGenerator:
 
                 # Get element type from Coex type tracking
                 elem_llvm_type = ir.IntType(64)  # default
+                elem_coex_type = None
                 if isinstance(expr.object, Identifier):
                     var_name = expr.object.name
                     if var_name in cg.var_coex_types:
                         from ast_nodes import ListType
                         coex_type = cg.var_coex_types[var_name]
                         if isinstance(coex_type, ListType):
-                            elem_llvm_type = cg._get_llvm_type(coex_type.element_type)
+                            elem_coex_type = coex_type.element_type
+                            elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+                elif isinstance(expr.object, MemberExpr):
+                    # Handle field access like call.param_values[0]
+                    if isinstance(expr.object.object, Identifier):
+                        obj_name = expr.object.object.name
+                        if obj_name in cg.var_coex_types:
+                            obj_type = cg.var_coex_types[obj_name]
+                            if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                                for field_name, field_type in cg.type_fields[obj_type.name]:
+                                    if field_name == expr.object.member:
+                                        from ast_nodes import ListType
+                                        if isinstance(field_type, ListType):
+                                            elem_coex_type = field_type.element_type
+                                            elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+                                        break
 
-                typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
-                return cg.builder.load(typed_ptr)
+                # Reference types are stored as handles in lists - load and dereference
+                if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                    # Load the handle (i64)
+                    handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                    handle = cg.builder.load(handle_ptr)
+                    # Dereference handle to get pointer
+                    ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                    return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                else:
+                    typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+                    return cg.builder.load(typed_ptr)
 
             # JSON indexing: j["key"] or j[0]
             if hasattr(pointee, 'name') and pointee.name == "struct.Json":
@@ -1301,16 +1343,23 @@ class ExpressionGenerator:
 
                 # Check function kind hierarchy
                 if name in cg.func_decls:
-                    callee_kind = cg.func_decls[name].kind
-                    self._check_function_kind_hierarchy(name, callee_kind)
+                    func_decl = cg.func_decls[name]
+                    # KindFunctionDecl doesn't have a kind - it uses user-defined kinds
+                    if not isinstance(func_decl, KindFunctionDecl):
+                        callee_kind = func_decl.kind
+                        self._check_function_kind_hierarchy(name, callee_kind)
 
                 # Check if this is a thread function call
-                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.THREAD:
-                    return self._generate_thread_call(name, func, expr.args)
+                if name in cg.func_decls:
+                    func_decl = cg.func_decls[name]
+                    if not isinstance(func_decl, KindFunctionDecl) and func_decl.kind == FunctionKind.THREAD:
+                        return self._generate_thread_call(name, func, expr.args)
 
                 # Check if this is a task function call
-                if name in cg.func_decls and cg.func_decls[name].kind == FunctionKind.TASK:
-                    return self._generate_task_call(name, func, expr.args)
+                if name in cg.func_decls:
+                    func_decl = cg.func_decls[name]
+                    if not isinstance(func_decl, KindFunctionDecl) and func_decl.kind == FunctionKind.TASK:
+                        return self._generate_task_call(name, func, expr.args)
 
                 args = []
                 func_decl = cg.func_decls.get(name)
@@ -1625,6 +1674,34 @@ class ExpressionGenerator:
         # Check if this is a call on a type identifier (static method)
         if isinstance(expr.object, Identifier):
             type_name = expr.object.name
+
+            # Handle json static methods (json is primitive, not in type_registry)
+            if type_name == "json":
+                if expr.method == "parse" and expr.args:
+                    arg_val = self.generate_expression(expr.args[0])
+                    return cg.builder.call(cg.json_parse, [arg_val])
+                elif expr.method == "new_null":
+                    return cg.builder.call(cg.json_new_null, [])
+                elif expr.method == "new_bool" and expr.args:
+                    arg_val = self.generate_expression(expr.args[0])
+                    arg_val = cg._cast_value(arg_val, ir.IntType(1))
+                    return cg.builder.call(cg.json_new_bool, [arg_val])
+                elif expr.method == "new_int" and expr.args:
+                    arg_val = self.generate_expression(expr.args[0])
+                    arg_val = cg._cast_value(arg_val, ir.IntType(64))
+                    return cg.builder.call(cg.json_new_int, [arg_val])
+                elif expr.method == "new_float" and expr.args:
+                    arg_val = self.generate_expression(expr.args[0])
+                    arg_val = cg._cast_value(arg_val, ir.DoubleType())
+                    return cg.builder.call(cg.json_new_float, [arg_val])
+                elif expr.method == "new_string" and expr.args:
+                    arg_val = self.generate_expression(expr.args[0])
+                    return cg.builder.call(cg.json_new_string, [arg_val])
+                elif expr.method == "new_array":
+                    return cg.builder.call(cg.json_new_array_empty, [])
+                elif expr.method == "new_object":
+                    return cg.builder.call(cg.json_new_object_empty, [])
+
             if type_name in cg.type_registry:
                 # Static method call: Type.method()
                 if expr.method == "new":
@@ -1643,6 +1720,13 @@ class ExpressionGenerator:
                             return cg.builder.call(cg.string_from_int, [arg_val])
                     elif isinstance(arg_type, ir.DoubleType):
                         return cg.builder.call(cg.string_from_float, [arg_val])
+                    elif isinstance(arg_type, ir.PointerType):
+                        # Check if it's a json pointer - use json_to_string (returns raw value, no quotes)
+                        if hasattr(cg, 'json_struct') and arg_type.pointee == cg.json_struct:
+                            return cg.builder.call(cg.json_to_string, [arg_val])
+                        # Other pointer types - fallback to int
+                        arg_val = cg._cast_value(arg_val, ir.IntType(64))
+                        return cg.builder.call(cg.string_from_int, [arg_val])
                     else:
                         arg_val = cg._cast_value(arg_val, ir.IntType(64))
                         return cg.builder.call(cg.string_from_int, [arg_val])

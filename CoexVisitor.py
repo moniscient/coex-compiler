@@ -34,6 +34,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#kindDecl.
+    def visitKindDecl(self, ctx:CoexParser.KindDeclContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#declaration.
     def visitDeclaration(self, ctx:CoexParser.DeclarationContext):
         return self.visitChildren(ctx)
@@ -46,6 +51,16 @@ class CoexVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by CoexParser#functionDecl.
     def visitFunctionDecl(self, ctx:CoexParser.FunctionDeclContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#rawBlock.
+    def visitRawBlock(self, ctx:CoexParser.RawBlockContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#rawBlockContent.
+    def visitRawBlockContent(self, ctx:CoexParser.RawBlockContentContext):
         return self.visitChildren(ctx)
 
 
@@ -526,6 +541,11 @@ class CoexVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by CoexParser#baseType.
     def visitBaseType(self, ctx:CoexParser.BaseTypeContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by CoexParser#listType.
+    def visitListType(self, ctx:CoexParser.ListTypeContext):
         return self.visitChildren(ctx)
 
 

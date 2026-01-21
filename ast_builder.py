@@ -13,11 +13,30 @@ from ast_nodes import *
 
 class ASTBuilder:
     """Converts ANTLR parse tree to Coex AST"""
+
+    def __init__(self):
+        """Initialize AST builder with kind registry."""
+        # Registry for user-defined kinds
+        self.kind_registry: Dict[str, KindDecl] = {}
+        # Track the original source for raw body capture
+        self._token_stream = None
+    """Converts ANTLR parse tree to Coex AST"""
     
-    def build(self, tree: CoexParser.ProgramContext) -> Program:
+    def build(self, tree: CoexParser.ProgramContext, token_stream=None) -> Program:
         """Build AST from parse tree root"""
         program = Program()
+        self._token_stream = token_stream
 
+        # First pass: collect all kind declarations (needed before parsing functions)
+        for child in tree.children:
+            if isinstance(child, CoexParser.DeclarationContext):
+                decl_child = child.getChild(0)
+                if hasattr(CoexParser, 'KindDeclContext') and isinstance(decl_child, CoexParser.KindDeclContext):
+                    kind_decl = self.visit_kind_decl(decl_child)
+                    program.kinds.append(kind_decl)
+                    self.kind_registry[kind_decl.name] = kind_decl
+
+        # Second pass: process all other declarations
         for child in tree.children:
             if isinstance(child, CoexParser.ImportDeclContext):
                 imp = self.visit_import_decl(child)
@@ -33,12 +52,15 @@ class ASTBuilder:
                     program.directives.append(directive)
             elif isinstance(child, CoexParser.DeclarationContext):
                 decl = self.visit_declaration(child)
-                if isinstance(decl, FunctionDecl):
+                if isinstance(decl, (FunctionDecl, KindFunctionDecl)):
                     program.functions.append(decl)
                 elif isinstance(decl, TypeDecl):
                     program.types.append(decl)
                 elif isinstance(decl, TraitDecl):
                     program.traits.append(decl)
+                elif isinstance(decl, KindDecl):
+                    # Already processed in first pass
+                    pass
 
         return program
 
@@ -120,8 +142,19 @@ class ASTBuilder:
             return self.visit_type_decl(child)
         elif isinstance(child, CoexParser.TraitDeclContext):
             return self.visit_trait_decl(child)
+        elif hasattr(CoexParser, 'KindDeclContext') and isinstance(child, CoexParser.KindDeclContext):
+            # Kind declarations already processed in first pass, return it for tracking
+            return self.kind_registry.get(child.IDENTIFIER(0).getText())
 
         return None
+
+    def visit_kind_decl(self, ctx) -> KindDecl:
+        """Visit a kind declaration: kind NAME -> RETURN_TYPE via HANDLER"""
+        identifiers = ctx.IDENTIFIER()
+        name = identifiers[0].getText()
+        return_type = self.visit_type_expr(ctx.typeExpr())
+        handler = identifiers[1].getText()
+        return KindDecl(name=name, return_type=return_type, handler=handler)
     
     def visit_function_decl(self, ctx: CoexParser.FunctionDeclContext) -> FunctionDecl:
         """Visit a function declaration"""
@@ -154,6 +187,11 @@ class ASTBuilder:
         # Get function kind
         kind_ctx = ctx.functionKind()
         kind_text = kind_ctx.getText()
+
+        # Check if this is a user-defined kind
+        if kind_text in self.kind_registry:
+            return self._visit_kind_function(ctx, kind_text, annotations)
+
         if kind_text == "formula":
             kind = FunctionKind.FORMULA
         elif kind_text == "task":
@@ -162,8 +200,11 @@ class ASTBuilder:
             kind = FunctionKind.THREAD
         elif kind_text == "extern":
             kind = FunctionKind.EXTERN
-        else:
+        elif kind_text == "func":
             kind = FunctionKind.FUNC
+        else:
+            # Unknown function kind - raise error
+            raise RuntimeError(f"Unknown function kind '{kind_text}'. Did you forget 'kind {kind_text} -> TYPE via HANDLER'?")
 
         # Get function name
         name = ctx.IDENTIFIER().getText()
@@ -201,6 +242,166 @@ class ASTBuilder:
             # Extract string value without quotes
             argument = self._get_string_value(ctx.stringLiteral())
         return Annotation(name, argument)
+
+    def _visit_kind_function(self, ctx, kind_name: str, annotations: PyList[Annotation]) -> KindFunctionDecl:
+        """Visit a function using a user-defined kind.
+
+        The body is captured as raw text rather than parsed statements.
+        """
+        # Get function name
+        name = ctx.IDENTIFIER().getText()
+
+        # Get parameters
+        params = []
+        if ctx.parameterList():
+            params = self.visit_param_list(ctx.parameterList())
+
+        # Get return type (or use the kind's default return type)
+        return_type = None
+        if ctx.returnType():
+            return_type = self.visit_type_expr(ctx.returnType().typeExpr())
+        else:
+            # Default to the kind's declared return type
+            kind_decl = self.kind_registry[kind_name]
+            return_type = kind_decl.return_type
+
+        # Capture raw body text - prefer rawBlock if present, fall back to block
+        if ctx.rawBlock():
+            body = self._capture_raw_block(ctx.rawBlock())
+        elif ctx.block():
+            body = self._capture_raw_body(ctx.block())
+        else:
+            body = ""
+
+        return KindFunctionDecl(
+            kind_name=kind_name,
+            name=name,
+            params=params,
+            return_type=return_type,
+            body=body,
+            annotations=annotations
+        )
+
+    def _capture_raw_block(self, raw_block_ctx) -> str:
+        """Capture the raw text from a rawBlock context.
+
+        This reconstructs the text from the input stream, preserving whitespace.
+        """
+        if raw_block_ctx is None:
+            return ""
+
+        # Use the token stream to get the original text with whitespace
+        if self._token_stream is not None:
+            start = raw_block_ctx.start
+            stop = raw_block_ctx.stop
+
+            if start is not None and stop is not None:
+                # Get input stream from the token stream
+                input_stream = self._token_stream.tokenSource.inputStream
+                tokens = self._token_stream.tokens
+
+                # To preserve indentation, we need to start from after the
+                # previous token (NEWLINE), not from the first content token
+                # (which would miss skipped whitespace before it)
+                start_idx = start.tokenIndex
+                if start_idx > 0:
+                    prev_token = tokens[start_idx - 1]
+                    # Start capturing right after the previous token ends
+                    start_pos = prev_token.stop + 1
+                else:
+                    start_pos = start.start
+
+                # Find the position just before the terminator (~)
+                stop_pos = stop.start - 1
+
+                if start_pos <= stop_pos:
+                    # Get raw text from input stream
+                    raw_text = input_stream.getText(start_pos, stop_pos)
+                else:
+                    raw_text = ""
+        else:
+            # Fallback: get text from context but whitespace may be lost
+            content_parts = []
+            for i in range(raw_block_ctx.getChildCount()):
+                child = raw_block_ctx.getChild(i)
+                if hasattr(child, 'getText') and child.getText() not in ('~', 'end'):
+                    content_parts.append(child.getText())
+            raw_text = ' '.join(content_parts)
+
+        # Strip leading/trailing whitespace and normalize
+        lines = raw_text.split('\n')
+
+        # Remove leading empty lines
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        # Remove trailing empty lines
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        # Find common indentation to dedent
+        if lines:
+            non_empty_lines = [line for line in lines if line.strip()]
+            if non_empty_lines:
+                min_indent = min(len(line) - len(line.lstrip()) for line in non_empty_lines)
+                lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
+
+        return '\n'.join(lines)
+
+    def _capture_raw_body(self, block_ctx) -> str:
+        """Capture the raw text of a block, stripping the terminator.
+
+        This preserves the original source text for kind functions,
+        allowing DSL bodies to contain any syntax.
+        """
+        if self._token_stream is None or block_ctx is None:
+            return ""
+
+        # Get the token indices for the block
+        start = block_ctx.start
+        stop = block_ctx.stop
+
+        if start is None or stop is None:
+            return ""
+
+        # Get all tokens in the block
+        tokens = self._token_stream.tokens
+
+        # Find the start and end token indices
+        start_idx = start.tokenIndex
+        stop_idx = stop.tokenIndex
+
+        # Build the raw text from tokens
+        raw_parts = []
+        for i in range(start_idx, stop_idx + 1):
+            if i < len(tokens):
+                raw_parts.append(tokens[i].text)
+
+        raw_text = ''.join(raw_parts)
+
+        # Strip the block terminator (~ or end) from the end
+        raw_text = raw_text.rstrip()
+        if raw_text.endswith('~'):
+            raw_text = raw_text[:-1].rstrip()
+        elif raw_text.endswith('end'):
+            raw_text = raw_text[:-3].rstrip()
+
+        # Strip leading/trailing whitespace and normalize newlines
+        lines = raw_text.split('\n')
+        # Remove leading empty lines
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        # Remove trailing empty lines
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        # Find common indentation to dedent
+        if lines:
+            non_empty_lines = [line for line in lines if line.strip()]
+            if non_empty_lines:
+                min_indent = min(len(line) - len(line.lstrip()) for line in non_empty_lines)
+                lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
+
+        return '\n'.join(lines)
     
     def visit_generic_params(self, ctx: CoexParser.GenericParamsContext) -> List[TypeParam]:
         """Visit generic type parameters"""
@@ -372,6 +573,10 @@ class ASTBuilder:
         """Visit a base type"""
         if ctx.primitiveType():
             return self.visit_primitive_type(ctx.primitiveType())
+        elif ctx.listType():
+            # [T] shorthand for List<T>
+            element_type = self.visit_type_expr(ctx.listType().typeExpr())
+            return ListType(element_type)
         elif ctx.IDENTIFIER():
             name = ctx.IDENTIFIER().getText()
             # Handle generic types
@@ -1111,6 +1316,9 @@ class ASTBuilder:
                 type_args = self.visit_generic_args(ctx.genericArgs())
                 return Identifier(name, type_args)
             return Identifier(name)
+        elif ctx.JSON_TYPE():
+            # 'json' keyword used as identifier for static method calls like json.parse()
+            return Identifier("json")
         elif ctx.SELF():
             return SelfExpr()
         elif ctx.LPAREN():

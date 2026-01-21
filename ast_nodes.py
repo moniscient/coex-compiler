@@ -827,6 +827,34 @@ class DirectiveDecl:
     enabled: bool  # True for on/present, False for off
 
 
+@dataclass
+class KindDecl:
+    """User-defined function kind declaration: kind NAME -> RETURN_TYPE via HANDLER
+
+    User-defined kinds allow embedding DSLs (SQL, templates, etc.) in Coex.
+    The compiler captures the function body as raw text and passes it to
+    a handler function that implements the behavior.
+    """
+    name: str           # Kind name (e.g., "sqlquery", "template")
+    return_type: Type   # Return type of functions using this kind
+    handler: str        # Handler function name
+
+
+@dataclass
+class KindFunctionDecl:
+    """Function using a user-defined kind with raw body capture.
+
+    Unlike regular functions, the body is captured as raw text (not parsed)
+    and passed to the handler function at call time.
+    """
+    kind_name: str                                  # The user-defined kind name
+    name: str                                       # Function name
+    params: List[Parameter] = field(default_factory=list)
+    return_type: Optional[Type] = None
+    body: str = ""                                  # Raw text body (not parsed)
+    annotations: List[Annotation] = field(default_factory=list)
+
+
 # ============================================================================
 # Program Node
 # ============================================================================
@@ -836,6 +864,7 @@ class Program:
     imports: List[ImportDecl] = field(default_factory=list)
     replaces: List['ReplaceDecl'] = field(default_factory=list)
     directives: List['DirectiveDecl'] = field(default_factory=list)
+    kinds: List['KindDecl'] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)
-    functions: List[FunctionDecl] = field(default_factory=list)
+    functions: List[Union[FunctionDecl, 'KindFunctionDecl']] = field(default_factory=list)

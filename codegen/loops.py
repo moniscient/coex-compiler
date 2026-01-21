@@ -306,7 +306,7 @@ class LoopGenerator:
             return
 
         # Check if iterable is a list, array, or map
-        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr, MapExpr)):
+        if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr, MapExpr, MemberExpr)):
             # Generate the iterable expression
             iterable = cg._generate_expression(stmt.iterable)
             if isinstance(iterable.type, ir.PointerType):
@@ -667,7 +667,11 @@ class LoopGenerator:
         elem_ptr = cg.builder.call(cg.list_get, [list_ptr, current_idx])
 
         # Determine element type from pattern or tracked type
+        elem_coex_type = self.get_list_element_coex_type(stmt)
         elem_type = self.get_list_element_type_for_pattern(stmt)
+
+        # Load element directly - lists store values/pointers inline
+        # For reference types like String*, the list stores the pointer directly
         typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
         elem_val = cg.builder.load(typed_ptr)
 
@@ -676,8 +680,6 @@ class LoopGenerator:
 
         # Track Coex type for loop variable (enables method calls on string, etc.)
         if isinstance(stmt.pattern, IdentifierPattern):
-            # Get element type from tracked list type
-            elem_coex_type = self.get_list_element_coex_type(stmt)
             if elem_coex_type:
                 cg.var_coex_types[stmt.pattern.name] = elem_coex_type
 
@@ -2813,6 +2815,20 @@ class LoopGenerator:
                 if isinstance(coex_type, ListType):
                     return cg._get_llvm_type(coex_type.element_type)
 
+        # Handle field access iterables (e.g., item.values)
+        if isinstance(stmt.iterable, MemberExpr):
+            # Get the object's type
+            if isinstance(stmt.iterable.object, Identifier):
+                obj_name = stmt.iterable.object.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                        # Look up field type
+                        for field_name, field_type in cg.type_fields[obj_type.name]:
+                            if field_name == stmt.iterable.member:
+                                if isinstance(field_type, ListType):
+                                    return cg._get_llvm_type(field_type.element_type)
+
         # Handle method call iterables (e.g., text.split("\n"))
         if isinstance(stmt.iterable, MethodCallExpr):
             if stmt.iterable.method == "split":
@@ -2844,6 +2860,20 @@ class LoopGenerator:
                 coex_type = cg.var_coex_types[var_name]
                 if isinstance(coex_type, ListType):
                     return coex_type.element_type
+
+        # Handle field access iterables (e.g., item.values)
+        if isinstance(stmt.iterable, MemberExpr):
+            # Get the object's type
+            if isinstance(stmt.iterable.object, Identifier):
+                obj_name = stmt.iterable.object.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                        # Look up field type
+                        for field_name, field_type in cg.type_fields[obj_type.name]:
+                            if field_name == stmt.iterable.member:
+                                if isinstance(field_type, ListType):
+                                    return field_type.element_type
 
         # Handle method call iterables (e.g., text.split("\n"))
         if isinstance(stmt.iterable, MethodCallExpr):

@@ -163,6 +163,15 @@ class JsonGenerator:
         cg.json_is_array = ir.Function(cg.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_array")
         cg.json_is_object = ir.Function(cg.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_is_object")
 
+        # Value accessor methods: as_int, as_float, as_bool, as_string
+        cg.json_as_int = ir.Function(cg.module, ir.FunctionType(i64, [json_ptr]), name="coex_json_as_int")
+        cg.json_as_float = ir.Function(cg.module, ir.FunctionType(ir.DoubleType(), [json_ptr]), name="coex_json_as_float")
+        cg.json_as_bool = ir.Function(cg.module, ir.FunctionType(i1, [json_ptr]), name="coex_json_as_bool")
+        cg.json_as_string = ir.Function(cg.module, ir.FunctionType(cg.string_struct.as_pointer(), [json_ptr]), name="coex_json_as_string")
+
+        # json_to_string(Json*) -> String* (smart conversion: raw value for primitives, stringify for complex)
+        cg.json_to_string = ir.Function(cg.module, ir.FunctionType(cg.string_struct.as_pointer(), [json_ptr]), name="coex_json_to_string")
+
         # json_len(Json*) -> i64 (length for arrays/objects, 0 otherwise)
         cg.json_len = ir.Function(cg.module, ir.FunctionType(i64, [json_ptr]), name="coex_json_len")
 
@@ -252,6 +261,13 @@ class JsonGenerator:
         self._implement_json_is_string()
         self._implement_json_is_array()
         self._implement_json_is_object()
+
+        # Implement value accessor methods
+        self._implement_json_as_int()
+        self._implement_json_as_float()
+        self._implement_json_as_bool()
+        self._implement_json_as_string()
+        self._implement_json_to_string()
 
         # Implement access and mutation methods
         self._implement_json_len()
@@ -690,6 +706,154 @@ class JsonGenerator:
         tag = builder.load(tag_ptr)
         result = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_OBJECT))
         builder.ret(result)
+
+    def _implement_json_as_int(self):
+        """Implement as_int(): return the integer value from json."""
+        cg = self.cg
+        func = cg.json_as_int
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i64 = ir.IntType(64)
+
+        # Load value from field 1 (stored directly as i64)
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        value = builder.load(value_ptr)
+        builder.ret(value)
+
+    def _implement_json_as_float(self):
+        """Implement as_float(): return the float value from json."""
+        cg = self.cg
+        func = cg.json_as_float
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i64 = ir.IntType(64)
+
+        # Load value from field 1 (stored as bitcast i64) and bitcast back to double
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        value = builder.bitcast(value_i64, ir.DoubleType())
+        builder.ret(value)
+
+    def _implement_json_as_bool(self):
+        """Implement as_bool(): return the boolean value from json."""
+        cg = self.cg
+        func = cg.json_as_bool
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i64 = ir.IntType(64)
+
+        # Load value from field 1 (stored as zext i64) and truncate to i1
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        value = builder.trunc(value_i64, ir.IntType(1))
+        builder.ret(value)
+
+    def _implement_json_as_string(self):
+        """Implement as_string(): return the string value from json."""
+        cg = self.cg
+        func = cg.json_as_string
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        i64 = ir.IntType(64)
+
+        # Load value from field 1 (stored as ptrtoint) and inttoptr back to String*
+        value_ptr = builder.gep(func.args[0], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+        value_i64 = builder.load(value_ptr)
+        value = builder.inttoptr(value_i64, cg.string_struct.as_pointer())
+        builder.ret(value)
+
+    def _implement_json_to_string(self):
+        """Implement to_string(): smart conversion to string.
+
+        For string json, returns the raw string value (no quotes).
+        For int/float/bool, converts to string.
+        For null, returns "null".
+        For arrays/objects, falls back to stringify (with quotes).
+        """
+        cg = self.cg
+        func = cg.json_to_string
+        i64 = ir.IntType(64)
+        i32 = ir.IntType(32)
+
+        # Create all blocks upfront
+        entry = func.append_basic_block("entry")
+        str_check = func.append_basic_block("str_check")
+        str_handle = func.append_basic_block("str_handle")
+        int_check = func.append_basic_block("int_check")
+        int_handle = func.append_basic_block("int_handle")
+        float_check = func.append_basic_block("float_check")
+        float_handle = func.append_basic_block("float_handle")
+        bool_check = func.append_basic_block("bool_check")
+        bool_handle = func.append_basic_block("bool_handle")
+        null_check = func.append_basic_block("null_check")
+        null_handle = func.append_basic_block("null_handle")
+        fallback = func.append_basic_block("fallback")
+
+        builder = ir.IRBuilder(entry)
+        json_ptr = func.args[0]
+
+        # Load tag from field 0
+        tag_ptr = builder.gep(json_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = builder.load(tag_ptr)
+        builder.branch(str_check)
+
+        # Check for string (tag == 4)
+        builder.position_at_end(str_check)
+        is_str = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_STRING))
+        builder.cbranch(is_str, str_handle, int_check)
+
+        # String case: return raw string value
+        builder.position_at_end(str_handle)
+        str_result = builder.call(cg.json_as_string, [json_ptr])
+        builder.ret(str_result)
+
+        # Check for int (tag == 2)
+        builder.position_at_end(int_check)
+        is_i = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_INT))
+        builder.cbranch(is_i, int_handle, float_check)
+
+        # Int case: convert to string
+        builder.position_at_end(int_handle)
+        int_val = builder.call(cg.json_as_int, [json_ptr])
+        int_str = builder.call(cg.string_from_int, [int_val])
+        builder.ret(int_str)
+
+        # Check for float (tag == 3)
+        builder.position_at_end(float_check)
+        is_f = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_FLOAT))
+        builder.cbranch(is_f, float_handle, bool_check)
+
+        # Float case: convert to string
+        builder.position_at_end(float_handle)
+        float_val = builder.call(cg.json_as_float, [json_ptr])
+        float_str = builder.call(cg.string_from_float, [float_val])
+        builder.ret(float_str)
+
+        # Check for bool (tag == 1)
+        builder.position_at_end(bool_check)
+        is_b = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_BOOL))
+        builder.cbranch(is_b, bool_handle, null_check)
+
+        # Bool case: convert to string
+        builder.position_at_end(bool_handle)
+        bool_val = builder.call(cg.json_as_bool, [json_ptr])
+        bool_str = builder.call(cg.string_from_bool, [bool_val])
+        builder.ret(bool_str)
+
+        # Check for null (tag == 0)
+        builder.position_at_end(null_check)
+        is_n = builder.icmp_unsigned("==", tag, ir.Constant(i64, self.JSON_TAG_NULL))
+        builder.cbranch(is_n, null_handle, fallback)
+
+        # Null case: return "null"
+        builder.position_at_end(null_handle)
+        null_literal = self._get_or_create_global_string(builder, "null", "to_string_null")
+        builder.ret(null_literal)
+
+        # Fallback: use stringify for arrays/objects
+        builder.position_at_end(fallback)
+        stringify_result = builder.call(cg.json_stringify, [json_ptr])
+        builder.ret(stringify_result)
 
     def _implement_json_len(self):
         """Implement len(): return length of array/object, 0 otherwise."""
@@ -1810,6 +1974,11 @@ class JsonGenerator:
             "is_string": "coex_json_is_string",
             "is_array": "coex_json_is_array",
             "is_object": "coex_json_is_object",
+            # Value accessors
+            "as_int": "coex_json_as_int",
+            "as_float": "coex_json_as_float",
+            "as_bool": "coex_json_as_bool",
+            "as_string": "coex_json_as_string",
             # Access
             "get": "coex_json_get_field",
             "len": "coex_json_len",
@@ -1845,6 +2014,13 @@ class JsonGenerator:
         cg.functions["coex_json_is_string"] = cg.json_is_string
         cg.functions["coex_json_is_array"] = cg.json_is_array
         cg.functions["coex_json_is_object"] = cg.json_is_object
+
+        # Value accessor functions
+        cg.functions["coex_json_as_int"] = cg.json_as_int
+        cg.functions["coex_json_as_float"] = cg.json_as_float
+        cg.functions["coex_json_as_bool"] = cg.json_as_bool
+        cg.functions["coex_json_as_string"] = cg.json_as_string
+        cg.functions["coex_json_to_string"] = cg.json_to_string
 
         # Access and mutation functions
         cg.functions["coex_json_len"] = cg.json_len
@@ -2579,4 +2755,99 @@ class JsonGenerator:
 
         # For complex types, return the raw value as i64
         return value
+
+    def wrap_value_as_json(self, value: ir.Value, coex_type: 'Type') -> ir.Value:
+        """Wrap a Coex value in a JSON container based on its type annotation.
+
+        This is used by user-defined kind functions to pass parameter values
+        as json elements to the handler.
+
+        Args:
+            value: The LLVM value to wrap
+            coex_type: The Coex type annotation for the value
+
+        Returns:
+            A JSON handle (i64) containing the wrapped value
+        """
+        from ast_nodes import PrimitiveType, NamedType, ListType, AtomicType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        # Handle primitive types
+        if isinstance(coex_type, PrimitiveType):
+            type_name = coex_type.name
+
+            if type_name == "int":
+                return builder.call(cg.json_new_int, [value])
+
+            elif type_name in ("int32", "byte"):
+                # Extend to i64
+                extended = builder.zext(value, i64) if value.type.width < 64 else value
+                return builder.call(cg.json_new_int, [extended])
+
+            elif type_name == "float":
+                return builder.call(cg.json_new_float, [value])
+
+            elif type_name == "float32":
+                # Extend to f64
+                extended = builder.fpext(value, ir.DoubleType())
+                return builder.call(cg.json_new_float, [extended])
+
+            elif type_name == "bool":
+                return builder.call(cg.json_new_bool, [value])
+
+            elif type_name == "string":
+                # value is a String* pointer (struct.String*)
+                str_struct = value
+                if not isinstance(value.type, ir.PointerType):
+                    # If it's an i64 handle, dereference first
+                    str_ptr = builder.call(cg.gc.gc_handle_deref, [value])
+                    str_struct = builder.bitcast(str_ptr, cg.string_struct.as_pointer())
+                return builder.call(cg.json_new_string, [str_struct])
+
+            elif type_name == "json":
+                # Already JSON
+                return value
+
+        # Handle atomic types - extract value
+        if isinstance(coex_type, AtomicType):
+            inner = coex_type.inner
+            if inner == "int":
+                return builder.call(cg.json_new_int, [value])
+            elif inner == "float":
+                return builder.call(cg.json_new_float, [value])
+            elif inner == "bool":
+                return builder.call(cg.json_new_bool, [value])
+
+        # Handle named types (user-defined structs, enums)
+        if isinstance(coex_type, NamedType):
+            type_name = coex_type.name
+
+            # Handle JSON type
+            if type_name == "json":
+                return value
+
+            # Handle List type
+            if type_name == "List" or (hasattr(coex_type, 'name') and coex_type.name.startswith("List<")):
+                return self.convert_list_to_json_array(value)
+
+            # For other user types, convert to JSON object
+            if type_name in cg.type_registry:
+                ptr_i8 = builder.call(cg.gc.gc_handle_deref, [value])
+                struct_ptr = builder.bitcast(ptr_i8, cg.type_registry[type_name].as_pointer())
+                return self.convert_udt_to_json(struct_ptr, type_name)
+
+        # Handle list types
+        if isinstance(coex_type, ListType):
+            return self.convert_list_to_json_array(value)
+
+        # Fallback: wrap as int
+        if isinstance(value.type, ir.IntType):
+            if value.type.width < 64:
+                value = builder.zext(value, i64)
+            return builder.call(cg.json_new_int, [value])
+
+        # Last resort: null
+        return builder.call(cg.json_new_null, [])
 
