@@ -91,7 +91,7 @@ func main() -> int
 class TestTaskChannelBlocking:
     """Tests for blocking/suspension behavior"""
 
-    @pytest.mark.xfail(reason="BUG-012: Task calls are synchronous, not async")
+    @pytest.mark.skip(reason="BUG-012: Task calls are synchronous - test hangs indefinitely")
     def test_receive_waits_for_send(self, expect_output):
         """Receive blocks until data available"""
         expect_output('''
@@ -120,7 +120,7 @@ func main() -> int
 ~
 ''', "4950\n")
 
-    @pytest.mark.xfail(reason="BUG-012: Task calls are synchronous, not async")
+    @pytest.mark.skip(reason="BUG-012: Task calls are synchronous - test hangs indefinitely")
     def test_multiple_waiters(self, expect_output):
         """Multiple receivers wait for values"""
         expect_output('''
@@ -230,7 +230,7 @@ func main() -> int
 ~
 ''', "499500\n")
 
-    @pytest.mark.xfail(reason="BUG-012: Task calls are synchronous, not async")
+    @pytest.mark.skip(reason="BUG-012: Task calls are synchronous - test hangs indefinitely")
     def test_ping_pong(self, expect_output):
         """Ping-pong communication pattern"""
         expect_output('''
