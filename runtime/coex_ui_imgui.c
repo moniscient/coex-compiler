@@ -1,0 +1,611 @@
+/**
+ * Coex UI ImGui Wrapper Implementation
+ *
+ * Wraps cimgui (C wrapper for Dear ImGui) to provide the widget API
+ * used by the JSON layout interpreter.
+ */
+
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#include "coex_ui_imgui.h"
+
+/* Check if cimgui is available */
+#ifdef COEX_UI_HAS_IMGUI
+#include "cimgui.h"
+#endif
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+/* Global ImGui context */
+static int _imgui_initialized = 0;
+
+#ifdef COEX_UI_HAS_IMGUI
+static ImGuiContext* _imgui_ctx = NULL;
+#endif
+
+/* ============================================================================
+ * Initialization
+ * ============================================================================ */
+
+int64_t coex_imgui_init(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (_imgui_initialized) return 1;
+
+    /* Create ImGui context */
+    _imgui_ctx = igCreateContext(NULL);
+    if (!_imgui_ctx) {
+        fprintf(stderr, "coex_imgui_init: Failed to create ImGui context\n");
+        return 0;
+    }
+
+    /* Get IO for configuration */
+    ImGuiIO* io = igGetIO();
+
+    /* Configure basic settings */
+    io->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    /* Set default style */
+    igStyleColorsDark(NULL);
+
+    _imgui_initialized = 1;
+    return 1;
+#else
+    fprintf(stderr, "coex_imgui_init: ImGui not available (compile with COEX_UI_HAS_IMGUI)\n");
+    return 0;
+#endif
+}
+
+void coex_imgui_shutdown(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+
+    igDestroyContext(_imgui_ctx);
+    _imgui_ctx = NULL;
+    _imgui_initialized = 0;
+#endif
+}
+
+void coex_imgui_new_frame(int64_t width, int64_t height, double delta_time) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+
+    ImGuiIO* io = igGetIO();
+    io->DisplaySize.x = (float)width;
+    io->DisplaySize.y = (float)height;
+    io->DeltaTime = delta_time > 0.0 ? (float)delta_time : 1.0f / 60.0f;
+
+    igNewFrame();
+#endif
+}
+
+void coex_imgui_render(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igRender();
+#endif
+}
+
+void* coex_imgui_get_draw_data(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return NULL;
+    return igGetDrawData();
+#else
+    return NULL;
+#endif
+}
+
+/* ============================================================================
+ * Input Handling
+ * ============================================================================ */
+
+void coex_imgui_io_set_mouse_pos(double x, double y) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImGuiIO* io = igGetIO();
+    io->MousePos.x = (float)x;
+    io->MousePos.y = (float)y;
+#endif
+}
+
+void coex_imgui_io_set_mouse_down(int64_t button, int64_t pressed) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    if (button < 0 || button >= 5) return;
+    ImGuiIO* io = igGetIO();
+    io->MouseDown[button] = pressed ? true : false;
+#endif
+}
+
+void coex_imgui_io_set_mouse_scroll(double x, double y) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImGuiIO* io = igGetIO();
+    io->MouseWheelH += (float)x;
+    io->MouseWheel += (float)y;
+#endif
+}
+
+void coex_imgui_io_set_key(int64_t keycode, int64_t pressed) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    if (keycode < 0 || keycode >= 512) return;
+    ImGuiIO* io = igGetIO();
+    io->KeysDown[keycode] = pressed ? true : false;
+#endif
+}
+
+void coex_imgui_io_add_char(uint32_t codepoint) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImGuiIO_AddInputCharacter(igGetIO(), codepoint);
+#endif
+}
+
+void coex_imgui_io_set_modifiers(int64_t ctrl, int64_t shift, int64_t alt, int64_t super) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImGuiIO* io = igGetIO();
+    io->KeyCtrl = ctrl ? true : false;
+    io->KeyShift = shift ? true : false;
+    io->KeyAlt = alt ? true : false;
+    io->KeySuper = super ? true : false;
+#endif
+}
+
+int64_t coex_imgui_wants_keyboard(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return 0;
+    return igGetIO()->WantCaptureKeyboard ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_wants_mouse(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return 0;
+    return igGetIO()->WantCaptureMouse ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Container Widgets
+ * ============================================================================ */
+
+int64_t coex_imgui_begin_window(const char* label, int64_t flags) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return 0;
+
+    ImGuiWindowFlags imgui_flags = 0;
+    if (flags & COEX_IMGUI_WINDOW_NO_TITLE_BAR) imgui_flags |= ImGuiWindowFlags_NoTitleBar;
+    if (flags & COEX_IMGUI_WINDOW_NO_RESIZE) imgui_flags |= ImGuiWindowFlags_NoResize;
+    if (flags & COEX_IMGUI_WINDOW_NO_MOVE) imgui_flags |= ImGuiWindowFlags_NoMove;
+    if (flags & COEX_IMGUI_WINDOW_NO_SCROLLBAR) imgui_flags |= ImGuiWindowFlags_NoScrollbar;
+    if (flags & COEX_IMGUI_WINDOW_NO_BACKGROUND) imgui_flags |= ImGuiWindowFlags_NoBackground;
+    if (flags & COEX_IMGUI_WINDOW_ALWAYS_AUTO_RESIZE) imgui_flags |= ImGuiWindowFlags_AlwaysAutoResize;
+
+    return igBegin(label, NULL, imgui_flags) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+void coex_imgui_end_window(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igEnd();
+#endif
+}
+
+void coex_imgui_begin_horizontal(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    /* ImGui doesn't have explicit horizontal groups, use columns */
+    /* For now, do nothing - handled via same_line */
+#endif
+}
+
+void coex_imgui_end_horizontal(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    /* End horizontal group */
+#endif
+}
+
+void coex_imgui_spacing(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igSpacing();
+#endif
+}
+
+void coex_imgui_same_line(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igSameLine(0, -1);
+#endif
+}
+
+void coex_imgui_separator(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igSeparator();
+#endif
+}
+
+void coex_imgui_push_item_width(double width) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPushItemWidth((float)width);
+#endif
+}
+
+void coex_imgui_pop_item_width(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPopItemWidth();
+#endif
+}
+
+/* ============================================================================
+ * Basic Widgets
+ * ============================================================================ */
+
+void coex_imgui_text(const char* text) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !text) return;
+    igTextUnformatted(text, NULL);
+#endif
+}
+
+void coex_imgui_text_colored(const char* text, float r, float g, float b, float a) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !text) return;
+    ImVec4 color = {r, g, b, a};
+    igTextColored(color, "%s", text);
+#endif
+}
+
+void coex_imgui_text_wrapped(const char* text) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !text) return;
+    igTextWrapped("%s", text);
+#endif
+}
+
+int64_t coex_imgui_button(const char* label) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    ImVec2 size = {0, 0};
+    return igButton(label, size) ? COEX_IMGUI_RESULT_CLICKED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_button_sized(const char* label, double width, double height) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    ImVec2 size = {(float)width, (float)height};
+    return igButton(label, size) ? COEX_IMGUI_RESULT_CLICKED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_small_button(const char* label) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    return igSmallButton(label) ? COEX_IMGUI_RESULT_CLICKED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_checkbox(const char* label, int* value) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    bool bool_val = *value != 0;
+    bool changed = igCheckbox(label, &bool_val);
+    *value = bool_val ? 1 : 0;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_radio_button(const char* label, int active) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    return igRadioButton_Bool(label, active != 0) ? COEX_IMGUI_RESULT_CLICKED : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Input Widgets
+ * ============================================================================ */
+
+int64_t coex_imgui_input_text(const char* label, char* buf, int64_t buf_size, int64_t flags) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !buf) return 0;
+
+    ImGuiInputTextFlags imgui_flags = 0;
+    if (flags & COEX_IMGUI_INPUT_TEXT_READONLY) imgui_flags |= ImGuiInputTextFlags_ReadOnly;
+    if (flags & COEX_IMGUI_INPUT_TEXT_PASSWORD) imgui_flags |= ImGuiInputTextFlags_Password;
+    if (flags & COEX_IMGUI_INPUT_TEXT_ENTER_RETURNS_TRUE) imgui_flags |= ImGuiInputTextFlags_EnterReturnsTrue;
+
+    return igInputText(label, buf, (size_t)buf_size, imgui_flags, NULL, NULL) ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_input_text_multiline(const char* label, char* buf, int64_t buf_size,
+                                         double width, double height, int64_t flags) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !buf) return 0;
+
+    ImGuiInputTextFlags imgui_flags = 0;
+    if (flags & COEX_IMGUI_INPUT_TEXT_READONLY) imgui_flags |= ImGuiInputTextFlags_ReadOnly;
+
+    ImVec2 size = {(float)width, (float)height};
+    return igInputTextMultiline(label, buf, (size_t)buf_size, size, imgui_flags, NULL, NULL) ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_input_int(const char* label, int64_t* value) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    int int_val = (int)*value;
+    bool changed = igInputInt(label, &int_val, 1, 100, 0);
+    *value = int_val;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_input_float(const char* label, double* value) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    float float_val = (float)*value;
+    bool changed = igInputFloat(label, &float_val, 0.0f, 0.0f, "%.3f", 0);
+    *value = float_val;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Sliders
+ * ============================================================================ */
+
+int64_t coex_imgui_slider_float(const char* label, double* value, double min, double max) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    float float_val = (float)*value;
+    bool changed = igSliderFloat(label, &float_val, (float)min, (float)max, "%.3f", 0);
+    *value = float_val;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_slider_int(const char* label, int64_t* value, int64_t min, int64_t max) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    int int_val = (int)*value;
+    bool changed = igSliderInt(label, &int_val, (int)min, (int)max, "%d", 0);
+    *value = int_val;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_vslider_float(const char* label, double width, double height,
+                                  double* value, double min, double max) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !value) return 0;
+    float float_val = (float)*value;
+    ImVec2 size = {(float)width, (float)height};
+    bool changed = igVSliderFloat(label, size, &float_val, (float)min, (float)max, "%.3f", 0);
+    *value = float_val;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Selection Widgets
+ * ============================================================================ */
+
+int64_t coex_imgui_combo(const char* label, int64_t* current_item,
+                          const char* const* items, int64_t items_count) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !current_item || !items) return 0;
+    int int_item = (int)*current_item;
+    bool changed = igCombo_Str_arr(label, &int_item, items, (int)items_count, -1);
+    *current_item = int_item;
+    return changed ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_begin_combo(const char* label, const char* preview) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    return igBeginCombo(label, preview, 0) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+void coex_imgui_end_combo(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igEndCombo();
+#endif
+}
+
+int64_t coex_imgui_selectable(const char* label, int selected) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    ImVec2 size = {0, 0};
+    return igSelectable_Bool(label, selected != 0, 0, size) ? COEX_IMGUI_RESULT_CLICKED : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Color Widgets
+ * ============================================================================ */
+
+int64_t coex_imgui_color_edit3(const char* label, float* color) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !color) return 0;
+    return igColorEdit3(label, color, 0) ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_color_edit4(const char* label, float* color) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label || !color) return 0;
+    return igColorEdit4(label, color, 0) ? COEX_IMGUI_RESULT_CHANGED : 0;
+#else
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ * Progress Widgets
+ * ============================================================================ */
+
+void coex_imgui_progress_bar(double fraction, double width, double height, const char* overlay) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImVec2 size = {(float)width, (float)height};
+    igProgressBar((float)fraction, size, overlay);
+#endif
+}
+
+/* ============================================================================
+ * Tree/Collapsing Widgets
+ * ============================================================================ */
+
+int64_t coex_imgui_collapsing_header(const char* label) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    return igCollapsingHeader_TreeNodeFlags(label, 0) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int64_t coex_imgui_tree_node(const char* label) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !label) return 0;
+    return igTreeNode_Str(label) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+void coex_imgui_tree_pop(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igTreePop();
+#endif
+}
+
+/* ============================================================================
+ * ID Management
+ * ============================================================================ */
+
+void coex_imgui_push_id_str(const char* str_id) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized || !str_id) return;
+    igPushID_Str(str_id);
+#endif
+}
+
+void coex_imgui_push_id_int(int64_t int_id) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPushID_Int((int)int_id);
+#endif
+}
+
+void coex_imgui_pop_id(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPopID();
+#endif
+}
+
+/* ============================================================================
+ * Style
+ * ============================================================================ */
+
+void coex_imgui_style_colors_dark(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igStyleColorsDark(NULL);
+#endif
+}
+
+void coex_imgui_style_colors_light(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igStyleColorsLight(NULL);
+#endif
+}
+
+void coex_imgui_push_style_color(int64_t idx, float r, float g, float b, float a) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImVec4 color = {r, g, b, a};
+    igPushStyleColor_Vec4((ImGuiCol)idx, color);
+#endif
+}
+
+void coex_imgui_pop_style_color(int64_t count) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPopStyleColor((int)count);
+#endif
+}
+
+void coex_imgui_push_style_var_float(int64_t idx, double val) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPushStyleVar_Float((ImGuiStyleVar)idx, (float)val);
+#endif
+}
+
+void coex_imgui_push_style_var_vec2(int64_t idx, double x, double y) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    ImVec2 val = {(float)x, (float)y};
+    igPushStyleVar_Vec2((ImGuiStyleVar)idx, val);
+#endif
+}
+
+void coex_imgui_pop_style_var(int64_t count) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+    igPopStyleVar((int)count);
+#endif
+}

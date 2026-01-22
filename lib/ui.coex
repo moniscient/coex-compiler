@@ -1,0 +1,197 @@
+# Coex UI Library Module
+#
+# Cross-platform UI using Dear ImGui (widgets) and Skia (rendering).
+# JSON-driven immediate mode: describe UI as JSON, render it, get events back.
+#
+# Usage:
+#   import ui
+#
+#   func main() -> int
+#       ui.init({ title: "My App", width: 800, height: 600 })
+#
+#       state: json = { count: 0 }
+#       layout: json = {
+#           type: "window",
+#           title: "Counter",
+#           children: [
+#               { type: "text", bind: "count" },
+#               { type: "button", label: "+", action: "increment" }
+#           ]
+#       }
+#
+#       loop
+#           state = ui.render(layout, state)
+#           if state._pending_action == "increment"
+#               state = state.set("count", state.count + 1)
+#           ~
+#           state = state.remove("_pending_action")
+#           if ui.should_close()
+#               break
+#           ~
+#       ~
+#
+#       ui.shutdown()
+#       return 0
+#   ~
+
+# =============================================================================
+# FFI Declarations
+# =============================================================================
+
+extern coex_ui_init(config: string) -> int ~
+extern coex_ui_shutdown() -> () ~
+extern coex_ui_should_close() -> int ~
+extern coex_ui_get_time() -> float ~
+extern coex_ui_render_json(layout: string, state: string) -> string ~
+extern coex_ui_free_json(json: string) -> () ~
+extern coex_ui_begin_frame() -> () ~
+extern coex_ui_end_frame() -> () ~
+
+# =============================================================================
+# High-Level API
+# =============================================================================
+
+# Initialize the UI library.
+#
+# config: Configuration object with fields:
+#   - title: Window title (string)
+#   - width: Window width in pixels (int)
+#   - height: Window height in pixels (int)
+#   - resizable: Whether window can be resized (bool, default true)
+#   - theme: "dark" or "light" (string, default "dark")
+#
+# Returns: Result<(), string> - Ok on success, Err with message on failure
+func init(config: json) -> Result<(), string>
+    config_str = json_to_string(config)
+    result = coex_ui_init(config_str)
+    if result == 1
+        return Ok(())
+    else
+        return Err("Failed to initialize UI")
+    ~
+~
+
+# Shut down the UI library and close the window.
+func shutdown() -> ()
+    coex_ui_shutdown()
+~
+
+# Check if the window should close (user clicked X, etc).
+func should_close() -> bool
+    return coex_ui_should_close() == 1
+~
+
+# Get time since init in seconds.
+func get_time() -> float
+    return coex_ui_get_time()
+~
+
+# Render a UI frame from layout and state.
+#
+# layout: JSON object describing the UI structure. See widget types below.
+# state: JSON object with current widget values (widget_id -> value)
+#
+# Returns: JSON object with:
+#   - state: Updated widget values
+#   - events: Array of events that occurred
+#
+# The returned state should be passed back to the next render() call
+# after processing any events/actions.
+func render(layout: json, state: json) -> json
+    layout_str = json_to_string(layout)
+    state_str = json_to_string(state)
+    result_str = coex_ui_render_json(layout_str, state_str)
+    result = json_from_string(result_str)
+    coex_ui_free_json(result_str)
+    return result
+~
+
+# =============================================================================
+# Low-Level Frame API
+# (For advanced use - normally use render() instead)
+# =============================================================================
+
+# Begin a new frame for manual widget rendering.
+func begin_frame() -> ()
+    coex_ui_begin_frame()
+~
+
+# End the current frame.
+func end_frame() -> ()
+    coex_ui_end_frame()
+~
+
+# =============================================================================
+# Widget Types Reference
+# =============================================================================
+#
+# Container Widgets:
+#   window    - Top-level window
+#               { type: "window", title: "...", children: [...] }
+#   column    - Vertical layout (default)
+#               { type: "column", children: [...] }
+#   row       - Horizontal layout
+#               { type: "row", children: [...] }
+#
+# Display Widgets:
+#   text      - Static text
+#               { type: "text", text: "Hello" }
+#               { type: "text", bind: "state_key" }  # bind to state value
+#               { type: "text", text: "...", color: [r,g,b,a] }
+#               { type: "text", text: "...", wrapped: true }
+#   separator - Horizontal line
+#               { type: "separator" }
+#   spacing   - Vertical space
+#               { type: "spacing" }
+#   progress  - Progress bar
+#               { type: "progress", fraction: 0.5 }
+#               { type: "progress", bind: "progress_key" }
+#
+# Interactive Widgets:
+#   button    - Clickable button
+#               { type: "button", label: "Click", id: "btn1" }
+#               { type: "button", label: "...", action: "action_name" }
+#   checkbox  - Toggle checkbox
+#               { type: "checkbox", label: "Enable", id: "check1" }
+#   slider_float - Float slider
+#               { type: "slider_float", id: "val", min: 0, max: 100 }
+#   slider_int - Integer slider
+#               { type: "slider_int", id: "val", min: 0, max: 100 }
+#   input_text - Text input field
+#               { type: "input_text", label: "Name", id: "name" }
+#               { type: "input_text", ..., password: true }
+#               { type: "input_text", ..., readonly: true }
+#   input_int  - Integer input
+#               { type: "input_int", label: "Age", id: "age" }
+#   input_float - Float input
+#               { type: "input_float", label: "Price", id: "price" }
+#   combo      - Dropdown selection
+#               { type: "combo", label: "Choice", id: "sel", items: ["A","B","C"] }
+#   color_edit - Color picker
+#               { type: "color_edit", label: "Color", id: "col" }
+#               { type: "color_edit", ..., alpha: true }  # include alpha
+#
+# Structural Widgets:
+#   tree      - Collapsible tree node
+#               { type: "tree", label: "Options", children: [...] }
+#   collapsing - Collapsible section header
+#               { type: "collapsing", label: "Advanced", children: [...] }
+#
+# =============================================================================
+# State and Events
+# =============================================================================
+#
+# State is a JSON object mapping widget IDs to their values:
+#   { "slider1": 50.0, "check1": true, "input1": "hello" }
+#
+# Events are returned in the events array:
+#   [
+#     { type: "click", id: "btn1" },
+#     { type: "change", id: "slider1", value: 55.0 }
+#   ]
+#
+# Actions set _pending_action in the returned state:
+#   { type: "button", action: "increment" }
+#   -> state._pending_action == "increment" after click
+#
+# =============================================================================
