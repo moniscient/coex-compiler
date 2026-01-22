@@ -40,7 +40,7 @@ int64_t coex_imgui_init(void) {
     }
 
     /* Get IO for configuration */
-    ImGuiIO* io = igGetIO();
+    ImGuiIO* io = igGetIO_Nil();
 
     /* Configure basic settings */
     io->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -70,7 +70,7 @@ void coex_imgui_new_frame(int64_t width, int64_t height, double delta_time) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
 
-    ImGuiIO* io = igGetIO();
+    ImGuiIO* io = igGetIO_Nil();
     io->DisplaySize.x = (float)width;
     io->DisplaySize.y = (float)height;
     io->DeltaTime = delta_time > 0.0 ? (float)delta_time : 1.0f / 60.0f;
@@ -102,9 +102,8 @@ void* coex_imgui_get_draw_data(void) {
 void coex_imgui_io_set_mouse_pos(double x, double y) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
-    ImGuiIO* io = igGetIO();
-    io->MousePos.x = (float)x;
-    io->MousePos.y = (float)y;
+    ImGuiIO* io = igGetIO_Nil();
+    ImGuiIO_AddMousePosEvent(io, (float)x, (float)y);
 #endif
 }
 
@@ -112,51 +111,65 @@ void coex_imgui_io_set_mouse_down(int64_t button, int64_t pressed) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
     if (button < 0 || button >= 5) return;
-    ImGuiIO* io = igGetIO();
-    io->MouseDown[button] = pressed ? true : false;
+    ImGuiIO* io = igGetIO_Nil();
+    ImGuiIO_AddMouseButtonEvent(io, (int)button, pressed ? true : false);
 #endif
 }
 
 void coex_imgui_io_set_mouse_scroll(double x, double y) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
-    ImGuiIO* io = igGetIO();
-    io->MouseWheelH += (float)x;
-    io->MouseWheel += (float)y;
+    ImGuiIO* io = igGetIO_Nil();
+    ImGuiIO_AddMouseWheelEvent(io, (float)x, (float)y);
 #endif
 }
 
 void coex_imgui_io_set_key(int64_t keycode, int64_t pressed) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
-    if (keycode < 0 || keycode >= 512) return;
-    ImGuiIO* io = igGetIO();
-    io->KeysDown[keycode] = pressed ? true : false;
+    /* Modern ImGui uses ImGuiKey enum, but we accept raw keycodes */
+    /* For simplicity, only handle common keys */
+    ImGuiIO* io = igGetIO_Nil();
+    ImGuiKey key = ImGuiKey_None;
+    if (keycode >= 'A' && keycode <= 'Z') key = ImGuiKey_A + (keycode - 'A');
+    else if (keycode >= 'a' && keycode <= 'z') key = ImGuiKey_A + (keycode - 'a');
+    else if (keycode >= '0' && keycode <= '9') key = ImGuiKey_0 + (keycode - '0');
+    else if (keycode == 256) key = ImGuiKey_Escape;
+    else if (keycode == 257) key = ImGuiKey_Enter;
+    else if (keycode == 258) key = ImGuiKey_Tab;
+    else if (keycode == 259) key = ImGuiKey_Backspace;
+    else if (keycode == 262) key = ImGuiKey_RightArrow;
+    else if (keycode == 263) key = ImGuiKey_LeftArrow;
+    else if (keycode == 264) key = ImGuiKey_DownArrow;
+    else if (keycode == 265) key = ImGuiKey_UpArrow;
+    if (key != ImGuiKey_None) {
+        ImGuiIO_AddKeyEvent(io, key, pressed ? true : false);
+    }
 #endif
 }
 
 void coex_imgui_io_add_char(uint32_t codepoint) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
-    ImGuiIO_AddInputCharacter(igGetIO(), codepoint);
+    ImGuiIO_AddInputCharacter(igGetIO_Nil(), codepoint);
 #endif
 }
 
 void coex_imgui_io_set_modifiers(int64_t ctrl, int64_t shift, int64_t alt, int64_t super) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
-    ImGuiIO* io = igGetIO();
-    io->KeyCtrl = ctrl ? true : false;
-    io->KeyShift = shift ? true : false;
-    io->KeyAlt = alt ? true : false;
-    io->KeySuper = super ? true : false;
+    ImGuiIO* io = igGetIO_Nil();
+    ImGuiIO_AddKeyEvent(io, ImGuiMod_Ctrl, ctrl ? true : false);
+    ImGuiIO_AddKeyEvent(io, ImGuiMod_Shift, shift ? true : false);
+    ImGuiIO_AddKeyEvent(io, ImGuiMod_Alt, alt ? true : false);
+    ImGuiIO_AddKeyEvent(io, ImGuiMod_Super, super ? true : false);
 #endif
 }
 
 int64_t coex_imgui_wants_keyboard(void) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return 0;
-    return igGetIO()->WantCaptureKeyboard ? 1 : 0;
+    return igGetIO_Nil()->WantCaptureKeyboard ? 1 : 0;
 #else
     return 0;
 #endif
@@ -165,7 +178,7 @@ int64_t coex_imgui_wants_keyboard(void) {
 int64_t coex_imgui_wants_mouse(void) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return 0;
-    return igGetIO()->WantCaptureMouse ? 1 : 0;
+    return igGetIO_Nil()->WantCaptureMouse ? 1 : 0;
 #else
     return 0;
 #endif
