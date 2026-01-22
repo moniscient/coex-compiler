@@ -74,9 +74,10 @@ ifeq ($(UNAME_S),Darwin)
     UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_macos.o coex_ui_metal.o coex_ui_skia.o
     UI_FRAMEWORKS = -framework Cocoa -framework Metal -framework QuartzCore
 else
-    UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_linux.o coex_ui_skia.o
-    # Linux uses GLFW
-    UI_FRAMEWORKS = -lglfw -lGL -lX11
+    UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_linux.o coex_ui_opengl.o coex_ui_skia.o
+    # Linux uses GLFW and OpenGL
+    UI_CFLAGS += -DCOEX_UI_HAS_GLFW -DCOEX_UI_HAS_OPENGL
+    UI_FRAMEWORKS = -lglfw3 -lGL -lX11 -lpthread -ldl -lm
 endif
 
 # All libraries (UI is optional, only built if deps available)
@@ -152,6 +153,9 @@ coex_ui_metal.o: coex_ui_metal.m coex_ui_metal.h
 	$(CC) $(OBJCFLAGS) $(UI_CFLAGS) -c -o $@ $<
 else
 coex_ui_shell_linux.o: coex_ui_shell_linux.c coex_ui_shell.h
+	$(CC) $(CFLAGS) $(UI_CFLAGS) -c -o $@ $<
+
+coex_ui_opengl.o: coex_ui_opengl.c coex_ui_opengl.h
 	$(CC) $(CFLAGS) $(UI_CFLAGS) -c -o $@ $<
 endif
 

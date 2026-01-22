@@ -93,6 +93,51 @@ echo "cimgui built"
 echo ""
 
 # -----------------------------------------------------------------------------
+# GLFW - Cross-platform windowing library (zlib license)
+# Only needed on Linux (macOS uses native Cocoa)
+# -----------------------------------------------------------------------------
+if [ "$UNAME_S" = "Linux" ]; then
+    echo "=== Building GLFW ==="
+
+    if [ ! -d "glfw" ]; then
+        echo "Cloning GLFW..."
+        git clone --depth 1 --branch 3.3.9 https://github.com/glfw/glfw.git
+    fi
+
+    cd glfw
+
+    # Build GLFW with static library
+    echo "Building GLFW..."
+    mkdir -p build
+    cd build
+
+    # Configure for static library, disable examples/tests/docs
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGLFW_BUILD_EXAMPLES=OFF \
+        -DGLFW_BUILD_TESTS=OFF \
+        -DGLFW_BUILD_DOCS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+    make -j$(nproc 2>/dev/null || echo 4)
+
+    # Copy outputs
+    cp src/libglfw3.a "$SCRIPT_DIR/lib/"
+
+    cd ..
+
+    # Copy headers
+    cp -r include/GLFW "$SCRIPT_DIR/include/"
+
+    cd "$SCRIPT_DIR"
+    echo "GLFW built: lib/libglfw3.a"
+    echo ""
+else
+    echo "=== Skipping GLFW (not needed on macOS) ==="
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
 # Skia - 2D graphics library (BSD license)
 # We use prebuilt binaries because building from source is extremely complex
 # -----------------------------------------------------------------------------
@@ -179,4 +224,8 @@ fi
 echo ""
 echo "To use in your project:"
 echo "  CFLAGS += -I$SCRIPT_DIR/include"
-echo "  LDFLAGS += -L$SCRIPT_DIR/lib -lcimgui -lcjson -lskia"
+if [ "$UNAME_S" = "Linux" ]; then
+    echo "  LDFLAGS += -L$SCRIPT_DIR/lib -lcimgui -lcjson -lglfw3 -lGL -lX11 -lpthread -ldl"
+else
+    echo "  LDFLAGS += -L$SCRIPT_DIR/lib -lcimgui -lcjson"
+fi

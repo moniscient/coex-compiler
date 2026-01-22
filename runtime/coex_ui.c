@@ -9,9 +9,16 @@
 #include "coex_ui_shell.h"
 #include "coex_ui_imgui.h"
 
-/* Metal renderer for macOS */
+/* Platform-specific renderers */
 #ifdef __APPLE__
 #include "coex_ui_metal.h"
+#else
+/* OpenGL renderer for Linux */
+#include "coex_ui_opengl.h"
+#ifdef COEX_UI_HAS_OPENGL
+#define GL_GLEXT_PROTOTYPES
+#include <GL/gl.h>
+#endif
 #endif
 
 /* cJSON for JSON parsing - can be included directly */
@@ -904,6 +911,25 @@ int64_t coex_ui_init(const char* config_json) {
         cJSON_Delete(config);
         return 0;
     }
+#else
+    /* Initialize OpenGL renderer */
+    if (!coex_ui_opengl_init()) {
+        fprintf(stderr, "coex_ui_init: Failed to initialize OpenGL renderer\n");
+        coex_imgui_shutdown();
+        coex_ui_shell_shutdown();
+        cJSON_Delete(config);
+        return 0;
+    }
+
+    /* Create font texture */
+    if (!coex_ui_opengl_create_fonts_texture()) {
+        fprintf(stderr, "coex_ui_init: Failed to create font texture\n");
+        coex_ui_opengl_shutdown();
+        coex_imgui_shutdown();
+        coex_ui_shell_shutdown();
+        cJSON_Delete(config);
+        return 0;
+    }
 #endif
 
     _ui_state.initialized = 1;
@@ -931,6 +957,8 @@ void coex_ui_shutdown(void) {
 
 #ifdef __APPLE__
     coex_ui_metal_shutdown();
+#else
+    coex_ui_opengl_shutdown();
 #endif
     coex_imgui_shutdown();
     coex_ui_shell_shutdown();
@@ -1000,6 +1028,21 @@ void coex_ui_end_frame(void) {
         coex_ui_metal_render(command_buffer, render_target, draw_data, fb_width, fb_height);
         coex_ui_shell_present_and_commit(command_buffer);
     }
+#else
+#ifdef COEX_UI_HAS_OPENGL
+    /* Render with OpenGL */
+    void* draw_data = coex_imgui_get_draw_data();
+    if (draw_data) {
+        int64_t fb_width, fb_height;
+        coex_ui_shell_get_framebuffer_size(&fb_width, &fb_height);
+
+        /* Clear the framebuffer */
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        coex_ui_opengl_render(draw_data, fb_width, fb_height);
+    }
+#endif
 #endif
 
     coex_ui_shell_end_frame();
