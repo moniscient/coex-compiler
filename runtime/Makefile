@@ -71,7 +71,7 @@ else
 endif
 
 ifeq ($(UNAME_S),Darwin)
-    UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_macos.o coex_ui_skia.o
+    UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_macos.o coex_ui_metal.o coex_ui_skia.o
     UI_FRAMEWORKS = -framework Cocoa -framework Metal -framework QuartzCore
 else
     UI_OBJ = coex_ui.o coex_ui_imgui.o coex_ui_shell_linux.o coex_ui_skia.o
@@ -147,6 +147,9 @@ coex_ui_skia.o: coex_ui_skia.cpp coex_ui_skia.h
 ifeq ($(UNAME_S),Darwin)
 coex_ui_shell_macos.o: coex_ui_shell_macos.m coex_ui_shell.h
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
+
+coex_ui_metal.o: coex_ui_metal.m coex_ui_metal.h
+	$(CC) $(OBJCFLAGS) $(UI_CFLAGS) -c -o $@ $<
 else
 coex_ui_shell_linux.o: coex_ui_shell_linux.c coex_ui_shell.h
 	$(CC) $(CFLAGS) $(UI_CFLAGS) -c -o $@ $<
@@ -173,6 +176,6 @@ endif
 
 clean:
 	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) coex_metal.o coex_metal_stub.o $(BLAS_OBJ) $(LIBS) test_task test_metal
-	rm -f $(UI_OBJ) $(UI_LIB)
+	rm -f $(UI_OBJ) $(UI_LIB) coex_ui_metal.o
 
 .PHONY: all test clean test_metal ui

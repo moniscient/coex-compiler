@@ -243,6 +243,43 @@ double coex_ui_shell_get_time(void);
  */
 void* coex_ui_shell_get_render_context(void);
 
+/* ============================================================================
+ * Metal-specific functions (macOS only)
+ * ============================================================================ */
+
+#ifdef __APPLE__
+/**
+ * Get the Metal device.
+ * @return MTLDevice pointer
+ */
+void* coex_ui_shell_get_metal_device(void);
+
+/**
+ * Get the Metal command queue.
+ * @return MTLCommandQueue pointer
+ */
+void* coex_ui_shell_get_metal_command_queue(void);
+
+/**
+ * Get the current drawable's texture for rendering.
+ * Only valid between begin_frame and end_frame.
+ * @return MTLTexture pointer, or NULL if no drawable
+ */
+void* coex_ui_shell_get_current_drawable_texture(void);
+
+/**
+ * Create a new command buffer for rendering.
+ * @return MTLCommandBuffer pointer
+ */
+void* coex_ui_shell_create_command_buffer(void);
+
+/**
+ * Present the current drawable and commit the command buffer.
+ * @param command_buffer  MTLCommandBuffer to commit
+ */
+void coex_ui_shell_present_and_commit(void* command_buffer);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

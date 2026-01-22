@@ -432,7 +432,7 @@ int64_t coex_ui_shell_init(const char* title, int64_t width, int64_t height, int
         return 1;  /* Already initialized */
     }
 
-    memset(&_ui_state, 0, sizeof(_ui_state));
+    memset((void*)&_ui_state, 0, sizeof(_ui_state));
     pthread_mutex_init(&_ui_state.event_mutex, NULL);
 
     @autoreleasepool {
@@ -545,14 +545,8 @@ void coex_ui_shell_begin_frame(void) {
 
 void coex_ui_shell_end_frame(void) {
     @autoreleasepool {
-        if (_ui_state.current_drawable) {
-            /* Present is handled by the rendering layer (Skia/ImGui) */
-            /* If doing direct Metal rendering, present here */
-            id<MTLCommandBuffer> commandBuffer = [_ui_state.command_queue commandBuffer];
-            [commandBuffer presentDrawable:_ui_state.current_drawable];
-            [commandBuffer commit];
-            _ui_state.current_drawable = nil;
-        }
+        /* Clear current drawable reference - presentation is handled by Metal renderer */
+        _ui_state.current_drawable = nil;
     }
 }
 
@@ -673,21 +667,36 @@ void* coex_ui_shell_get_render_context(void) {
 }
 
 /* ============================================================================
- * Additional Metal helpers for direct rendering
+ * Metal API for External Rendering (returns void* for C compatibility)
  * ============================================================================ */
 
-id<MTLDevice> coex_ui_shell_get_metal_device(void) {
-    return _ui_state.metal_device;
+void* coex_ui_shell_get_metal_device(void) {
+    return (__bridge void*)_ui_state.metal_device;
 }
 
-id<MTLCommandQueue> coex_ui_shell_get_command_queue(void) {
-    return _ui_state.command_queue;
+void* coex_ui_shell_get_metal_command_queue(void) {
+    return (__bridge void*)_ui_state.command_queue;
 }
 
-id<CAMetalDrawable> coex_ui_shell_get_current_drawable(void) {
-    return _ui_state.current_drawable;
+void* coex_ui_shell_get_current_drawable_texture(void) {
+    if (_ui_state.current_drawable) {
+        return (__bridge void*)[_ui_state.current_drawable texture];
+    }
+    return NULL;
 }
 
-MTLPixelFormat coex_ui_shell_get_pixel_format(void) {
-    return _ui_state.metal_layer.pixelFormat;
+void* coex_ui_shell_create_command_buffer(void) {
+    return (__bridge void*)[_ui_state.command_queue commandBuffer];
+}
+
+void coex_ui_shell_present_and_commit(void* command_buffer) {
+    if (!command_buffer) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = (__bridge id<MTLCommandBuffer>)command_buffer;
+        if (_ui_state.current_drawable) {
+            [cmdBuffer presentDrawable:_ui_state.current_drawable];
+        }
+        [cmdBuffer commit];
+    }
 }

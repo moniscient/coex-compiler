@@ -9,6 +9,11 @@
 #include "coex_ui_shell.h"
 #include "coex_ui_imgui.h"
 
+/* Metal renderer for macOS */
+#ifdef __APPLE__
+#include "coex_ui_metal.h"
+#endif
+
 /* cJSON for JSON parsing - can be included directly */
 #ifdef COEX_UI_HAS_CJSON
 #include "cJSON.h"
@@ -879,6 +884,28 @@ int64_t coex_ui_init(const char* config_json) {
         coex_imgui_style_colors_dark();
     }
 
+#ifdef __APPLE__
+    /* Initialize Metal renderer */
+    void* metal_device = coex_ui_shell_get_metal_device();
+    if (!coex_ui_metal_init(metal_device)) {
+        fprintf(stderr, "coex_ui_init: Failed to initialize Metal renderer\n");
+        coex_imgui_shutdown();
+        coex_ui_shell_shutdown();
+        cJSON_Delete(config);
+        return 0;
+    }
+
+    /* Create font texture */
+    if (!coex_ui_metal_create_fonts_texture()) {
+        fprintf(stderr, "coex_ui_init: Failed to create font texture\n");
+        coex_ui_metal_shutdown();
+        coex_imgui_shutdown();
+        coex_ui_shell_shutdown();
+        cJSON_Delete(config);
+        return 0;
+    }
+#endif
+
     _ui_state.initialized = 1;
     _ui_state.last_frame_time = coex_ui_shell_get_time();
     _ui_state.pending_events = cJSON_CreateArray();
@@ -902,6 +929,9 @@ void coex_ui_shutdown(void) {
         _ui_state.pending_events = NULL;
     }
 
+#ifdef __APPLE__
+    coex_ui_metal_shutdown();
+#endif
     coex_imgui_shutdown();
     coex_ui_shell_shutdown();
     _ui_state.initialized = 0;
@@ -956,7 +986,22 @@ void coex_ui_end_frame(void) {
     if (!_ui_state.initialized) return;
 
     coex_imgui_render();
-    /* TODO: Render ImGui draw data with Skia */
+
+#ifdef __APPLE__
+    /* Render with Metal */
+    void* draw_data = coex_imgui_get_draw_data();
+    void* command_buffer = coex_ui_shell_create_command_buffer();
+    void* render_target = coex_ui_shell_get_current_drawable_texture();
+
+    if (draw_data && command_buffer && render_target) {
+        int64_t fb_width, fb_height;
+        coex_ui_shell_get_framebuffer_size(&fb_width, &fb_height);
+
+        coex_ui_metal_render(command_buffer, render_target, draw_data, fb_width, fb_height);
+        coex_ui_shell_present_and_commit(command_buffer);
+    }
+#endif
+
     coex_ui_shell_end_frame();
 }
 
