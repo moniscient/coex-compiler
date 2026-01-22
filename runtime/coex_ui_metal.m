@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "coex_ui_metal.h"
+#include "coex_ui_imgui.h"
 
 /* Include cimgui if available */
 #ifdef COEX_UI_HAS_IMGUI
@@ -208,25 +209,22 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
     if (!_renderer.initialized) return 0;
 
     @autoreleasepool {
-        ImGuiIO* io = igGetIO_Nil();
+        /* Get font texture data via the imgui wrapper */
+        unsigned char* pixels = NULL;
+        int width = 0, height = 0, bytesPerPixel = 0;
 
-        /* Get font texture data from the TexData member */
-        ImTextureData* texData = io->Fonts->TexData;
-        if (!texData || !texData->Pixels) {
-            fprintf(stderr, "coex_ui_metal_create_fonts_texture: No font texture data available\n");
+        if (!coex_imgui_get_font_tex_data_rgba32(&pixels, &width, &height, &bytesPerPixel)) {
+            fprintf(stderr, "coex_ui_metal_create_fonts_texture: Failed to get font texture data\n");
             return 0;
         }
 
-        int width = texData->Width;
-        int height = texData->Height;
-        unsigned char* pixels = texData->Pixels;
-        int bytesPerPixel = texData->BytesPerPixel;
-
-        /* Determine pixel format based on bytes per pixel */
-        MTLPixelFormat pixelFormat = MTLPixelFormatRGBA8Unorm;
-        if (bytesPerPixel == 1) {
-            pixelFormat = MTLPixelFormatA8Unorm;
+        if (!pixels || width <= 0 || height <= 0) {
+            fprintf(stderr, "coex_ui_metal_create_fonts_texture: Invalid font texture data\n");
+            return 0;
         }
+
+        /* Use RGBA format (bytesPerPixel should be 4 from GetTexDataAsRGBA32) */
+        MTLPixelFormat pixelFormat = MTLPixelFormatRGBA8Unorm;
 
         /* Create Metal texture */
         MTLTextureDescriptor* texDesc = [MTLTextureDescriptor
@@ -250,8 +248,8 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
                                    withBytes:pixels
                                  bytesPerRow:width * bytesPerPixel];
 
-        /* Store texture ID in ImGui (cast pointer to ImTextureID which is unsigned long long) */
-        ImTextureData_SetTexID(texData, (ImTextureID)(uintptr_t)(__bridge void*)_renderer.fontTexture);
+        /* Store texture ID in ImGui */
+        coex_imgui_set_font_tex_id((__bridge void*)_renderer.fontTexture);
     }
 
     return 1;
@@ -263,10 +261,7 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
 void coex_ui_metal_invalidate_fonts_texture(void) {
 #ifdef COEX_UI_HAS_IMGUI
     _renderer.fontTexture = nil;
-    ImGuiIO* io = igGetIO_Nil();
-    if (io->Fonts->TexData) {
-        ImTextureData_SetTexID(io->Fonts->TexData, (ImTextureID)0);
-    }
+    coex_imgui_set_font_tex_id(NULL);
 #endif
 }
 

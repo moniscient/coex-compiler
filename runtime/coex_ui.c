@@ -445,6 +445,7 @@ static char* cJSON_GetStringValue(const cJSON* item) { return item ? item->value
 
 static struct {
     int initialized;
+    int font_texture_created;  /* Deferred font texture creation flag */
     double last_frame_time;
     cJSON* pending_events;
 
@@ -901,16 +902,7 @@ int64_t coex_ui_init(const char* config_json) {
         cJSON_Delete(config);
         return 0;
     }
-
-    /* Create font texture */
-    if (!coex_ui_metal_create_fonts_texture()) {
-        fprintf(stderr, "coex_ui_init: Failed to create font texture\n");
-        coex_ui_metal_shutdown();
-        coex_imgui_shutdown();
-        coex_ui_shell_shutdown();
-        cJSON_Delete(config);
-        return 0;
-    }
+    /* Font texture creation is deferred until first frame */
 #else
     /* Initialize OpenGL renderer */
     if (!coex_ui_opengl_init()) {
@@ -920,19 +912,11 @@ int64_t coex_ui_init(const char* config_json) {
         cJSON_Delete(config);
         return 0;
     }
-
-    /* Create font texture */
-    if (!coex_ui_opengl_create_fonts_texture()) {
-        fprintf(stderr, "coex_ui_init: Failed to create font texture\n");
-        coex_ui_opengl_shutdown();
-        coex_imgui_shutdown();
-        coex_ui_shell_shutdown();
-        cJSON_Delete(config);
-        return 0;
-    }
+    /* Font texture creation is deferred until first frame */
 #endif
 
     _ui_state.initialized = 1;
+    _ui_state.font_texture_created = 0;
     _ui_state.last_frame_time = coex_ui_shell_get_time();
     _ui_state.pending_events = cJSON_CreateArray();
 
@@ -1008,6 +992,19 @@ void coex_ui_begin_frame(void) {
     /* Begin platform and ImGui frames */
     coex_ui_shell_begin_frame();
     coex_imgui_new_frame(width, height, delta);
+
+    /* Create font texture on first frame (after NewFrame builds the font atlas) */
+    if (!_ui_state.font_texture_created) {
+#ifdef __APPLE__
+        if (coex_ui_metal_create_fonts_texture()) {
+            _ui_state.font_texture_created = 1;
+        }
+#else
+        if (coex_ui_opengl_create_fonts_texture()) {
+            _ui_state.font_texture_created = 1;
+        }
+#endif
+    }
 }
 
 void coex_ui_end_frame(void) {

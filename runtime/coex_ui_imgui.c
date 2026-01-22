@@ -45,6 +45,12 @@ int64_t coex_imgui_init(void) {
     /* Configure basic settings */
     io->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+    /* Tell ImGui our backend handles textures */
+    io->BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+
+    /* Add default font so there's something to render */
+    ImFontAtlas_AddFontDefault(io->Fonts, NULL);
+
     /* Set default style */
     igStyleColorsDark(NULL);
 
@@ -620,5 +626,70 @@ void coex_imgui_pop_style_var(int64_t count) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
     igPopStyleVar((int)count);
+#endif
+}
+
+/* ============================================================================
+ * Font Atlas
+ * ============================================================================ */
+
+int64_t coex_imgui_get_font_tex_data_rgba32(
+    unsigned char** out_pixels,
+    int* out_width,
+    int* out_height,
+    int* out_bytes_per_pixel
+) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return 0;
+    if (!out_pixels || !out_width || !out_height) return 0;
+
+    ImGuiIO* io = igGetIO_Nil();
+    if (!io->Fonts) return 0;
+
+    /* Modern cimgui uses TexData structure */
+    ImTextureData* texData = io->Fonts->TexData;
+    if (!texData || !texData->Pixels) {
+        /*
+         * Font atlas hasn't been built yet.
+         * With RendererHasTextures flag set, the build will happen on first NewFrame.
+         * For now, return failure - caller should retry after NewFrame.
+         */
+        fprintf(stderr, "coex_imgui_get_font_tex_data_rgba32: Font atlas not built yet (TexData=%p)\n", (void*)texData);
+        return 0;
+    }
+
+    /* Get pixel data using ImTextureData_GetPixels */
+    *out_pixels = (unsigned char*)ImTextureData_GetPixels(texData);
+    *out_width = texData->Width;
+    *out_height = texData->Height;
+    if (out_bytes_per_pixel) *out_bytes_per_pixel = texData->BytesPerPixel;
+
+    if (!*out_pixels) {
+        fprintf(stderr, "coex_imgui_get_font_tex_data_rgba32: No pixel data available\n");
+        return 0;
+    }
+
+    return 1;
+#else
+    (void)out_pixels;
+    (void)out_width;
+    (void)out_height;
+    (void)out_bytes_per_pixel;
+    return 0;
+#endif
+}
+
+void coex_imgui_set_font_tex_id(void* texture_id) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_imgui_initialized) return;
+
+    ImGuiIO* io = igGetIO_Nil();
+    if (io->Fonts && io->Fonts->TexData) {
+        ImTextureData_SetTexID(io->Fonts->TexData, (ImTextureID)texture_id);
+        /* Mark texture as ready */
+        ImTextureData_SetStatus(io->Fonts->TexData, ImTextureStatus_OK);
+    }
+#else
+    (void)texture_id;
 #endif
 }

@@ -450,6 +450,35 @@ void coex_imgui_push_style_var_vec2(int64_t idx, double x, double y);
  */
 void coex_imgui_pop_style_var(int64_t count);
 
+/* ============================================================================
+ * Font Atlas
+ * ============================================================================ */
+
+/**
+ * Build the font atlas and get texture data.
+ * Call this before creating the font texture in the renderer.
+ *
+ * @param out_pixels      Receives pointer to pixel data (owned by ImGui, don't free)
+ * @param out_width       Receives texture width
+ * @param out_height      Receives texture height
+ * @param out_bytes_per_pixel  Receives bytes per pixel (1 for alpha, 4 for RGBA)
+ * @return 1 on success, 0 on failure
+ */
+int64_t coex_imgui_get_font_tex_data_rgba32(
+    unsigned char** out_pixels,
+    int* out_width,
+    int* out_height,
+    int* out_bytes_per_pixel
+);
+
+/**
+ * Set the font texture ID after creating the texture.
+ * This tells ImGui what texture handle to use when rendering text.
+ *
+ * @param texture_id  Opaque texture handle (platform-specific)
+ */
+void coex_imgui_set_font_tex_id(void* texture_id);
+
 #ifdef __cplusplus
 }
 #endif
