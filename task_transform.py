@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Set, TYPE_CHECKING
 from llvmlite import ir
 
-from ast_nodes import FunctionDecl, FunctionKind, Type, Parameter
+from ast_nodes import FunctionDecl, FunctionKind, Type, Parameter, KindFunctionDecl
 from task_analysis import analyze_task, TaskAnalysis, SuspensionPoint, ControlFlowContext
 
 if TYPE_CHECKING:
@@ -101,6 +101,9 @@ class TaskTransformer:
         # First pass: analyze all tasks and create their frame types
         task_analyses = {}
         for func in task_functions:
+            # Skip KindFunctionDecl (user-defined kind functions)
+            if isinstance(func, KindFunctionDecl):
+                continue
             if func.kind != FunctionKind.TASK:
                 continue
             analysis = analyze_task(func, self._task_function_names)
