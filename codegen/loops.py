@@ -19,7 +19,7 @@ from ast_nodes import (
     SliceExpr, ListExpr, TupleExpr, RangeExpr, LambdaExpr, MapExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, Type, ListType,
     PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral, FunctionKind,
-    FunctionDecl, Parameter
+    FunctionDecl, Parameter, KindFunctionDecl
 )
 
 if TYPE_CHECKING:
@@ -1100,7 +1100,11 @@ class LoopGenerator:
             if isinstance(expr.callee, Identifier):
                 name = expr.callee.name
                 if name in cg.func_decls:
-                    return cg.func_decls[name].kind == FunctionKind.THREAD
+                    func_decl = cg.func_decls[name]
+                    # KindFunctionDecl doesn't have a 'kind' attribute
+                    if isinstance(func_decl, KindFunctionDecl):
+                        return False
+                    return func_decl.kind == FunctionKind.THREAD
         return False
 
     def _is_task_call(self, expr: Expr) -> bool:
@@ -1110,8 +1114,11 @@ class LoopGenerator:
             if isinstance(expr.callee, Identifier):
                 name = expr.callee.name
                 if name in cg.func_decls:
-                    kind = cg.func_decls[name].kind
-                    return kind in (FunctionKind.TASK, FunctionKind.THREAD)
+                    func_decl = cg.func_decls[name]
+                    # KindFunctionDecl doesn't have a 'kind' attribute
+                    if isinstance(func_decl, KindFunctionDecl):
+                        return False
+                    return func_decl.kind in (FunctionKind.TASK, FunctionKind.THREAD)
         return False
 
     def _extract_body_expr(self, body: list) -> Optional[Expr]:
