@@ -223,8 +223,39 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
             return 0;
         }
 
-        /* Use RGBA format (bytesPerPixel should be 4 from GetTexDataAsRGBA32) */
-        MTLPixelFormat pixelFormat = MTLPixelFormatRGBA8Unorm;
+        printf("Font texture: %dx%d, %d bytes per pixel\n", width, height, bytesPerPixel);
+
+        /* Determine pixel format based on source format */
+        MTLPixelFormat pixelFormat;
+        unsigned char* uploadPixels = pixels;
+        unsigned char* convertedPixels = NULL;
+        int uploadBytesPerPixel = bytesPerPixel;
+
+        if (bytesPerPixel == 1) {
+            /* Alpha8 format - convert to RGBA32 for proper rendering */
+            /* Each alpha byte becomes (255, 255, 255, alpha) */
+            pixelFormat = MTLPixelFormatRGBA8Unorm;
+            uploadBytesPerPixel = 4;
+            convertedPixels = (unsigned char*)malloc(width * height * 4);
+            if (!convertedPixels) {
+                fprintf(stderr, "coex_ui_metal_create_fonts_texture: Failed to allocate conversion buffer\n");
+                return 0;
+            }
+            for (int i = 0; i < width * height; i++) {
+                convertedPixels[i * 4 + 0] = 255;           /* R */
+                convertedPixels[i * 4 + 1] = 255;           /* G */
+                convertedPixels[i * 4 + 2] = 255;           /* B */
+                convertedPixels[i * 4 + 3] = pixels[i];     /* A */
+            }
+            uploadPixels = convertedPixels;
+            printf("Converted Alpha8 to RGBA32\n");
+        } else if (bytesPerPixel == 4) {
+            /* Already RGBA32 */
+            pixelFormat = MTLPixelFormatRGBA8Unorm;
+        } else {
+            fprintf(stderr, "coex_ui_metal_create_fonts_texture: Unsupported bytes per pixel: %d\n", bytesPerPixel);
+            return 0;
+        }
 
         /* Create Metal texture */
         MTLTextureDescriptor* texDesc = [MTLTextureDescriptor
@@ -238,6 +269,7 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
         _renderer.fontTexture = [_renderer.device newTextureWithDescriptor:texDesc];
         if (!_renderer.fontTexture) {
             fprintf(stderr, "coex_ui_metal_create_fonts_texture: Failed to create texture\n");
+            if (convertedPixels) free(convertedPixels);
             return 0;
         }
 
@@ -245,8 +277,11 @@ int64_t coex_ui_metal_create_fonts_texture(void) {
         MTLRegion region = MTLRegionMake2D(0, 0, width, height);
         [_renderer.fontTexture replaceRegion:region
                                  mipmapLevel:0
-                                   withBytes:pixels
-                                 bytesPerRow:width * bytesPerPixel];
+                                   withBytes:uploadPixels
+                                 bytesPerRow:width * uploadBytesPerPixel];
+
+        /* Free conversion buffer if we allocated one */
+        if (convertedPixels) free(convertedPixels);
 
         /* Store texture ID in ImGui */
         coex_imgui_set_font_tex_id((__bridge void*)_renderer.fontTexture);
@@ -262,6 +297,55 @@ void coex_ui_metal_invalidate_fonts_texture(void) {
 #ifdef COEX_UI_HAS_IMGUI
     _renderer.fontTexture = nil;
     coex_imgui_set_font_tex_id(NULL);
+#endif
+}
+
+int64_t coex_ui_metal_update_fonts_texture(void) {
+#ifdef COEX_UI_HAS_IMGUI
+    if (!_renderer.initialized || !_renderer.fontTexture) return 0;
+
+    ImGuiIO* io = igGetIO_Nil();
+    if (!io->Fonts || !io->Fonts->TexData) return 0;
+
+    ImTextureData* texData = io->Fonts->TexData;
+
+    /* Check if texture needs updating */
+    if (texData->Status != ImTextureStatus_WantUpdates) {
+        return 1; /* No update needed */
+    }
+
+    @autoreleasepool {
+        /* Re-upload the entire texture */
+        unsigned char* pixels = texData->Pixels;
+        int width = texData->Width;
+        int height = texData->Height;
+        int bytesPerPixel = texData->BytesPerPixel;
+
+        if (!pixels || width <= 0 || height <= 0) {
+            return 0;
+        }
+
+        /* Check if texture size changed - need to recreate */
+        if (width != (int)_renderer.fontTexture.width || height != (int)_renderer.fontTexture.height) {
+            /* Size changed - recreate texture */
+            coex_ui_metal_invalidate_fonts_texture();
+            return coex_ui_metal_create_fonts_texture();
+        }
+
+        /* Same size - just update the data */
+        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+        [_renderer.fontTexture replaceRegion:region
+                                 mipmapLevel:0
+                                   withBytes:pixels
+                                 bytesPerRow:width * bytesPerPixel];
+
+        /* Mark texture as OK */
+        ImTextureData_SetStatus(texData, ImTextureStatus_OK);
+    }
+
+    return 1;
+#else
+    return 0;
 #endif
 }
 

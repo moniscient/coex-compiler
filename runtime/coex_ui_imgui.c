@@ -48,6 +48,9 @@ int64_t coex_imgui_init(void) {
     /* Tell ImGui our backend handles textures */
     io->BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
+    /* Request RGBA32 format for font texture (easier to work with in Metal/OpenGL) */
+    io->Fonts->TexDesiredFormat = ImTextureFormat_RGBA32;
+
     /* Add default font so there's something to render */
     ImFontAtlas_AddFontDefault(io->Fonts, NULL);
 
@@ -72,17 +75,23 @@ void coex_imgui_shutdown(void) {
 #endif
 }
 
-void coex_imgui_new_frame(int64_t width, int64_t height, double delta_time) {
+void coex_imgui_new_frame_scaled(int64_t width, int64_t height, float scale_x, float scale_y, double delta_time) {
 #ifdef COEX_UI_HAS_IMGUI
     if (!_imgui_initialized) return;
 
     ImGuiIO* io = igGetIO_Nil();
     io->DisplaySize.x = (float)width;
     io->DisplaySize.y = (float)height;
+    io->DisplayFramebufferScale.x = scale_x;
+    io->DisplayFramebufferScale.y = scale_y;
     io->DeltaTime = delta_time > 0.0 ? (float)delta_time : 1.0f / 60.0f;
 
     igNewFrame();
 #endif
+}
+
+void coex_imgui_new_frame(int64_t width, int64_t height, double delta_time) {
+    coex_imgui_new_frame_scaled(width, height, 1.0f, 1.0f, delta_time);
 }
 
 void coex_imgui_render(void) {
@@ -648,18 +657,42 @@ int64_t coex_imgui_get_font_tex_data_rgba32(
 
     /* Modern cimgui uses TexData structure */
     ImTextureData* texData = io->Fonts->TexData;
-    if (!texData || !texData->Pixels) {
-        /*
-         * Font atlas hasn't been built yet.
-         * With RendererHasTextures flag set, the build will happen on first NewFrame.
-         * For now, return failure - caller should retry after NewFrame.
-         */
-        fprintf(stderr, "coex_imgui_get_font_tex_data_rgba32: Font atlas not built yet (TexData=%p)\n", (void*)texData);
+    if (!texData) {
+        fprintf(stderr, "coex_imgui_get_font_tex_data_rgba32: TexData is NULL\n");
         return 0;
     }
 
-    /* Get pixel data using ImTextureData_GetPixels */
-    *out_pixels = (unsigned char*)ImTextureData_GetPixels(texData);
+    fprintf(stderr, "DEBUG: TexData=%p, Width=%d, Height=%d, BytesPerPixel=%d, Format=%d, Pixels=%p\n",
+            (void*)texData, texData->Width, texData->Height, texData->BytesPerPixel,
+            (int)texData->Format, (void*)texData->Pixels);
+    fprintf(stderr, "DEBUG: TexDesiredFormat=%d (RGBA32=%d, Alpha8=%d)\n",
+            (int)io->Fonts->TexDesiredFormat, (int)ImTextureFormat_RGBA32, (int)ImTextureFormat_Alpha8);
+
+    /* Dump first 32 bytes of pixel data to see what it looks like */
+    if (texData->Pixels) {
+        fprintf(stderr, "DEBUG: First 32 bytes of pixel data:\n");
+        for (int i = 0; i < 32; i++) {
+            fprintf(stderr, "%02x ", texData->Pixels[i]);
+            if ((i + 1) % 16 == 0) fprintf(stderr, "\n");
+        }
+        /* Find first non-zero pixel */
+        int firstNonZero = -1;
+        for (int i = 0; i < texData->Width * texData->Height * texData->BytesPerPixel; i++) {
+            if (texData->Pixels[i] != 0) {
+                firstNonZero = i;
+                break;
+            }
+        }
+        fprintf(stderr, "DEBUG: First non-zero byte at offset %d\n", firstNonZero);
+    }
+
+    if (!texData->Pixels) {
+        fprintf(stderr, "coex_imgui_get_font_tex_data_rgba32: Pixels is NULL\n");
+        return 0;
+    }
+
+    /* Get pixel data - use direct access since GetPixels might return NULL */
+    *out_pixels = texData->Pixels;
     *out_width = texData->Width;
     *out_height = texData->Height;
     if (out_bytes_per_pixel) *out_bytes_per_pixel = texData->BytesPerPixel;

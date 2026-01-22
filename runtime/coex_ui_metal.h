@@ -58,6 +58,14 @@ void coex_ui_metal_render(
  */
 void coex_ui_metal_invalidate_fonts_texture(void);
 
+/**
+ * Update font texture if ImGui requests it.
+ * Call this each frame to handle dynamic glyph loading.
+ *
+ * @return 1 on success, 0 on failure
+ */
+int64_t coex_ui_metal_update_fonts_texture(void);
+
 #ifdef __cplusplus
 }
 #endif

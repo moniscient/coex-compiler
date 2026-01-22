@@ -968,11 +968,14 @@ void coex_ui_begin_frame(void) {
     double delta = now - _ui_state.last_frame_time;
     _ui_state.last_frame_time = now;
 
-    /* Get display size */
+    /* Get window size (in points) and scale factor for HiDPI */
     int64_t width, height;
-    coex_ui_shell_get_framebuffer_size(&width, &height);
+    coex_ui_shell_get_size(&width, &height);
 
-    /* Update ImGui input */
+    float scale_x, scale_y;
+    coex_ui_shell_get_content_scale(&scale_x, &scale_y);
+
+    /* Update ImGui input - mouse coords are in points */
     double mx, my;
     coex_ui_shell_get_mouse_pos(&mx, &my);
     coex_imgui_io_set_mouse_pos(mx, my);
@@ -991,7 +994,7 @@ void coex_ui_begin_frame(void) {
 
     /* Begin platform and ImGui frames */
     coex_ui_shell_begin_frame();
-    coex_imgui_new_frame(width, height, delta);
+    coex_imgui_new_frame_scaled(width, height, scale_x, scale_y, delta);
 
     /* Create font texture on first frame (after NewFrame builds the font atlas) */
     if (!_ui_state.font_texture_created) {
@@ -1013,6 +1016,9 @@ void coex_ui_end_frame(void) {
     coex_imgui_render();
 
 #ifdef __APPLE__
+    /* Update font texture if needed (for dynamic glyph loading) */
+    coex_ui_metal_update_fonts_texture();
+
     /* Render with Metal */
     void* draw_data = coex_imgui_get_draw_data();
     void* command_buffer = coex_ui_shell_create_command_buffer();

@@ -52,11 +52,22 @@ void coex_imgui_shutdown(void);
  * Start a new ImGui frame.
  * Must be called once per frame before any widget calls.
  *
- * @param width   Display width
- * @param height  Display height
+ * @param width   Display width in points
+ * @param height  Display height in points
  * @param delta_time  Time since last frame in seconds
  */
 void coex_imgui_new_frame(int64_t width, int64_t height, double delta_time);
+
+/**
+ * Start a new ImGui frame with HiDPI scale factor.
+ *
+ * @param width   Display width in points
+ * @param height  Display height in points
+ * @param scale_x  Framebuffer scale X (e.g., 2.0 for Retina)
+ * @param scale_y  Framebuffer scale Y
+ * @param delta_time  Time since last frame in seconds
+ */
+void coex_imgui_new_frame_scaled(int64_t width, int64_t height, float scale_x, float scale_y, double delta_time);
 
 /**
  * End ImGui frame and generate draw data.
