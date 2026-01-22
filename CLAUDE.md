@@ -217,6 +217,59 @@ print(text)          # OK - text was not moved
 
 Use `:=` when you want to explicitly transfer ownership and catch accidental reuse of the source variable.
 
+### The := Operator and Flattening
+
+The `:=` operator has a unified semantic meaning across Coex: "flatten to value immediately." This applies in several contexts:
+
+1. **Collections**: Deep copy (escape shared heap reference)
+2. **Concurrent operations**: Immediate await (escape deferred execution)
+3. **Lazy expressions**: Eager evaluation (escape thunk deferral)
+4. **JSON serialization**: Deep-copy and serialize (escape Coex runtime entirely)
+
+### JSON Type and Deep-Copy Invariant
+
+**INVARIANT**: The JSON type always contains deep-copied values. JSON is a serialization format designed to leave the Coex runtime (FFI, file I/O, network), so it must never contain handles or references to Coex objects—only concrete, serialized values.
+
+**Assignment Rule**: When assigning to a `json`-typed variable:
+- `json_var = <expr>` — RHS must already be type `json` (e.g., JSON literal, `json.parse()` result, or another json variable)
+- `json_var := <expr>` — Any type allowed; value is deep-copied and serialized to JSON
+
+```coex
+# JSON literals are already json type
+j: json = { name: "Alice", age: 30 }    # OK - literal is json
+
+# json.parse() returns json
+j: json = json.parse(str)               # OK - parse returns json
+
+# json-to-json assignment is OK with =
+j2: json = j.get("name")                # OK - .get() returns json
+
+# Non-JSON to JSON requires :=
+my_list = [1, 2, 3]
+j: json = my_list                       # ERROR: must use :=
+j: json := my_list                      # OK: deep-copy to JSON
+
+# UDT to JSON requires :=
+p: Person = Person(name: "Bob", age: 25)
+j: json = p                             # ERROR: must use :=
+j: json := p                            # OK: serialize UDT to JSON
+```
+
+**Function Parameters and Return Types**: When a function parameter or return type is `json`, conversion happens automatically without requiring `:=` at the call site—the function signature already declares the intent to serialize.
+
+```coex
+func send_to_api(data: json) -> int
+    # data is already serialized json
+    ...
+~
+
+func main() -> int
+    my_data = [1, 2, 3]
+    send_to_api(my_data)    # OK - param type implies conversion
+    return 0
+~
+```
+
 ### Bindings: `const` vs Rebindable
 
 Coex uses `const` for non-rebindable bindings. Bare identifier declarations are rebindable by default:

@@ -17,7 +17,8 @@ from ast_nodes import (
     PrimitiveType, NamedType, ListType, OptionalType, ResultType,
     TupleType, FunctionType, MapType, SetType, ArrayType,
     IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, Identifier,
-    ListExpr, MapExpr, SetExpr, JsonObjectExpr, CallExpr, MemberExpr, IndexExpr
+    ListExpr, MapExpr, SetExpr, JsonObjectExpr, CallExpr, MemberExpr, IndexExpr,
+    MethodCallExpr
 )
 
 if TYPE_CHECKING:
@@ -273,6 +274,10 @@ class GenericsHandler:
         elif isinstance(expr, Identifier):
             # Look up variable type
             name = expr.name
+            # First check var_coex_types which tracks Coex types directly
+            if hasattr(cg, 'var_coex_types') and name in cg.var_coex_types:
+                return cg.var_coex_types[name]
+            # Fall back to LLVM type lookup
             if name in cg.locals:
                 llvm_type = cg.locals[name].type.pointee
                 return self.llvm_type_to_coex(llvm_type)
@@ -295,6 +300,33 @@ class GenericsHandler:
                 return SetType(elem_type)
             return SetType(PrimitiveType("int"))
         elif isinstance(expr, CallExpr):
+            # Check for method calls via MemberExpr callee (e.g., j.get(), json.parse())
+            if isinstance(expr.callee, MemberExpr):
+                # Check for method calls on json variables (e.g., j.get())
+                if isinstance(expr.callee.object, Identifier):
+                    obj_name = expr.callee.object.name
+                    # Check if this is a method call on a json variable
+                    if hasattr(cg, 'var_coex_types') and obj_name in cg.var_coex_types:
+                        obj_type = cg.var_coex_types[obj_name]
+                        if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
+                            # JSON method calls
+                            method = expr.callee.member
+                            if method in ("get", "set", "remove"):
+                                return PrimitiveType("json")
+                            elif method == "stringify":
+                                return PrimitiveType("string")
+                            elif method in ("as_int", "len"):
+                                return PrimitiveType("int")
+                            elif method == "as_float":
+                                return PrimitiveType("float")
+                            elif method in ("as_bool", "is_null", "is_bool", "is_int", "is_float",
+                                            "is_string", "is_array", "is_object", "has"):
+                                return PrimitiveType("bool")
+                            elif method == "as_string":
+                                return PrimitiveType("string")
+                    # Check for json.parse()
+                    elif obj_name == "json" and expr.callee.member == "parse":
+                        return PrimitiveType("json")
             # Check if this is a type constructor call (e.g., Point(10, 20))
             func_name = expr.callee.name if isinstance(expr.callee, Identifier) else None
             if func_name and func_name in cg.type_fields:
@@ -324,6 +356,29 @@ class GenericsHandler:
             # For maps, return value type
             if isinstance(obj_type, MapType):
                 return obj_type.value_type
+        elif isinstance(expr, MethodCallExpr):
+            # Check the receiver type and method name
+            obj_type = self.infer_type_from_expr(expr.object)
+            if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
+                # JSON methods that return JSON
+                if expr.method in ("get", "set", "remove"):
+                    return PrimitiveType("json")
+                # JSON methods that return primitives
+                elif expr.method == "stringify":
+                    return PrimitiveType("string")
+                elif expr.method in ("as_int", "len"):
+                    return PrimitiveType("int")
+                elif expr.method == "as_float":
+                    return PrimitiveType("float")
+                elif expr.method in ("as_bool", "is_null", "is_bool", "is_int", "is_float",
+                                      "is_string", "is_array", "is_object", "has"):
+                    return PrimitiveType("bool")
+                elif expr.method == "as_string":
+                    return PrimitiveType("string")
+                elif expr.method == "keys":
+                    return ListType(PrimitiveType("string"))
+                elif expr.method == "values":
+                    return ListType(PrimitiveType("json"))
 
         # Default
         return PrimitiveType("int")

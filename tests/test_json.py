@@ -58,7 +58,7 @@ class TestJsonPrimitives:
         """JSON nil literal."""
         expect_output('''
 func main() -> int
-    j: json = nil
+    j: json := nil
     print(1)
     return 0
 ~
@@ -68,7 +68,7 @@ func main() -> int
         """JSON true literal."""
         expect_output('''
 func main() -> int
-    j: json = true
+    j: json := true
     print(1)
     return 0
 ~
@@ -78,7 +78,7 @@ func main() -> int
         """JSON false literal."""
         expect_output('''
 func main() -> int
-    j: json = false
+    j: json := false
     print(1)
     return 0
 ~
@@ -88,7 +88,7 @@ func main() -> int
         """JSON integer literal."""
         expect_output('''
 func main() -> int
-    j: json = 42
+    j: json := 42
     print(1)
     return 0
 ~
@@ -98,7 +98,7 @@ func main() -> int
         """JSON float literal."""
         expect_output('''
 func main() -> int
-    j: json = 3.14
+    j: json := 3.14
     print(1)
     return 0
 ~
@@ -108,7 +108,7 @@ func main() -> int
         """JSON string literal."""
         expect_output('''
 func main() -> int
-    j: json = "hello"
+    j: json := "hello"
     print(1)
     return 0
 ~
@@ -226,7 +226,7 @@ class TestJsonTypeMethods:
         """is_null() returns true for nil."""
         expect_output('''
 func main() -> int
-    j: json = nil
+    j: json := nil
     if j.is_null()
         print(1)
     else
@@ -254,7 +254,7 @@ func main() -> int
         """is_bool() returns true for boolean."""
         expect_output('''
 func main() -> int
-    j: json = true
+    j: json := true
     if j.is_bool()
         print(1)
     else
@@ -268,7 +268,7 @@ func main() -> int
         """is_int() returns true for integer."""
         expect_output('''
 func main() -> int
-    j: json = 42
+    j: json := 42
     if j.is_int()
         print(1)
     else
@@ -282,7 +282,7 @@ func main() -> int
         """is_float() returns true for float."""
         expect_output('''
 func main() -> int
-    j: json = 3.14
+    j: json := 3.14
     if j.is_float()
         print(1)
     else
@@ -296,7 +296,7 @@ func main() -> int
         """is_string() returns true for string."""
         expect_output('''
 func main() -> int
-    j: json = "hello"
+    j: json := "hello"
     if j.is_string()
         print(1)
     else
@@ -466,7 +466,7 @@ type Person:
 
 func main() -> int
     p: Person = Person(name: "Alice", age: 30)
-    j: json = p
+    j: json := p
     if j.is_object()
         print(1)
     else
@@ -486,7 +486,7 @@ type Person:
 
 func main() -> int
     p: Person = Person(name: "Bob", age: 25)
-    j: json = p
+    j: json := p
     if j.has("_type")
         print(1)
     else
@@ -506,7 +506,7 @@ type Point:
 
 func main() -> int
     pt: Point = Point(x: 10, y: 20)
-    j: json = pt
+    j: json := pt
     print(j.len())
     return 0
 ~
@@ -523,7 +523,7 @@ type Color:
 
 func main() -> int
     c: Color = Color.Red
-    j: json = c
+    j: json := c
     if j.is_object()
         print(1)
     else
@@ -543,7 +543,7 @@ type Status:
 
 func main() -> int
     s: Status = Status.Active
-    j: json = s
+    j: json := s
     if j.has("_variant")
         print(1)
     else
@@ -563,7 +563,7 @@ type Outcome:
 
 func main() -> int
     r: Outcome = Outcome.Success(42)
-    j: json = r
+    j: json := r
     if j.has("value")
         print(1)
     else
@@ -588,7 +588,7 @@ type Outer:
 func main() -> int
     i: Inner = Inner(value: 99)
     o: Outer = Outer(inner: i, name: "test")
-    j: json = o
+    j: json := o
     if j.is_object()
         print(1)
     else
@@ -608,7 +608,7 @@ type Container:
 
 func main() -> int
     c: Container = Container(items: [1, 2, 3], count: 3)
-    j: json = c
+    j: json := c
     print(j.len())
     return 0
 ~
@@ -635,7 +635,7 @@ func main() -> int
     l3: Level3 = Level3(value: 42)
     l2: Level2 = Level2(nested: l3, label: "test")
     l1: Level1 = Level1(child: l2, id: 1)
-    j: json = l1
+    j: json := l1
     if j.is_object()
         print(1)
     else
@@ -660,7 +660,7 @@ type User:
 
 func main() -> int
     u: User = User(name: "Alice", status: Status.Active)
-    j: json = u
+    j: json := u
     if j.is_object()
         print(1)
     else
@@ -678,7 +678,7 @@ class TestJsonToCoexConversion:
         """JSON integer can be cast to int."""
         expect_output('''
 func main() -> int
-    j: json = 42
+    j: json := 42
     n: int = j as int
     print(n)
     return 0
@@ -689,7 +689,7 @@ func main() -> int
         """JSON float can be cast to float."""
         expect_output('''
 func main() -> int
-    j: json = 3.14
+    j: json := 3.14
     f: float = j as float
     print(f)
     return 0
@@ -700,7 +700,7 @@ func main() -> int
         """JSON boolean can be cast to bool."""
         expect_output('''
 func main() -> int
-    j: json = true
+    j: json := true
     b: bool = j as bool
     if b
         print(1)
@@ -715,7 +715,7 @@ func main() -> int
         """JSON string can be cast to string."""
         expect_output('''
 func main() -> int
-    j: json = "hello"
+    j: json := "hello"
     s: string = j as string
     print(s.len())
     return 0
@@ -744,7 +744,7 @@ type Point:
 
 func main() -> int
     pt: Point = Point(x: 10, y: 20)
-    j: json = pt
+    j: json := pt
     pt2: Point = j as Point
     print(pt2.x)
     print(pt2.y)
@@ -760,7 +760,7 @@ class TestJsonSerialization:
         """Null JSON serializes to 'null'."""
         expect_output('''
 func main() -> int
-    j: json = nil
+    j: json := nil
     s: string = j as string
     print(s)
     return 0
@@ -771,7 +771,7 @@ func main() -> int
         """True JSON serializes to 'true'."""
         expect_output('''
 func main() -> int
-    j: json = true
+    j: json := true
     s: string = j as string
     print(s)
     return 0
@@ -782,7 +782,7 @@ func main() -> int
         """False JSON serializes to 'false'."""
         expect_output('''
 func main() -> int
-    j: json = false
+    j: json := false
     s: string = j as string
     print(s)
     return 0
@@ -793,7 +793,7 @@ func main() -> int
         """Int JSON serializes to number string."""
         expect_output('''
 func main() -> int
-    j: json = 42
+    j: json := 42
     s: string = j as string
     print(s)
     return 0
@@ -804,7 +804,7 @@ func main() -> int
         """Float JSON serializes to decimal string."""
         expect_output('''
 func main() -> int
-    j: json = 3.14
+    j: json := 3.14
     s: string = j as string
     print(s)
     return 0
@@ -815,7 +815,7 @@ func main() -> int
         """String JSON extraction returns unquoted string."""
         expect_output('''
 func main() -> int
-    j: json = "hello"
+    j: json := "hello"
     s: string = j as string
     print(s)
     return 0
@@ -826,7 +826,7 @@ func main() -> int
         """Array JSON serializes to bracket notation."""
         expect_output('''
 func main() -> int
-    j: json = [1, 2, 3]
+    j: json := [1, 2, 3]
     s: string = j as string
     print(s)
     return 0

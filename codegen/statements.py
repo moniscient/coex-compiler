@@ -22,7 +22,7 @@ from ast_nodes import (
     Identifier, MemberExpr, IndexExpr, CallExpr, MethodCallExpr,
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
     AssignOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
-    OptionalType, PrimitiveType, NamedType, AtomicType
+    OptionalType, PrimitiveType, NamedType, AtomicType, KindFunctionDecl, FunctionDecl
 )
 
 # Import uniqueness analysis for in-place mutation optimization
@@ -297,8 +297,11 @@ class StatementGenerator:
             if isinstance(expr.callee, Identifier):
                 name = expr.callee.name
                 if name in cg.func_decls:
-                    kind = cg.func_decls[name].kind
-                    return kind in (FunctionKind.THREAD, FunctionKind.TASK)
+                    func_decl = cg.func_decls[name]
+                    # KindFunctionDecl doesn't have a 'kind' attribute - it's a user-defined kind
+                    if isinstance(func_decl, KindFunctionDecl):
+                        return False
+                    return func_decl.kind in (FunctionKind.THREAD, FunctionKind.TASK)
         return False
 
     def _is_formula_call(self, expr) -> bool:
@@ -308,8 +311,11 @@ class StatementGenerator:
             if isinstance(expr.callee, Identifier):
                 name = expr.callee.name
                 if name in cg.func_decls:
-                    kind = cg.func_decls[name].kind
-                    return kind == FunctionKind.FORMULA
+                    func_decl = cg.func_decls[name]
+                    # KindFunctionDecl doesn't have a 'kind' attribute
+                    if isinstance(func_decl, KindFunctionDecl):
+                        return False
+                    return func_decl.kind == FunctionKind.FORMULA
         return False
 
     def _generate_fire_and_forget_call(self, expr: CallExpr):
@@ -595,6 +601,19 @@ class StatementGenerator:
             else:
                 init_value = cg._generate_expression(stmt.initializer)
         elif isinstance(stmt.type_annotation, PrimitiveType) and stmt.type_annotation.name == "json":
+            # IMPORTANT: Non-JSON values require := operator for explicit deep-copy semantics
+            # JSON is a serialization format that must contain fully flattened values
+            init_type = cg._infer_type_from_expr(stmt.initializer)
+            is_already_json = isinstance(init_type, PrimitiveType) and init_type.name == "json"
+
+            # If using = (not :=) with a non-JSON value, emit an error
+            if not stmt.is_copy and not is_already_json:
+                raise RuntimeError(
+                    f"Assignment to json variable '{stmt.name}' requires ':=' operator for non-JSON values. "
+                    f"Use '{stmt.name} := <expr>' to explicitly convert and deep-copy the value to JSON. "
+                    f"(Source type: {init_type})"
+                )
+
             init_value = cg._generate_expression(stmt.initializer)
             init_value = cg._convert_to_json(init_value, stmt.initializer)
         else:
@@ -706,6 +725,42 @@ class StatementGenerator:
             var_name = stmt.initializer.name
             if var_name in cg.var_coex_types:
                 inferred_coex_type = cg.var_coex_types[var_name]
+        elif isinstance(stmt.initializer, IndexExpr):
+            # Handle list indexing: v = vals[0] where vals: [json] -> v: json
+            index_obj = stmt.initializer.object
+            if isinstance(index_obj, Identifier):
+                obj_name = index_obj.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if isinstance(obj_type, ListType):
+                        inferred_coex_type = obj_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(index_obj, MemberExpr):
+                # Handle field access like call.param_values[0]
+                if isinstance(index_obj.object, Identifier):
+                    obj_name = index_obj.object.name
+                    if obj_name in cg.var_coex_types:
+                        obj_type = cg.var_coex_types[obj_name]
+                        if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                            for field_name, field_type in cg.type_fields[obj_type.name]:
+                                if field_name == index_obj.member:
+                                    if isinstance(field_type, ListType):
+                                        inferred_coex_type = field_type.element_type
+                                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                                    break
+        elif isinstance(stmt.initializer, MemberExpr):
+            # Handle field access: vals = call.param_values where call: KindCall
+            member_obj = stmt.initializer.object
+            if isinstance(member_obj, Identifier):
+                obj_name = member_obj.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                        for field_name, field_type in cg.type_fields[obj_type.name]:
+                            if field_name == stmt.initializer.member:
+                                inferred_coex_type = field_type
+                                cg.var_coex_types[stmt.name] = inferred_coex_type
+                                break
         elif isinstance(stmt.initializer, (MapExpr, ListExpr, SetExpr)):
             inferred_coex_type = cg._infer_type_from_expr(stmt.initializer)
             cg.var_coex_types[stmt.name] = inferred_coex_type
@@ -723,7 +778,13 @@ class StatementGenerator:
                         inferred_coex_type = ListType(PrimitiveType("string"))
                         cg.var_coex_types[stmt.name] = inferred_coex_type
         elif isinstance(stmt.initializer, CallExpr):
-            if isinstance(stmt.initializer.callee, MemberExpr):
+            if isinstance(stmt.initializer.callee, Identifier):
+                callee_name = stmt.initializer.callee.name
+                # Check if this is a type constructor call
+                if callee_name in cg.type_registry:
+                    inferred_coex_type = NamedType(callee_name)
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(stmt.initializer.callee, MemberExpr):
                 callee_member = stmt.initializer.callee
                 method_name = callee_member.member
                 receiver_type = cg._get_receiver_type(callee_member.object)

@@ -682,7 +682,12 @@ class JsonGenerator:
         builder.ret(json_ptr)
 
     def _implement_json_new_string(self):
-        """Implement json_new_string(String*): allocate a Json with string value."""
+        """Implement json_new_string(String*): allocate a Json with string value.
+
+        INVARIANT: JSON always deep-copies values. The string is copied so the JSON
+        owns its own independent copy. This ensures JSON captures a snapshot of values
+        at composition time, not references that could become stale.
+        """
         cg = self.cg
         func = cg.json_new_string
         func.args[0].name = "value"
@@ -691,6 +696,10 @@ class JsonGenerator:
 
         i8 = ir.IntType(8)
         i64 = ir.IntType(64)
+
+        # DEEP COPY: Create an independent copy of the string
+        # JSON must own its data, not share references with the source
+        copied_string = builder.call(cg.string_deep_copy, [func.args[0]])
 
         # Allocate Json struct
         json_size = ir.Constant(i64, 16)
@@ -702,15 +711,24 @@ class JsonGenerator:
         tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(ir.Constant(i64, self.JSON_TAG_STRING), tag_ptr)
 
-        # Set value (store pointer as i64)
+        # Set value (store pointer to COPIED string as i64)
         value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
-        value_i64 = builder.ptrtoint(func.args[0], i64)
+        value_i64 = builder.ptrtoint(copied_string, i64)
         builder.store(value_i64, value_ptr)
 
         builder.ret(json_ptr)
 
     def _implement_json_new_array(self):
-        """Implement json_new_array(List*): allocate a Json with array value."""
+        """Implement json_new_array(List*): allocate a Json with array value.
+
+        INVARIANT: JSON deep-copy semantics. The List* passed to this function
+        MUST be a freshly-created list that the JSON will own. The list must
+        contain Json* pointers (as i64) that are themselves independently-owned
+        values. Callers (convert_list_to_json_array, json_from_cjson) are
+        responsible for creating new lists with deep-copied Json elements.
+
+        This ensures the JSON array is a snapshot of values, not references.
+        """
         cg = self.cg
         func = cg.json_new_array
         func.args[0].name = "value"
@@ -730,7 +748,7 @@ class JsonGenerator:
         tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(ir.Constant(i64, self.JSON_TAG_ARRAY), tag_ptr)
 
-        # Set value (store pointer as i64)
+        # Set value (store pointer to owned list as i64)
         value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.ptrtoint(func.args[0], i64)
         builder.store(value_i64, value_ptr)
@@ -738,7 +756,17 @@ class JsonGenerator:
         builder.ret(json_ptr)
 
     def _implement_json_new_object(self):
-        """Implement json_new_object(Map*): allocate a Json with object value."""
+        """Implement json_new_object(Map*): allocate a Json with object value.
+
+        INVARIANT: JSON deep-copy semantics. The Map* passed to this function
+        MUST be a freshly-created map that the JSON will own. The map must
+        contain String* keys (which are immutable literals or deep-copied)
+        and Json* values (as i64) that are independently-owned values.
+        Callers (generate_json_object, json_from_cjson) are responsible for
+        creating new maps with properly-owned keys and deep-copied Json values.
+
+        This ensures the JSON object is a snapshot of values, not references.
+        """
         cg = self.cg
         func = cg.json_new_object
         func.args[0].name = "value"
@@ -758,7 +786,7 @@ class JsonGenerator:
         tag_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         builder.store(ir.Constant(i64, self.JSON_TAG_OBJECT), tag_ptr)
 
-        # Set value (store pointer as i64)
+        # Set value (store pointer to owned map as i64)
         value_ptr = builder.gep(json_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         value_i64 = builder.ptrtoint(func.args[0], i64)
         builder.store(value_i64, value_ptr)
@@ -2797,24 +2825,28 @@ class JsonGenerator:
             elif field_type.name == "bool":
                 return builder.call(cg.json_new_bool, [field_val])
             elif field_type.name == "string":
-                # field_val is i64 (pointer as int), convert back to pointer
+                # field_val is i64 GC handle - dereference to get pointer
+                # (strings are reference types stored as handles in UDT fields)
                 if isinstance(field_val.type, ir.IntType):
-                    str_ptr = builder.inttoptr(field_val, cg.string_struct.as_pointer())
+                    ptr_i8 = builder.call(cg.gc.gc_handle_deref, [field_val])
+                    str_ptr = builder.bitcast(ptr_i8, cg.string_struct.as_pointer())
                 else:
                     str_ptr = field_val
                 return builder.call(cg.json_new_string, [str_ptr])
 
-        # Handle collections
+        # Handle collections - stored as i64 GC handles in UDT fields
         if isinstance(field_type, ListType):
             if isinstance(field_val.type, ir.IntType):
-                list_ptr = builder.inttoptr(field_val, cg.list_struct.as_pointer())
+                ptr_i8 = builder.call(cg.gc.gc_handle_deref, [field_val])
+                list_ptr = builder.bitcast(ptr_i8, cg.list_struct.as_pointer())
             else:
                 list_ptr = field_val
             return builder.call(cg.json_new_array, [list_ptr])
 
         if isinstance(field_type, MapType):
             if isinstance(field_val.type, ir.IntType):
-                map_ptr = builder.inttoptr(field_val, cg.map_struct.as_pointer())
+                ptr_i8 = builder.call(cg.gc.gc_handle_deref, [field_val])
+                map_ptr = builder.bitcast(ptr_i8, cg.map_struct.as_pointer())
             else:
                 map_ptr = field_val
             return builder.call(cg.json_new_object, [map_ptr])

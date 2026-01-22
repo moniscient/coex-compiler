@@ -939,6 +939,19 @@ class CodeGenerator:
         gpu_funcs = {'coex_metal_matmul', 'coex_metal_matmul_f32_native'}
         return any(fn in self.extern_function_decls for fn in gpu_funcs)
 
+    def uses_ui(self) -> bool:
+        """Check if the compiled program uses the UI library.
+
+        Returns True if any coex_ui_* functions are used, which requires linking
+        libcoex_ui.a along with Cocoa, Metal, and QuartzCore frameworks.
+        """
+        if not hasattr(self, 'extern_function_decls'):
+            return False
+        ui_funcs = {'coex_ui_init', 'coex_ui_shutdown', 'coex_ui_should_close',
+                    'coex_ui_get_time', 'coex_ui_render_json', 'coex_ui_free_json',
+                    'coex_ui_begin_frame', 'coex_ui_end_frame'}
+        return any(fn in self.extern_function_decls for fn in ui_funcs)
+
     # ========================================================================
     # User-Defined Kind Validation
     # ========================================================================
@@ -1305,9 +1318,14 @@ class CodeGenerator:
         """Convert a C return value back to Coex type.
 
         Since Coex int is 64-bit and maps to C int64_t, no conversion needed.
-        For most types, the value passes through unchanged.
+        String requires special handling: convert C char* to Coex String*.
         """
-        # No conversion needed - types match between Coex and C ABI
+        if isinstance(coex_type, PrimitiveType):
+            if coex_type.name == "string":
+                # Convert C char* to Coex String using string_from_literal
+                # This handles null-terminated C strings and creates a proper Coex String
+                return self.builder.call(self.string_from_literal, [value])
+        # For other types, no conversion needed
         return value
 
     def _declare_function(self, func):
@@ -1700,7 +1718,22 @@ class CodeGenerator:
                 # Default to JSON (which is what JsonObjectExpr([]) generates)
                 init_value = self._generate_expression(stmt.initializer)
         # Handle assignment to json type - convert primitives to JSON
+        # IMPORTANT: Non-JSON values require := operator for explicit deep-copy semantics
+        # JSON is a serialization format that must contain fully flattened values
         elif isinstance(stmt.type_annotation, PrimitiveType) and stmt.type_annotation.name == "json":
+            # Infer the type of the initializer to check if it's already JSON
+            init_type = self._infer_type_from_expr(stmt.initializer)
+            is_already_json = isinstance(init_type, PrimitiveType) and init_type.name == "json"
+
+            # If using = (not :=) with a non-JSON value, emit an error
+            if not stmt.is_copy and not is_already_json:
+                init_desc = type(stmt.initializer).__name__
+                raise RuntimeError(
+                    f"Assignment to json variable '{stmt.name}' requires ':=' operator for non-JSON values. "
+                    f"Use '{stmt.name} := <expr>' to explicitly convert and deep-copy the value to JSON. "
+                    f"(Source type: {init_type})"
+                )
+
             init_value = self._generate_expression(stmt.initializer)
             init_value = self._convert_to_json(init_value, stmt.initializer)
         else:
