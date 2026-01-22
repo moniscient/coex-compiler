@@ -391,8 +391,7 @@ static int translate_modifiers(NSEventModifierFlags flags) {
 @implementation CoexUIAppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    [NSApp activateIgnoringOtherApps:YES];
+    /* Activation is now handled in coex_ui_shell_init for CLI apps */
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -439,9 +438,15 @@ int64_t coex_ui_shell_init(const char* title, int64_t width, int64_t height, int
         /* Initialize application */
         [NSApplication sharedApplication];
 
+        /* Set activation policy BEFORE finishing launch - required for CLI apps */
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
         /* Create app delegate */
         _ui_state.app_delegate = [[CoexUIAppDelegate alloc] init];
         [NSApp setDelegate:_ui_state.app_delegate];
+
+        /* Finish launching to process activation */
+        [NSApp finishLaunching];
 
         /* Get Metal device */
         _ui_state.metal_device = MTLCreateSystemDefaultDevice();
@@ -506,8 +511,17 @@ int64_t coex_ui_shell_init(const char* title, int64_t width, int64_t height, int
         [_ui_state.window makeKeyAndOrderFront:nil];
         [_ui_state.view.window makeFirstResponder:_ui_state.view];
 
-        /* Run app activation */
-        [NSApp finishLaunching];
+        /* Activate app - required for CLI apps to receive mouse events */
+        [NSApp activateIgnoringOtherApps:YES];
+
+        /* Process pending events to complete activation */
+        NSEvent* event;
+        while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                           untilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]
+                                              inMode:NSDefaultRunLoopMode
+                                             dequeue:YES])) {
+            [NSApp sendEvent:event];
+        }
 
         _ui_state.initialized = 1;
     }
