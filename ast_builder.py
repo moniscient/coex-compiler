@@ -1436,14 +1436,14 @@ class ASTBuilder:
 
             for entry in ctx.mapEntryList().mapEntry():
                 # Check which alternative matched in mapEntry:
-                # 1. IDENTIFIER COLON expression -> JSON-style bare identifier key
+                # 1. jsonKey COLON expression -> JSON-style bare identifier/keyword key
                 # 2. stringLiteral COLON expression -> Map-style string literal key
                 # 3. LPAREN expression RPAREN COLON expression -> Map-style parenthesized key
                 # 4. expression COLON expression -> Map-style expression key
 
-                if entry.IDENTIFIER():
-                    # JSON-style: bare identifier key (e.g., {name: "Alice"})
-                    key_str = entry.IDENTIFIER().getText()
+                if entry.jsonKey():
+                    # JSON-style: bare identifier or keyword key (e.g., {name: "Alice", type: "window"})
+                    key_str = entry.jsonKey().getText()
                     value = self.visit_expression(entry.expression(0))
                     json_entries.append((key_str, value))
                     has_json_key = True

@@ -39,13 +39,13 @@
 # =============================================================================
 
 extern coex_ui_init(config: string) -> int ~
-extern coex_ui_shutdown() -> () ~
+extern coex_ui_shutdown() -> int ~
 extern coex_ui_should_close() -> int ~
 extern coex_ui_get_time() -> float ~
 extern coex_ui_render_json(layout: string, state: string) -> string ~
-extern coex_ui_free_json(json: string) -> () ~
-extern coex_ui_begin_frame() -> () ~
-extern coex_ui_end_frame() -> () ~
+extern coex_ui_free_json(json_str: string) -> int ~
+extern coex_ui_begin_frame() -> int ~
+extern coex_ui_end_frame() -> int ~
 
 # =============================================================================
 # High-Level API
@@ -60,20 +60,14 @@ extern coex_ui_end_frame() -> () ~
 #   - resizable: Whether window can be resized (bool, default true)
 #   - theme: "dark" or "light" (string, default "dark")
 #
-# Returns: Result<(), string> - Ok on success, Err with message on failure
-func init(config: json) -> Result<(), string>
-    config_str = json_to_string(config)
-    result = coex_ui_init(config_str)
-    if result == 1
-        return Ok(())
-    else
-        return Err("Failed to initialize UI")
-    ~
+# Returns: 1 on success, 0 on failure
+func initialize(config: json) -> int
+    return coex_ui_init(config.stringify())
 ~
 
 # Shut down the UI library and close the window.
-func shutdown() -> ()
-    coex_ui_shutdown()
+func close() -> int
+    return coex_ui_shutdown()
 ~
 
 # Check if the window should close (user clicked X, etc).
@@ -89,21 +83,13 @@ func get_time() -> float
 # Render a UI frame from layout and state.
 #
 # layout: JSON object describing the UI structure. See widget types below.
-# state: JSON object with current widget values (widget_id -> value)
+# state: State as JSON string with widget values (widget_id -> value)
 #
-# Returns: JSON object with:
-#   - state: Updated widget values
-#   - events: Array of events that occurred
-#
-# The returned state should be passed back to the next render() call
-# after processing any events/actions.
-func render(layout: json, state: json) -> json
-    layout_str = json_to_string(layout)
-    state_str = json_to_string(state)
-    result_str = coex_ui_render_json(layout_str, state_str)
-    result = json_from_string(result_str)
-    coex_ui_free_json(result_str)
-    return result
+# Returns: Updated state as JSON string.
+#   The returned state should be passed back to the next render() call
+#   after processing any events/actions.
+func render(layout: json, state: string) -> string
+    return coex_ui_render_json(layout.stringify(), state)
 ~
 
 # =============================================================================
@@ -112,13 +98,13 @@ func render(layout: json, state: json) -> json
 # =============================================================================
 
 # Begin a new frame for manual widget rendering.
-func begin_frame() -> ()
-    coex_ui_begin_frame()
+func begin_frame() -> int
+    return coex_ui_begin_frame()
 ~
 
 # End the current frame.
-func end_frame() -> ()
-    coex_ui_end_frame()
+func end_frame() -> int
+    return coex_ui_end_frame()
 ~
 
 # =============================================================================

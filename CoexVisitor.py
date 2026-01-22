@@ -519,6 +519,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#jsonKey.
+    def visitJsonKey(self, ctx:CoexParser.JsonKeyContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#lambdaExpr.
     def visitLambdaExpr(self, ctx:CoexParser.LambdaExprContext):
         return self.visitChildren(ctx)

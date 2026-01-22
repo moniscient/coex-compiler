@@ -454,6 +454,7 @@ static struct {
         char* id;
         char* buffer;
         int buffer_size;
+        int initialized;  /* Set to 1 after first initialization from state */
     } text_buffers[64];
     int text_buffer_count;
 } _ui_state;
@@ -481,8 +482,9 @@ static int get_bool(cJSON* obj, const char* key, int def) {
     return def;
 }
 
-static char* get_text_buffer(const char* id, int size) {
+static char* get_text_buffer(const char* id, int size, int* needs_init) {
     if (!id) return NULL;
+    if (needs_init) *needs_init = 0;
 
     /* Look for existing buffer */
     for (int i = 0; i < _ui_state.text_buffer_count; i++) {
@@ -492,6 +494,11 @@ static char* get_text_buffer(const char* id, int size) {
                 _ui_state.text_buffers[i].buffer = realloc(
                     _ui_state.text_buffers[i].buffer, size);
                 _ui_state.text_buffers[i].buffer_size = size;
+            }
+            /* Check if needs initialization */
+            if (needs_init && !_ui_state.text_buffers[i].initialized) {
+                *needs_init = 1;
+                _ui_state.text_buffers[i].initialized = 1;
             }
             return _ui_state.text_buffers[i].buffer;
         }
@@ -503,6 +510,8 @@ static char* get_text_buffer(const char* id, int size) {
         _ui_state.text_buffers[idx].id = strdup(id);
         _ui_state.text_buffers[idx].buffer = calloc(size, 1);
         _ui_state.text_buffers[idx].buffer_size = size;
+        _ui_state.text_buffers[idx].initialized = 1;
+        if (needs_init) *needs_init = 1;  /* New buffer needs initialization */
         return _ui_state.text_buffers[idx].buffer;
     }
 
@@ -515,6 +524,50 @@ static void add_event(const char* type, const char* id, cJSON* value) {
     if (id) cJSON_AddItemToObject(event, "id", cJSON_CreateString(id));
     if (value) cJSON_AddItemToObject(event, "value", value);
     cJSON_AddItemToArray(_ui_state.pending_events, event);
+}
+
+/* ============================================================================
+ * JSON Helper - Replace or Add Item
+ * ============================================================================ */
+
+/* Replace an existing key's value, or add if it doesn't exist.
+ * This avoids duplicate keys in the JSON object. */
+static void cJSON_ReplaceOrAddItemToObject(cJSON* object, const char* key, cJSON* item) {
+    if (!object || !key || !item) return;
+
+    /* Search for existing item with this key */
+    cJSON* existing = object->child;
+    cJSON* prev = NULL;
+
+    while (existing) {
+        if (existing->string && strcmp(existing->string, key) == 0) {
+            /* Found existing key - replace the value */
+            item->string = strdup(key);
+            item->next = existing->next;
+            item->prev = existing->prev;
+
+            if (prev) {
+                prev->next = item;
+            } else {
+                object->child = item;
+            }
+
+            if (existing->next) {
+                existing->next->prev = item;
+            }
+
+            /* Free the old item */
+            existing->next = NULL;
+            existing->prev = NULL;
+            cJSON_Delete(existing);
+            return;
+        }
+        prev = existing;
+        existing = existing->next;
+    }
+
+    /* Key not found - add new item */
+    cJSON_AddItemToObject(object, key, item);
 }
 
 /* ============================================================================
@@ -616,7 +669,7 @@ static void render_button(cJSON* widget, cJSON* state, cJSON* new_state) {
     if (clicked) {
         add_event("click", id ? id : label, NULL);
         if (action) {
-            cJSON_AddItemToObject(new_state, "_pending_action", cJSON_CreateString(action));
+            cJSON_ReplaceOrAddItemToObject(new_state, "_pending_action", cJSON_CreateString(action));
         }
     }
 }
@@ -630,7 +683,7 @@ static void render_checkbox(cJSON* widget, cJSON* state, cJSON* new_state) {
     int value = cJSON_IsTrue(state_val) ? 1 : 0;
 
     if (coex_imgui_checkbox(label, &value) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateBool(value));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateBool(value));
         add_event("change", id, cJSON_CreateBool(value));
     }
 }
@@ -646,7 +699,7 @@ static void render_slider_float(cJSON* widget, cJSON* state, cJSON* new_state) {
     double value = cJSON_IsNumber(state_val) ? cJSON_GetNumberValue(state_val) : min;
 
     if (coex_imgui_slider_float(label, &value, min, max) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateNumber(value));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateNumber(value));
         add_event("change", id, cJSON_CreateNumber(value));
     }
 }
@@ -662,7 +715,7 @@ static void render_slider_int(cJSON* widget, cJSON* state, cJSON* new_state) {
     int64_t value = cJSON_IsNumber(state_val) ? (int64_t)cJSON_GetNumberValue(state_val) : min;
 
     if (coex_imgui_slider_int(label, &value, min, max) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateNumber(value));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateNumber(value));
         add_event("change", id, cJSON_CreateNumber(value));
     }
 }
@@ -672,22 +725,30 @@ static void render_input_text(cJSON* widget, cJSON* state, cJSON* new_state) {
     const char* id = get_string(widget, "id", label);
     int buf_size = (int)get_number(widget, "max_length", 256);
 
-    char* buf = get_text_buffer(id, buf_size);
+    int needs_init = 0;
+    char* buf = get_text_buffer(id, buf_size, &needs_init);
     if (!buf) return;
 
-    /* Initialize from state */
-    cJSON* state_val = cJSON_GetObjectItem(state, id);
-    if (cJSON_IsString(state_val)) {
-        strncpy(buf, cJSON_GetStringValue(state_val), buf_size - 1);
-        buf[buf_size - 1] = 0;
+    /* Initialize from state only on first use - don't overwrite user's typing */
+    if (needs_init) {
+        cJSON* state_val = cJSON_GetObjectItem(state, id);
+        if (cJSON_IsString(state_val)) {
+            strncpy(buf, cJSON_GetStringValue(state_val), buf_size - 1);
+            buf[buf_size - 1] = 0;
+        }
     }
 
     int64_t flags = 0;
     if (get_bool(widget, "readonly", 0)) flags |= COEX_IMGUI_INPUT_TEXT_READONLY;
     if (get_bool(widget, "password", 0)) flags |= COEX_IMGUI_INPUT_TEXT_PASSWORD;
 
-    if (coex_imgui_input_text(label, buf, buf_size, flags) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateString(buf));
+    int result = coex_imgui_input_text(label, buf, buf_size, flags);
+
+    /* Always update state with current buffer contents (user may be mid-edit) */
+    cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateString(buf));
+
+    /* Only fire change event when edit is committed */
+    if (result & COEX_IMGUI_RESULT_CHANGED) {
         add_event("change", id, cJSON_CreateString(buf));
     }
 }
@@ -700,7 +761,7 @@ static void render_input_int(cJSON* widget, cJSON* state, cJSON* new_state) {
     int64_t value = cJSON_IsNumber(state_val) ? (int64_t)cJSON_GetNumberValue(state_val) : 0;
 
     if (coex_imgui_input_int(label, &value) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateNumber(value));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateNumber(value));
         add_event("change", id, cJSON_CreateNumber(value));
     }
 }
@@ -713,7 +774,7 @@ static void render_input_float(cJSON* widget, cJSON* state, cJSON* new_state) {
     double value = cJSON_IsNumber(state_val) ? cJSON_GetNumberValue(state_val) : 0;
 
     if (coex_imgui_input_float(label, &value) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateNumber(value));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateNumber(value));
         add_event("change", id, cJSON_CreateNumber(value));
     }
 }
@@ -739,7 +800,7 @@ static void render_combo(cJSON* widget, cJSON* state, cJSON* new_state) {
     int64_t selected = cJSON_IsNumber(state_val) ? (int64_t)cJSON_GetNumberValue(state_val) : 0;
 
     if (coex_imgui_combo(label, &selected, items, count) & COEX_IMGUI_RESULT_CHANGED) {
-        cJSON_AddItemToObject(new_state, id, cJSON_CreateNumber(selected));
+        cJSON_ReplaceOrAddItemToObject(new_state, id, cJSON_CreateNumber(selected));
         add_event("change", id, cJSON_CreateNumber(selected));
     }
 }
@@ -772,7 +833,7 @@ static void render_color_edit(cJSON* widget, cJSON* state, cJSON* new_state) {
         cJSON_AddItemToArray(arr, cJSON_CreateNumber(color[1]));
         cJSON_AddItemToArray(arr, cJSON_CreateNumber(color[2]));
         if (alpha) cJSON_AddItemToArray(arr, cJSON_CreateNumber(color[3]));
-        cJSON_AddItemToObject(new_state, id, arr);
+        cJSON_ReplaceOrAddItemToObject(new_state, id, arr);
         add_event("change", id, NULL);  /* Color array already in state */
     }
 }
@@ -992,6 +1053,16 @@ void coex_ui_begin_frame(void) {
         mods & COEX_UI_MOD_SUPER
     );
 
+    /* Process character input events and forward to ImGui */
+    CoexUIEvent event;
+    while (coex_ui_shell_poll_event(&event)) {
+        if (event.type == COEX_UI_EVENT_CHAR) {
+            coex_imgui_io_add_char(event.data.character.codepoint);
+        } else if (event.type == COEX_UI_EVENT_KEY) {
+            coex_imgui_io_set_key(event.data.key.keycode, event.data.key.pressed);
+        }
+    }
+
     /* Begin platform and ImGui frames */
     coex_ui_shell_begin_frame();
     coex_imgui_new_frame_scaled(width, height, scale_x, scale_y, delta);
@@ -1058,19 +1129,44 @@ const char* coex_ui_render_json(const char* layout_json, const char* state_json)
 
     /* Parse inputs */
     cJSON* layout = cJSON_Parse(layout_json ? layout_json : "{}");
-    cJSON* state = cJSON_Parse(state_json ? state_json : "{}");
+    cJSON* state_input = cJSON_Parse(state_json ? state_json : "{}");
 
-    if (!layout || !state) {
+    if (!layout || !state_input) {
         if (layout) cJSON_Delete(layout);
-        if (state) cJSON_Delete(state);
+        if (state_input) cJSON_Delete(state_input);
         return strdup("{\"state\":{},\"events\":[],\"error\":\"parse_error\"}");
+    }
+
+    /* Handle wrapped state format: {"state": {...}, "events": [...]}
+     * If state_input has a "state" field, use that as the actual state */
+    cJSON* state = cJSON_GetObjectItem(state_input, "state");
+    if (!state) {
+        state = state_input;  /* Use the input directly if not wrapped */
     }
 
     /* Begin frame */
     coex_ui_begin_frame();
 
-    /* Create output containers */
+    /* Create output containers - copy input state to preserve unchanged values */
     cJSON* new_state = cJSON_CreateObject();
+    if (state && state->child) {
+        cJSON* item = state->child;
+        while (item) {
+            if (item->string) {
+                /* Copy each item from input state */
+                if (cJSON_IsNumber(item)) {
+                    cJSON_AddItemToObject(new_state, item->string, cJSON_CreateNumber(cJSON_GetNumberValue(item)));
+                } else if (cJSON_IsTrue(item)) {
+                    cJSON_AddItemToObject(new_state, item->string, cJSON_CreateBool(1));
+                } else if (cJSON_IsFalse(item)) {
+                    cJSON_AddItemToObject(new_state, item->string, cJSON_CreateBool(0));
+                } else if (cJSON_IsString(item)) {
+                    cJSON_AddItemToObject(new_state, item->string, cJSON_CreateString(cJSON_GetStringValue(item)));
+                }
+            }
+            item = item->next;
+        }
+    }
 
     /* Clear pending events */
     cJSON_Delete(_ui_state.pending_events);
@@ -1082,18 +1178,13 @@ const char* coex_ui_render_json(const char* layout_json, const char* state_json)
     /* End frame */
     coex_ui_end_frame();
 
-    /* Build result */
-    cJSON* result = cJSON_CreateObject();
-    cJSON_AddItemToObject(result, "state", new_state);
-    cJSON_AddItemToObject(result, "events", _ui_state.pending_events);
-    _ui_state.pending_events = cJSON_CreateArray();  /* Create new array for next frame */
+    /* Return just the state (not wrapped) for simpler Coex-side handling */
+    char* output = cJSON_Print(new_state);
 
-    char* output = cJSON_Print(result);
-
-    /* Cleanup (note: new_state and events are now owned by result) */
-    cJSON_Delete(result);
+    /* Cleanup */
+    cJSON_Delete(new_state);
     cJSON_Delete(layout);
-    cJSON_Delete(state);
+    cJSON_Delete(state_input);
 
     return output;
 }

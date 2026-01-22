@@ -614,9 +614,9 @@
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2026-01-18)
-- **Open**: 10 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044)
-- **Resolved**: 36 bugs (including BUG-045: Metal double type fix)
+### Bug Count Summary (as of 2026-01-21)
+- **Open**: 11 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050)
+- **Resolved**: 39 bugs (including BUG-045: Metal double type fix, BUG-047/48/49: Parser and GPU fixes)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX
@@ -685,3 +685,39 @@
 - **Fix**: Changed check to `decl.kind in (FunctionKind.FORMULA, FunctionKind.FORMULA32)`
 - **Status**: Fixed (2026-01-19)
 
+### BUG-050: UI library shutdown segfault
+- **Discovered**: 2026-01-21, during UI performance test
+- **Category**: Runtime
+- **Severity**: Low
+- **Reproduction**: Run any UI test program (e.g., `./test_ui_performance`) and let it complete
+- **Observed**: Segmentation fault (signal 11) occurs after test prints success message during `coex_ui_shutdown()`
+- **Expected**: Clean shutdown without crash
+- **Hypothesis**: Cleanup ordering issue - ImGui context may be destroyed before Metal renderer releases resources that depend on it, or macOS Cocoa objects are being released in wrong order
+- **Files**: `runtime/coex_ui.c:coex_ui_shutdown()`, `runtime/coex_ui_imgui.c:coex_imgui_shutdown()`, `runtime/coex_ui_metal.m:coex_ui_metal_shutdown()`, `runtime/coex_ui_shell_macos.m:coex_ui_shell_shutdown()`
+- **Status**: Open
+- **Note**: Does not affect functionality - crash occurs after all test work completes successfully. Performance test achieves 103 FPS with 100 widgets before the shutdown crash.
+
+
+### BUG-051: json.parse returns empty object/array for complex JSON
+- **Discovered**: 2026-01-22, during UI library JSON literal integration
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: 
+  ```coex
+  func main() -> int
+      result: json = json.parse("{\"name\":\"Alice\",\"age\":30}")
+      print(result.stringify())  # Prints "{}" instead of the parsed object
+      return 0
+  ~
+  ```
+- **Observed**: `json.parse` returns empty `{}` for objects and empty `[]` for arrays regardless of input content. Primitives (null, true, false, numbers) parse correctly.
+- **Expected**: Full recursive parsing of JSON strings into Json objects
+- **Hypothesis**: The `_implement_json_parse` function in `codegen/json_type.py` has stub implementations for arrays and objects that just return empty containers:
+  ```python
+  # Parse array - simplified: return empty array for now
+  # Parse object - simplified: return empty object for now
+  ```
+- **Files**: `codegen/json_type.py:1949-1960` (`_implement_json_parse` method)
+- **Workaround**: Keep JSON as strings when round-tripping through FFI calls. Use `json.stringify()` for output but avoid `json.parse()` for complex structures.
+- **Fix Required**: Implement full recursive JSON parsing in LLVM IR, handling nested objects, arrays, string escapes, and number formats. Consider using a C helper function for parsing complexity.
+- **Status**: Open

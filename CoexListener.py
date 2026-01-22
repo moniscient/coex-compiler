@@ -926,6 +926,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#jsonKey.
+    def enterJsonKey(self, ctx:CoexParser.JsonKeyContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#jsonKey.
+    def exitJsonKey(self, ctx:CoexParser.JsonKeyContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#lambdaExpr.
     def enterLambdaExpr(self, ctx:CoexParser.LambdaExprContext):
         pass

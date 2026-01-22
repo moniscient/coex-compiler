@@ -554,8 +554,8 @@ tupleElement
 
 // List literals: [expr, expr, ...] or [expr for pattern in iterable if condition]
 listLiteral
-    : LBRACKET expressionList? RBRACKET                   // Regular list
-    | LBRACKET expression comprehensionClauses RBRACKET   // List comprehension
+    : LBRACKET NEWLINE* expressionList? NEWLINE* RBRACKET                   // Regular list
+    | LBRACKET NEWLINE* expression comprehensionClauses NEWLINE* RBRACKET   // List comprehension
     ;
 
 // Comprehension clauses: for pattern in iterable (if condition)?
@@ -568,32 +568,43 @@ comprehensionClause
     ;
 
 expressionList
-    : expression (COMMA expression)*
+    : expression (COMMA NEWLINE* expression)* COMMA?
     ;
 
 // Map/Set/JSON literals and comprehensions
 // JSON: {} or {name: "Alice", age: 30} (bare identifier or string keys)
 // Map: {1: 10, 2: 20} or {(var): value} (expression keys, use parens for variables)
 // Set: {a, b, c} (values only, no colons)
+// Note: NEWLINE* allows multi-line literals
 mapLiteral
-    : LBRACE RBRACE                                                  // Empty JSON object
-    | LBRACE mapEntryList RBRACE                                     // JSON or Map literal
-    | LBRACE expressionList RBRACE                                   // Set literal
-    | LBRACE expression COLON expression comprehensionClauses RBRACE // Map comprehension
-    | LBRACE expression comprehensionClauses RBRACE                  // Set comprehension
+    : LBRACE NEWLINE* RBRACE                                                  // Empty JSON object
+    | LBRACE NEWLINE* mapEntryList NEWLINE* RBRACE                            // JSON or Map literal
+    | LBRACE NEWLINE* expressionList NEWLINE* RBRACE                          // Set literal
+    | LBRACE NEWLINE* expression COLON expression comprehensionClauses NEWLINE* RBRACE // Map comprehension
+    | LBRACE NEWLINE* expression comprehensionClauses NEWLINE* RBRACE         // Set comprehension
     ;
 
 mapEntryList
-    : mapEntry (COMMA mapEntry)*
+    : mapEntry (COMMA NEWLINE* mapEntry)* COMMA?
     ;
 
 // Map entries with key type distinction for JSON vs Map disambiguation
 // Order matters: ANTLR uses ordered choice (PEG-style)
 mapEntry
-    : IDENTIFIER COLON expression                     // JSON-style: bare identifier key
+    : jsonKey COLON expression                        // JSON-style: identifier or keyword key
     | stringLiteral COLON expression                  // JSON-style: quoted string key
     | LPAREN expression RPAREN COLON expression       // Map-style: parenthesized variable key
     | expression COLON expression                     // Map-style: expression key (int, etc.)
+    ;
+
+// JSON keys can be identifiers or certain keywords that are commonly used as keys
+jsonKey
+    : IDENTIFIER
+    | TYPE      // Allow 'type' as JSON key
+    | KIND      // Allow 'kind' as JSON key
+    | INT_TYPE | FLOAT_TYPE | BOOL_TYPE | STRING_TYPE | BYTE_TYPE | CHAR_TYPE | JSON_TYPE
+    | TRUE | FALSE | NIL
+    | IN | ON | OFF | AS
     ;
 
 // Lambda expressions: formula(_ x: int) => x * x
