@@ -1,0 +1,43 @@
+# UI Playground - Interactive Demo
+# Compile: python3 coexc.py examples/ui_playground.coex -o ui_playground
+# Run: ./ui_playground
+import ui
+
+func main() -> int
+    print("=== Coex UI Playground ===")
+    print("A window will open. Interact with the widgets!")
+    print("Close the window when done.")
+
+    # Initialize with a nice window size
+    config = "{\"title\": \"Coex UI Playground\", \"width\": 500, \"height\": 450}"
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    print("UI initialized. Window should be visible now.")
+
+    # A rich layout with many widget types
+    layout = "{\"type\": \"window\", \"title\": \"Coex UI Playground\", \"children\": [{\"type\": \"text\", \"text\": \"Welcome to Coex UI!\"}, {\"type\": \"text\", \"text\": \"This is a live ImGui window rendered from Coex.\"}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Buttons:\"}, {\"type\": \"row\", \"children\": [{\"type\": \"button\", \"label\": \"Button A\", \"id\": \"btnA\"}, {\"type\": \"button\", \"label\": \"Button B\", \"id\": \"btnB\"}, {\"type\": \"button\", \"label\": \"Button C\", \"id\": \"btnC\"}]}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Sliders:\"}, {\"type\": \"slider_int\", \"id\": \"slider1\", \"label\": \"Integer Slider\", \"min\": 0, \"max\": 100}, {\"type\": \"slider_float\", \"id\": \"slider2\", \"label\": \"Float Slider\", \"min\": 0.0, \"max\": 1.0}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Inputs:\"}, {\"type\": \"checkbox\", \"label\": \"Enable Feature\", \"id\": \"check1\"}, {\"type\": \"checkbox\", \"label\": \"Debug Mode\", \"id\": \"check2\"}, {\"type\": \"input_text\", \"label\": \"Your Name\", \"id\": \"name\"}, {\"type\": \"input_int\", \"label\": \"Your Age\", \"id\": \"age\"}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Close this window to exit the demo.\"}]}"
+
+    # Initial state values
+    state = "{\"slider1\": 50, \"slider2\": 0.5, \"check1\": false, \"check2\": true, \"name\": \"User\", \"age\": 25}"
+
+    # Run until user closes window
+    while true
+        if ui.should_close()
+            print("Window closed by user.")
+            break
+        ~
+
+        # Render frame and get updated state
+        state = ui.render(layout, state)
+    ~
+
+    print("Final widget state:")
+    print(state)
+    print("Goodbye!")
+
+    return 0
+~

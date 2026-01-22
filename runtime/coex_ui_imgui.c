@@ -153,10 +153,16 @@ void coex_imgui_io_set_key(int64_t keycode, int64_t pressed) {
     else if (keycode == 257) key = ImGuiKey_Enter;
     else if (keycode == 258) key = ImGuiKey_Tab;
     else if (keycode == 259) key = ImGuiKey_Backspace;
+    else if (keycode == 260) key = ImGuiKey_Insert;
+    else if (keycode == 261) key = ImGuiKey_Delete;
     else if (keycode == 262) key = ImGuiKey_RightArrow;
     else if (keycode == 263) key = ImGuiKey_LeftArrow;
     else if (keycode == 264) key = ImGuiKey_DownArrow;
     else if (keycode == 265) key = ImGuiKey_UpArrow;
+    else if (keycode == 266) key = ImGuiKey_PageUp;
+    else if (keycode == 267) key = ImGuiKey_PageDown;
+    else if (keycode == 268) key = ImGuiKey_Home;
+    else if (keycode == 269) key = ImGuiKey_End;
     if (key != ImGuiKey_None) {
         ImGuiIO_AddKeyEvent(io, key, pressed ? true : false);
     }

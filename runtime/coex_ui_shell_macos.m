@@ -304,13 +304,18 @@ static int translate_modifiers(NSEventModifierFlags flags) {
         _ui_state.key_states[keycode] = 1;
     }
 
-    /* Also try to get ASCII value */
+    /* Also try to get ASCII value for printable characters.
+     * Only use ASCII as keycode if this isn't a special key (translate returned -1).
+     * This preserves COEX_UI_KEY_BACKSPACE etc. instead of overwriting with ASCII 8/127. */
     NSString* chars = [event characters];
     if ([chars length] > 0) {
         unichar c = [chars characterAtIndex:0];
-        if (c < 128) {
+        if (c < 128 && c >= 32 && c != 127) {
+            /* Printable ASCII - use as keycode only if not a special key */
             _ui_state.key_states[(int)c] = 1;
-            keycode = (int)c;
+            if (keycode < 0) {
+                keycode = (int)c;
+            }
         }
     }
 
@@ -342,12 +347,15 @@ static int translate_modifiers(NSEventModifierFlags flags) {
         _ui_state.key_states[keycode] = 0;
     }
 
+    /* Only use ASCII as keycode for printable characters if not a special key */
     NSString* chars = [event characters];
     if ([chars length] > 0) {
         unichar c = [chars characterAtIndex:0];
-        if (c < 128) {
+        if (c < 128 && c >= 32 && c != 127) {
             _ui_state.key_states[(int)c] = 0;
-            keycode = (int)c;
+            if (keycode < 0) {
+                keycode = (int)c;
+            }
         }
     }
 
