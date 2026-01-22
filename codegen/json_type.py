@@ -2528,27 +2528,28 @@ class JsonGenerator:
         elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
         elem_i64 = builder.load(elem_i64_ptr)
 
-        # Check if this might be a Json* pointer by checking the list's element type
-        # For JSON array literals, elements are already Json* pointers stored as i64
-        # We need to check if the pointer looks like a valid Json struct
-        # A Json* will have a type field in range 0-6, so we can do a runtime check
+        # CRITICAL: Check if this looks like a pointer BEFORE trying to dereference it.
+        # Small integers (like 1, 2, 3) will crash if we try to load from them as pointers.
+        # Valid heap pointers are typically > 0x10000.
+        is_pointer_range = builder.icmp_unsigned(">", elem_i64, ir.Constant(i64, 0x10000))
+
+        # Branch: check pointer range first to avoid dereferencing small integers
+        check_json_block = func.append_basic_block("check_if_json")
+        int_block = func.append_basic_block("elem_is_int")
+        json_block = func.append_basic_block("elem_is_json")
+        merge_block = func.append_basic_block("elem_merge")
+
+        builder.cbranch(is_pointer_range, check_json_block, int_block)
+
+        # Check if the pointer looks like valid JSON
+        builder.position_at_end(check_json_block)
         maybe_json = builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
         type_ptr = builder.gep(maybe_json, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         type_val = builder.load(type_ptr)
 
         # Check if type is in valid JSON range (0-6 for null/bool/int/float/string/array/object)
         is_valid_json = builder.icmp_unsigned("<=", type_val, ir.Constant(i64, 6))
-
-        # Also check that it's not a small integer (valid pointers are large values)
-        is_pointer_range = builder.icmp_unsigned(">", elem_i64, ir.Constant(i64, 0x10000))
-        is_json_ptr = builder.and_(is_valid_json, is_pointer_range)
-
-        # Branch: if it looks like JSON, use it directly; otherwise wrap as int
-        json_block = func.append_basic_block("elem_is_json")
-        int_block = func.append_basic_block("elem_is_int")
-        merge_block = func.append_basic_block("elem_merge")
-
-        builder.cbranch(is_json_ptr, json_block, int_block)
+        builder.cbranch(is_valid_json, json_block, int_block)
 
         # Already JSON - use directly
         builder.position_at_end(json_block)

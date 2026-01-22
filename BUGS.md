@@ -713,10 +713,10 @@
   ```
 - **Observed**: Segmentation fault (signal 11) when accessing array field from JSON object literal
 - **Expected**: Array field should be accessible and have correct length
-- **Hypothesis**: Issue with `convert_list_to_json_array` in `codegen/json_type.py` when converting Coex list literals to JSON arrays inside JSON object literals. The conversion may be producing invalid List* pointers.
-- **Files**: `codegen/json_type.py:convert_list_to_json_array`, `codegen/json_type.py:generate_json_object`
-- **Note**: This is a pre-existing bug unrelated to BUG-051 fix. Affects 5 tests in `tests/test_json.py` (test_bracket_access_int_index, test_is_array_on_list, test_len_on_array, test_json_array_as_list, test_serialize_array)
-- **Status**: Open
+- **Root Cause**: In `convert_list_to_json_array`, the code tried to dereference potential JSON pointers BEFORE checking if the value was actually a pointer. When the list contained small integers (1, 2, 3), it would interpret them as memory addresses and crash trying to load from address 1.
+- **Files**: `codegen/json_type.py:convert_list_to_json_array`
+- **Status**: Fixed (2026-01-22)
+- **Resolution**: Restructured the logic to check `is_pointer_range` (value > 0x10000) BEFORE attempting to load from the potential pointer. Only dereferences values that are in valid heap pointer range.
 
 
 ### BUG-051: json.parse returns empty object/array for complex JSON
