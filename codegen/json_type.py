@@ -2460,7 +2460,7 @@ class JsonGenerator:
                     return value
                 elif struct_name == "struct.List":
                     # List -> JSON array (need to convert elements to JSON)
-                    return self.convert_list_to_json_array(value)
+                    return self.convert_list_to_json_array(value, expr)
                 elif struct_name == "struct.Map":
                     # Map -> JSON object
                     return builder.call(cg.json_new_object, [value])
@@ -2477,33 +2477,90 @@ class JsonGenerator:
         # Fallback: create null JSON
         return builder.call(cg.json_new_null, [])
 
-    def convert_list_to_json_array(self, list_ptr: ir.Value) -> ir.Value:
+    def convert_list_to_json_array(self, list_ptr: ir.Value, expr: 'Expr' = None) -> ir.Value:
         """Convert a Coex list to a JSON array by converting each element to JSON.
 
-        This creates a new list where each element is a Json* pointer, then wraps
-        it in a JSON array.
+        If expr is a ListExpr, we can iterate through elements at compile time,
+        which is both more efficient and allows proper type-based conversion.
+
+        Otherwise, we use type inference to determine the element type and generate
+        a runtime loop with the correct conversion.
+        """
+        from ast_nodes import ListExpr, PrimitiveType, ListType, NamedType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # If we have a ListExpr, handle it at compile time - much cleaner and safer
+        if isinstance(expr, ListExpr):
+            return self._convert_list_expr_to_json_array(expr)
+
+        # For non-literal lists, use type inference to determine element type
+        elem_type = None
+        if expr is not None:
+            inferred = cg._infer_type_from_expr(expr)
+            if isinstance(inferred, ListType):
+                elem_type = inferred.element_type
+
+        # Generate runtime loop with type-appropriate conversion
+        return self._convert_list_runtime_to_json_array(list_ptr, elem_type)
+
+    def _convert_list_expr_to_json_array(self, expr: 'ListExpr') -> ir.Value:
+        """Convert a ListExpr to JSON array at compile time.
+
+        This iterates through the AST elements and generates JSON conversion
+        for each, avoiding any runtime type guessing.
         """
         cg = self.cg
         builder = cg.builder
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Get source list length and element size
-        src_len = builder.call(cg.list_len, [list_ptr])
+        # Create new list with 8-byte elements (for Json* pointers)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
 
-        # Get the element size from the list struct (field 3)
-        elem_size_ptr = builder.gep(list_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
-        src_elem_size = builder.load(elem_size_ptr)
+        # Convert each element at compile time
+        for elem_expr in expr.elements:
+            # Generate the element value
+            elem_value = cg._generate_expression(elem_expr)
+
+            # Convert to JSON using the expression for proper type handling
+            json_elem = self.convert_to_json(elem_value, elem_expr)
+
+            # Append to list
+            temp = builder.alloca(i64, name="json_temp")
+            json_i64 = builder.ptrtoint(json_elem, i64)
+            builder.store(json_i64, temp)
+            temp_i8 = builder.bitcast(temp, i8_ptr)
+            json_list = builder.call(cg.list_append, [json_list, temp_i8, ir.Constant(i64, 8)])
+
+        return builder.call(cg.json_new_array, [json_list])
+
+    def _convert_list_runtime_to_json_array(self, list_ptr: ir.Value, elem_type: 'Type' = None) -> ir.Value:
+        """Convert an existing list to JSON array at runtime.
+
+        Uses elem_type to determine the correct conversion for each element.
+        If elem_type is None, defaults to treating elements as integers.
+        """
+        from ast_nodes import PrimitiveType, NamedType, ListType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Get source list length
+        src_len = builder.call(cg.list_len, [list_ptr])
 
         # Create new list with 8-byte elements (for Json* pointers)
         json_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
 
-        # Store pointers for loop (allocate OUTSIDE loop to avoid stack overflow)
+        # Store pointers for loop
         json_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="json_list_ptr")
         builder.store(json_list, json_list_ptr)
         idx_ptr = builder.alloca(i64, name="conv_idx")
         builder.store(ir.Constant(i64, 0), idx_ptr)
-        temp = builder.alloca(i64, name="json_temp")  # Reused each iteration
+        temp = builder.alloca(i64, name="json_temp")
 
         # Create loop blocks
         func = builder.function
@@ -2519,54 +2576,14 @@ class JsonGenerator:
         cmp = builder.icmp_signed("<", idx, src_len)
         builder.cbranch(cmp, loop_body, loop_done)
 
-        # Loop body: get element, convert to JSON, append
+        # Loop body: get element, convert to JSON based on known type, append
         builder.position_at_end(loop_body)
         elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
 
-        # Determine conversion based on element size
-        # Elements are 8 bytes: could be int, float, or pointer (String*, Json*, etc.)
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
+        # Convert element based on known element type
+        json_elem = self._convert_list_element_to_json(elem_data_ptr, elem_type)
 
-        # Check if this might be a Json* pointer by checking the list's element type
-        # For JSON array literals, elements are already Json* pointers stored as i64
-        # We need to check if the pointer looks like a valid Json struct
-        # A Json* will have a type field in range 0-6, so we can do a runtime check
-        maybe_json = builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
-        type_ptr = builder.gep(maybe_json, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
-        type_val = builder.load(type_ptr)
-
-        # Check if type is in valid JSON range (0-6 for null/bool/int/float/string/array/object)
-        is_valid_json = builder.icmp_unsigned("<=", type_val, ir.Constant(i64, 6))
-
-        # Also check that it's not a small integer (valid pointers are large values)
-        is_pointer_range = builder.icmp_unsigned(">", elem_i64, ir.Constant(i64, 0x10000))
-        is_json_ptr = builder.and_(is_valid_json, is_pointer_range)
-
-        # Branch: if it looks like JSON, use it directly; otherwise wrap as int
-        json_block = func.append_basic_block("elem_is_json")
-        int_block = func.append_basic_block("elem_is_int")
-        merge_block = func.append_basic_block("elem_merge")
-
-        builder.cbranch(is_json_ptr, json_block, int_block)
-
-        # Already JSON - use directly
-        builder.position_at_end(json_block)
-        json_direct = maybe_json
-        builder.branch(merge_block)
-
-        # Integer - wrap in json_new_int
-        builder.position_at_end(int_block)
-        json_wrapped = builder.call(cg.json_new_int, [elem_i64])
-        builder.branch(merge_block)
-
-        # Merge
-        builder.position_at_end(merge_block)
-        json_elem = builder.phi(cg.json_struct.as_pointer(), name="json_elem")
-        json_elem.add_incoming(json_direct, json_block)
-        json_elem.add_incoming(json_wrapped, int_block)
-
-        # Append to JSON list (reuse pre-allocated temp)
+        # Append to JSON list
         json_i64 = builder.ptrtoint(json_elem, i64)
         builder.store(json_i64, temp)
         temp_i8 = builder.bitcast(temp, i8_ptr)
@@ -2584,6 +2601,57 @@ class JsonGenerator:
         builder.position_at_end(loop_done)
         final_list = builder.load(json_list_ptr)
         return builder.call(cg.json_new_array, [final_list])
+
+    def _convert_list_element_to_json(self, elem_data_ptr: ir.Value, elem_type: 'Type') -> ir.Value:
+        """Convert a list element to JSON based on its known type."""
+        from ast_nodes import PrimitiveType, NamedType, ListType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        # Load element value as i64 (all list elements are 8 bytes)
+        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
+        elem_i64 = builder.load(elem_i64_ptr)
+
+        # Convert based on type
+        if elem_type is None:
+            # Default: treat as integer
+            return builder.call(cg.json_new_int, [elem_i64])
+
+        if isinstance(elem_type, PrimitiveType):
+            if elem_type.name == "int":
+                return builder.call(cg.json_new_int, [elem_i64])
+            elif elem_type.name == "float":
+                # Reinterpret i64 bits as double
+                elem_double = builder.bitcast(elem_i64, ir.DoubleType())
+                return builder.call(cg.json_new_float, [elem_double])
+            elif elem_type.name == "bool":
+                elem_bool = builder.trunc(elem_i64, ir.IntType(1))
+                return builder.call(cg.json_new_bool, [elem_bool])
+            elif elem_type.name == "string":
+                elem_str = builder.inttoptr(elem_i64, cg.string_struct.as_pointer())
+                return builder.call(cg.json_new_string, [elem_str])
+            elif elem_type.name == "json":
+                # Already JSON
+                return builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+
+        if isinstance(elem_type, NamedType):
+            if elem_type.name == "Json":
+                return builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+            elif elem_type.name == "String":
+                elem_str = builder.inttoptr(elem_i64, cg.string_struct.as_pointer())
+                return builder.call(cg.json_new_string, [elem_str])
+            # For other named types (user-defined), convert to JSON
+            elem_ptr = builder.inttoptr(elem_i64, ir.IntType(8).as_pointer())
+            return self.convert_udt_to_json(elem_ptr, elem_type.name)
+
+        if isinstance(elem_type, ListType):
+            # Nested list - recursively convert
+            elem_list = builder.inttoptr(elem_i64, cg.list_struct.as_pointer())
+            return self.convert_list_to_json_array(elem_list, None)
+
+        # Default fallback: treat as integer
+        return builder.call(cg.json_new_int, [elem_i64])
 
     def convert_udt_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
         """Convert a user-defined type or enum to JSON with _type metadata."""

@@ -713,10 +713,14 @@
   ```
 - **Observed**: Segmentation fault (signal 11) when accessing array field from JSON object literal
 - **Expected**: Array field should be accessible and have correct length
-- **Hypothesis**: Issue with `convert_list_to_json_array` in `codegen/json_type.py` when converting Coex list literals to JSON arrays inside JSON object literals. The conversion may be producing invalid List* pointers.
-- **Files**: `codegen/json_type.py:convert_list_to_json_array`, `codegen/json_type.py:generate_json_object`
-- **Note**: This is a pre-existing bug unrelated to BUG-051 fix. Affects 5 tests in `tests/test_json.py` (test_bracket_access_int_index, test_is_array_on_list, test_len_on_array, test_json_array_as_list, test_serialize_array)
-- **Status**: Open
+- **Root Cause**: `convert_list_to_json_array` used runtime heuristics to guess whether list elements were integers or JSON pointers. It tried to dereference values as pointers before checking if they were valid pointer addresses, causing crashes when dereferencing small integers like 1, 2, 3.
+- **Files**: `codegen/json_type.py:convert_list_to_json_array`
+- **Status**: Fixed (2026-01-22)
+- **Resolution**: Completely rewrote the list-to-JSON-array conversion to use compile-time type information:
+  1. For `ListExpr` (literal lists like `[1, 2, 3]`), iterate through AST elements at compile time and convert each with proper type knowledge
+  2. For other lists (variables), use type inference (`_infer_type_from_expr`) to determine element type
+  3. Generate type-appropriate conversion code (json_new_int for ints, json_new_float for floats, json_new_string for strings, etc.)
+  4. No more runtime pointer guessing - element types are known at compile time
 
 
 ### BUG-051: json.parse returns empty object/array for complex JSON
