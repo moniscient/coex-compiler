@@ -29,11 +29,287 @@ class JsonGenerator:
     JSON_TAG_ARRAY = 5
     JSON_TAG_OBJECT = 6
 
+    # cJSON type constants (from cJSON.h)
+    CJSON_INVALID = 0
+    CJSON_FALSE = 1 << 0    # 1
+    CJSON_TRUE = 1 << 1     # 2
+    CJSON_NULL = 1 << 2     # 4
+    CJSON_NUMBER = 1 << 3   # 8
+    CJSON_STRING = 1 << 4   # 16
+    CJSON_ARRAY = 1 << 5    # 32
+    CJSON_OBJECT = 1 << 6   # 64
+
     def __init__(self, codegen: 'CodeGenerator'):
         """Initialize with reference to main code generator."""
         self.cg = codegen
+        self.cjson_struct = None
+        self.cJSON_Parse = None
+        self.cJSON_Delete = None
+        self.json_from_cjson = None
 
+    def _declare_cjson_types(self):
+        """Declare cJSON struct type and external functions for JSON parsing."""
+        cg = self.cg
+        i8 = ir.IntType(8)
+        i8_ptr = i8.as_pointer()
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
 
+        # cJSON struct type (from cJSON.h):
+        # struct cJSON { next, prev, child, type, valuestring, valueint, valuedouble, string }
+        # Note: llvmlite requires us to define the type before we can use pointers to it
+        self.cjson_struct = ir.global_context.get_identified_type("struct.cJSON")
+        cjson_ptr = self.cjson_struct.as_pointer()
+
+        # Set the body after getting the type so we can use self-referential pointers
+        self.cjson_struct.set_body(
+            cjson_ptr,      # next
+            cjson_ptr,      # prev
+            cjson_ptr,      # child
+            i32,            # type (bitmask)
+            i8_ptr,         # valuestring
+            i32,            # valueint
+            ir.DoubleType(), # valuedouble
+            i8_ptr,         # string (key name)
+        )
+
+        # Declare cJSON_Parse(const char*) -> cJSON*
+        cJSON_Parse_ty = ir.FunctionType(cjson_ptr, [i8_ptr])
+        self.cJSON_Parse = ir.Function(cg.module, cJSON_Parse_ty, name="cJSON_Parse")
+
+        # Declare cJSON_Delete(cJSON*) -> void
+        cJSON_Delete_ty = ir.FunctionType(ir.VoidType(), [cjson_ptr])
+        self.cJSON_Delete = ir.Function(cg.module, cJSON_Delete_ty, name="cJSON_Delete")
+
+    def _implement_json_from_cjson(self):
+        """Implement coex_json_from_cjson(cJSON*) -> Json*
+
+        Recursively converts a cJSON tree to Coex Json objects.
+        """
+        cg = self.cg
+        i8 = ir.IntType(8)
+        i8_ptr = i8.as_pointer()
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i1 = ir.IntType(1)
+        cjson_ptr = self.cjson_struct.as_pointer()
+        json_ptr = cg.json_struct.as_pointer()
+
+        # Create the function
+        func_ty = ir.FunctionType(json_ptr, [cjson_ptr])
+        self.json_from_cjson = ir.Function(cg.module, func_ty, name="coex_json_from_cjson")
+        func = self.json_from_cjson
+        func.args[0].name = "cjson"
+
+        # Create basic blocks
+        entry = func.append_basic_block("entry")
+        check_null_type = func.append_basic_block("check_null_type")
+        check_true = func.append_basic_block("check_true")
+        check_false = func.append_basic_block("check_false")
+        check_number = func.append_basic_block("check_number")
+        check_string = func.append_basic_block("check_string")
+        check_array = func.append_basic_block("check_array")
+        check_object = func.append_basic_block("check_object")
+        return_null = func.append_basic_block("return_null")
+        return_true = func.append_basic_block("return_true")
+        return_false = func.append_basic_block("return_false")
+        return_number = func.append_basic_block("return_number")
+        return_string = func.append_basic_block("return_string")
+        process_array = func.append_basic_block("process_array")
+        array_loop = func.append_basic_block("array_loop")
+        array_body = func.append_basic_block("array_body")
+        array_done = func.append_basic_block("array_done")
+        process_object = func.append_basic_block("process_object")
+        object_loop = func.append_basic_block("object_loop")
+        object_body = func.append_basic_block("object_body")
+        object_done = func.append_basic_block("object_done")
+        fallback = func.append_basic_block("fallback")
+
+        builder = ir.IRBuilder(entry)
+        cjson = func.args[0]
+
+        # Check for null input
+        null_cjson = ir.Constant(cjson_ptr, None)
+        is_null_input = builder.icmp_unsigned("==", cjson, null_cjson)
+        builder.cbranch(is_null_input, fallback, check_null_type)
+
+        # Get the type field (field 3 in cJSON struct)
+        builder.position_at_end(check_null_type)
+        type_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        cjson_type = builder.load(type_ptr)
+
+        # Check for cJSON_NULL (type & 4)
+        is_null = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_NULL))
+        is_null_bool = builder.icmp_unsigned("!=", is_null, ir.Constant(i32, 0))
+        builder.cbranch(is_null_bool, return_null, check_true)
+
+        # Return null JSON
+        builder.position_at_end(return_null)
+        null_result = builder.call(cg.json_new_null, [])
+        builder.ret(null_result)
+
+        # Check for cJSON_True (type & 2)
+        builder.position_at_end(check_true)
+        is_true = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_TRUE))
+        is_true_bool = builder.icmp_unsigned("!=", is_true, ir.Constant(i32, 0))
+        builder.cbranch(is_true_bool, return_true, check_false)
+
+        # Return true JSON
+        builder.position_at_end(return_true)
+        true_result = builder.call(cg.json_new_bool, [ir.Constant(i1, 1)])
+        builder.ret(true_result)
+
+        # Check for cJSON_False (type & 1)
+        builder.position_at_end(check_false)
+        is_false = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_FALSE))
+        is_false_bool = builder.icmp_unsigned("!=", is_false, ir.Constant(i32, 0))
+        builder.cbranch(is_false_bool, return_false, check_number)
+
+        # Return false JSON
+        builder.position_at_end(return_false)
+        false_result = builder.call(cg.json_new_bool, [ir.Constant(i1, 0)])
+        builder.ret(false_result)
+
+        # Check for cJSON_Number (type & 8)
+        builder.position_at_end(check_number)
+        is_number = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_NUMBER))
+        is_number_bool = builder.icmp_unsigned("!=", is_number, ir.Constant(i32, 0))
+        builder.cbranch(is_number_bool, return_number, check_string)
+
+        # Return number as float JSON (cJSON stores all numbers as double)
+        builder.position_at_end(return_number)
+        valuedouble_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        valuedouble = builder.load(valuedouble_ptr)
+        number_result = builder.call(cg.json_new_float, [valuedouble])
+        builder.ret(number_result)
+
+        # Check for cJSON_String (type & 16)
+        builder.position_at_end(check_string)
+        is_string = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_STRING))
+        is_string_bool = builder.icmp_unsigned("!=", is_string, ir.Constant(i32, 0))
+        builder.cbranch(is_string_bool, return_string, check_array)
+
+        # Return string JSON
+        builder.position_at_end(return_string)
+        valuestring_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        valuestring = builder.load(valuestring_ptr)
+        coex_string = builder.call(cg.string_from_literal, [valuestring])
+        string_result = builder.call(cg.json_new_string, [coex_string])
+        builder.ret(string_result)
+
+        # Check for cJSON_Array (type & 32)
+        builder.position_at_end(check_array)
+        is_array = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_ARRAY))
+        is_array_bool = builder.icmp_unsigned("!=", is_array, ir.Constant(i32, 0))
+        builder.cbranch(is_array_bool, process_array, check_object)
+
+        # Process array: create list, iterate through child elements
+        builder.position_at_end(process_array)
+        list_val = builder.call(cg.list_new, [ir.Constant(i64, 8)])  # 8 bytes for pointer
+        list_ptr_alloca = builder.alloca(cg.list_struct.as_pointer(), name="list_ptr")
+        builder.store(list_val, list_ptr_alloca)
+
+        # Get first child
+        child_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        first_child = builder.load(child_ptr)
+        child_alloca = builder.alloca(cjson_ptr, name="child")
+        builder.store(first_child, child_alloca)
+        builder.branch(array_loop)
+
+        # Array loop condition
+        builder.position_at_end(array_loop)
+        current_child = builder.load(child_alloca)
+        is_child_null = builder.icmp_unsigned("==", current_child, null_cjson)
+        builder.cbranch(is_child_null, array_done, array_body)
+
+        # Array loop body: convert child and append to list
+        builder.position_at_end(array_body)
+        child_json = builder.call(self.json_from_cjson, [current_child])
+
+        # Store json pointer in temp location for list_append
+        temp_json_ptr = builder.alloca(json_ptr, name="temp_json")
+        builder.store(child_json, temp_json_ptr)
+        temp_i8_ptr = builder.bitcast(temp_json_ptr, i8_ptr)
+
+        # Append to list
+        curr_list = builder.load(list_ptr_alloca)
+        new_list = builder.call(cg.list_append, [curr_list, temp_i8_ptr, ir.Constant(i64, 8)])
+        builder.store(new_list, list_ptr_alloca)
+
+        # Move to next sibling
+        next_ptr = builder.gep(current_child, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        next_child = builder.load(next_ptr)
+        builder.store(next_child, child_alloca)
+        builder.branch(array_loop)
+
+        # Array done: wrap list in json array
+        builder.position_at_end(array_done)
+        final_list = builder.load(list_ptr_alloca)
+        array_result = builder.call(cg.json_new_array, [final_list])
+        builder.ret(array_result)
+
+        # Check for cJSON_Object (type & 64)
+        builder.position_at_end(check_object)
+        is_object = builder.and_(cjson_type, ir.Constant(i32, self.CJSON_OBJECT))
+        is_object_bool = builder.icmp_unsigned("!=", is_object, ir.Constant(i32, 0))
+        builder.cbranch(is_object_bool, process_object, fallback)
+
+        # Process object: create map, iterate through child elements
+        builder.position_at_end(process_object)
+        # Create map with string keys and pointer values
+        map_flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR)
+        map_val = builder.call(cg.map_new, [map_flags])
+        map_ptr_alloca = builder.alloca(cg.map_struct.as_pointer(), name="map_ptr")
+        builder.store(map_val, map_ptr_alloca)
+
+        # Get first child
+        obj_child_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        obj_first_child = builder.load(obj_child_ptr)
+        obj_child_alloca = builder.alloca(cjson_ptr, name="obj_child")
+        builder.store(obj_first_child, obj_child_alloca)
+        builder.branch(object_loop)
+
+        # Object loop condition
+        builder.position_at_end(object_loop)
+        obj_current_child = builder.load(obj_child_alloca)
+        is_obj_child_null = builder.icmp_unsigned("==", obj_current_child, null_cjson)
+        builder.cbranch(is_obj_child_null, object_done, object_body)
+
+        # Object loop body: get key, convert value, add to map
+        builder.position_at_end(object_body)
+
+        # Get key string (field 7 in cJSON struct)
+        key_cstr_ptr = builder.gep(obj_current_child, [ir.Constant(i32, 0), ir.Constant(i32, 7)], inbounds=True)
+        key_cstr = builder.load(key_cstr_ptr)
+        key_string = builder.call(cg.string_from_literal, [key_cstr])
+
+        # Convert value
+        value_json = builder.call(self.json_from_cjson, [obj_current_child])
+
+        # Convert json pointer to i64 for map storage
+        value_i64 = builder.ptrtoint(value_json, i64)
+
+        # Add to map
+        curr_map = builder.load(map_ptr_alloca)
+        new_map = builder.call(cg.map_set_string, [curr_map, key_string, value_i64])
+        builder.store(new_map, map_ptr_alloca)
+
+        # Move to next sibling
+        obj_next_ptr = builder.gep(obj_current_child, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        obj_next_child = builder.load(obj_next_ptr)
+        builder.store(obj_next_child, obj_child_alloca)
+        builder.branch(object_loop)
+
+        # Object done: wrap map in json object
+        builder.position_at_end(object_done)
+        final_map = builder.load(map_ptr_alloca)
+        object_result = builder.call(cg.json_new_object, [final_map])
+        builder.ret(object_result)
+
+        # Fallback: return null
+        builder.position_at_end(fallback)
+        fallback_result = builder.call(cg.json_new_null, [])
+        builder.ret(fallback_result)
 
     def create_json_type(self):
         """Create the JSON type and helper functions.
@@ -282,6 +558,11 @@ class JsonGenerator:
         # Implement serialization functions
         self._implement_json_stringify()
         self._implement_json_pretty()
+
+        # Declare cJSON types and implement converter (needed for json.parse)
+        self._declare_cjson_types()
+        self._implement_json_from_cjson()
+
         self._implement_json_parse()
 
         # Implement string.validjson() now that json_parse exists
@@ -1946,18 +2227,83 @@ class JsonGenerator:
         str_json = builder.call(cg.json_new_string, [str_ptr])
         builder.ret(str_json)
 
-        # Parse array - simplified: return empty array for now
-        builder.position_at_end(parse_array)
-        empty_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
-        array_json = builder.call(cg.json_new_array, [empty_list])
-        builder.ret(array_json)
+        # Parse array/object using cJSON - both cases need to:
+        # 1. Create null-terminated C string from Coex string
+        # 2. Call cJSON_Parse
+        # 3. Convert cJSON tree to Coex Json
+        # 4. Free cJSON tree with cJSON_Delete
 
-        # Parse object - simplified: return empty object for now
+        # Parse array
+        builder.position_at_end(parse_array)
+
+        # Get string size (byte count) from field 3
+        i32 = ir.IntType(32)
+        size_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        byte_size = builder.load(size_ptr)
+
+        # Allocate size+1 bytes for C string with null terminator
+        alloc_size = builder.add(byte_size, ir.Constant(i64, 1))
+        type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
+        cstr_buf = cg.gc.alloc_arena_or_gc(builder, alloc_size, type_id)
+
+        # Copy string data to buffer
+        builder.call(cg.memcpy, [cstr_buf, data_ptr, byte_size])
+
+        # Add null terminator
+        null_pos = builder.gep(cstr_buf, [byte_size])
+        builder.store(ir.Constant(i8, 0), null_pos)
+
+        # Call cJSON_Parse
+        cjson_result = builder.call(self.cJSON_Parse, [cstr_buf])
+
+        # Check for null (parse error)
+        cjson_ptr_type = self.cjson_struct.as_pointer()
+        null_cjson = ir.Constant(cjson_ptr_type, None)
+        is_cjson_null = builder.icmp_unsigned("==", cjson_result, null_cjson)
+
+        array_parse_ok = func.append_basic_block("array_parse_ok")
+        builder.cbranch(is_cjson_null, return_null, array_parse_ok)
+
+        builder.position_at_end(array_parse_ok)
+        # Convert cJSON tree to Coex Json
+        array_result = builder.call(self.json_from_cjson, [cjson_result])
+        # Free cJSON tree
+        builder.call(self.cJSON_Delete, [cjson_result])
+        builder.ret(array_result)
+
+        # Parse object - same approach as array
         builder.position_at_end(parse_object)
-        flags = ir.Constant(i64, 0x01)  # String keys
-        empty_map = builder.call(cg.map_new, [flags])
-        obj_json = builder.call(cg.json_new_object, [empty_map])
-        builder.ret(obj_json)
+
+        # Get string size (byte count) from field 3
+        obj_size_ptr = builder.gep(str_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        obj_byte_size = builder.load(obj_size_ptr)
+
+        # Allocate size+1 bytes for C string with null terminator
+        obj_alloc_size = builder.add(obj_byte_size, ir.Constant(i64, 1))
+        obj_cstr_buf = cg.gc.alloc_arena_or_gc(builder, obj_alloc_size, type_id)
+
+        # Copy string data to buffer
+        builder.call(cg.memcpy, [obj_cstr_buf, data_ptr, obj_byte_size])
+
+        # Add null terminator
+        obj_null_pos = builder.gep(obj_cstr_buf, [obj_byte_size])
+        builder.store(ir.Constant(i8, 0), obj_null_pos)
+
+        # Call cJSON_Parse
+        obj_cjson_result = builder.call(self.cJSON_Parse, [obj_cstr_buf])
+
+        # Check for null (parse error)
+        is_obj_cjson_null = builder.icmp_unsigned("==", obj_cjson_result, null_cjson)
+
+        object_parse_ok = func.append_basic_block("object_parse_ok")
+        builder.cbranch(is_obj_cjson_null, return_null, object_parse_ok)
+
+        builder.position_at_end(object_parse_ok)
+        # Convert cJSON tree to Coex Json
+        object_result = builder.call(self.json_from_cjson, [obj_cjson_result])
+        # Free cJSON tree
+        builder.call(self.cJSON_Delete, [obj_cjson_result])
+        builder.ret(object_result)
 
     def _register_json_methods(self):
         """Register JSON as a type with methods."""

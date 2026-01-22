@@ -698,11 +698,32 @@
 - **Note**: Does not affect functionality - crash occurs after all test work completes successfully. Performance test achieves 103 FPS with 100 widgets before the shutdown crash.
 
 
+### BUG-052: JSON array literals in objects cause crash
+- **Discovered**: 2026-01-22, during BUG-051 fix testing
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      j: json = { items: [1, 2, 3] }
+      arr: json = j.items
+      print(arr.len())  # CRASH
+      return 0
+  ~
+  ```
+- **Observed**: Segmentation fault (signal 11) when accessing array field from JSON object literal
+- **Expected**: Array field should be accessible and have correct length
+- **Hypothesis**: Issue with `convert_list_to_json_array` in `codegen/json_type.py` when converting Coex list literals to JSON arrays inside JSON object literals. The conversion may be producing invalid List* pointers.
+- **Files**: `codegen/json_type.py:convert_list_to_json_array`, `codegen/json_type.py:generate_json_object`
+- **Note**: This is a pre-existing bug unrelated to BUG-051 fix. Affects 5 tests in `tests/test_json.py` (test_bracket_access_int_index, test_is_array_on_list, test_len_on_array, test_json_array_as_list, test_serialize_array)
+- **Status**: Open
+
+
 ### BUG-051: json.parse returns empty object/array for complex JSON
 - **Discovered**: 2026-01-22, during UI library JSON literal integration
 - **Category**: Codegen
 - **Severity**: High
-- **Reproduction**: 
+- **Reproduction**:
   ```coex
   func main() -> int
       result: json = json.parse("{\"name\":\"Alice\",\"age\":30}")
@@ -712,12 +733,12 @@
   ```
 - **Observed**: `json.parse` returns empty `{}` for objects and empty `[]` for arrays regardless of input content. Primitives (null, true, false, numbers) parse correctly.
 - **Expected**: Full recursive parsing of JSON strings into Json objects
-- **Hypothesis**: The `_implement_json_parse` function in `codegen/json_type.py` has stub implementations for arrays and objects that just return empty containers:
-  ```python
-  # Parse array - simplified: return empty array for now
-  # Parse object - simplified: return empty object for now
-  ```
-- **Files**: `codegen/json_type.py:1949-1960` (`_implement_json_parse` method)
-- **Workaround**: Keep JSON as strings when round-tripping through FFI calls. Use `json.stringify()` for output but avoid `json.parse()` for complex structures.
-- **Fix Required**: Implement full recursive JSON parsing in LLVM IR, handling nested objects, arrays, string escapes, and number formats. Consider using a C helper function for parsing complexity.
-- **Status**: Open
+- **Root Cause**: The `_implement_json_parse` function in `codegen/json_type.py` had stub implementations for arrays and objects that just returned empty containers.
+- **Files**: `codegen/json_type.py` (`_implement_json_parse` method, `_declare_cjson_types`, `_implement_json_from_cjson`)
+- **Status**: Fixed (2026-01-22)
+- **Resolution**:
+  1. Declared cJSON struct type and external functions (cJSON_Parse, cJSON_Delete) in LLVM IR
+  2. Implemented `coex_json_from_cjson` recursive converter that walks cJSON tree and builds Coex Json objects
+  3. Updated `_implement_json_parse` to use cJSON for array/object parsing
+  4. cJSON library now always linked in `coexc.py`
+  5. Added 12 comprehensive tests in `tests/test_json.py::TestJsonParse`

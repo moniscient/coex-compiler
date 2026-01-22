@@ -865,3 +865,154 @@ func main() -> int
     return 0
 ~
 ''', '{"user":{"name":"Bob"}}\n')
+
+
+class TestJsonParse:
+    """Test JSON string parsing with json.parse()."""
+
+    def test_parse_empty_object(self, expect_output):
+        """Parse empty JSON object."""
+        expect_output('''
+func main() -> int
+    s: string = "{}"
+    j: json = json.parse(s)
+    print(j.stringify())
+    return 0
+~
+''', "{}\n")
+
+    def test_parse_simple_object(self, expect_output):
+        """Parse simple JSON object with string value."""
+        expect_output(r'''
+func main() -> int
+    s: string = "{\"name\":\"Alice\"}"
+    j: json = json.parse(s)
+    print(j.stringify())
+    return 0
+~
+''', '{"name":"Alice"}\n')
+
+    def test_parse_object_with_int(self, expect_output):
+        """Parse JSON object with integer value."""
+        expect_output(r'''
+func main() -> int
+    s: string = "{\"age\":30}"
+    j: json = json.parse(s)
+    print(j.stringify())
+    return 0
+~
+''', '{"age":30}\n')
+
+    def test_parse_object_multiple_fields(self, expect_output):
+        """Parse JSON object with multiple fields."""
+        expect_output(r'''
+func main() -> int
+    s: string = "{\"name\":\"Bob\",\"age\":25}"
+    j: json = json.parse(s)
+    print(j.get("name").as_string())
+    print(j.get("age").as_float())
+    return 0
+~
+''', "Bob\n25.000000\n")
+
+    def test_parse_nested_object(self, expect_output):
+        """Parse nested JSON object."""
+        expect_output(r'''
+func main() -> int
+    s: string = "{\"user\":{\"name\":\"Carol\"}}"
+    j: json = json.parse(s)
+    print(j.get("user").get("name").as_string())
+    return 0
+~
+''', "Carol\n")
+
+    def test_parse_array(self, expect_output):
+        """Parse JSON array."""
+        expect_output(r'''
+func main() -> int
+    s: string = "[1,2,3]"
+    j: json = json.parse(s)
+    print(j.len())
+    return 0
+~
+''', "3\n")
+
+    def test_parse_array_of_strings(self, expect_output):
+        """Parse JSON array of strings."""
+        expect_output(r'''
+func main() -> int
+    s: string = "[\"a\",\"b\",\"c\"]"
+    j: json = json.parse(s)
+    print(j.len())
+    return 0
+~
+''', "3\n")
+
+    def test_parse_object_with_array(self, expect_output):
+        """Parse JSON object containing an array."""
+        expect_output(r'''
+func main() -> int
+    s: string = "{\"items\":[10,20,30]}"
+    j: json = json.parse(s)
+    items: json = j.get("items")
+    print(items.len())
+    return 0
+~
+''', "3\n")
+
+    def test_parse_null(self, expect_output):
+        """Parse JSON null."""
+        expect_output('''
+func main() -> int
+    s: string = "null"
+    j: json = json.parse(s)
+    if j.is_null()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_parse_true(self, expect_output):
+        """Parse JSON true."""
+        expect_output('''
+func main() -> int
+    s: string = "true"
+    j: json = json.parse(s)
+    if j.as_bool()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "1\n")
+
+    def test_parse_false(self, expect_output):
+        """Parse JSON false."""
+        expect_output('''
+func main() -> int
+    s: string = "false"
+    j: json = json.parse(s)
+    if j.as_bool()
+        print(1)
+    else
+        print(0)
+    ~
+    return 0
+~
+''', "0\n")
+
+    def test_roundtrip_stringify_parse(self, expect_output):
+        """Round-trip: create JSON, stringify, parse back."""
+        expect_output('''
+func main() -> int
+    original: json = { name: "Dan", count: 42 }
+    str: string = original.stringify()
+    parsed: json = json.parse(str)
+    print(parsed.get("name").as_string())
+    return 0
+~
+''', "Dan\n")

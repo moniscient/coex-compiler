@@ -56,8 +56,11 @@ class ErrorCollector(ErrorListener):
         self.errors.append(f"Line {line}:{column} - {msg}")
 
 
-def parse_source(source: str) -> CoexParser.ProgramContext:
-    """Parse Coex source code from string."""
+def parse_source(source: str) -> tuple:
+    """Parse Coex source code from string.
+
+    Returns (tree, token_stream) tuple to support raw body capture for kind functions.
+    """
     input_stream = InputStream(source)
     lexer = CoexLexer(input_stream)
     token_stream = CommonTokenStream(lexer)
@@ -75,7 +78,7 @@ def parse_source(source: str) -> CoexParser.ProgramContext:
             print(f"Syntax error: {error}", file=sys.stderr)
         raise CompileError(f"{len(error_collector.errors)} syntax error(s)")
 
-    return tree
+    return tree, token_stream
 
 
 def parse_file(source_path: str) -> CoexParser.ProgramContext:
@@ -167,12 +170,12 @@ def compile_coex(source_path: str, output_path: str = None,
 
     # Parse clean source (without #@ comments)
     print(f"Parsing {source_path}...")
-    tree = parse_source(clean_source)
+    tree, token_stream = parse_source(clean_source)
 
     # Build AST
     print("Building AST...")
     builder = ASTBuilder()
-    program = builder.build(tree)
+    program = builder.build(tree, token_stream)
 
     # Run analyzers and update commentary (unless disabled)
     if not no_commentary:
@@ -322,6 +325,30 @@ def compile_coex(source_path: str, output_path: str = None,
                     link_cmd.append("-lopenblas")
             else:
                 print(f"Warning: BLAS runtime library not found at {blas_runtime}")
+                print("Build it with: cd runtime && make")
+
+        # Always link cJSON for json.parse support
+        deps_dir = os.path.join(os.path.dirname(__file__), "deps", "lib")
+        cjson_lib = os.path.join(deps_dir, "libcjson.a")
+        if os.path.exists(cjson_lib):
+            link_cmd.append(cjson_lib)
+
+        # Add UI runtime when UI library is used
+        if codegen.uses_ui():
+            ui_runtime = os.path.join(runtime_dir, "libcoex_ui.a")
+            if os.path.exists(ui_runtime):
+                link_cmd.append(ui_runtime)
+                # Add cimgui dependency
+                cimgui_lib = os.path.join(deps_dir, "libcimgui.a")
+                if os.path.exists(cimgui_lib):
+                    link_cmd.append(cimgui_lib)
+                # Add required frameworks (macOS)
+                if sys.platform == "darwin":
+                    link_cmd.extend(["-framework", "Cocoa", "-framework", "Metal", "-framework", "QuartzCore"])
+                    # Link C++ standard library for cimgui
+                    link_cmd.append("-lc++")
+            else:
+                print(f"Warning: UI runtime library not found at {ui_runtime}")
                 print("Build it with: cd runtime && make")
 
         result = subprocess.run(
