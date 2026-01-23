@@ -45,6 +45,19 @@ jobs:
         pip install -r requirements.txt
         pip install pytest-xdist  # For parallel test execution
 
+    - name: Build cJSON library
+      run: |
+        mkdir -p deps/lib deps/include
+        if [ ! -d "deps/cJSON" ]; then
+          git clone --depth 1 https://github.com/DaveGamble/cJSON.git deps/cJSON
+        fi
+        cp deps/cJSON/cJSON.h deps/include/
+        cc -O2 -fPIC -c deps/cJSON/cJSON.c -o cJSON.o
+        ar rcs deps/lib/libcjson.a cJSON.o
+        rm -f cJSON.o
+        echo "cJSON built:"
+        ls -la deps/lib/libcjson.a
+
     - name: Build runtime libraries
       run: |
         cd runtime && make clean && make
