@@ -14,6 +14,7 @@ Using smaller integer types (i8, i16, i32) for struct fields causes alignment di
 between Linux and macOS that lead to incorrect field offsets at runtime.
 """
 
+import os
 from llvmlite import ir
 
 
@@ -46,6 +47,19 @@ class JsonGenerator:
         self.cJSON_Parse = None
         self.cJSON_Delete = None
         self.json_from_cjson = None
+        self._cjson_available = None  # Cached availability check
+
+    def _is_cjson_available(self) -> bool:
+        """Check if cJSON library is available for linking."""
+        if self._cjson_available is not None:
+            return self._cjson_available
+
+        # Check for cJSON library in deps directory
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        deps_dir = os.path.join(script_dir, "deps", "lib")
+        cjson_lib = os.path.join(deps_dir, "libcjson.a")
+        self._cjson_available = os.path.exists(cjson_lib)
+        return self._cjson_available
 
     def _declare_cjson_types(self):
         """Declare cJSON struct type and external functions for JSON parsing."""
@@ -560,10 +574,14 @@ class JsonGenerator:
         self._implement_json_pretty()
 
         # Declare cJSON types and implement converter (needed for json.parse)
-        self._declare_cjson_types()
-        self._implement_json_from_cjson()
-
-        self._implement_json_parse()
+        # Only if cJSON library is available
+        if self._is_cjson_available():
+            self._declare_cjson_types()
+            self._implement_json_from_cjson()
+            self._implement_json_parse()
+        else:
+            # Implement stub json.parse that returns null when cJSON not available
+            self._implement_json_parse_stub()
 
         # Implement string.validjson() now that json_parse exists
         cg._strings.implement_string_validjson()
@@ -2332,6 +2350,22 @@ class JsonGenerator:
         # Free cJSON tree
         builder.call(self.cJSON_Delete, [obj_cjson_result])
         builder.ret(object_result)
+
+    def _implement_json_parse_stub(self):
+        """Implement stub json_parse when cJSON is not available.
+
+        Without cJSON, json.parse always returns null JSON. This allows
+        programs to compile and run, but JSON parsing will be non-functional.
+        Full JSON parsing requires the cJSON library to be available.
+        """
+        cg = self.cg
+        func = cg.json_parse
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Simply return null JSON for all inputs when cJSON is unavailable
+        null_json = builder.call(cg.json_new_null, [])
+        builder.ret(null_json)
 
     def _register_json_methods(self):
         """Register JSON as a type with methods."""
