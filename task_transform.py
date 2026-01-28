@@ -2358,19 +2358,14 @@ class TaskTransformer:
             elif op == BinaryOp.MOD:
                 return builder.srem(left, right, name="mod")
             elif op in (BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE, BinaryOp.EQ, BinaryOp.NE):
+                cmp_map = {
+                    BinaryOp.LT: '<', BinaryOp.GT: '>',
+                    BinaryOp.LE: '<=', BinaryOp.GE: '>=',
+                    BinaryOp.EQ: '==', BinaryOp.NE: '!='
+                }
                 if isinstance(left.type, ir.IntType):
-                    cmp_map = {
-                        BinaryOp.LT: 'slt', BinaryOp.GT: 'sgt',
-                        BinaryOp.LE: 'sle', BinaryOp.GE: 'sge',
-                        BinaryOp.EQ: 'eq', BinaryOp.NE: 'ne'
-                    }
                     cmp = builder.icmp_signed(cmp_map[op], left, right, name="cmp")
                 else:
-                    cmp_map = {
-                        BinaryOp.LT: 'olt', BinaryOp.GT: 'ogt',
-                        BinaryOp.LE: 'ole', BinaryOp.GE: 'oge',
-                        BinaryOp.EQ: 'oeq', BinaryOp.NE: 'one'
-                    }
                     cmp = builder.fcmp_ordered(cmp_map[op], left, right, name="cmp")
                 return builder.zext(cmp, ir.IntType(64))
             elif op == BinaryOp.AND:

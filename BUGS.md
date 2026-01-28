@@ -153,6 +153,30 @@
 
 ## Resolved Bugs
 
+### BUG-054: Metal texture released prematurely causing segfault
+- **Discovered**: 2026-01-22, during SVG module testing
+- **Category**: Runtime
+- **Severity**: Critical
+- **Reproduction**: Run any SVG example on macOS with Metal backend
+- **Observed**: Segfault in `coex_ui_shell_begin_frame()` when calling `[metal_layer nextDrawable]`
+- **Expected**: SVG textures should remain valid until explicitly destroyed
+- **Root Cause**: Metal textures were stored in a C struct field (`id<MTLTexture>`), but ARC doesn't track Objective-C objects stored in plain C struct fields. The texture was being released when the autoreleasepool drained.
+- **Fix**: Changed struct to use `void*` field with explicit `CFBridgingRetain()` on creation and `CFRelease()` on destruction, bypassing ARC.
+- **Files**: `runtime/svg/coex_svg_texture_metal.m`
+- **Status**: Resolved 2026-01-22
+
+### BUG-053: Heap corruption when clicking button with SVG in layout
+- **Discovered**: 2026-01-22, during SVG module testing
+- **Category**: Runtime
+- **Severity**: Critical
+- **Reproduction**: Run `svg_button_test.coex` which has both an SVG image and a button, click the button
+- **Observed**: Heap corruption error: "malloc: Heap corruption detected, free list is damaged" on the frame after click
+- **Expected**: Button click should work normally alongside SVG rendering
+- **Root Cause**: Custom `cJSON_ReplaceOrAddItemToObject` in `coex_ui.c` performed manual linked-list manipulation that conflicted with system cJSON's internal bookkeeping. When an item was replaced, the manual list surgery corrupted cJSON's internal pointers.
+- **Fix**: Rewrote function to use system cJSON's native `cJSON_HasObjectItem()` and `cJSON_ReplaceItemInObject()` instead of manual pointer manipulation.
+- **Files**: `runtime/coex_ui.c`
+- **Status**: Resolved 2026-01-22
+
 ### BUG-045: Metal GPU offload crashes with double types
 - **Discovered**: 2026-01-18, during GPU offload testing
 - **Category**: Codegen
@@ -723,6 +747,18 @@
   4. No more runtime pointer guessing - element types are known at compile time
 
 
+### BUG-055: SVG drag state keys persist after mouse release
+- **Discovered**: 2026-01-23, during SVG comprehensive demo testing
+- **Category**: Runtime
+- **Severity**: Medium
+- **Reproduction**: Run `svg_comprehensive_demo`, drag the orange box, release mouse, start second drag
+- **Observed**: Box position resets to origin on second drag instead of continuing from previous position
+- **Expected**: Drag position should accumulate between drag operations
+- **Root Cause**: In `render_svg_image()`, the drag state keys (`{state_key}_dragging`, `_drag_dx`, `_drag_dy`) were only added when `is_item_active()` returned true, but never removed when false. Since `new_state` is initialized by copying all keys from the input state (line 1344-1350), these keys persisted forever. The Coex code's "drag ended" detection (`else` branch checking `is_dragging == 1`) never fired because `boxClicked_dragging` was still present in state.
+- **Files**: `runtime/coex_ui.c:render_svg_image()`
+- **Status**: Fixed (2026-01-23)
+- **Resolution**: Added `else` clause to explicitly remove drag keys from `new_state` using `cJSON_DeleteItemFromObject()` when `is_item_active()` returns false. This allows the Coex code to detect the drag-end transition and commit the accumulated offset.
+
 ### BUG-051: json.parse returns empty object/array for complex JSON
 - **Discovered**: 2026-01-22, during UI library JSON literal integration
 - **Category**: Codegen
@@ -746,3 +782,36 @@
   3. Updated `_implement_json_parse` to use cJSON for array/object parsing
   4. cJSON library now always linked in `coexc.py`
   5. Added 12 comprehensive tests in `tests/test_json.py::TestJsonParse`
+
+### BUG-056: Task transform uses invalid comparison operators for icmp
+- **Discovered**: 2026-01-28, during scheduler stress test development
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  task dispatch(i: int, is_heavy: bool) -> int
+      if is_heavy
+          return 1
+      else
+          return 0
+      ~
+  ~
+
+  task coordinator() -> int
+      for i in 0..10
+          r := dispatch(i, i % 4 == 0)  # Comparison as task argument
+      ~
+      return 0
+  ~
+
+  func main() -> int
+      print(coordinator())
+      return 0
+  ~
+  ```
+- **Observed**: `ValueError: invalid comparison 'eq' for icmp` in llvmlite
+- **Expected**: Comparison expressions should work as task call arguments
+- **Root Cause**: In `task_transform.py:2362-2366`, the `_evaluate_expr_in_state_context` method uses LLVM IR predicate names (`'eq'`, `'ne'`, `'slt'`) instead of llvmlite's expected operator strings (`'=='`, `'!='`, `'<'`). The main codegen in `expressions.py` uses the correct format.
+- **Files**: `task_transform.py:2360-2375`
+- **Status**: Fixed (2026-01-28)
+- **Resolution**: Changed comparison operator mapping from LLVM IR predicates (`'eq'`, `'ne'`, `'slt'`, etc.) to llvmlite's expected format (`'=='`, `'!='`, `'<'`, etc.). Unified the mapping for both integer and float comparisons.
