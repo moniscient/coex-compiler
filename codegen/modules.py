@@ -119,6 +119,16 @@ class ModuleGenerator:
 
         prefix = f"__{module_info.name}__"
 
+        # BUG-063 FIX: Process imports within this module first
+        # This allows library modules to import and use other libraries
+        for imp in program.imports:
+            if imp.is_library:
+                # Library import: import "path/to/lib.cxz"
+                self.load_library(imp.library_path, imp.module)
+            else:
+                # Module import: import ui
+                self.load_module(imp.module)
+
         # Register traits from module
         for trait_decl in program.traits:
             cg._register_trait(trait_decl)

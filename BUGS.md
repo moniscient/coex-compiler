@@ -149,6 +149,35 @@
 - **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
+### BUG-064: Library modules cannot call ui.render() with String values in JSON
+- **Discovered**: 2026-01-28, during heapwatch implementation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Create a library that imports ui and calls ui.render() with a JSON panel
+  containing String struct values (from String.from()):
+  ```coex
+  import ui
+
+  func render_panel() -> int
+      value = String.from(42)
+      panel: json = {
+          type: "text",
+          text: value  # String struct, not string literal
+      }
+      ui.render(panel, "{}")  # CRASH
+      return 1
+  ~
+  ```
+- **Observed**: Segmentation fault (signal 11) when running the compiled program
+- **Expected**: String struct values should be convertible to JSON string values
+- **Hypothesis**: When a String struct (not a string literal) is used as a JSON field value,
+  the struct pointer is embedded directly instead of extracting the string value. This causes
+  issues when the JSON is serialized via stringify() for the C runtime.
+- **Workaround**: Use console output via print() instead of ui.render() for library modules
+  that need to display dynamic values
+- **Files**: `codegen/json_type.py` (JSON literal construction), `codegen/expressions.py`
+- **Status**: Open
+
 ---
 
 ## Resolved Bugs
@@ -239,6 +268,29 @@
 - **Files**: `coex_gc.py:2990-3000` (mark_json block in `_implement_gc_mark_object`)
 - **Status**: Fixed (2026-01-28)
 - **Resolution**: Changed struct to `{i64, i64}` and comparison constant from `i8` to `i64`
+
+### BUG-063: Library modules cannot import other libraries
+- **Discovered**: 2026-01-28, during heapwatch implementation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Create lib/a.coex with a function, create lib/b.coex that imports a and calls a.func()
+- **Observed**: Error "Undeclared identifier 'a': variable has not been declared in this scope"
+- **Expected**: Library b should be able to import and use library a
+- **Root Cause**: `generate_module_contents()` in `codegen/modules.py` does not process
+  `program.imports` - it only handles traits, types, kinds, and functions. Nested imports
+  within library modules were completely ignored.
+- **Files**: `codegen/modules.py:115-228`
+- **Status**: Fixed (2026-01-28)
+- **Resolution**: Added import processing at the start of `generate_module_contents()`:
+  ```python
+  # BUG-063 FIX: Process imports within this module first
+  for imp in program.imports:
+      if imp.is_library:
+          self.load_library(imp.library_path, imp.module)
+      else:
+          self.load_module(imp.module)
+  ```
+  Library modules can now import other libraries. Tested with heapwatch importing ui.
 
 ### BUG-062: Handle table grows unboundedly causing crash
 - **Discovered**: 2026-01-28, during BUG-060 investigation
@@ -753,8 +805,8 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-28)
-- **Open**: 13 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
-- **Resolved**: 44 bugs (including BUG-059: json.append fix, BUG-060: TLAB reclamation, BUG-061: GC JSON struct fix, BUG-062: handle table leak fix)
+- **Open**: 14 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058, BUG-064)
+- **Resolved**: 45 bugs (including BUG-059: json.append fix, BUG-060: TLAB reclamation, BUG-061: GC JSON struct fix, BUG-062: handle table leak fix, BUG-063: library nested imports)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX
