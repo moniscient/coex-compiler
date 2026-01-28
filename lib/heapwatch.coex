@@ -1,0 +1,49 @@
+# Heapwatch - Real-time Heap Monitoring Library
+#
+# Displays GC statistics. For v1, prints to console.
+# Call render(frame) with frame number - prints every 1000 frames.
+# Call render_now() to print immediately.
+
+extern coex_gc_get_total_allocations() -> int ~
+extern coex_gc_get_total_bytes() -> int ~
+extern coex_gc_get_collections() -> int ~
+extern coex_gc_get_live_objects() -> int ~
+extern coex_gc_get_swept_objects() -> int ~
+extern coex_gc_get_next_handle() -> int ~
+extern coex_gc_get_handle_table_size() -> int ~
+extern coex_gc_get_tlabs_reclaimed() -> int ~
+
+# Render heapwatch stats (prints every 1000 frames)
+# Pass your frame counter - will print when frame % 1000 == 0
+func render(frame: int) -> int
+    if frame % 1000 != 0
+        return 0
+    ~
+
+    total_allocs = coex_gc_get_total_allocations()
+    total_bytes = coex_gc_get_total_bytes()
+    collections = coex_gc_get_collections()
+    live = coex_gc_get_live_objects()
+    next_handle = coex_gc_get_next_handle()
+    table_size = coex_gc_get_handle_table_size()
+    tlabs_reclaimed = coex_gc_get_tlabs_reclaimed()
+
+    print("[HEAPWATCH] Allocs: " + String.from(total_allocs) + " | Bytes: " + String.from(total_bytes) + " | GCs: " + String.from(collections))
+    print("[HEAPWATCH] Live: " + String.from(live) + " | Handles: " + String.from(next_handle) + "/" + String.from(table_size) + " | TLABs: " + String.from(tlabs_reclaimed))
+    return 1
+~
+
+# Force immediate render (ignores frame counter)
+func render_now() -> int
+    total_allocs = coex_gc_get_total_allocations()
+    total_bytes = coex_gc_get_total_bytes()
+    collections = coex_gc_get_collections()
+    live = coex_gc_get_live_objects()
+    next_handle = coex_gc_get_next_handle()
+    table_size = coex_gc_get_handle_table_size()
+    tlabs_reclaimed = coex_gc_get_tlabs_reclaimed()
+
+    print("[HEAPWATCH] Allocs: " + String.from(total_allocs) + " | Bytes: " + String.from(total_bytes) + " | GCs: " + String.from(collections))
+    print("[HEAPWATCH] Live: " + String.from(live) + " | Handles: " + String.from(next_handle) + "/" + String.from(table_size) + " | TLABs: " + String.from(tlabs_reclaimed))
+    return 1
+~

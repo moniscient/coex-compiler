@@ -153,6 +153,120 @@
 
 ## Resolved Bugs
 
+### BUG-059: json.append() corrupts array when appending JSON objects
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      arr: json := []
+      arr = arr.append({ name: "Alice" })
+      arr = arr.append({ name: "Bob" })
+      print(arr.len())       # Works: prints 2
+      print(arr.stringify()) # CRASH: segfault
+      return 0
+  ~
+  ```
+- **Observed**: Appending integers works, but appending JSON objects causes corruption. `len()` returns correct value but `stringify()` crashes with segfault.
+- **Expected**: JSON array should contain valid JSON object pointers after append
+- **Root Cause**: In `_implement_json_append` (json_type.py:1408-1412), the code passed the JSON pointer directly to `list_append`, which copies bytes FROM that address. This copied the JSON struct's tag field instead of the pointer value.
+- **Files**: `codegen/json_type.py:1381-1420` (`_implement_json_append`)
+- **Status**: Fixed (2026-01-28)
+- **Resolution**: Allocate stack space for the pointer, store the JSON pointer there, and pass the stack address to `list_append`. This ensures the pointer value itself is copied into the list.
+
+### BUG-060: TLAB memory never reclaimed - causes memory leak
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**:
+  Run Galaxian game: `python3 coexc.py examples/galaxian.coex -o galaxian && ./galaxian`
+- **Observed**:
+  - Memory grows from <1GB to >5GB over ~37 seconds, then crashes with segfault
+  - After investigation with debug counters:
+    ```
+    total_allocations: 13,983,049
+    swept: 13,968,937 (99.9% of allocations ARE being swept)
+    reclaimed_bytes: 1,204,408 (only 1.2MB of 1.2GB reclaimed!)
+    tlab_freed: 13,968,937 (100% of freed objects were TLAB-allocated)
+    nontlab_freed: 0
+    ```
+  - Objects ARE being tracked and swept, but actual memory is never freed
+- **Root Cause**: 100% of allocations use TLAB (Thread-Local Allocation Buffer):
+  1. Objects allocated from 256KB TLAB buffers (fast path)
+  2. When objects become garbage, sweep frees the allocation NODE (24-byte tracking struct)
+  3. But TLAB-allocated object MEMORY is NOT freed - it stays in the TLAB forever
+  4. Code at coex_gc.py unmarked_node block has: `with builder.if_then(builder.not_(is_tlab)): free(header_ptr)`
+  5. This means TLAB objects never have their memory freed
+  6. Old TLABs should be freed when completely empty, but no mechanism exists to track this
+- **Expected**: When all objects in a TLAB become garbage, the TLAB buffer should be reclaimed
+- **Fix Required**: Implement TLAB reclamation:
+  1. Track live object count per TLAB (or use bitmap)
+  2. When sweeping a TLAB object, decrement the TLAB's live count
+  3. When TLAB live count reaches 0, free the entire 256KB buffer
+  4. Alternative: Use compaction to consolidate live objects into fewer TLABs
+- **Investigation History**:
+  - Initial hypothesis: `gc_alloc_to_thread_list` dropping allocations (pthread TLS issue)
+  - Partial fix applied: Added global fallback when pthread_getspecific returns NULL
+  - This fixed the tracking issue but revealed the deeper TLAB issue
+  - Debug counters added to trace allocation, sweep, and TLAB behavior
+- **Files**:
+  - `coex_gc.py:5880-5895` (unmarked_node - TLAB check)
+  - `coex_gc.py:4850-4960` (gc_tlab_alloc, gc_tlab_refill)
+  - `coex_gc.py:5610-6040` (gc_sweep_thread_lists)
+- **Status**: Fixed (2026-01-28)
+- **Resolution**:
+  1. Fixed gc_alloc_to_thread_list to use global tls_thread_entry fallback when pthread TLS fails
+  2. Added TLAB header structure with live_count for reference counting per TLAB
+  3. Extended alloc_node_type to include tlab_base pointer (field 3)
+  4. Modified gc_alloc to store TLAB base and increment live_count on allocation
+  5. Modified gc_tlab_init and gc_tlab_refill to initialize TLAB headers
+  6. Modified gc_sweep_thread_lists to decrement live_count on sweep
+  7. Implemented deferred TLAB freeing (add to dead list, free at end of sweep)
+  - Memory footprint reduced from 5GB+ to ~1GB
+  - ~18K TLABs (~4.5GB) properly reclaimed over 4000 frames
+- **Note**: A separate crash at ~42 seconds was discovered during testing (see BUG-062)
+
+### BUG-061: GC uses wrong struct layout for JSON marking
+- **Discovered**: 2026-01-28, during Galaxian GC debugging
+- **Category**: GC
+- **Severity**: Medium (works on little-endian by accident)
+- **Reproduction**: Any code that creates JSON objects with strings, arrays, or nested objects on a big-endian system
+- **Observed**: GC's `gc_mark_object` uses `{i8, i64}` struct for JSON, but actual JSON struct is `{i64, i64}`
+- **Expected**: GC should use correct struct layout matching `codegen/json_type.py:350-354`
+- **Root Cause**: Comment at coex_gc.py:2991 incorrectly stated "JSON struct: { i8 tag (0), i64 value (1) }" when the actual struct (defined in json_type.py) uses i64 for both fields for alignment.
+- **Impact**: On little-endian systems (x86, ARM), reading 1 byte of an 8-byte value with values 0-6 happens to work. On big-endian systems, this would read the wrong byte and fail to mark JSON children correctly.
+- **Files**: `coex_gc.py:2990-3000` (mark_json block in `_implement_gc_mark_object`)
+- **Status**: Fixed (2026-01-28)
+- **Resolution**: Changed struct to `{i64, i64}` and comparison constant from `i8` to `i64`
+
+### BUG-062: Handle table grows unboundedly causing crash
+- **Discovered**: 2026-01-28, during BUG-060 investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian game for ~42 seconds: `./galaxian`
+- **Observed**:
+  - Program crashes with SIGSEGV (exit code 139) after ~4000-4500 frames
+  - Memory grows at ~10MB/sec, reaching 5-6GB before crash
+  - `gc_next_handle` grows to 56M+, handle table doubles repeatedly
+  - Stack overflow in macOS CFRunLoop due to excessive memory pressure
+- **Expected**: Program should run indefinitely without crashing
+- **Root Cause**: `gc_handle_pool_refill()` in `coex_gc.py` **never used the free list**.
+  - When a thread's handle pool was empty, it always bump-allocated new handles
+  - Handles retired by GC were added to the free list but never reused
+  - Handle table grew: 1M -> 2M -> 4M -> 8M -> 16M -> 32M -> 64M (512MB)
+  - Eventually caused memory exhaustion and stack overflow
+- **Files**: `coex_gc.py` (`_implement_gc_handle_pool_refill`)
+- **Status**: Fixed (2026-01-28)
+- **Resolution**: Modified `gc_handle_pool_refill` to drain handles from the free list
+  before falling back to bump allocation. Implementation:
+  1. Lock mutex and check if free list has handles
+  2. Pop handles from free list into local array (up to pool size)
+  3. Give thread one handle, push rest back to free list
+  4. Only use bump allocation when free list is completely empty
+  - Result: `next_handle` stabilizes at ~28K, table stays at 1M
+  - Memory usage stable, can run indefinitely
+
 ### BUG-054: Metal texture released prematurely causing segfault
 - **Discovered**: 2026-01-22, during SVG module testing
 - **Category**: Runtime
@@ -638,9 +752,9 @@
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2026-01-21)
-- **Open**: 11 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050)
-- **Resolved**: 39 bugs (including BUG-045: Metal double type fix, BUG-047/48/49: Parser and GPU fixes)
+### Bug Count Summary (as of 2026-01-28)
+- **Open**: 13 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
+- **Resolved**: 44 bugs (including BUG-059: json.append fix, BUG-060: TLAB reclamation, BUG-061: GC JSON struct fix, BUG-062: handle table leak fix)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX
@@ -782,6 +896,64 @@
   3. Updated `_implement_json_parse` to use cJSON for array/object parsing
   4. cJSON library now always linked in `coexc.py`
   5. Added 12 comprehensive tests in `tests/test_json.py::TestJsonParse`
+
+### BUG-057: Module-level constant declarations not supported
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: Parser
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  # At module level, outside any function:
+  KEY_LEFT = 263
+  KEY_RIGHT = 262
+
+  func main() -> int
+      print(KEY_LEFT)
+      return 0
+  ~
+  ```
+- **Observed**: Parser error: `Syntax error: Line X:Y - mismatched input '=' expecting IDENTIFIER`
+- **Expected**: Module-level constant assignments should be allowed for defining named constants
+- **Hypothesis**: The grammar only allows variable declarations inside function bodies. Top-level statements are restricted to function/type definitions and imports.
+- **Files**: `Coex.g4` (grammar rules for top-level declarations), `ast_builder.py`
+- **Workaround**: Define constants as local variables in each function that needs them, or use literal values directly
+- **Status**: Open
+
+### BUG-058: LLVM domination error with repeated variable declarations in if-blocks
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      i = 0
+      while i < 10
+          if i % 2 == 0
+              row = i / 2
+              col = i % 5
+              print(row)
+          ~
+          if i % 3 == 0
+              row = i / 3    # Same variable name as above
+              col = i % 4    # Same variable name as above
+              print(col)
+          ~
+          i = i + 1
+      ~
+      return 0
+  ~
+  ```
+- **Observed**: LLVM IR verification error:
+  ```
+  Instruction does not dominate all uses!
+    %row = alloca i64, align 8
+    store i64 %.XXX, i64* %row, align 8
+  ```
+- **Expected**: Variables with the same name in different if-blocks should create separate allocas or be scoped correctly
+- **Hypothesis**: The codegen creates new allocas for each variable declaration inside if-blocks, but LLVM requires all allocas to be in the entry block for proper dominance. When the same variable name is used in multiple non-nested if-blocks within a loop, the allocas are placed in different basic blocks, causing dominance violations.
+- **Files**: `codegen/statements.py` (variable declaration handling), `codegen/flow_control.py` (if/while generation)
+- **Workaround**: Declare all loop-scoped variables once before the loop or at the top of the while body, then reassign them in the if-blocks rather than re-declaring
+- **Status**: Open
 
 ### BUG-056: Task transform uses invalid comparison operators for icmp
 - **Discovered**: 2026-01-28, during scheduler stress test development

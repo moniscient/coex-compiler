@@ -1,0 +1,596 @@
+#@ [MOVE] Variable 'calc_ey' is not used after this assignment. Consider: explosion_y := calc_ey (move instead of copy)
+#@ [MOVE] Variable 'calc_ex' is not used after this assignment. Consider: explosion_x := calc_ex (move instead of copy)
+#@ [PERF] Loop modifies 'canvas_children' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+#@ [PERF] Loop modifies 'canvas_children' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Galaxian - Classic Arcade Space Shooter
+#
+# A Galaxian-style game demonstrating Coex's UI system, SVG rendering,
+# keyboard input, and game state management.
+#
+# Controls:
+#   Left/Right Arrow or A/D - Move ship
+#   Space - Fire bullet
+#   Escape - Quit
+#
+# Run with: python3 coexc.py examples/galaxian.coex -o galaxian
+#           ./galaxian
+
+import ui
+import svg
+import heapwatch
+
+# =============================================================================
+# Collision Detection
+# =============================================================================
+
+formula check_overlap(ax: int, ay: int, aw: int, ah: int, bx: int, by: int, bw: int, bh: int) -> bool
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+~
+
+# =============================================================================
+# Main Game
+# =============================================================================
+
+func main() -> int
+    print("=== GALAXIAN ===")
+    print("")
+    print("Controls:")
+    print("  Arrow Keys or A/D - Move")
+    print("  Space - Fire")
+    print("  Escape - Quit")
+    print("")
+
+    # Initialize UI
+    config: json = {
+        title: "Galaxian",
+        width: 640,
+        height: 480,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    # Check SVG availability
+    if svg.is_available() == 0
+        print("SVG module not available")
+        ui.close()
+        return 1
+    ~
+
+    print("Loading assets...")
+
+    # Load SVG assets
+    player_ship = svg.load("examples/galaxian_assets/player_ship.svg")
+    if player_ship == 0
+        print("Failed to load player_ship.svg")
+        ui.close()
+        return 1
+    ~
+
+    enemy_drone = svg.load("examples/galaxian_assets/enemy_drone.svg")
+    if enemy_drone == 0
+        print("Failed to load enemy_drone.svg")
+        ui.close()
+        return 1
+    ~
+
+    enemy_emissary = svg.load("examples/galaxian_assets/enemy_emissary.svg")
+    if enemy_emissary == 0
+        print("Failed to load enemy_emissary.svg")
+        ui.close()
+        return 1
+    ~
+
+    enemy_hornet = svg.load("examples/galaxian_assets/enemy_hornet.svg")
+    if enemy_hornet == 0
+        print("Failed to load enemy_hornet.svg")
+        ui.close()
+        return 1
+    ~
+
+    enemy_galboss = svg.load("examples/galaxian_assets/enemy_galboss.svg")
+    if enemy_galboss == 0
+        print("Failed to load enemy_galboss.svg")
+        ui.close()
+        return 1
+    ~
+
+    player_bullet_svg = svg.load("examples/galaxian_assets/player_bullet.svg")
+    if player_bullet_svg == 0
+        print("Failed to load player_bullet.svg")
+        ui.close()
+        return 1
+    ~
+
+    enemy_bullet_svg = svg.load("examples/galaxian_assets/enemy_bullet.svg")
+    if enemy_bullet_svg == 0
+        print("Failed to load enemy_bullet.svg")
+        ui.close()
+        return 1
+    ~
+
+    explosion_svg = svg.load("examples/galaxian_assets/explosion.svg")
+    if explosion_svg == 0
+        print("Failed to load explosion.svg")
+        ui.close()
+        return 1
+    ~
+
+    star_svg = svg.load("examples/galaxian_assets/star.svg")
+    if star_svg == 0
+        print("Failed to load star.svg")
+        ui.close()
+        return 1
+    ~
+
+    print("All assets loaded!")
+
+    # =============================================================================
+    # Game State Variables
+    # =============================================================================
+
+    # Player state
+    player_x = 300
+    player_y = 430
+    lives = 3
+    score = 0
+    wave = 1
+
+    # Player bullet (only one at a time)
+    player_bullet_active = 0
+    player_bullet_x = 0
+    player_bullet_y = 0
+
+    # Formation movement
+    formation_offset_x = 0
+    formation_dir = 1
+    formation_speed = 1
+
+    # Enemy bullet
+    enemy_bullet_active = 0
+    enemy_bullet_x = 0
+    enemy_bullet_y = 0
+
+    # Frame counter for timing
+    frame_count = 0
+
+    # Explosion effect
+    explosion_active = 0
+    explosion_x = 0
+    explosion_y = 0
+    explosion_timer = 0
+
+    # Game state
+    game_over = 0
+
+    # Temporary calculation variables (declared once to avoid compiler issue)
+    calc_row = 0
+    calc_col = 0
+    calc_ex = 0
+    calc_ey = 0
+    calc_etype = 0
+    calc_ew = 0
+    calc_eh = 0
+    calc_handle = 0
+
+    # Enemy alive status (38 enemies: 4 rows)
+    # Row 0: drones (indices 0-9)
+    # Row 1: drones (indices 10-19)
+    # Row 2: emissaries (indices 20-29)
+    # Row 3: hornets (30-32), galboss (33-34), hornets (35-37)
+    enemy_alive = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                   1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                   1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                   1, 1, 1, 1, 1, 1, 1, 1]
+
+    # Enemy types: 0=drone, 1=emissary, 2=hornet, 3=galboss
+    enemy_types = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                   1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                   2, 2, 2, 3, 3, 2, 2, 2]
+
+    # Star positions for background (20 stars for simplicity)
+    star_x = [50, 120, 200, 280, 350, 420, 500, 580, 30, 90,
+              160, 240, 310, 390, 460, 540, 610, 70, 140, 220]
+    star_y = [30, 70, 45, 90, 25, 80, 55, 35, 120, 160,
+              200, 240, 280, 320, 360, 400, 380, 330, 260, 220]
+
+    # State string for UI rendering
+    state = "{}"
+
+    print("Starting game loop...")
+
+    # =============================================================================
+    # Main Game Loop
+    # =============================================================================
+
+    while game_over == 0
+        if ui.should_close()
+            break
+        ~
+
+        frame_count = frame_count + 1
+
+        # Debug: print frame count and GC stats periodically
+        if frame_count % 1000 == 0
+            print("Frame: ")
+            print(frame_count)
+            gc_dump_stats()
+        ~
+
+        # GC every frame to manage memory
+        gc()
+
+        # ---------------------------------------------------------------------
+        # Input Handling
+        # Key codes: 263=Left, 262=Right, 65=A, 68=D, 32=Space, 256=Escape
+        # ---------------------------------------------------------------------
+
+        # Movement - Arrow keys or A/D
+        if ui.get_key(263) or ui.get_key(65)
+            player_x = player_x - 5
+            if player_x < 0
+                player_x = 0
+            ~
+        ~
+
+        if ui.get_key(262) or ui.get_key(68)
+            player_x = player_x + 5
+            if player_x > 600
+                player_x = 600
+            ~
+        ~
+
+        # Fire - Space (only if no bullet active)
+        if ui.get_key(32) and player_bullet_active == 0
+            player_bullet_active = 1
+            player_bullet_x = player_x + 18
+            player_bullet_y = player_y - 12
+        ~
+
+        # Quit - Escape
+        if ui.get_key(256)
+            break
+        ~
+
+        # ---------------------------------------------------------------------
+        # Update Player Bullet
+        # ---------------------------------------------------------------------
+
+        if player_bullet_active == 1
+            player_bullet_y = player_bullet_y - 8
+            if player_bullet_y < 0
+                player_bullet_active = 0
+            ~
+        ~
+
+        # ---------------------------------------------------------------------
+        # Update Formation Movement
+        # ---------------------------------------------------------------------
+
+        formation_offset_x = formation_offset_x + formation_dir * formation_speed
+        if formation_offset_x > 60
+            formation_dir = -1
+        ~
+        if formation_offset_x < -60
+            formation_dir = 1
+        ~
+
+        # ---------------------------------------------------------------------
+        # Check Player Bullet vs Enemies
+        # ---------------------------------------------------------------------
+
+        if player_bullet_active == 1
+            i = 0
+            while i < 38
+                if enemy_alive.get(i) == 1
+                    # Calculate enemy position
+                    calc_row = i / 10
+                    calc_col = i % 10
+                    calc_ex = 80 + calc_col * 40 + formation_offset_x
+                    calc_ey = 60 + calc_row * 36
+                    calc_etype = enemy_types.get(i)
+
+                    # Size based on type
+                    calc_ew = 24
+                    calc_eh = 24
+                    if calc_etype == 1
+                        calc_ew = 28
+                    ~
+                    if calc_etype == 2
+                        calc_ew = 28
+                    ~
+                    if calc_etype == 3
+                        calc_ew = 36
+                        calc_eh = 28
+                    ~
+
+                    # Check collision
+                    if check_overlap(player_bullet_x, player_bullet_y, 4, 12, calc_ex, calc_ey, calc_ew, calc_eh)
+                        # Hit!
+                        enemy_alive = enemy_alive.set(i, 0)
+                        player_bullet_active = 0
+
+                        # Add score based on type
+                        if calc_etype == 0
+                            score = score + 30
+                        ~
+                        if calc_etype == 1
+                            score = score + 40
+                        ~
+                        if calc_etype == 2
+                            score = score + 50
+                        ~
+                        if calc_etype == 3
+                            score = score + 150
+                        ~
+
+                        # Trigger explosion
+                        explosion_active = 1
+                        explosion_x = calc_ex
+                        explosion_y = calc_ey
+                        explosion_timer = 15
+
+                        break
+                    ~
+                ~
+                i = i + 1
+            ~
+        ~
+
+        # ---------------------------------------------------------------------
+        # Update Explosion
+        # ---------------------------------------------------------------------
+
+        if explosion_active == 1
+            explosion_timer = explosion_timer - 1
+            if explosion_timer <= 0
+                explosion_active = 0
+            ~
+        ~
+
+        # ---------------------------------------------------------------------
+        # Enemy Firing (one bullet at a time for simplicity)
+        # ---------------------------------------------------------------------
+
+        if frame_count % 90 == 0 and enemy_bullet_active == 0
+            # Find an alive enemy to fire
+            fire_idx = (frame_count / 90) % 38
+            attempts = 0
+            while attempts < 38
+                if enemy_alive.get(fire_idx) == 1
+                    calc_row = fire_idx / 10
+                    calc_col = fire_idx % 10
+                    enemy_bullet_x = 80 + calc_col * 40 + formation_offset_x + 10
+                    enemy_bullet_y = 60 + calc_row * 36 + 20
+                    enemy_bullet_active = 1
+                    break
+                ~
+                fire_idx = (fire_idx + 1) % 38
+                attempts = attempts + 1
+            ~
+        ~
+
+        # ---------------------------------------------------------------------
+        # Update Enemy Bullet
+        # ---------------------------------------------------------------------
+
+        if enemy_bullet_active == 1
+            enemy_bullet_y = enemy_bullet_y + 4
+            if enemy_bullet_y > 480
+                enemy_bullet_active = 0
+            ~
+            # Check collision with player
+            if check_overlap(enemy_bullet_x, enemy_bullet_y, 4, 10, player_x, player_y, 40, 32)
+                enemy_bullet_active = 0
+                lives = lives - 1
+                if lives <= 0
+                    game_over = 1
+                ~
+            ~
+        ~
+
+        # ---------------------------------------------------------------------
+        # Check Wave Completion
+        # ---------------------------------------------------------------------
+
+        enemies_remaining = 0
+        i = 0
+        while i < 38
+            if enemy_alive.get(i) == 1
+                enemies_remaining = enemies_remaining + 1
+            ~
+            i = i + 1
+        ~
+
+        if enemies_remaining == 0
+            # Wave complete - reset enemies
+            wave = wave + 1
+            formation_speed = formation_speed + 1
+            i = 0
+            while i < 38
+                enemy_alive = enemy_alive.set(i, 1)
+                i = i + 1
+            ~
+            print("Wave ")
+            print(wave)
+            print(" starting!")
+        ~
+
+        # ---------------------------------------------------------------------
+        # Build Layout for Rendering
+        # ---------------------------------------------------------------------
+
+        # Build game canvas children (sprites with absolute positioning)
+        canvas_children: json := []
+
+        # Background stars
+        si = 0
+        while si < 20
+            sx = star_x.get(si)
+            sy = star_y.get(si)
+            canvas_children = canvas_children.append({
+                type: "svg_image",
+                id: "star_" + String.from(si),
+                handle: star_svg,
+                width: 2,
+                height: 2,
+                offsetX: sx,
+                offsetY: sy
+            })
+            si = si + 1
+        ~
+
+        # Enemies
+        i = 0
+        while i < 38
+            if enemy_alive.get(i) == 1
+                calc_row = i / 10
+                calc_col = i % 10
+                calc_ex = 80 + calc_col * 40 + formation_offset_x
+                calc_ey = 60 + calc_row * 36
+
+                calc_etype = enemy_types.get(i)
+                calc_handle = enemy_drone
+                calc_ew = 24
+                calc_eh = 24
+
+                if calc_etype == 1
+                    calc_handle = enemy_emissary
+                    calc_ew = 28
+                ~
+                if calc_etype == 2
+                    calc_handle = enemy_hornet
+                    calc_ew = 28
+                ~
+                if calc_etype == 3
+                    calc_handle = enemy_galboss
+                    calc_ew = 36
+                    calc_eh = 28
+                ~
+
+                canvas_children = canvas_children.append({
+                    type: "svg_image",
+                    id: "enemy_" + String.from(i),
+                    handle: calc_handle,
+                    width: calc_ew,
+                    height: calc_eh,
+                    offsetX: calc_ex,
+                    offsetY: calc_ey
+                })
+            ~
+            i = i + 1
+        ~
+
+        # Player ship
+        canvas_children = canvas_children.append({
+            type: "svg_image",
+            id: "player",
+            handle: player_ship,
+            width: 40,
+            height: 32,
+            offsetX: player_x,
+            offsetY: player_y
+        })
+
+        # Player bullet
+        if player_bullet_active == 1
+            canvas_children = canvas_children.append({
+                type: "svg_image",
+                id: "player_bullet",
+                handle: player_bullet_svg,
+                width: 4,
+                height: 12,
+                offsetX: player_bullet_x,
+                offsetY: player_bullet_y
+            })
+        ~
+
+        # Enemy bullet
+        if enemy_bullet_active == 1
+            canvas_children = canvas_children.append({
+                type: "svg_image",
+                id: "enemy_bullet",
+                handle: enemy_bullet_svg,
+                width: 4,
+                height: 10,
+                offsetX: enemy_bullet_x,
+                offsetY: enemy_bullet_y
+            })
+        ~
+
+        # Explosion effect
+        if explosion_active == 1
+            canvas_children = canvas_children.append({
+                type: "svg_image",
+                id: "explosion",
+                handle: explosion_svg,
+                width: 40,
+                height: 40,
+                offsetX: explosion_x,
+                offsetY: explosion_y
+            })
+        ~
+
+        # Build final layout with header + canvas
+        layout: json = {
+            type: "window",
+            title: "Galaxian",
+            children: [
+                {
+                    type: "row",
+                    children: [
+                        { type: "text", text: "SCORE: " + String.from(score), color: [1.0, 1.0, 0.0, 1.0] },
+                        { type: "spacing" },
+                        { type: "text", text: "LIVES: " + String.from(lives), color: [0.0, 1.0, 1.0, 1.0] },
+                        { type: "spacing" },
+                        { type: "text", text: "WAVE: " + String.from(wave), color: [1.0, 0.5, 1.0, 1.0] }
+                    ]
+                },
+                {
+                    type: "canvas",
+                    width: 640,
+                    height: 450,
+                    children: canvas_children
+                }
+            ]
+        }
+
+        # Render frame
+        state = ui.render(layout, state)
+
+        # Render heapwatch stats (every 1000 frames)
+        heapwatch.render(frame_count)
+    ~
+
+    # Game over
+    if lives <= 0
+        print("")
+        print("=== GAME OVER ===")
+        print("Final Score: ")
+        print(score)
+        print("Waves Completed: ")
+        print(wave - 1)
+    ~
+
+    # Cleanup
+    print("")
+    print("Cleaning up...")
+    svg.destroy(player_ship)
+    svg.destroy(enemy_drone)
+    svg.destroy(enemy_emissary)
+    svg.destroy(enemy_hornet)
+    svg.destroy(enemy_galboss)
+    svg.destroy(player_bullet_svg)
+    svg.destroy(enemy_bullet_svg)
+    svg.destroy(explosion_svg)
+    svg.destroy(star_svg)
+    ui.close()
+
+    print("Thanks for playing!")
+    return 0
+~

@@ -279,6 +279,7 @@ class GarbageCollector:
         # Phase 0: Debugging infrastructure
         self._implement_gc_trace()
         self._implement_gc_dump_stats()
+        self._implement_gc_stat_getters()  # Heapwatch getter functions
         self._implement_gc_dump_heap()
         self._implement_gc_dump_roots()
         self._implement_gc_dump_object()
@@ -315,12 +316,21 @@ class GarbageCollector:
         ])
 
         # Allocation node: { i8* next, i64 handle, i64 size }
+        # TLAB header structure - placed at start of each TLAB buffer
+        # Used to track live object count for TLAB reclamation
+        self.tlab_header_type = ir.LiteralStructType([
+            self.i64,     # live_count - atomic counter of live objects
+            self.i8_ptr,  # next_tlab - linked list of all TLABs for this thread
+        ])
+        self.TLAB_HEADER_SIZE = 16  # sizeof(tlab_header_type)
+
         # Linked list of all allocations for sweep
         # Phase 7: Changed from i8* data to i64 handle for handle-based GC
         self.alloc_node_type = ir.LiteralStructType([
             self.i8_ptr,  # next allocation node
             self.i64,     # handle to the object (instead of data pointer)
             self.i64,     # size of allocation
+            self.i8_ptr,  # tlab_base - pointer to TLAB header (NULL for non-TLAB)
         ])
 
         # GC Frame: { i8* parent, i64 num_roots, i64* handle_slots }
@@ -771,6 +781,73 @@ class GarbageCollector:
         self.tls_slot_index.linkage = 'internal'
         self.tls_slot_index.thread_local = 'localdynamic'
 
+        # DEBUG: Counter for successful list additions
+        self.gc_debug_list_adds = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_list_adds")
+        self.gc_debug_list_adds.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_list_adds.linkage = 'internal'
+
+        # DEBUG: Counter for skipped adds (no thread entry)
+        self.gc_debug_list_skips = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_list_skips")
+        self.gc_debug_list_skips.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_list_skips.linkage = 'internal'
+
+        # DEBUG: Counter for threads iterated during sweep
+        self.gc_debug_sweep_threads = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_sweep_threads")
+        self.gc_debug_sweep_threads.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_sweep_threads.linkage = 'internal'
+
+        # DEBUG: Counter for nodes seen during sweep
+        self.gc_debug_sweep_nodes = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_sweep_nodes")
+        self.gc_debug_sweep_nodes.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_sweep_nodes.linkage = 'internal'
+
+        # DEBUG: Counter for empty lists during sweep
+        self.gc_debug_sweep_empty = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_sweep_empty")
+        self.gc_debug_sweep_empty.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_sweep_empty.linkage = 'internal'
+
+        # DEBUG: Counter for marked nodes during sweep (survivors)
+        self.gc_debug_sweep_marked = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_sweep_marked")
+        self.gc_debug_sweep_marked.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_sweep_marked.linkage = 'internal'
+
+        # DEBUG: Counter for unmarked nodes during sweep (freed)
+        self.gc_debug_sweep_unmarked = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_sweep_unmarked")
+        self.gc_debug_sweep_unmarked.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_sweep_unmarked.linkage = 'internal'
+
+        # DEBUG: Counter for TLAB objects freed
+        self.gc_debug_tlab_freed = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_tlab_freed")
+        self.gc_debug_tlab_freed.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_tlab_freed.linkage = 'internal'
+
+        # DEBUG: Counter for non-TLAB objects freed
+        self.gc_debug_nontlab_freed = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_nontlab_freed")
+        self.gc_debug_nontlab_freed.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_nontlab_freed.linkage = 'internal'
+
+        # DEBUG: Counter for TLABs reclaimed (munmap called)
+        self.gc_debug_tlabs_reclaimed = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_tlabs_reclaimed")
+        self.gc_debug_tlabs_reclaimed.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_tlabs_reclaimed.linkage = 'internal'
+
+        # Deferred TLAB free list - TLABs to free at end of sweep
+        # This avoids use-after-free when multiple objects in same TLAB die in same cycle
+        self.gc_dead_tlab_list = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_dead_tlab_list")
+        self.gc_dead_tlab_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_dead_tlab_list.linkage = 'internal'
+
         # ============================================================
         # Phase 5: Mark Worklist for Concurrent Marking
         # ============================================================
@@ -1217,6 +1294,42 @@ class GarbageCollector:
         # Print all shadow stack frames and their roots
         gc_dump_shadow_stacks_ty = ir.FunctionType(self.void, [])
         self.gc_dump_shadow_stacks = ir.Function(self.module, gc_dump_shadow_stacks_ty, name="coex_gc_dump_shadow_stacks")
+
+        # ============================================================
+        # Heapwatch Getter Functions (read-only access to GC stats)
+        # ============================================================
+
+        # gc_get_total_allocations() -> i64
+        gc_get_total_allocations_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_total_allocations = ir.Function(self.module, gc_get_total_allocations_ty, name="coex_gc_get_total_allocations")
+
+        # gc_get_total_bytes() -> i64
+        gc_get_total_bytes_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_total_bytes = ir.Function(self.module, gc_get_total_bytes_ty, name="coex_gc_get_total_bytes")
+
+        # gc_get_collections() -> i64
+        gc_get_collections_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_collections = ir.Function(self.module, gc_get_collections_ty, name="coex_gc_get_collections")
+
+        # gc_get_live_objects() -> i64
+        gc_get_live_objects_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_live_objects = ir.Function(self.module, gc_get_live_objects_ty, name="coex_gc_get_live_objects")
+
+        # gc_get_swept_objects() -> i64
+        gc_get_swept_objects_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_swept_objects = ir.Function(self.module, gc_get_swept_objects_ty, name="coex_gc_get_swept_objects")
+
+        # gc_get_next_handle() -> i64
+        gc_get_next_handle_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_next_handle = ir.Function(self.module, gc_get_next_handle_ty, name="coex_gc_get_next_handle")
+
+        # gc_get_handle_table_size() -> i64
+        gc_get_handle_table_size_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_handle_table_size = ir.Function(self.module, gc_get_handle_table_size_ty, name="coex_gc_get_handle_table_size")
+
+        # gc_get_tlabs_reclaimed() -> i64
+        gc_get_tlabs_reclaimed_ty = ir.FunctionType(self.i64, [])
+        self.gc_get_tlabs_reclaimed = ir.Function(self.module, gc_get_tlabs_reclaimed_ty, name="coex_gc_get_tlabs_reclaimed")
 
         # ============================================================
         # Handle Management Function Declarations (Handle-Based GC - Phase 1)
@@ -2220,10 +2333,12 @@ class GarbageCollector:
             ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
         )
 
-        # Allocate stack slots for block pointer and is_tlab flag
+        # Allocate stack slots for block pointer, is_tlab flag, and tlab_base
         block_alloca = builder.alloca(self.i8_ptr, name="block")
         is_tlab_alloca = builder.alloca(self.i64, name="is_tlab")
+        tlab_base_alloca = builder.alloca(self.i8_ptr, name="tlab_base")
         builder.store(ir.Constant(self.i64, 0), is_tlab_alloca)
+        builder.store(ir.Constant(self.i8_ptr, None), tlab_base_alloca)
         builder.branch(try_tlab)
 
         # ============================================================
@@ -2238,6 +2353,13 @@ class GarbageCollector:
         builder.position_at_end(tlab_ok)
         builder.store(tlab_block, block_alloca)
         builder.store(ir.Constant(self.i64, 1), is_tlab_alloca)  # Mark as TLAB allocation
+        # Load and store current TLAB base from ThreadEntry for reference counting
+        tls_key_ok = builder.load(self.tls_thread_entry_key)
+        thread_entry_ok_i8 = builder.call(self.pthread_getspecific, [tls_key_ok])
+        thread_entry_ok = builder.bitcast(thread_entry_ok_i8, self.thread_entry_type.as_pointer())
+        tlab_base_ptr_ok = builder.gep(thread_entry_ok, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)], inbounds=True)
+        current_tlab_base_ok = builder.load(tlab_base_ptr_ok)
+        builder.store(current_tlab_base_ok, tlab_base_alloca)
         builder.branch(have_block_tlab)
 
         # ============================================================
@@ -2256,6 +2378,13 @@ class GarbageCollector:
         builder.position_at_end(tlab_retry_ok)
         builder.store(retry_block, block_alloca)
         builder.store(ir.Constant(self.i64, 1), is_tlab_alloca)  # Mark as TLAB allocation
+        # Load and store current TLAB base (now points to newly refilled TLAB)
+        tls_key_retry = builder.load(self.tls_thread_entry_key)
+        thread_entry_retry_i8 = builder.call(self.pthread_getspecific, [tls_key_retry])
+        thread_entry_retry = builder.bitcast(thread_entry_retry_i8, self.thread_entry_type.as_pointer())
+        tlab_base_ptr_retry = builder.gep(thread_entry_retry, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)], inbounds=True)
+        current_tlab_base_retry = builder.load(tlab_base_ptr_retry)
+        builder.store(current_tlab_base_retry, tlab_base_alloca)
         builder.branch(have_block_tlab)
 
         # ============================================================
@@ -2374,7 +2503,7 @@ class GarbageCollector:
         # Allocate allocation node (ALWAYS use malloc for nodes, not TLAB)
         # This ensures sweep can safely free nodes without tracking TLAB status
         # malloc() is thread-safe on modern systems
-        node_size = ir.Constant(self.i64, 24)  # sizeof(alloc_node)
+        node_size = ir.Constant(self.i64, 32)  # sizeof(alloc_node) - now includes tlab_base
         raw_node = builder.call(self.codegen.malloc, [node_size])
 
         node = builder.bitcast(raw_node, self.alloc_node_type.as_pointer())
@@ -2393,6 +2522,20 @@ class GarbageCollector:
         node_size_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         aligned_size_reload = builder.load(size_ptr)  # Reload from header
         builder.store(aligned_size_reload, node_size_ptr)
+
+        # node->tlab_base = tlab_base (for TLAB reclamation)
+        tlab_base_for_node = builder.load(tlab_base_alloca)
+        tlab_base_node_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
+        builder.store(tlab_base_for_node, tlab_base_node_ptr)
+
+        # If this is a TLAB allocation, increment the TLAB's live_count
+        tlab_base_int = builder.ptrtoint(tlab_base_for_node, self.i64)
+        is_tlab_alloc = builder.icmp_unsigned("!=", tlab_base_int, ir.Constant(self.i64, 0))
+        with builder.if_then(is_tlab_alloc):
+            # TLAB header is at tlab_base, live_count is field 0
+            tlab_header = builder.bitcast(tlab_base_for_node, self.tlab_header_type.as_pointer())
+            live_count_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+            builder.atomic_rmw('add', live_count_ptr, ir.Constant(self.i64, 1), 'monotonic')
 
         # Add to per-thread allocation list (lock-free - thread-local data only)
         builder.call(self.gc_alloc_to_thread_list, [raw_node])
@@ -2988,15 +3131,16 @@ class GarbageCollector:
         builder.branch(pv_node_loop)
 
         # Mark JSON: check tag, if string/array/object then mark the value pointer
-        # JSON struct: { i8 tag (0), i64 value (1) }
+        # JSON struct: { i64 tag (0), i64 value (1) } - both fields are i64 for alignment!
+        # (BUG-061 fix: was incorrectly using {i8, i64} which misread the tag on non-little-endian)
         # Tags 4 (string), 5 (array), 6 (object) have pointer values
         builder.position_at_end(mark_json)
-        json_ptr_type = ir.LiteralStructType([self.i8, self.i64]).as_pointer()
+        json_ptr_type = ir.LiteralStructType([self.i64, self.i64]).as_pointer()
         json_typed = builder.bitcast(ptr, json_ptr_type)
         json_tag_ptr = builder.gep(json_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
         json_tag = builder.load(json_tag_ptr)
         # Check if tag >= 4 (string, array, or object - all have pointer values)
-        is_ptr_type = builder.icmp_unsigned(">=", json_tag, ir.Constant(self.i8, 4))
+        is_ptr_type = builder.icmp_unsigned(">=", json_tag, ir.Constant(self.i64, 4))
         builder.cbranch(is_ptr_type, mark_json_ptr, mark_json_done)
 
         # Mark the pointer value
@@ -4834,19 +4978,31 @@ class GarbageCollector:
         thread_entry = func.args[0]
         thread_entry_typed = builder.bitcast(thread_entry, self.thread_entry_type.as_pointer())
 
-        # Set tlab_base (field 6)
+        # Initialize TLAB header at the start of the buffer
+        tlab_header = builder.bitcast(buffer, self.tlab_header_type.as_pointer())
+
+        # header->live_count = 0
+        live_count_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), live_count_ptr)
+
+        # header->next_tlab = NULL (first TLAB has no previous)
+        next_tlab_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), next_tlab_ptr)
+
+        # Set tlab_base (field 6) - points to start of buffer (where header is)
         tlab_base_ptr = builder.gep(thread_entry_typed, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 6)
         ], inbounds=True)
         builder.store(buffer, tlab_base_ptr)
 
-        # Set tlab_cursor (field 7) - starts at base
+        # Set tlab_cursor (field 7) - starts AFTER the header
+        cursor_start = builder.gep(buffer, [ir.Constant(self.i64, self.TLAB_HEADER_SIZE)])
         tlab_cursor_ptr = builder.gep(thread_entry_typed, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 7)
         ], inbounds=True)
-        builder.store(buffer, tlab_cursor_ptr)
+        builder.store(cursor_start, tlab_cursor_ptr)
 
         # Set tlab_limit (field 8) - base + TLAB_SIZE
         limit = builder.gep(buffer, [tlab_size])
@@ -5015,19 +5171,32 @@ class GarbageCollector:
 
         builder.position_at_end(alloc_ok)
 
-        # Update tlab_base (field 6)
+        # Initialize TLAB header at the start of the buffer
+        tlab_header = builder.bitcast(buffer, self.tlab_header_type.as_pointer())
+
+        # header->live_count = 0
+        live_count_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), live_count_ptr)
+
+        # header->next_tlab = old tlab_base (link to previous TLAB)
         tlab_base_ptr = builder.gep(thread_entry_typed, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 6)
         ], inbounds=True)
+        old_tlab_base = builder.load(tlab_base_ptr)
+        next_tlab_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        builder.store(old_tlab_base, next_tlab_ptr)
+
+        # Update tlab_base (field 6) - points to start of buffer (where header is)
         builder.store(buffer, tlab_base_ptr)
 
-        # Update tlab_cursor (field 7)
+        # Update tlab_cursor (field 7) - starts AFTER the header
+        cursor_start = builder.gep(buffer, [ir.Constant(self.i64, self.TLAB_HEADER_SIZE)])
         tlab_cursor_ptr = builder.gep(thread_entry_typed, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 7)
         ], inbounds=True)
-        builder.store(buffer, tlab_cursor_ptr)
+        builder.store(cursor_start, tlab_cursor_ptr)
 
         # Update tlab_limit (field 8)
         limit = builder.gep(buffer, [tlab_size])
@@ -5495,6 +5664,8 @@ class GarbageCollector:
 
         # Allocate space to track expected value for CAS (must be in entry block)
         expected_alloca = builder.alloca(self.i8_ptr, name="expected")
+        # Allocate space for thread entry pointer (may come from TLS or global fallback)
+        thread_entry_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="thread_entry_ptr")
 
         # Get current thread entry (use pthread TLS)
         tls_key = builder.load(self.tls_thread_entry_key)
@@ -5502,12 +5673,41 @@ class GarbageCollector:
         thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
         thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
 
-        # Check if we have a thread entry
+        # Check if we have a thread entry from TLS
         is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_entry, done, have_entry)
+        # BUG-060 fix: try global fallback before giving up
+        try_global_fallback = func.append_basic_block("try_global_fallback")
+        have_tls_entry = func.append_basic_block("have_tls_entry")
+        builder.cbranch(is_null_entry, try_global_fallback, have_tls_entry)
+
+        # TLS path succeeded - store to alloca and branch to have_entry
+        builder.position_at_end(have_tls_entry)
+        builder.store(thread_entry, thread_entry_alloca)
+        builder.branch(have_entry)
+
+        # Try the global tls_thread_entry fallback (set in gc_register_thread)
+        builder.position_at_end(try_global_fallback)
+        global_entry = builder.load(self.tls_thread_entry)
+        global_entry_int = builder.ptrtoint(global_entry, self.i64)
+        is_global_null = builder.icmp_unsigned("==", global_entry_int, ir.Constant(self.i64, 0))
+        # If global is also NULL, give up (thread not registered)
+        have_global = func.append_basic_block("have_global")
+        skip_add = func.append_basic_block("skip_add")
+        builder.cbranch(is_global_null, skip_add, have_global)
+
+        # DEBUG: increment skip counter when no thread entry found
+        builder.position_at_end(skip_add)
+        builder.atomic_rmw('add', self.gc_debug_list_skips, ir.Constant(self.i64, 1), 'monotonic')
+        builder.branch(done)
+
+        # Use global entry
+        builder.position_at_end(have_global)
+        builder.store(global_entry, thread_entry_alloca)
+        builder.branch(have_entry)
 
         builder.position_at_end(have_entry)
-        thread_entry_typed = thread_entry  # Already correctly typed
+        # Load the thread entry from alloca (either from TLS or global fallback)
+        thread_entry_typed = builder.load(thread_entry_alloca, name="thread_entry_loaded")
 
         # Get pointer to thread's alloc_list head (field 9)
         alloc_list_ptr = builder.gep(thread_entry_typed, [
@@ -5552,6 +5752,8 @@ class GarbageCollector:
         builder.branch(cas_loop)
 
         builder.position_at_end(cas_success)
+        # DEBUG: increment success counter
+        builder.atomic_rmw('add', self.gc_debug_list_adds, ir.Constant(self.i64, 1), 'monotonic')
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -5637,6 +5839,9 @@ class GarbageCollector:
         # Process this thread's allocation list
         builder.position_at_end(process_thread)
 
+        # DEBUG: Increment thread counter
+        builder.atomic_rmw('add', self.gc_debug_sweep_threads, ir.Constant(self.i64, 1), 'monotonic')
+
         # Get pointer to thread's alloc_list head (field 9)
         alloc_list_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0),
@@ -5672,6 +5877,12 @@ class GarbageCollector:
         builder.position_at_end(steal_done)
         stolen_list = builder.load(stolen_alloca)
 
+        # DEBUG: Check if stolen list is empty
+        stolen_int = builder.ptrtoint(stolen_list, self.i64)
+        stolen_is_empty = builder.icmp_unsigned("==", stolen_int, ir.Constant(self.i64, 0))
+        with builder.if_then(stolen_is_empty):
+            builder.atomic_rmw('add', self.gc_debug_sweep_empty, ir.Constant(self.i64, 1), 'monotonic')
+
         # Initialize survivors list for this thread
         builder.store(ir.Constant(self.i8_ptr, None), survivors_head_alloca)
         builder.store(ir.Constant(self.i8_ptr, None), survivors_tail_alloca)
@@ -5689,6 +5900,8 @@ class GarbageCollector:
 
         # Process this node
         builder.position_at_end(process_node)
+        # DEBUG: Increment nodes seen counter
+        builder.atomic_rmw('add', self.gc_debug_sweep_nodes, ir.Constant(self.i64, 1), 'monotonic')
         node_typed = builder.bitcast(curr_node, self.alloc_node_type.as_pointer())
 
         # Get node->handle (field 1) - this is an i64 handle, not a pointer!
@@ -5747,6 +5960,9 @@ class GarbageCollector:
         # Object is marked - add to survivors list
         builder.position_at_end(marked_node)
 
+        # DEBUG: Increment marked counter
+        builder.atomic_rmw('add', self.gc_debug_sweep_marked, ir.Constant(self.i64, 1), 'monotonic')
+
         # Increment live object count
         old_live = builder.load(live_count_alloca)
         new_live = builder.add(old_live, ir.Constant(self.i64, 1))
@@ -5780,6 +5996,9 @@ class GarbageCollector:
         # Object is unmarked - free it
         builder.position_at_end(unmarked_node)
 
+        # DEBUG: Increment unmarked counter
+        builder.atomic_rmw('add', self.gc_debug_sweep_unmarked, ir.Constant(self.i64, 1), 'monotonic')
+
         # Increment swept count and bytes reclaimed
         old_swept = builder.load(swept_count_alloca)
         new_swept = builder.add(old_swept, ir.Constant(self.i64, 1))
@@ -5792,9 +6011,43 @@ class GarbageCollector:
         tlab_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_TLAB))
         is_tlab = builder.icmp_unsigned("!=", tlab_bit, ir.Constant(self.i64, 0))
 
-        # Only free non-TLAB objects (TLAB objects are freed when TLAB is reclaimed)
-        with builder.if_then(builder.not_(is_tlab)):
-            builder.call(self.codegen.free, [header_ptr])
+        # Load tlab_base from node (field 3) - needed for TLAB reclamation
+        tlab_base_ptr_node = builder.gep(node_typed, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        node_tlab_base = builder.load(tlab_base_ptr_node)
+
+        # Handle TLAB vs non-TLAB objects
+        with builder.if_else(is_tlab) as (then_tlab, else_nontlab):
+            with then_tlab:
+                # DEBUG: TLAB object
+                builder.atomic_rmw('add', self.gc_debug_tlab_freed, ir.Constant(self.i64, 1), 'monotonic')
+
+                # Decrement TLAB's live_count and free if empty
+                tlab_header = builder.bitcast(node_tlab_base, self.tlab_header_type.as_pointer())
+                live_count_ptr_tlab = builder.gep(tlab_header, [
+                    ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+                ], inbounds=True)
+                # atomic_rmw('sub') returns OLD value, so we check if old == 1 (meaning new == 0)
+                old_live_count = builder.atomic_rmw('sub', live_count_ptr_tlab, ir.Constant(self.i64, 1), 'acq_rel')
+                was_last = builder.icmp_unsigned("==", old_live_count, ir.Constant(self.i64, 1))
+
+                with builder.if_then(was_last):
+                    # TLAB is now empty - add to dead list for deferred freeing
+                    # This avoids use-after-free when multiple objects in same TLAB die
+                    builder.atomic_rmw('add', self.gc_debug_tlabs_reclaimed, ir.Constant(self.i64, 1), 'monotonic')
+                    # Use TLAB header's next_tlab field to link into dead list
+                    next_tlab_field = builder.gep(tlab_header, [
+                        ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+                    ], inbounds=True)
+                    old_dead_head = builder.load(self.gc_dead_tlab_list)
+                    builder.store(old_dead_head, next_tlab_field)
+                    builder.store(node_tlab_base, self.gc_dead_tlab_list)
+
+            with else_nontlab:
+                # DEBUG: Non-TLAB object - actually freed
+                builder.atomic_rmw('add', self.gc_debug_nontlab_freed, ir.Constant(self.i64, 1), 'monotonic')
+                builder.call(self.codegen.free, [header_ptr])
 
         # Always free the allocation node (nodes are always from malloc)
         builder.call(self.codegen.free, [curr_node])
@@ -5925,12 +6178,13 @@ class GarbageCollector:
         final_live = builder.load(live_count_alloca)
         builder.store(final_live, marked_stat_ptr)
 
-        # objects_swept_last_cycle (offset 6) = objects freed
+        # objects_swept_last_cycle (offset 6) = objects freed (CUMULATIVE)
         swept_stat_ptr = builder.gep(self.gc_stats, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)
         ], inbounds=True)
         final_swept = builder.load(swept_count_alloca)
-        builder.store(final_swept, swept_stat_ptr)
+        # Accumulate instead of overwrite
+        builder.atomic_rmw('add', swept_stat_ptr, final_swept, 'monotonic')
 
         # bytes_reclaimed_last_cycle (offset 7)
         reclaimed_stat_ptr = builder.gep(self.gc_stats, [
@@ -5938,6 +6192,40 @@ class GarbageCollector:
         ], inbounds=True)
         final_reclaimed = builder.load(reclaimed_bytes_alloca)
         builder.store(final_reclaimed, reclaimed_stat_ptr)
+
+        # Free all dead TLABs (deferred from sweep to avoid use-after-free)
+        free_tlab_loop = func.append_basic_block("free_tlab_loop")
+        free_tlab_body = func.append_basic_block("free_tlab_body")
+        free_tlab_done = func.append_basic_block("free_tlab_done")
+
+        # Get and clear the dead list (sweep is single-threaded so regular load/store is safe)
+        dead_head = builder.load(self.gc_dead_tlab_list)
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_dead_tlab_list)
+        dead_tlab_alloca = builder.alloca(self.i8_ptr, name="dead_tlab")
+        builder.store(dead_head, dead_tlab_alloca)
+        builder.branch(free_tlab_loop)
+
+        builder.position_at_end(free_tlab_loop)
+        curr_dead = builder.load(dead_tlab_alloca)
+        curr_dead_int = builder.ptrtoint(curr_dead, self.i64)
+        is_null_dead = builder.icmp_unsigned("==", curr_dead_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_dead, free_tlab_done, free_tlab_body)
+
+        builder.position_at_end(free_tlab_body)
+        # Get next TLAB before freeing (from header->next_tlab)
+        dead_header = builder.bitcast(curr_dead, self.tlab_header_type.as_pointer())
+        next_dead_ptr = builder.gep(dead_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        next_dead = builder.load(next_dead_ptr)
+        # Free this TLAB
+        tlab_size_const = ir.Constant(self.i64, self.TLAB_SIZE)
+        builder.call(self.munmap, [curr_dead, tlab_size_const])
+        # Move to next
+        builder.store(next_dead, dead_tlab_alloca)
+        builder.branch(free_tlab_loop)
+
+        builder.position_at_end(free_tlab_done)
 
         # Unlock registry mutex
         builder.call(self.pthread_mutex_unlock, [registry_mutex])
@@ -6323,7 +6611,109 @@ class GarbageCollector:
         last_gc_ns = builder.load(last_gc_ns_ptr)
         builder.call(printf, [timing_ptr, last_gc_ns])
 
+        # DEBUG: List add stats
+        debug_fmt = "[GC:DEBUG] adds: %lld, tlab_freed: %lld, tlabs_reclaimed: %lld\n"
+        debug_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(debug_fmt) + 1), name=".gc_stats_debug")
+        debug_global.global_constant = True
+        debug_global.linkage = 'private'
+        debug_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(debug_fmt) + 1),
+                                                 bytearray(debug_fmt.encode('utf-8')) + bytearray([0]))
+        debug_ptr = builder.bitcast(debug_global, self.i8_ptr)
+
+        list_adds = builder.load(self.gc_debug_list_adds)
+        tlab_freed = builder.load(self.gc_debug_tlab_freed)
+        tlabs_reclaimed = builder.load(self.gc_debug_tlabs_reclaimed)
+        builder.call(printf, [debug_ptr, list_adds, tlab_freed, tlabs_reclaimed])
+
+        # DEBUG: Handle table stats - check if handles are being reused
+        handle_fmt = "[GC:DEBUG] next_handle: %lld, table_size: %lld\n"
+        handle_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(handle_fmt) + 1), name=".gc_stats_handle")
+        handle_global.global_constant = True
+        handle_global.linkage = 'private'
+        handle_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(handle_fmt) + 1),
+                                                 bytearray(handle_fmt.encode('utf-8')) + bytearray([0]))
+        handle_ptr = builder.bitcast(handle_global, self.i8_ptr)
+
+        next_handle = builder.load(self.gc_next_handle)
+        table_size = builder.load(self.gc_handle_table_size)
+        builder.call(printf, [handle_ptr, next_handle, table_size])
+
+        # Flush stdout to ensure output appears immediately
+        fflush_ty = ir.FunctionType(self.i32, [self.i8_ptr])
+        if "fflush" in self.module.globals:
+            fflush = self.module.globals["fflush"]
+        else:
+            fflush = ir.Function(self.module, fflush_ty, name="fflush")
+        builder.call(fflush, [ir.Constant(self.i8_ptr, None)])  # fflush(NULL) flushes all streams
+
         builder.ret_void()
+
+    def _implement_gc_stat_getters(self):
+        """Implement getter functions for heapwatch.
+
+        These are simple functions that load a global value and return it.
+        Used by the heapwatch library to display GC statistics.
+        """
+        # gc_get_total_allocations() -> i64
+        func = self.gc_get_total_allocations
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        val = builder.load(ptr)
+        builder.ret(val)
+
+        # gc_get_total_bytes() -> i64
+        func = self.gc_get_total_bytes
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        val = builder.load(ptr)
+        builder.ret(val)
+
+        # gc_get_collections() -> i64
+        func = self.gc_get_collections
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        val = builder.load(ptr)
+        builder.ret(val)
+
+        # gc_get_live_objects() -> i64
+        func = self.gc_get_live_objects
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 5)], inbounds=True)
+        val = builder.load(ptr)
+        builder.ret(val)
+
+        # gc_get_swept_objects() -> i64
+        func = self.gc_get_swept_objects
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        ptr = builder.gep(self.gc_stats, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)], inbounds=True)
+        val = builder.load(ptr)
+        builder.ret(val)
+
+        # gc_get_next_handle() -> i64
+        func = self.gc_get_next_handle
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        val = builder.load(self.gc_next_handle)
+        builder.ret(val)
+
+        # gc_get_handle_table_size() -> i64
+        func = self.gc_get_handle_table_size
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        val = builder.load(self.gc_handle_table_size)
+        builder.ret(val)
+
+        # gc_get_tlabs_reclaimed() -> i64
+        func = self.gc_get_tlabs_reclaimed
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+        val = builder.load(self.gc_debug_tlabs_reclaimed)
+        builder.ret(val)
 
     def _implement_gc_dump_heap(self):
         """Implement function to print all objects in the heap.
@@ -7770,6 +8160,10 @@ class GarbageCollector:
         Called when gc_handle_pool_alloc returns 0 (pool empty).
         Acquires mutex and allocates HANDLE_POOL_SIZE (512) handles in batch.
 
+        IMPORTANT: Try free list first before bump allocation! (BUG-062 fix)
+        The free list contains handles retired by previous GC cycles.
+        Bump allocation should only be used when free list is exhausted.
+
         This is the only place that touches the global handle table for
         allocation - all other allocations go through the thread-local pool.
 
@@ -7782,6 +8176,10 @@ class GarbageCollector:
 
         entry = func.append_basic_block("entry")
         have_entry = func.append_basic_block("have_entry")
+        try_free_list = func.append_basic_block("try_free_list")
+        drain_free_list = func.append_basic_block("drain_free_list")
+        check_pool_full = func.append_basic_block("check_pool_full")
+        pool_ready = func.append_basic_block("pool_ready")
         use_bump = func.append_basic_block("use_bump")
         need_grow = func.append_basic_block("need_grow")
         do_bump = func.append_basic_block("do_bump")
@@ -7806,17 +8204,150 @@ class GarbageCollector:
         mutex_ptr = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_lock, [mutex_ptr])
 
-        builder.branch(use_bump)
+        # Allocate stack space for collecting handles from free list
+        pool_size = ir.Constant(self.i64, self.HANDLE_POOL_SIZE)
+        pool_handles = builder.alloca(ir.ArrayType(self.i64, self.HANDLE_POOL_SIZE), name="pool_handles")
+        pool_count = builder.alloca(self.i64, name="pool_count")
+        builder.store(ir.Constant(self.i64, 0), pool_count)
+
+        builder.branch(try_free_list)
+
+        # ============================================================
+        # BUG-062 FIX: Try free list first before bump allocation
+        # ============================================================
+        builder.position_at_end(try_free_list)
+        free_head = builder.load(self.gc_handle_free_list)
+        free_head_int = builder.ptrtoint(free_head, self.i64) if free_head.type == self.i8_ptr else free_head
+        # Actually gc_handle_free_list is i64, not i8*
+        free_head_val = builder.load(self.gc_handle_free_list)
+        has_free = builder.icmp_unsigned('!=', free_head_val, ir.Constant(self.i64, 0))
+        builder.cbranch(has_free, drain_free_list, use_bump)
+
+        # Drain handles from free list into local array
+        builder.position_at_end(drain_free_list)
+        current_count = builder.load(pool_count)
+        is_pool_full = builder.icmp_unsigned('>=', current_count, pool_size)
+        builder.cbranch(is_pool_full, pool_ready, check_pool_full)
+
+        builder.position_at_end(check_pool_full)
+        # Get current free list head
+        curr_free = builder.load(self.gc_handle_free_list)
+        has_more_free = builder.icmp_unsigned('!=', curr_free, ir.Constant(self.i64, 0))
+
+        # If free list empty, check if we got any handles
+        check_got_any = func.append_basic_block("check_got_any")
+        get_one_handle = func.append_basic_block("get_one_handle")
+        builder.cbranch(has_more_free, get_one_handle, check_got_any)
+
+        builder.position_at_end(get_one_handle)
+        # Pop one handle from free list
+        table = builder.load(self.gc_handle_table)
+        slot_ptr = builder.gep(table, [curr_free])
+        next_free_ptr = builder.load(slot_ptr)
+        next_free = builder.ptrtoint(next_free_ptr, self.i64)
+        # Update free list head
+        builder.store(next_free, self.gc_handle_free_list)
+        # Clear the slot (will be set by gc_handle_store later)
+        builder.store(ir.Constant(self.i8_ptr, None), slot_ptr)
+        # Store handle in local array
+        cnt = builder.load(pool_count)
+        handle_slot = builder.gep(pool_handles, [ir.Constant(self.i64, 0), cnt])
+        builder.store(curr_free, handle_slot)
+        # Increment count
+        new_cnt = builder.add(cnt, ir.Constant(self.i64, 1))
+        builder.store(new_cnt, pool_count)
+        builder.branch(drain_free_list)
+
+        builder.position_at_end(check_got_any)
+        got_count = builder.load(pool_count)
+        got_any = builder.icmp_unsigned('>', got_count, ir.Constant(self.i64, 0))
+        builder.cbranch(got_any, pool_ready, use_bump)
+
+        # Pool is ready from free list - set up thread's pool
+        builder.position_at_end(pool_ready)
+        # Get first handle from our collected array
+        first_handle_ptr = builder.gep(pool_handles, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+        first_handle = builder.load(first_handle_ptr)
+        final_count = builder.load(pool_count)
+        # For free list handles, we can't use contiguous range
+        # Instead, we return them one by one to the global free list and take first one
+        # Actually, simpler approach: just take the first handle and set pool to single-element
+        # The pool mechanism expects contiguous handles, so we'll just refill with 1 handle at a time
+        # from free list, which is less efficient but correct.
+        #
+        # Better approach: store handles in reverse order back to free list except first one,
+        # and give thread just the first handle as a pool of 1.
+        #
+        # Actually, the simplest correct fix: if we got handles from free list,
+        # push all but the first back to free list, and give thread a pool of size 1.
+        # On next refill, we'll get another handle from free list.
+
+        # Push all except first handle back to free list
+        push_back_loop = func.append_basic_block("push_back_loop")
+        push_back_body = func.append_basic_block("push_back_body")
+        push_back_done = func.append_basic_block("push_back_done")
+
+        push_idx = builder.alloca(self.i64, name="push_idx")
+        builder.store(ir.Constant(self.i64, 1), push_idx)  # Start at index 1
+        builder.branch(push_back_loop)
+
+        builder.position_at_end(push_back_loop)
+        pidx = builder.load(push_idx)
+        fcnt = builder.load(pool_count)
+        done_pushing = builder.icmp_unsigned('>=', pidx, fcnt)
+        builder.cbranch(done_pushing, push_back_done, push_back_body)
+
+        builder.position_at_end(push_back_body)
+        # Get handle at index pidx
+        h_ptr = builder.gep(pool_handles, [ir.Constant(self.i64, 0), pidx])
+        h_val = builder.load(h_ptr)
+        # Push to free list
+        old_free_head = builder.load(self.gc_handle_free_list)
+        table2 = builder.load(self.gc_handle_table)
+        slot_ptr2 = builder.gep(table2, [h_val])
+        old_head_as_ptr = builder.inttoptr(old_free_head, self.i8_ptr)
+        builder.store(old_head_as_ptr, slot_ptr2)
+        builder.store(h_val, self.gc_handle_free_list)
+        # Increment index
+        new_pidx = builder.add(pidx, ir.Constant(self.i64, 1))
+        builder.store(new_pidx, push_idx)
+        builder.branch(push_back_loop)
+
+        builder.position_at_end(push_back_done)
+        # Now set up pool with just the first handle (pool of size 1)
+        # This is inefficient but correct - we'll refill often from free list
+        pool_start_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 18)
+        ], inbounds=True)
+        builder.store(first_handle, pool_start_ptr)
+
+        pool_next_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 19)
+        ], inbounds=True)
+        builder.store(first_handle, pool_next_ptr)
+
+        pool_end_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 20)
+        ], inbounds=True)
+        end_h = builder.add(first_handle, ir.Constant(self.i64, 1))
+        builder.store(end_h, pool_end_ptr)
+
+        # Unlock and return
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.branch(done)
 
         # ============================================================
         # Bump allocate a contiguous batch of HANDLE_POOL_SIZE handles
+        # (Only used when free list is empty)
         # ============================================================
         builder.position_at_end(use_bump)
         next_handle_val = builder.load(self.gc_next_handle)
         table_size = builder.load(self.gc_handle_table_size)
 
         # Calculate end of batch
-        pool_size = ir.Constant(self.i64, self.HANDLE_POOL_SIZE)
         batch_end = builder.add(next_handle_val, pool_size)
 
         # Check if we need to grow the table
