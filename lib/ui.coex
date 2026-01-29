@@ -46,6 +46,7 @@ extern coex_ui_render_json(layout: string, state: string) -> string ~
 extern coex_ui_free_json(json_str: string) -> int ~
 extern coex_ui_begin_frame() -> int ~
 extern coex_ui_end_frame() -> int ~
+extern coex_ui_shell_get_key(keycode: int) -> int ~
 
 # =============================================================================
 # High-Level API
@@ -105,6 +106,12 @@ func begin_frame() -> int
 # End the current frame.
 func end_frame() -> int
     return coex_ui_end_frame()
+~
+
+# Check if a key is currently pressed.
+# keycode: GLFW key code (e.g., 262=RIGHT, 263=LEFT, 265=UP, 264=DOWN, 32=SPACE, 256=ESCAPE)
+func get_key(keycode: int) -> bool
+    return coex_ui_shell_get_key(keycode) == 1
 ~
 
 # =============================================================================

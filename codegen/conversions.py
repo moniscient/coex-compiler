@@ -509,11 +509,17 @@ class ConversionGenerator:
             # string is heap-allocated
             if coex_type.name == "string":
                 return True
+            # json is heap-allocated
+            if coex_type.name == "json":
+                return True
         if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
             return True
         if isinstance(coex_type, NamedType):
             # String is heap-allocated
             if coex_type.name == "string":
+                return True
+            # JSON is heap-allocated
+            if coex_type.name == "json":
                 return True
             # User-defined types are heap-allocated
             if coex_type.name in self.cg.type_fields:

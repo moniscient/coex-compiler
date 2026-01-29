@@ -342,10 +342,21 @@ def compile_coex(source_path: str, output_path: str = None,
                 cimgui_lib = os.path.join(deps_dir, "libcimgui.a")
                 if os.path.exists(cimgui_lib):
                     link_cmd.append(cimgui_lib)
+                # Add SVG runtime library
+                svg_runtime = os.path.join(runtime_dir, "libcoex_svg.a")
+                if os.path.exists(svg_runtime):
+                    link_cmd.append(svg_runtime)
+                    # Add lunasvg and plutovg dependencies
+                    lunasvg_lib = os.path.join(deps_dir, "liblunasvg.a")
+                    plutovg_lib = os.path.join(deps_dir, "libplutovg.a")
+                    if os.path.exists(lunasvg_lib):
+                        link_cmd.append(lunasvg_lib)
+                    if os.path.exists(plutovg_lib):
+                        link_cmd.append(plutovg_lib)
                 # Add required frameworks (macOS)
                 if sys.platform == "darwin":
                     link_cmd.extend(["-framework", "Cocoa", "-framework", "Metal", "-framework", "QuartzCore"])
-                    # Link C++ standard library for cimgui
+                    # Link C++ standard library for cimgui and lunasvg
                     link_cmd.append("-lc++")
             else:
                 print(f"Warning: UI runtime library not found at {ui_runtime}")

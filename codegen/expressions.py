@@ -763,7 +763,9 @@ class ExpressionGenerator:
             typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
             return cg.builder.load(typed_ptr)
 
-        if type_name and type_name in cg.type_methods:
+        # Skip type_methods["get"] for JSON - JSON has specialized index handling below
+        # that correctly dispatches between get_field (string key) and get_index (int index)
+        if type_name and type_name in cg.type_methods and type_name != "Json":
             method_map = cg.type_methods[type_name]
             if "get" in method_map:
                 mangled = method_map["get"]

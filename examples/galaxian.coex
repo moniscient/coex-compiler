@@ -54,6 +54,13 @@ func main() -> int
         return 1
     ~
 
+    # Initialize SVG module (must be after UI init)
+    if svg.initialize() != 1
+        print("Failed to initialize SVG module")
+        ui.close()
+        return 1
+    ~
+
     # Check SVG availability
     if svg.is_available() == 0
         print("SVG module not available")
@@ -536,6 +543,7 @@ func main() -> int
             })
         ~
 
+
         # Build final layout with header + canvas
         layout: json = {
             type: "window",
@@ -559,6 +567,21 @@ func main() -> int
                 }
             ]
         }
+
+        # Debug: print layout on first frame
+        if frame_count == 1
+            layout_str: string = layout.stringify()
+            print("DEBUG layout length: ")
+            print(layout_str.len())
+            # Print first 500 chars of layout
+            if layout_str.len() > 500
+                print("DEBUG layout (first 500): ")
+                print(layout_str.slice(0, 500))
+            else
+                print("DEBUG layout: ")
+                print(layout_str)
+            ~
+        ~
 
         # Render frame
         state = ui.render(layout, state)
@@ -589,6 +612,7 @@ func main() -> int
     svg.destroy(enemy_bullet_svg)
     svg.destroy(explosion_svg)
     svg.destroy(star_svg)
+    svg.shutdown()
     ui.close()
 
     print("Thanks for playing!")
