@@ -230,6 +230,14 @@ The `:=` operator has a unified semantic meaning across Coex: "flatten to value 
 
 **INVARIANT**: The JSON type always contains deep-copied values. JSON is a serialization format designed to leave the Coex runtime (FFI, file I/O, network), so it must never contain handles or references to Coex objects—only concrete, serialized values.
 
+**IMPLEMENTATION INVARIANT (GC)**: JSON objects are **not traced during garbage collection**. This means:
+- All values within JSON must be flattened inline—no pointers or handles to GC-managed objects may ever be stored within JSON structures
+- JSON arrays store 16-byte inline `Json` structs (tag + value), not 8-byte pointers to Json objects
+- Strings within JSON are copied inline, not referenced via handles
+- Nested JSON objects are stored as complete inline values
+
+This design is intentionally inefficient for complex nested data. Programmers requiring high-performance data structures with GC-traced references should use native Coex structs, lists, and maps instead of JSON. JSON is optimized for serialization and FFI, not for internal data manipulation.
+
 **Assignment Rule**: When assigning to a `json`-typed variable:
 - `json_var = <expr>` — RHS must already be type `json` (e.g., JSON literal, `json.parse()` result, or another json variable)
 - `json_var := <expr>` — Any type allowed; value is deep-copied and serialized to JSON
