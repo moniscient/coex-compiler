@@ -22,7 +22,8 @@ from ast_nodes import (
     Identifier, MemberExpr, IndexExpr, CallExpr, MethodCallExpr,
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
     AssignOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
-    OptionalType, PrimitiveType, NamedType, AtomicType, KindFunctionDecl, FunctionDecl
+    OptionalType, PrimitiveType, NamedType, AtomicType, KindFunctionDecl, FunctionDecl,
+    FunctionType
 )
 
 # Import uniqueness analysis for in-place mutation optimization
@@ -38,6 +39,48 @@ class StatementGenerator:
     def __init__(self, cg: 'CodeGenerator'):
         """Initialize with reference to parent CodeGenerator instance."""
         self.cg = cg
+
+    # ========================================================================
+    # JSON Annotation Warnings
+    # ========================================================================
+
+    def _emit_json_annotation_warning(self, var_name: str, source_type, init_value: ir.Value):
+        """Emit a compile-time warning when non-JSON types are assigned to json.
+
+        Phase 6 of JSON refactoring: warn the user that their data will be
+        converted to an annotation format, not native JSON.
+        """
+        cg = self.cg
+
+        # Check if source type is a non-JSON type that produces an annotation
+        needs_warning = False
+        type_name = None
+
+        if isinstance(source_type, SetType):
+            needs_warning = True
+            type_name = "Set"
+        elif isinstance(source_type, FunctionType):
+            needs_warning = True
+            type_name = "function"
+        # Check LLVM IR type for function pointers and sets
+        elif isinstance(init_value, ir.Function):
+            needs_warning = True
+            type_name = "function"
+        elif isinstance(init_value.type, ir.PointerType):
+            if isinstance(init_value.type.pointee, ir.FunctionType):
+                needs_warning = True
+                type_name = "function"
+            elif hasattr(init_value.type.pointee, 'name'):
+                if init_value.type.pointee.name == "struct.Set":
+                    needs_warning = True
+                    type_name = "Set"
+
+        if needs_warning:
+            cg._emit_warning(
+                "WARN",
+                f"'{var_name}': {type_name} type assigned to json will be converted to annotation "
+                f"format ({{\"@coex:{type_name.lower()}\": ...}}). This is not standard JSON."
+            )
 
     # ========================================================================
     # In-Place Mutation Optimization
@@ -615,6 +658,10 @@ class StatementGenerator:
                 )
 
             init_value = cg._generate_expression(stmt.initializer)
+
+            # Emit warning for non-JSON types being converted to JSON
+            self._emit_json_annotation_warning(stmt.name, init_type, init_value)
+
             init_value = cg._convert_to_json(init_value, stmt.initializer)
         else:
             init_value = cg._generate_expression(stmt.initializer)

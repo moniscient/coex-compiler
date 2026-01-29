@@ -1201,3 +1201,101 @@
 - **Files**: `task_transform.py:2360-2375`
 - **Status**: Fixed (2026-01-28)
 - **Resolution**: Changed comparison operator mapping from LLVM IR predicates (`'eq'`, `'ne'`, `'slt'`, etc.) to llvmlite's expected format (`'=='`, `'!='`, `'<'`, etc.). Unified the mapping for both integer and float comparisons.
+
+### BUG-070: json_set_index uses wrong elem_size (8 instead of 16)
+- **Discovered**: 2026-01-29, during JSON refactoring implementation
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      j: json := [1, 2, 3]
+      j2: json = j.set(1, 42)
+      print(j2.get(1).as_int())  # May return corrupted data
+      return 0
+  ~
+  ```
+- **Observed**: `json_set_index` uses `elem_size = 8` (pointer size) for `list_set` call
+- **Expected**: Should use `elem_size = 16` (Json struct size: tag i64 + value i64)
+- **Root Cause**: The BUG-069 fix was applied to `json_append` (line 1379) but the same fix was not applied to `json_set_index` (line 1335). JSON arrays store 16-byte inline Json structs, not 8-byte pointers.
+- **Files**: `codegen/json_type.py:1335`
+- **Status**: Fixed (2026-01-29)
+- **Resolution**: Changed `elem_size` from 8 to 16 in `_implement_json_set_index`, consistent with `json_append`.
+
+### BUG-071: Map.remove() with string keys doesn't use string-aware function
+- **Discovered**: 2026-01-29, during JSON refactoring test implementation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      m: Map<string, int> = {"a": 1, "b": 2}
+      m2: Map<string, int> = m.remove("b")
+      print(m2.len())  # Still prints 2 instead of 1
+      return 0
+  ~
+  ```
+- **Observed**: `map.remove("b")` returns original map unchanged for string keys
+- **Expected**: Should return new map with key removed
+- **Root Cause**: In `codegen/expressions.py:2045`, the special handling for Map with string keys only covers `get`, `has`, and `set` methods - not `remove`. The `remove` method falls through to `coex_map_remove` which expects an i64 key, not a string pointer.
+- **Files**: `codegen/expressions.py:2045-2069`
+- **Status**: Open
+- **Workaround**: Use integer keys for maps when using `.remove()`
+
+### BUG-072: json.parse() stores all numbers as floats, as_int() doesn't convert
+- **Discovered**: 2026-01-29, during JSON value semantics test development
+- **Category**: Runtime
+- **Severity**: High
+- **Reproduction**:
+```coex
+func main() -> int
+    j: json = json.parse("[1,2,3]")
+    e0: json = j[0]
+    print(e0.as_int())    # Prints 4607182418800017408 (float bits for 1.0)
+    return 0
+~
+```
+- **Observed**: `as_int()` returns garbage (IEEE 754 bit representation of float value)
+- **Expected**: `as_int()` should return the integer value (1)
+- **Root Cause**: `json.parse()` stores all numbers as floats (JSON_TYPE_FLOAT) even integers. However, `json_as_int()` doesn't check the type and convert - it just reinterprets the raw bits as int64.
+- **Files**: `runtime/coex_json.c` (json_parse, json_as_int)
+- **Status**: Open
+- **Workaround**: Use `as_float()` and cast to int, or avoid parsing + extracting integers
+
+### BUG-073: json.as_string() returns quoted form for parsed strings
+- **Discovered**: 2026-01-29, during JSON value semantics test development
+- **Category**: Runtime
+- **Severity**: Medium
+- **Reproduction**:
+```coex
+func main() -> int
+    j: json = json.parse("\"hello\"")
+    print(j.as_string())    # Prints "hello" (with quotes)
+    return 0
+~
+```
+- **Observed**: `as_string()` returns `"hello"` (with surrounding quotes)
+- **Expected**: `as_string()` should return `hello` (raw string value without quotes)
+- **Root Cause**: `json.parse()` likely stores the string with its JSON representation (including quotes), and `as_string()` returns this verbatim instead of stripping quotes.
+- **Files**: `runtime/coex_json.c` (json_parse, json_as_string)
+- **Status**: Open
+- **Note**: May be related to BUG-072 - parser may be storing raw JSON tokens instead of parsed values
+
+### BUG-074: json.set() with integer index dispatches to set_field instead of set_index
+- **Discovered**: 2026-01-29, during JSON value semantics test development
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+```coex
+func main() -> int
+    j: json := [1, 2, 3]
+    j2: json = j.set(1, 42)    # Compilation error: type mismatch
+    return 0
+~
+```
+- **Observed**: Compilation error `Type of #2 arg mismatch: i64 != %"struct.String"*`
+- **Expected**: `j.set(1, 42)` should dispatch to `json_set_index` and work correctly
+- **Root Cause**: Method dispatch in `codegen/expressions.py` routes all `.set()` calls to `json_set_field` which expects a string key. There's no overload resolution to call `json_set_index` when the first argument is an integer.
+- **Files**: `codegen/expressions.py` (generate_method_call), `codegen/json_type.py`
+- **Status**: Open
+- **Workaround**: Use bracket notation for reading (`j[i]`), but there's no workaround for setting by index - must rebuild array with append

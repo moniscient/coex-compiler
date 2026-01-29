@@ -1331,8 +1331,9 @@ class JsonGenerator:
         json_val = func.args[2]
         json_as_i8ptr = builder.bitcast(json_val, ir.IntType(8).as_pointer())
 
-        # Call list_set (elem_size = 8 for pointer)
-        new_list = builder.call(cg.list_set, [list_ptr, func.args[1], json_as_i8ptr, ir.Constant(i64, 8)])
+        # BUG-069 FIX: Call list_set with elem_size = 16 for the Json struct (tag + value)
+        # (consistent with json_append which uses elem_size = 16)
+        new_list = builder.call(cg.list_set, [list_ptr, func.args[1], json_as_i8ptr, ir.Constant(i64, 16)])
 
         # Create new json array with new list
         result = builder.call(cg.json_new_array, [new_list])
@@ -2488,13 +2489,17 @@ class JsonGenerator:
 
     def convert_to_json(self, value: ir.Value, expr: 'Expr') -> ir.Value:
         """Convert a value to a Json* pointer based on its type."""
-        from ast_nodes import NilLiteral
+        from ast_nodes import NilLiteral, Identifier
         cg = self.cg
         builder = cg.builder
 
         # Handle NilLiteral first - before type checks since nil generates i64(0)
         if isinstance(expr, NilLiteral):
             return builder.call(cg.json_new_null, [])
+
+        # Handle function references -> annotation {"@coex:func": "name"}
+        if isinstance(value, ir.Function):
+            return self.convert_function_to_json_annotation(value, expr)
 
         # Check value type and call appropriate json_new_* constructor
         if isinstance(value.type, ir.IntType):
@@ -2512,6 +2517,9 @@ class JsonGenerator:
             # Float
             return builder.call(cg.json_new_float, [value])
         elif isinstance(value.type, ir.PointerType):
+            # Check for function pointers
+            if isinstance(value.type.pointee, ir.FunctionType):
+                return self.convert_function_to_json_annotation(value, expr)
             if hasattr(value.type.pointee, 'name'):
                 struct_name = value.type.pointee.name
                 if struct_name == "struct.String":
@@ -2526,6 +2534,9 @@ class JsonGenerator:
                 elif struct_name == "struct.Map":
                     # Map -> JSON object
                     return builder.call(cg.json_new_object, [value])
+                elif struct_name == "struct.Set":
+                    # Set -> JSON annotation {"@coex:set": [elements...]}
+                    return self.convert_set_to_json_annotation(value, expr)
                 else:
                     # Check for user-defined types and enums
                     type_name = struct_name.replace("struct.", "") if struct_name.startswith("struct.") else struct_name
@@ -2723,6 +2734,146 @@ class JsonGenerator:
 
         # Unknown type - return null JSON
         return cg.builder.call(cg.json_new_null, [])
+
+    def convert_function_to_json_annotation(self, value: ir.Value, expr: 'Expr' = None) -> ir.Value:
+        """Convert a function reference to JSON annotation: {"@coex:func": "name"}.
+
+        Functions are not JSON-serializable, so we create an annotation object
+        that records the function name for debugging/inspection purposes.
+        """
+        from ast_nodes import Identifier
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+
+        # Try to get function name
+        func_name = "anonymous"
+        if isinstance(value, ir.Function):
+            # Direct function reference - get name from IR
+            func_name = value.name
+        elif isinstance(expr, Identifier):
+            # Get name from expression
+            func_name = expr.name
+
+        # Create annotation object: {"@coex:func": "func_name"}
+        flags = ir.Constant(i64, 0x01)  # String keys
+        map_ptr = builder.call(cg.map_new, [flags])
+
+        # Add @coex:func key with the function name string
+        key_str = cg._get_string_ptr("@coex:func")
+        name_str = cg._get_string_ptr(func_name)
+        name_json = builder.call(cg.json_new_string, [name_str])
+        name_json_i64 = builder.ptrtoint(name_json, i64)
+        map_ptr = builder.call(cg.map_set_string, [map_ptr, key_str, name_json_i64])
+
+        # Wrap map in JSON object
+        return builder.call(cg.json_new_object, [map_ptr])
+
+    def convert_set_to_json_annotation(self, set_ptr: ir.Value, expr: 'Expr' = None) -> ir.Value:
+        """Convert a Set to JSON annotation: {"@coex:set": [elements...]}.
+
+        Sets are not directly JSON-compatible, so we serialize them as an
+        annotation object that preserves the elements as an array.
+        """
+        from ast_nodes import SetType, PrimitiveType
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        func = builder.function
+
+        # Infer element type from expression if available
+        elem_type = None
+        if expr is not None:
+            inferred = cg._infer_type_from_expr(expr)
+            if isinstance(inferred, SetType):
+                elem_type = inferred.element_type
+
+        # Convert set to list for iteration
+        elems_list = builder.call(cg.set_to_list, [set_ptr])
+        list_len = builder.call(cg.list_len, [elems_list])
+
+        # Create JSON array for elements (16-byte inline Json structs)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, 16)])
+
+        # Loop to convert each element
+        index_var = builder.alloca(i64, name="set_conv_idx")
+        builder.store(ir.Constant(i64, 0), index_var)
+
+        # Create blocks for loop
+        cond_block = func.append_basic_block("set_conv_cond")
+        body_block = func.append_basic_block("set_conv_body")
+        exit_block = func.append_basic_block("set_conv_exit")
+
+        # Store json_list in an alloca for updating in loop
+        json_list_var = builder.alloca(cg.list_struct.as_pointer(), name="json_list_var")
+        builder.store(json_list, json_list_var)
+
+        builder.branch(cond_block)
+
+        # Condition
+        builder.position_at_end(cond_block)
+        current_idx = builder.load(index_var)
+        cond = builder.icmp_signed("<", current_idx, list_len)
+        builder.cbranch(cond, body_block, exit_block)
+
+        # Body
+        builder.position_at_end(body_block)
+        current_idx = builder.load(index_var)
+
+        # Get element from list
+        elem_ptr = builder.call(cg.list_get, [elems_list, current_idx])
+        typed_ptr = builder.bitcast(elem_ptr, i64.as_pointer())
+        elem_val = builder.load(typed_ptr)
+
+        # Convert element to JSON based on inferred type
+        if elem_type is not None and isinstance(elem_type, PrimitiveType):
+            if elem_type.name == "int":
+                json_elem = builder.call(cg.json_new_int, [elem_val])
+            elif elem_type.name == "float":
+                float_val = builder.bitcast(elem_val, ir.DoubleType())
+                json_elem = builder.call(cg.json_new_float, [float_val])
+            elif elem_type.name == "bool":
+                bool_val = builder.trunc(elem_val, ir.IntType(1))
+                json_elem = builder.call(cg.json_new_bool, [bool_val])
+            elif elem_type.name == "string":
+                str_ptr = builder.inttoptr(elem_val, cg.string_struct.as_pointer())
+                json_elem = builder.call(cg.json_new_string, [str_ptr])
+            else:
+                json_elem = builder.call(cg.json_new_int, [elem_val])
+        else:
+            # Default: treat as int
+            json_elem = builder.call(cg.json_new_int, [elem_val])
+
+        # Append to json_list
+        json_list_current = builder.load(json_list_var)
+        json_elem_i8 = builder.bitcast(json_elem, i8_ptr)
+        json_list_new = builder.call(cg.list_append, [json_list_current, json_elem_i8, ir.Constant(i64, 16)])
+        builder.store(json_list_new, json_list_var)
+
+        # Increment index
+        next_idx = builder.add(current_idx, ir.Constant(i64, 1))
+        builder.store(next_idx, index_var)
+        builder.branch(cond_block)
+
+        # Exit
+        builder.position_at_end(exit_block)
+        final_json_list = builder.load(json_list_var)
+
+        # Create JSON array from the list
+        json_array = builder.call(cg.json_new_array, [final_json_list])
+
+        # Create annotation object: {"@coex:set": json_array}
+        flags = ir.Constant(i64, 0x01)  # String keys
+        map_ptr = builder.call(cg.map_new, [flags])
+
+        # Add @coex:set key with the array value
+        key_str = cg._get_string_ptr("@coex:set")
+        json_array_i64 = builder.ptrtoint(json_array, i64)
+        map_ptr = builder.call(cg.map_set_string, [map_ptr, key_str, json_array_i64])
+
+        # Wrap map in JSON object
+        return builder.call(cg.json_new_object, [map_ptr])
 
     def convert_struct_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
         """Convert a user-defined struct to JSON object with _type field."""
