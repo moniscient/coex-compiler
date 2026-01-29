@@ -232,6 +232,61 @@
 
 ## Resolved Bugs
 
+### BUG-068: JSON array index access calls wrong function (get_field instead of get_index)
+- **Discovered**: 2026-01-29, during Galaxian game debugging
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      arr: json := []
+      arr = arr.append({value: 10})
+      arr = arr.append({value: 20})
+      print(arr.len())     # Correctly prints 2
+      elem: json = arr[0]  # Returns null instead of {value: 10}!
+      print(arr.stringify())  # Correctly prints [{"value":10},{"value":20}]
+      return 0
+  ~
+  ```
+- **Observed**: `arr[0]` returns null even though the array has elements. `stringify()`
+  correctly shows all elements, but index access returns null.
+- **Root Cause**: In `codegen/expressions.py` `generate_index()`, there's a check for
+  `type_methods["get"]` that intercepts index access for any type with a `get` method.
+  JSON has `"get": "coex_json_get_field"` registered, so `arr[0]` was routed to
+  `coex_json_get_field` with the integer 0 cast to a String* pointer. This function
+  expects a String key, not an integer index, so it returns null.
+  The proper JSON index handling at line 922-934 that correctly dispatches between
+  `get_field` (string key) and `get_index` (int index) was never reached.
+- **Fix**: Added a special case in `generate_index()` to skip the `type_methods["get"]`
+  lookup for JSON type, allowing JSON indexing to fall through to the specialized
+  handler that correctly distinguishes between string and integer indices.
+- **Files**: `codegen/expressions.py` (generate_index function)
+- **Status**: Fixed 2026-01-29
+
+### BUG-069: JSON array stores pointers causing use-after-free segfault
+- **Discovered**: 2026-01-29, during Galaxian game debugging
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian game for ~4000 frames (a few minutes). The game
+  creates JSON arrays with `.append()` heavily each frame for the UI layout.
+- **Observed**: Segmentation fault after approximately 4000 GC cycles. GC stats
+  show normal operation (48M allocations, 48M collected, 67 live objects) but
+  the crash occurs immediately after a GC cycle completes.
+- **Root Cause**: `json_append` stored 8-byte **pointers** to Json objects in the
+  underlying List, rather than the 16-byte Json struct values inline. When the
+  inner Json objects were no longer referenced elsewhere, the GC collected them.
+  The pointers in the array became dangling, and later access caused segfault.
+  The GC doesn't trace through List data buffers to find nested pointers.
+- **Fix**: Changed JSON array storage to store the 16-byte Json struct (tag + value)
+  inline in the List instead of an 8-byte pointer. Updated:
+  - `_implement_json_append`: elem_size 8 → 16, store struct not pointer
+  - `_implement_json_get_index`: return pointer to inline data directly
+  - `_convert_list_expr_to_json_array`: same fix for JSON array literals
+  - `_convert_list_runtime_to_json_array`: same fix for runtime conversion
+  - `json_from_cjson`: same fix for cJSON parsing
+- **Files**: `codegen/json_type.py`
+- **Status**: Fixed 2026-01-29
+
 ### BUG-065: gc() crashes after all TLAB objects are collected
 - **Discovered**: 2026-01-28, during BUG-064 investigation
 - **Category**: GC
@@ -255,6 +310,39 @@
   tlab_cursor, and tlab_limit fields to NULL before munmap'ing.
 - **Files**: `coex_gc.py` (gc_sweep_thread_lists)
 - **Status**: Fixed 2026-01-28
+
+### BUG-067: JSON type not recognized as heap type - causes GC to free live objects
+- **Discovered**: 2026-01-29, during Galaxian game loop debugging
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      frame = 0
+      while frame < 100
+          canvas: json := []
+          i = 0
+          while i < 20
+              canvas = canvas.append({ id: i })
+              i = i + 1
+          ~
+          gc()  # Frees canvas even though it's still in use!
+          print(canvas.len())  # CRASH or prints 0
+          frame = frame + 1
+      ~
+      return 0
+  ~
+  ```
+- **Observed**: After gc(), JSON objects are freed even though they're stored in local
+  variables. Accessing them crashes or returns corrupted data.
+- **Root Cause**: The `is_heap_type()` function in `codegen/conversions.py` did not
+  recognize `json` as a heap type. This meant JSON variables did not get shadow stack
+  entries, so the GC couldn't see them as roots and would free them.
+- **Fix**: Added `json` to the heap type checks in `is_heap_type()`:
+  - PrimitiveType case: `if coex_type.name == "json": return True`
+  - NamedType case: `if coex_type.name == "json": return True`
+- **Files**: `codegen/conversions.py` (is_heap_type function)
+- **Status**: Fixed 2026-01-29
 
 ### BUG-059: json.append() corrupts array when appending JSON objects
 - **Discovered**: 2026-01-28, during Galaxian game implementation

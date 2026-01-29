@@ -219,7 +219,8 @@ class JsonGenerator:
 
         # Process array: create list, iterate through child elements
         builder.position_at_end(process_array)
-        list_val = builder.call(cg.list_new, [ir.Constant(i64, 8)])  # 8 bytes for pointer
+        # BUG-069 FIX: Create list with 16-byte elements for inline Json structs
+        list_val = builder.call(cg.list_new, [ir.Constant(i64, 16)])
         list_ptr_alloca = builder.alloca(cg.list_struct.as_pointer(), name="list_ptr")
         builder.store(list_val, list_ptr_alloca)
 
@@ -240,14 +241,12 @@ class JsonGenerator:
         builder.position_at_end(array_body)
         child_json = builder.call(self.json_from_cjson, [current_child])
 
-        # Store json pointer in temp location for list_append
-        temp_json_ptr = builder.alloca(json_ptr, name="temp_json")
-        builder.store(child_json, temp_json_ptr)
-        temp_i8_ptr = builder.bitcast(temp_json_ptr, i8_ptr)
+        # BUG-069 FIX: Append the Json struct VALUE (16 bytes), not a pointer
+        child_json_i8 = builder.bitcast(child_json, i8_ptr)
 
         # Append to list
         curr_list = builder.load(list_ptr_alloca)
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8_ptr, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr_list, child_json_i8, ir.Constant(i64, 16)])
         builder.store(new_list, list_ptr_alloca)
 
         # Move to next sibling
@@ -929,9 +928,9 @@ class JsonGenerator:
         # In bounds: get element
         builder.position_at_end(in_bounds)
         result = builder.call(cg.list_get, [list_ptr, idx])
-        # Result is i8*, cast to json pointer (stored as i64 in list)
-        result_i64 = builder.ptrtoint(result, i64)
-        json_result = builder.inttoptr(result_i64, cg.json_struct.as_pointer())
+        # BUG-069 FIX: Result is i8* pointing to the 16-byte Json struct stored inline.
+        # Cast directly to Json* - the data is stored by value in the list buffer.
+        json_result = builder.bitcast(result, cg.json_struct.as_pointer())
         builder.ret(json_result)
 
         # Not array or out of bounds: return json null
@@ -1369,12 +1368,15 @@ class JsonGenerator:
         value_i64 = builder.load(value_ptr)
         list_ptr = builder.inttoptr(value_i64, cg.list_struct.as_pointer())
 
-        # Convert json value to i8* for list storage
+        # BUG-069 FIX: Store the Json struct VALUE (16 bytes: tag + value) inline,
+        # NOT a pointer to the Json object. Storing pointers causes use-after-free
+        # when the inner Json objects get garbage collected.
+        # Cast the Json* to i8* to pass to list_append which copies 16 bytes.
         json_val = func.args[1]
-        json_as_i8ptr = builder.bitcast(json_val, ir.IntType(8).as_pointer())
+        json_val_i8 = builder.bitcast(json_val, i8.as_pointer())
 
-        # Call list_append (elem_size = 8 for pointer)
-        new_list = builder.call(cg.list_append, [list_ptr, json_as_i8ptr, ir.Constant(i64, 8)])
+        # Call list_append with elem_size = 16 for the Json struct (tag + value)
+        new_list = builder.call(cg.list_append, [list_ptr, json_val_i8, ir.Constant(i64, 16)])
 
         # Create new json array with new list
         result = builder.call(cg.json_new_array, [new_list])
@@ -1654,9 +1656,8 @@ class JsonGenerator:
         # Loop body - stringify element and append to string list
         builder.position_at_end(body_block)
         elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
-        elem_json = builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+        # BUG-069 FIX: Elements are stored as 16-byte inline Json structs, not pointers
+        elem_json = builder.bitcast(elem_data_ptr, cg.json_struct.as_pointer())
         elem_str = builder.call(cg.json_stringify, [elem_json])
 
         # Append to string list (reuse pre-allocated temp_ptr)
@@ -2022,9 +2023,8 @@ class JsonGenerator:
 
         # Get element and pretty-print it
         elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
-        elem_json = builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+        # BUG-069 FIX: Elements are stored as 16-byte inline Json structs
+        elem_json = builder.bitcast(elem_data_ptr, cg.json_struct.as_pointer())
         elem_str = builder.call(cg.json_pretty_internal, [elem_json, indent_size, child_depth])
         curr_str = builder.call(cg.string_concat, [curr_str, elem_str])
         builder.store(curr_str, result_str_ptr)
@@ -2579,8 +2579,8 @@ class JsonGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create new list with 8-byte elements (for Json* pointers)
-        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
+        # BUG-069 FIX: Create list with 16-byte elements (for inline Json structs)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, 16)])
 
         # Convert each element at compile time
         for elem_expr in expr.elements:
@@ -2590,12 +2590,9 @@ class JsonGenerator:
             # Convert to JSON using the expression for proper type handling
             json_elem = self.convert_to_json(elem_value, elem_expr)
 
-            # Append to list
-            temp = builder.alloca(i64, name="json_temp")
-            json_i64 = builder.ptrtoint(json_elem, i64)
-            builder.store(json_i64, temp)
-            temp_i8 = builder.bitcast(temp, i8_ptr)
-            json_list = builder.call(cg.list_append, [json_list, temp_i8, ir.Constant(i64, 8)])
+            # BUG-069 FIX: Append the Json struct VALUE (16 bytes), not a pointer
+            json_elem_i8 = builder.bitcast(json_elem, i8_ptr)
+            json_list = builder.call(cg.list_append, [json_list, json_elem_i8, ir.Constant(i64, 16)])
 
         return builder.call(cg.json_new_array, [json_list])
 
@@ -2614,15 +2611,14 @@ class JsonGenerator:
         # Get source list length
         src_len = builder.call(cg.list_len, [list_ptr])
 
-        # Create new list with 8-byte elements (for Json* pointers)
-        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
+        # BUG-069 FIX: Create list with 16-byte elements (for inline Json structs)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, 16)])
 
         # Store pointers for loop
         json_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="json_list_ptr")
         builder.store(json_list, json_list_ptr)
         idx_ptr = builder.alloca(i64, name="conv_idx")
         builder.store(ir.Constant(i64, 0), idx_ptr)
-        temp = builder.alloca(i64, name="json_temp")
 
         # Create loop blocks
         func = builder.function
@@ -2645,13 +2641,11 @@ class JsonGenerator:
         # Convert element based on known element type
         json_elem = self._convert_list_element_to_json(elem_data_ptr, elem_type)
 
-        # Append to JSON list
-        json_i64 = builder.ptrtoint(json_elem, i64)
-        builder.store(json_i64, temp)
-        temp_i8 = builder.bitcast(temp, i8_ptr)
+        # BUG-069 FIX: Append the Json struct VALUE (16 bytes), not a pointer
+        json_elem_i8 = builder.bitcast(json_elem, i8_ptr)
 
         curr_list = builder.load(json_list_ptr)
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr_list, json_elem_i8, ir.Constant(i64, 16)])
         builder.store(new_list, json_list_ptr)
 
         # Increment and loop
