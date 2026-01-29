@@ -6044,6 +6044,30 @@ class GarbageCollector:
                     builder.store(old_dead_head, next_tlab_field)
                     builder.store(node_tlab_base, self.gc_dead_tlab_list)
 
+                    # BUG-065 FIX: Reset thread's TLAB fields if this is the thread's current TLAB
+                    # When a TLAB is added to the dead list, it will be munmap'd at end of sweep.
+                    # If we don't reset the thread's TLAB fields, the next allocation will try to
+                    # use stale pointers that point to freed memory, causing a crash.
+                    thread_tlab_base_ptr = builder.gep(curr_thread, [
+                        ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
+                    ], inbounds=True)
+                    thread_tlab_base = builder.load(thread_tlab_base_ptr)
+                    thread_tlab_base_int = builder.ptrtoint(thread_tlab_base, self.i64)
+                    node_tlab_base_int = builder.ptrtoint(node_tlab_base, self.i64)
+                    is_current_tlab = builder.icmp_unsigned("==", thread_tlab_base_int, node_tlab_base_int)
+
+                    with builder.if_then(is_current_tlab):
+                        # Reset tlab_base, tlab_cursor, tlab_limit to NULL
+                        builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_base_ptr)
+                        thread_tlab_cursor_ptr = builder.gep(curr_thread, [
+                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)  # tlab_cursor field
+                        ], inbounds=True)
+                        builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_cursor_ptr)
+                        thread_tlab_limit_ptr = builder.gep(curr_thread, [
+                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)  # tlab_limit field
+                        ], inbounds=True)
+                        builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_limit_ptr)
+
             with else_nontlab:
                 # DEBUG: Non-TLAB object - actually freed
                 builder.atomic_rmw('add', self.gc_debug_nontlab_freed, ir.Constant(self.i64, 1), 'monotonic')

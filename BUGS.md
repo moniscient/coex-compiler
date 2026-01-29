@@ -178,9 +178,83 @@
 - **Files**: `codegen/json_type.py` (JSON literal construction), `codegen/expressions.py`
 - **Status**: Open
 
+### BUG-066: Promoted arena values not surviving GC after formula return
+- **Discovered**: 2026-01-29, during BUG-065 fix verification
+- **Category**: GC
+- **Severity**: High
+- **Test**: `tests/test_gc.py::TestArenaEscapePromotion::test_formula_gc_after_return`
+- **Reproduction**:
+  ```coex
+  formula make_data() -> List<int>
+      const data = [100, 200, 300]
+      return data
+  ~
+
+  func main() -> int
+      const items = make_data()
+      gc()  # triggers collection
+      print(items.len())  # CRASH - items was freed
+      return 0
+  ~
+  ```
+- **Observed**: Segmentation fault in `coex_list_len` when accessing the list after gc().
+  The list pointer appears invalid (points to freed memory / text segment area).
+- **Expected**: Values returned from formulas should survive GC if they are stored in
+  local variables that are tracked in the shadow stack.
+- **Root Cause Analysis**:
+  1. Formula `make_data()` allocates `[100, 200, 300]` in the arena
+  2. On return, `gc_promote_to_heap` is called to copy the list to the GC heap
+  3. `gc_promote_to_heap` internally calls `gc_alloc()` which returns a HANDLE (i64)
+  4. BUT: `gc_promote_to_heap` dereferences the handle and returns a raw POINTER (i8*)
+  5. The handle is LOST - never stored in the shadow stack
+  6. Caller (`main`) stores the returned pointer in `items`, but this is a raw pointer
+  7. The shadow stack stores HANDLES, not pointers. Without the handle, the GC
+     cannot find this object during root scanning.
+  8. When `gc()` runs, it doesn't see the promoted object as a root
+  9. The object is swept and freed
+  10. Accessing `items.len()` crashes because the memory was freed
+- **Hypothesis**: The type system mismatch between handle-based GC (shadow stack stores
+  i64 handles) and function return values (List* pointers) means promoted values
+  fall through the cracks. The promoted object has a handle, but it's never exposed
+  to the caller.
+- **Possible Fixes**:
+  1. Change `gc_promote_to_heap` to return the handle instead of the pointer. Caller
+     can store handle in shadow stack and dereference when needed.
+  2. Add a "pointer-to-handle" lookup table so the caller can recover the handle from
+     the returned pointer.
+  3. Change how formula return values work to use handles instead of pointers.
+  4. Have the promotion code also register the handle in the calling function's
+     shadow stack (would require passing the caller's frame info).
+- **Files**: `coex_gc.py` (gc_promote_to_heap), `codegen/statements.py` (return handling)
+- **Status**: Open
+
 ---
 
 ## Resolved Bugs
+
+### BUG-065: gc() crashes after all TLAB objects are collected
+- **Discovered**: 2026-01-28, during BUG-064 investigation
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      print("Before gc")
+      gc()  # CRASH - segfault
+      print("After gc")
+      return 0
+  ~
+  ```
+- **Observed**: Segmentation fault on allocation AFTER gc() completes
+- **Root Cause**: When all objects in a TLAB die during GC sweep, the TLAB is added to
+  the dead list and munmap'd. However, the owning thread's ThreadEntry still has
+  tlab_base/tlab_cursor/tlab_limit pointing to the freed memory. The next allocation
+  tries to use these stale pointers, causing a crash.
+- **Fix**: In `_implement_gc_sweep_thread_lists`, when a TLAB becomes empty (was_last),
+  check if it's the current thread's TLAB. If so, reset the thread's tlab_base,
+  tlab_cursor, and tlab_limit fields to NULL before munmap'ing.
+- **Files**: `coex_gc.py` (gc_sweep_thread_lists)
+- **Status**: Fixed 2026-01-28
 
 ### BUG-059: json.append() corrupts array when appending JSON objects
 - **Discovered**: 2026-01-28, during Galaxian game implementation
