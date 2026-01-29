@@ -8,6 +8,8 @@
 #include "coex_ui.h"
 #include "coex_ui_shell.h"
 #include "coex_ui_imgui.h"
+#include "svg/coex_svg.h"
+#include "svg/coex_svg_texture.h"
 
 /* Platform-specific renderers */
 #ifdef __APPLE__
@@ -872,6 +874,120 @@ static void render_collapsing(cJSON* widget, cJSON* state, cJSON* new_state) {
     }
 }
 
+/* ImGui types for draw list rendering */
+typedef struct {
+    void* _TexData;      /* NULL for user textures */
+    uint64_t _TexID;     /* The actual texture ID */
+} ImTextureRef_c;
+
+typedef struct {
+    float x, y;
+} ImVec2_c;
+
+/* ImDrawList is opaque - we just need a pointer */
+typedef void ImDrawList;
+
+static void render_svg_image(cJSON* widget, cJSON* state, cJSON* new_state) {
+    (void)state; (void)new_state;
+
+    /* Get SVG handle - required */
+    int64_t handle = (int64_t)get_number(widget, "handle", 0);
+    if (handle < 1) return;
+
+    /* Get dimensions - use SVG intrinsic size if not specified */
+    double width = get_number(widget, "width", 0);
+    double height = get_number(widget, "height", 0);
+
+    if (width <= 0) width = coex_svg_width(handle);
+    if (height <= 0) height = coex_svg_height(handle);
+    if (width <= 0 || height <= 0) return;
+
+    /* Render SVG to texture */
+    if (!coex_svg_render_to_texture(handle, (int64_t)width, (int64_t)height)) {
+        return;
+    }
+
+    /* Get the ImGui texture ID */
+    void* texture_id = coex_svg_get_texture_id(handle);
+    if (!texture_id) return;
+
+    /* Get current cursor screen position for rendering */
+    extern ImVec2_c igGetCursorScreenPos(void);
+    ImVec2_c cursor_pos = igGetCursorScreenPos();
+    float cursor_x = cursor_pos.x;
+    float cursor_y = cursor_pos.y;
+
+
+    /* Get the window draw list */
+    extern ImDrawList* igGetWindowDrawList(void);
+    ImDrawList* draw_list = igGetWindowDrawList();
+    if (!draw_list) return;
+
+    /* Create ImTextureRef for user texture */
+    ImTextureRef_c tex_ref;
+    tex_ref._TexData = NULL;
+    tex_ref._TexID = (uint64_t)(uintptr_t)texture_id;
+
+    ImVec2_c p_min = { cursor_x, cursor_y };
+    ImVec2_c p_max = { cursor_x + (float)width, cursor_y + (float)height };
+    ImVec2_c uv_min = { 0.0f, 0.0f };
+    ImVec2_c uv_max = { 1.0f, 1.0f };
+
+    /* Add image to draw list - white color (0xFFFFFFFF) */
+    extern void ImDrawList_AddImage(ImDrawList* self, ImTextureRef_c tex_ref,
+                                    ImVec2_c p_min, ImVec2_c p_max,
+                                    ImVec2_c uv_min, ImVec2_c uv_max, uint32_t col);
+    ImDrawList_AddImage(draw_list, tex_ref, p_min, p_max, uv_min, uv_max, 0xFFFFFFFF);
+
+    /* Advance cursor with a dummy to account for the image space */
+    extern void igDummy(ImVec2_c size);
+    ImVec2_c dummy_size = { (float)width, (float)height };
+    igDummy(dummy_size);
+}
+
+static void render_canvas(cJSON* widget, cJSON* state, cJSON* new_state) {
+    /* Canvas is a container for absolutely positioned children */
+    double width = get_number(widget, "width", 640);
+    double height = get_number(widget, "height", 480);
+
+    /* ImGui declarations - use ImVec2_c structs */
+    extern int igBeginChild_Str(const char* str_id, ImVec2_c size, int child_flags, int window_flags);
+    extern void igEndChild(void);
+    extern ImVec2_c igGetCursorScreenPos(void);
+    extern void igSetCursorScreenPos(ImVec2_c pos);
+
+    /* Begin a child window for the canvas area
+     * ImGuiWindowFlags_NoScrollbar = 1 << 3 = 8
+     * ImGuiWindowFlags_NoScrollWithMouse = 1 << 4 = 16
+     */
+    ImVec2_c canvas_size = { (float)width, (float)height };
+    if (igBeginChild_Str("##canvas", canvas_size, 0, 8 | 16)) {
+        /* Get the screen position of the canvas origin */
+        ImVec2_c canvas_origin = igGetCursorScreenPos();
+
+        /* Render children with their offsets using screen-space positioning */
+        cJSON* children = cJSON_GetObjectItem(widget, "children");
+        if (cJSON_IsArray(children)) {
+            int count = cJSON_GetArraySize(children);
+            for (int i = 0; i < count; i++) {
+                cJSON* child = cJSON_GetArrayItem(children, i);
+
+                /* Get child's offset */
+                double offsetX = get_number(child, "offsetX", 0);
+                double offsetY = get_number(child, "offsetY", 0);
+
+                /* Position cursor at absolute screen position */
+                ImVec2_c pos = { canvas_origin.x + (float)offsetX, canvas_origin.y + (float)offsetY };
+                igSetCursorScreenPos(pos);
+
+                /* Render the child widget */
+                render_widget(child, state, new_state);
+            }
+        }
+    }
+    igEndChild();
+}
+
 static void render_widget(cJSON* widget, cJSON* state, cJSON* new_state) {
     if (!cJSON_IsObject(widget)) return;
 
@@ -903,6 +1019,8 @@ static void render_widget(cJSON* widget, cJSON* state, cJSON* new_state) {
     else if (strcmp(type, "collapsing") == 0) render_collapsing(widget, state, new_state);
     else if (strcmp(type, "separator") == 0) coex_imgui_separator();
     else if (strcmp(type, "spacing") == 0) coex_imgui_spacing();
+    else if (strcmp(type, "svg_image") == 0) render_svg_image(widget, state, new_state);
+    else if (strcmp(type, "canvas") == 0) render_canvas(widget, state, new_state);
 
     if (id) coex_imgui_pop_id();
 }
@@ -962,6 +1080,11 @@ int64_t coex_ui_init(const char* config_json) {
         coex_ui_shell_shutdown();
         cJSON_Delete(config);
         return 0;
+    }
+    /* Initialize SVG texture system with Metal device */
+    if (!svg_texture_init(metal_device)) {
+        fprintf(stderr, "coex_ui_init: Warning - SVG texture system failed to initialize\n");
+        /* Non-fatal - SVG rendering will just not work */
     }
     /* Font texture creation is deferred until first frame */
 #else
