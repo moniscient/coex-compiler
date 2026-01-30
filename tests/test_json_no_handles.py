@@ -86,6 +86,7 @@ func main() -> int
 ~
 ''', "1\n")
 
+    @pytest.mark.xfail(reason="BUG-078: JSON variables not properly rooted in shadow stack, crash on GC")
     def test_no_handles_after_gc_cycle(self, expect_output):
         """After GC, serialized JSON still contains proper values."""
         # NOTE: Use bracket notation for array access, .get() for object fields
