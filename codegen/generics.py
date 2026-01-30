@@ -332,6 +332,11 @@ class GenericsHandler:
             if func_name and func_name in cg.type_fields:
                 # This is a user type constructor
                 return NamedType(func_name)
+            # BUG-066 FIX: Check if this is a regular function call and return its type
+            if func_name and hasattr(cg, 'func_decls') and func_name in cg.func_decls:
+                func_decl = cg.func_decls[func_name]
+                if func_decl.return_type:
+                    return func_decl.return_type
         elif isinstance(expr, MemberExpr):
             # Check if accessing a field on a JSON object
             obj_type = self.infer_type_from_expr(expr.object)

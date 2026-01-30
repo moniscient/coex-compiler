@@ -178,9 +178,13 @@
 - **Files**: `codegen/json_type.py` (JSON literal construction), `codegen/expressions.py`
 - **Status**: Open
 
+---
+
+## Resolved Bugs
+
 ### BUG-066: Promoted arena values not surviving GC after formula return
 - **Discovered**: 2026-01-29, during BUG-065 fix verification
-- **Category**: GC
+- **Category**: GC/Codegen
 - **Severity**: High
 - **Test**: `tests/test_gc.py::TestArenaEscapePromotion::test_formula_gc_after_return`
 - **Reproduction**:
@@ -198,39 +202,32 @@
   ~
   ```
 - **Observed**: Segmentation fault in `coex_list_len` when accessing the list after gc().
-  The list pointer appears invalid (points to freed memory / text segment area).
 - **Expected**: Values returned from formulas should survive GC if they are stored in
   local variables that are tracked in the shadow stack.
-- **Root Cause Analysis**:
-  1. Formula `make_data()` allocates `[100, 200, 300]` in the arena
-  2. On return, `gc_promote_to_heap` is called to copy the list to the GC heap
-  3. `gc_promote_to_heap` internally calls `gc_alloc()` which returns a HANDLE (i64)
-  4. BUT: `gc_promote_to_heap` dereferences the handle and returns a raw POINTER (i8*)
-  5. The handle is LOST - never stored in the shadow stack
-  6. Caller (`main`) stores the returned pointer in `items`, but this is a raw pointer
-  7. The shadow stack stores HANDLES, not pointers. Without the handle, the GC
-     cannot find this object during root scanning.
-  8. When `gc()` runs, it doesn't see the promoted object as a root
-  9. The object is swept and freed
-  10. Accessing `items.len()` crashes because the memory was freed
-- **Hypothesis**: The type system mismatch between handle-based GC (shadow stack stores
-  i64 handles) and function return values (List* pointers) means promoted values
-  fall through the cracks. The promoted object has a handle, but it's never exposed
-  to the caller.
-- **Possible Fixes**:
-  1. Change `gc_promote_to_heap` to return the handle instead of the pointer. Caller
-     can store handle in shadow stack and dereference when needed.
-  2. Add a "pointer-to-handle" lookup table so the caller can recover the handle from
-     the returned pointer.
-  3. Change how formula return values work to use handles instead of pointers.
-  4. Have the promotion code also register the handle in the calling function's
-     shadow stack (would require passing the caller's frame info).
-- **Files**: `coex_gc.py` (gc_promote_to_heap), `codegen/statements.py` (return handling)
-- **Status**: Open
+- **Root Cause**: The `infer_type_from_expr` function in `codegen/generics.py` did not
+  handle regular function calls. When analyzing `const items = make_data()`:
+  1. The type inference checked if it was a method call (MemberExpr) - no
+  2. Checked if it was a type constructor (name in `type_fields`) - no
+  3. Fell through to return `PrimitiveType("int")` as default
 
----
+  Because `items` was inferred as `int` instead of `List<int>`, it was not identified
+  as a heap type in `collect_heap_vars_from_body`. No shadow stack slot was allocated,
+  so when `gc()` ran, the promoted object wasn't found as a root and was swept.
 
-## Resolved Bugs
+  Note: The original hypothesis about `gc_promote_to_heap` was incorrect. The promotion
+  mechanism works correctly - the promoted object's handle IS stored in its forward field
+  and can be recovered via `gc_ptr_to_handle` in `set_root`. The issue was that `set_root`
+  was never called because no shadow stack slot was allocated.
+- **Fix**: Added function call handling in `infer_type_from_expr` to check if the callee
+  is a function name in `func_decls` and return its return type:
+  ```python
+  if func_name and hasattr(cg, 'func_decls') and func_name in cg.func_decls:
+      func_decl = cg.func_decls[func_name]
+      if func_decl.return_type:
+          return func_decl.return_type
+  ```
+- **Files**: `codegen/generics.py` (infer_type_from_expr)
+- **Status**: Fixed (2026-01-30)
 
 ### BUG-068: JSON array index access calls wrong function (get_field instead of get_index)
 - **Discovered**: 2026-01-29, during Galaxian game debugging
@@ -966,9 +963,9 @@
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2026-01-28)
-- **Open**: 14 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058, BUG-064)
-- **Resolved**: 45 bugs (including BUG-059: json.append fix, BUG-060: TLAB reclamation, BUG-061: GC JSON struct fix, BUG-062: handle table leak fix, BUG-063: library nested imports)
+### Bug Count Summary (as of 2026-01-30)
+- **Open**: 13 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058, BUG-064)
+- **Resolved**: 46 bugs (including BUG-066: arena promotion type inference fix)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX
