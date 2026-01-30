@@ -48,24 +48,58 @@ class GarbageCollector:
     GC_TRACE_DETAIL = 3      # Individual object operations
     GC_TRACE_ALL = 4         # Everything including pointer traversals
 
-    # Built-in type IDs
+    # ============================================================
+    # Built-in Type IDs
+    # ============================================================
+    #
+    # HANDLE STORAGE INVARIANT (Critical for GC correctness):
+    # All stored references to GC-managed objects must be HANDLES (i64 indices
+    # into the handle table), never raw pointers. This applies to:
+    #   - Collection elements that are reference types (strings, nested lists, etc.)
+    #   - Struct fields containing reference types
+    #   - Map/Set keys and values that are reference types
+    #
+    # Types with _REF suffix (TYPE_LIST_TAIL_REF, TYPE_ARRAY_DATA_REF) indicate
+    # buffers where each element is an i64 handle that needs GC marking. The GC
+    # marks these by iterating through the buffer and pushing each handle onto
+    # the mark worklist.
+    #
+    # Types without _REF suffix (TYPE_LIST_TAIL, TYPE_ARRAY_DATA) contain raw
+    # primitive data (int, float, bool, byte) that the GC ignores during marking.
+    #
+    # Pattern for storing reference types in collections:
+    #   1. Allocate buffer with TYPE_*_REF type ID
+    #   2. For each element: handle = gc_ptr_to_handle(ptr); store handle
+    #   3. For retrieval: handle = load; ptr = gc_handle_deref(handle)
+    #
+    # Why handles, not pointers?
+    #   - Handles are stable across GC cycles; pointers may become invalid
+    #   - The handle table is the single source of truth for object locations
+    #   - Concurrent GC requires handle indirection for safe pointer fixup
+    #   - Raw pointers may "work" temporarily without compaction, but will fail
+    #     under GC pressure when objects move or are collected
+    #
+    # Debug: Use gc_validate_handle_storage() to detect invariant violations
+    # ============================================================
+
     TYPE_UNKNOWN = 0
-    TYPE_LIST = 1
-    TYPE_STRING = 2
-    TYPE_MAP = 3
-    TYPE_MAP_ENTRY = 4
-    TYPE_SET = 5
-    TYPE_SET_ENTRY = 6
-    TYPE_CHANNEL = 7
-    TYPE_ARRAY = 8
-    TYPE_LIST_TAIL = 9       # List tail buffer (primitive element data)
-    TYPE_PV_NODE = 10        # Persistent vector tree node
-    TYPE_STRING_DATA = 11    # String character data buffer
+    TYPE_LIST = 1            # List struct (root_handle, len, depth, tail_handle, ...)
+    TYPE_STRING = 2          # String struct (data_handle, len, ...)
+    TYPE_MAP = 3             # Map struct (HAMT root, len, flags)
+    TYPE_MAP_ENTRY = 4       # HAMT entry node
+    TYPE_SET = 5             # Set struct (HAMT root, len, flags)
+    TYPE_SET_ENTRY = 6       # HAMT entry node
+    TYPE_CHANNEL = 7         # Channel struct
+    TYPE_ARRAY = 8           # Array struct (handle, ndim, shape, strides, ...)
+    TYPE_LIST_TAIL = 9       # List tail buffer - PRIMITIVE elements (int, float, etc.)
+    TYPE_PV_NODE = 10        # Persistent vector internal tree node
+    TYPE_STRING_DATA = 11    # String character data buffer (raw bytes)
     TYPE_CHANNEL_BUFFER = 12 # Channel data buffer
-    TYPE_ARRAY_DATA = 13     # Array element data buffer
+    TYPE_ARRAY_DATA = 13     # Array data buffer - PRIMITIVE elements (int, float, etc.)
     TYPE_JSON = 14           # JSON value (tagged union: i8 tag, i64 value)
-    TYPE_LIST_TAIL_REF = 15  # List tail buffer (reference type elements - handles)
-    TYPE_ARRAY_DATA_REF = 16 # Array element data buffer (reference type elements - handles)
+    # ---- Reference-type buffers (elements are HANDLES, not raw data) ----
+    TYPE_LIST_TAIL_REF = 15  # List tail buffer - REFERENCE elements (each i64 is a handle)
+    TYPE_ARRAY_DATA_REF = 16 # Array data buffer - REFERENCE elements (each i64 is a handle)
     TYPE_FIRST_USER = 17     # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
@@ -190,6 +224,7 @@ class GarbageCollector:
         self.gc_fragmentation_report = None   # Analyze heap fragmentation
         self.gc_dump_handle_table = None      # Dump handle table state
         self.gc_dump_shadow_stacks = None     # Dump shadow stack frames
+        self.gc_validate_handle_storage = None  # Validate stored values are handles not pointers
 
         # ============================================================
         # Thread Registry (Multi-Thread GC Support)
@@ -291,6 +326,7 @@ class GarbageCollector:
         self._implement_gc_fragmentation_report()
         self._implement_gc_dump_handle_table()
         self._implement_gc_dump_shadow_stacks()
+        self._implement_gc_validate_handle_storage()
         # Handle-Based GC - Phase 1: Handle management functions
         self._implement_gc_handle_table_grow()
         self._implement_gc_handle_alloc()
@@ -1296,6 +1332,12 @@ class GarbageCollector:
         # Print all shadow stack frames and their roots
         gc_dump_shadow_stacks_ty = ir.FunctionType(self.void, [])
         self.gc_dump_shadow_stacks = ir.Function(self.module, gc_dump_shadow_stacks_ty, name="coex_gc_dump_shadow_stacks")
+
+        # gc_validate_handle_storage() -> i64
+        # Debug function to validate stored values look like handles (small integers)
+        # rather than raw pointers (large addresses). Returns count of violations.
+        gc_validate_handle_storage_ty = ir.FunctionType(self.i64, [])
+        self.gc_validate_handle_storage = ir.Function(self.module, gc_validate_handle_storage_ty, name="coex_gc_validate_handle_storage")
 
         # ============================================================
         # Heapwatch Getter Functions (read-only access to GC stats)
@@ -3172,8 +3214,19 @@ class GarbageCollector:
         builder.position_at_end(mark_json_done)
         builder.branch(done)
 
-        # Mark LIST_TAIL_REF: buffer containing handles to reference type elements
-        # Each element is an i64 handle that needs to be marked
+        # ============================================================
+        # Mark LIST_TAIL_REF: Handle buffer for reference-type list elements
+        # ============================================================
+        # HANDLE STORAGE INVARIANT: This buffer contains i64 HANDLES, not pointers.
+        # Each element was stored via: handle = gc_ptr_to_handle(obj); store handle
+        # We mark by iterating through and pushing each handle to the worklist.
+        #
+        # Pattern:
+        #   for i in 0..elem_count:
+        #       handle = buffer[i]
+        #       if handle != 0:  # skip null handles
+        #           gc_mark_push(handle)
+        # ============================================================
         builder.position_at_end(mark_list_tail_ref)
         # Get object size from header to calculate element count
         # Header is at ptr - HEADER_SIZE
@@ -3230,8 +3283,16 @@ class GarbageCollector:
         builder.store(next_idx_ref, idx_alloca_ref)
         builder.branch(list_tail_ref_loop)
 
-        # Mark ARRAY_DATA_REF: buffer containing handles to reference type elements
-        # Identical to LIST_TAIL_REF - each element is an i64 handle that needs to be marked
+        # ============================================================
+        # Mark ARRAY_DATA_REF: Handle buffer for reference-type array elements
+        # ============================================================
+        # HANDLE STORAGE INVARIANT: This buffer contains i64 HANDLES, not pointers.
+        # Identical pattern to LIST_TAIL_REF - arrays of reference types store
+        # handles that must be marked during GC.
+        #
+        # Used by: Array<string>, Array<List<T>>, Array<UDT>, etc.
+        # Allocated via: array_new_ref() which sets TYPE_ARRAY_DATA_REF type ID
+        # ============================================================
         builder.position_at_end(mark_array_data_ref)
         # Get object size from header to calculate element count
         # Header is at ptr - HEADER_SIZE
@@ -7894,6 +7955,247 @@ class GarbageCollector:
         end_ptr = builder.bitcast(end_global, self.i8_ptr)
         builder.call(printf, [end_ptr])
         builder.ret_void()
+
+    def _implement_gc_validate_handle_storage(self):
+        """Validate that stored values in reference-type buffers look like handles.
+
+        HANDLE STORAGE INVARIANT: All stored references to GC-managed objects must be
+        handles (small i64 indices into handle table), never raw pointers.
+
+        This debug function walks through objects with TYPE_LIST_TAIL_REF and
+        TYPE_ARRAY_DATA_REF, checking each stored value. A handle should be:
+        - A small positive integer (index into handle table)
+        - Less than gc_next_handle (the next available handle)
+        - Much smaller than typical pointer values (which are > 0x100000000)
+
+        A value that looks like a pointer (very large address, e.g., > 4GB) is
+        likely a bug where code stored a raw pointer instead of a handle.
+
+        Returns the count of suspicious values (potential invariant violations).
+        """
+        func = self.gc_validate_handle_storage
+
+        entry = func.append_basic_block("entry")
+        check_thread = func.append_basic_block("check_thread")
+        process_thread = func.append_basic_block("process_thread")
+        node_loop = func.append_basic_block("node_loop")
+        check_obj = func.append_basic_block("check_obj")
+        check_type = func.append_basic_block("check_type")
+        validate_ref_buffer = func.append_basic_block("validate_ref_buffer")
+        elem_loop = func.append_basic_block("elem_loop")
+        check_elem = func.append_basic_block("check_elem")
+        elem_suspicious = func.append_basic_block("elem_suspicious")
+        elem_next = func.append_basic_block("elem_next")
+        next_node = func.append_basic_block("next_node")
+        next_thread = func.append_basic_block("next_thread")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Get printf
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Violation counter
+        violations = builder.alloca(self.i64, name="violations")
+        builder.store(ir.Constant(self.i64, 0), violations)
+
+        # Objects checked counter
+        objects_checked = builder.alloca(self.i64, name="objects_checked")
+        builder.store(ir.Constant(self.i64, 0), objects_checked)
+
+        # Thread pointer for linked list traversal
+        thread_ptr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
+        curr_node_alloca = builder.alloca(self.i8_ptr, name="curr_node")
+
+        # Element loop variables (must be allocated in entry block)
+        elem_idx_alloca = builder.alloca(self.i64, name="elem_idx")
+        elem_count_alloca = builder.alloca(self.i64, name="elem_count")
+        handles_ptr_alloca = builder.alloca(self.i64_ptr, name="handles_ptr")
+
+        # Header message
+        hdr_fmt = "[GC:VALIDATE] Checking handle storage invariant...\n"
+        hdr_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(hdr_fmt) + 1), name=".validate_hdr")
+        hdr_global.global_constant = True
+        hdr_global.linkage = 'private'
+        hdr_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(hdr_fmt) + 1),
+                                              bytearray(hdr_fmt.encode('utf-8')) + bytearray([0]))
+        hdr_ptr = builder.bitcast(hdr_global, self.i8_ptr)
+        builder.call(printf, [hdr_ptr])
+
+        # Threshold: values above this are suspicious (likely pointers, not handles)
+        # 4GB = 0x100000000 = 4294967296 - any value above this is likely a pointer
+        POINTER_THRESHOLD = 0x100000000
+
+        # Get next_handle for upper bound check
+        next_handle = builder.load(self.gc_next_handle)
+
+        # Lock registry mutex to prevent thread registry changes during iteration
+        registry_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [registry_mutex])
+
+        # Get first thread from registry (linked list head)
+        registry_head = builder.load(self.gc_thread_registry)
+        builder.store(registry_head, thread_ptr_alloca)
+        builder.branch(check_thread)
+
+        # Check if there's a thread to process
+        builder.position_at_end(check_thread)
+        curr_thread = builder.load(thread_ptr_alloca)
+        thread_int = builder.ptrtoint(curr_thread, self.i64)
+        is_null_thread = builder.icmp_unsigned("==", thread_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_thread, done, process_thread)
+
+        # Process this thread's allocation list
+        builder.position_at_end(process_thread)
+        # Get thread's alloc_list head (field 9)
+        alloc_list_ptr = builder.gep(curr_thread,
+            [ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)], inbounds=True)
+        alloc_head = builder.load(alloc_list_ptr)
+        builder.store(alloc_head, curr_node_alloca)
+        builder.branch(node_loop)
+
+        # Node loop
+        builder.position_at_end(node_loop)
+        node_val = builder.load(curr_node_alloca)
+        node_int = builder.ptrtoint(node_val, self.i64)
+        is_null = builder.icmp_unsigned("==", node_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null, next_thread, check_obj)
+
+        # Check object
+        builder.position_at_end(check_obj)
+        node = builder.bitcast(node_val, self.alloc_node_type.as_pointer())
+
+        # Get handle from node and dereference
+        handle_ptr = builder.gep(node, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        obj_handle = builder.load(handle_ptr)
+        data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
+
+        # Get type_id from header
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header = builder.inttoptr(header_int, self.header_type.as_pointer())
+        type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+        size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        obj_size = builder.load(size_ptr)
+
+        builder.branch(check_type)
+
+        # Check if this is a reference-type buffer (LIST_TAIL_REF or ARRAY_DATA_REF)
+        builder.position_at_end(check_type)
+        is_list_tail_ref = builder.icmp_unsigned("==", type_id, ir.Constant(self.i64, self.TYPE_LIST_TAIL_REF))
+        is_array_data_ref = builder.icmp_unsigned("==", type_id, ir.Constant(self.i64, self.TYPE_ARRAY_DATA_REF))
+        is_ref_buffer = builder.or_(is_list_tail_ref, is_array_data_ref)
+        builder.cbranch(is_ref_buffer, validate_ref_buffer, next_node)
+
+        # Validate reference buffer - each element should be a handle
+        builder.position_at_end(validate_ref_buffer)
+
+        # Increment objects checked
+        old_checked = builder.load(objects_checked)
+        builder.store(builder.add(old_checked, ir.Constant(self.i64, 1)), objects_checked)
+
+        # Calculate element count (size / 8, since handles are i64)
+        elem_count = builder.udiv(obj_size, ir.Constant(self.i64, 8))
+        handles_ptr = builder.bitcast(data_ptr, self.i64_ptr)
+
+        # Initialize loop variables (allocas are in entry block)
+        builder.store(ir.Constant(self.i64, 0), elem_idx_alloca)
+        builder.store(elem_count, elem_count_alloca)
+        builder.store(handles_ptr, handles_ptr_alloca)
+
+        builder.branch(elem_loop)
+
+        # Element loop
+        builder.position_at_end(elem_loop)
+        idx = builder.load(elem_idx_alloca)
+        count = builder.load(elem_count_alloca)
+        done_elems = builder.icmp_unsigned(">=", idx, count)
+        builder.cbranch(done_elems, next_node, check_elem)
+
+        # Check element value
+        builder.position_at_end(check_elem)
+        handles_ptr_val = builder.load(handles_ptr_alloca)
+        elem_ptr = builder.gep(handles_ptr_val, [idx], inbounds=True)
+        elem_val = builder.load(elem_ptr)
+
+        # A valid handle should be:
+        # 1. Less than gc_next_handle (the next available handle)
+        # 2. Less than POINTER_THRESHOLD (definitely not a pointer)
+        # We check if it exceeds the threshold OR exceeds next_handle
+        is_above_threshold = builder.icmp_unsigned(">", elem_val, ir.Constant(self.i64, POINTER_THRESHOLD))
+        is_above_next_handle = builder.icmp_unsigned(">=", elem_val, next_handle)
+        is_suspicious = builder.or_(is_above_threshold, is_above_next_handle)
+
+        # Also allow 0 (null handle)
+        is_zero = builder.icmp_unsigned("==", elem_val, ir.Constant(self.i64, 0))
+        is_suspicious = builder.and_(is_suspicious, builder.not_(is_zero))
+
+        builder.cbranch(is_suspicious, elem_suspicious, elem_next)
+
+        # Report suspicious value
+        builder.position_at_end(elem_suspicious)
+        warn_fmt = "[GC:VALIDATE] WARNING: Object handle=%lld type=%lld elem[%lld] = %lld (looks like pointer, not handle!)\n"
+        warn_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(warn_fmt) + 1), name=".validate_warn")
+        warn_global.global_constant = True
+        warn_global.linkage = 'private'
+        warn_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(warn_fmt) + 1),
+                                               bytearray(warn_fmt.encode('utf-8')) + bytearray([0]))
+        warn_ptr = builder.bitcast(warn_global, self.i8_ptr)
+        builder.call(printf, [warn_ptr, obj_handle, type_id, idx, elem_val])
+
+        # Increment violation count
+        old_violations = builder.load(violations)
+        builder.store(builder.add(old_violations, ir.Constant(self.i64, 1)), violations)
+        builder.branch(elem_next)
+
+        # Next element
+        builder.position_at_end(elem_next)
+        old_idx = builder.load(elem_idx_alloca)
+        builder.store(builder.add(old_idx, ir.Constant(self.i64, 1)), elem_idx_alloca)
+        builder.branch(elem_loop)
+
+        # Next node in allocation list
+        builder.position_at_end(next_node)
+        curr_node_reload = builder.load(curr_node_alloca)
+        node_reload = builder.bitcast(curr_node_reload, self.alloc_node_type.as_pointer())
+        next_ptr_ptr = builder.gep(node_reload, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        next_ptr = builder.load(next_ptr_ptr)
+        builder.store(next_ptr, curr_node_alloca)
+        builder.branch(node_loop)
+
+        # Move to next thread in linked list (field 11 = next pointer)
+        builder.position_at_end(next_thread)
+        curr_thread_reload = builder.load(thread_ptr_alloca)
+        next_thread_ptr = builder.gep(curr_thread_reload, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 11)  # next field in ThreadEntry
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_thread_ptr)
+        next_thread_typed = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_typed, thread_ptr_alloca)
+        builder.branch(check_thread)
+
+        # Done - unlock mutex, print summary and return violation count
+        builder.position_at_end(done)
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
+
+        summary_fmt = "[GC:VALIDATE] Checked %lld ref-type buffers, found %lld violations\n"
+        summary_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(summary_fmt) + 1), name=".validate_summary")
+        summary_global.global_constant = True
+        summary_global.linkage = 'private'
+        summary_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(summary_fmt) + 1),
+                                                  bytearray(summary_fmt.encode('utf-8')) + bytearray([0]))
+        summary_ptr = builder.bitcast(summary_global, self.i8_ptr)
+        final_checked = builder.load(objects_checked)
+        final_violations = builder.load(violations)
+        builder.call(printf, [summary_ptr, final_checked, final_violations])
+
+        builder.ret(final_violations)
 
     # ============================================================
     # Handle-Based GC - Phase 1: Handle Management Functions

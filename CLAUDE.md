@@ -109,6 +109,42 @@ The GC uses a **handle-based** design where all heap references are i64 indices 
 - `gc_push_frame/gc_pop_frame`: Shadow stack management
 - `gc_set_root`: Store handle in shadow stack slot
 
+### Handle Storage Invariant
+
+**CRITICAL INVARIANT**: All stored references to GC-managed objects must be **handles** (i64 indices into the handle table), never raw pointers. This applies to:
+
+- Collection element storage (List, Array elements that are reference types)
+- Struct fields containing reference types
+- Map keys and values that are reference types
+- Any value persisted in heap-allocated structures
+
+**Why this matters:**
+- Handles are stable across GC cycles; pointers may become invalid after collection
+- The handle table is the single source of truth for object locations
+- Without compaction, raw pointers may "work" temporarily but will fail under GC pressure
+- Concurrent GC requires handle indirection for safe pointer fixup
+
+**Pattern for reference type storage:**
+```
+// CORRECT: Store handle, retrieve via deref
+handle = gc_ptr_to_handle(ptr)        // Get handle from object
+store handle to collection element    // Store i64 handle
+...
+retrieved_handle = load from element  // Later: load i64 handle
+ptr = gc_handle_deref(retrieved_handle)  // Convert back to pointer
+
+// WRONG: Store raw pointer directly
+store ptr to collection element       // BAD: ptr may become invalid
+```
+
+**Type IDs for reference type buffers:**
+- `TYPE_LIST_TAIL_REF` (15): List tail buffer containing handles (not raw data)
+- `TYPE_ARRAY_DATA_REF` (16): Array data buffer containing handles (not raw data)
+
+These `_REF` suffixed type IDs tell the GC "each element is an i64 handle that needs marking" rather than "this is raw data, skip it."
+
+**Debug validation**: Use `gc_validate_handle_storage()` to detect invariant violations at runtime. It checks if stored values look like handles (small integers) vs pointers (large addresses).
+
 ### GC Diagnostic Builtins
 
 These functions are available in Coex code for debugging:
@@ -120,6 +156,7 @@ These functions are available in Coex code for debugging:
 | `gc_dump_heap()` | Print all objects on the heap |
 | `gc_dump_roots()` | Print shadow stack root handles |
 | `gc_validate_heap() -> int` | Check heap integrity, return error count |
+| `gc_validate_handle_storage() -> int` | Check stored values are handles not pointers, return violation count |
 | `gc_fragmentation_report()` | Analyze heap fragmentation by size class |
 | `gc_dump_handle_table()` | Print handle table state (allocated/free/retired) |
 | `gc_dump_shadow_stacks()` | Print all shadow stack frames with roots |
@@ -224,44 +261,6 @@ The `:=` operator has a unified semantic meaning across Coex: "flatten to value 
 1. **Collections**: Deep copy (escape shared heap reference)
 2. **Concurrent operations**: Immediate await (escape deferred execution)
 3. **Lazy expressions**: Eager evaluation (escape thunk deferral)
-4. **JSON serialization**: Deep-copy and serialize (escape Coex runtime entirely)
-
-### JSON Type and Deep-Copy Invariant
-
-**INVARIANT**: The JSON type always contains deep-copied values. JSON is a serialization format designed to leave the Coex runtime (FFI, file I/O, network), so it must never contain handles or references to Coex objects—only concrete, serialized values.
-
-**IMPLEMENTATION INVARIANT (GC)**: JSON objects are **not traced during garbage collection**. This means:
-- All values within JSON must be flattened inline—no pointers or handles to GC-managed objects may ever be stored within JSON structures
-- JSON arrays store 16-byte inline `Json` structs (tag + value), not 8-byte pointers to Json objects
-- Strings within JSON are copied inline, not referenced via handles
-- Nested JSON objects are stored as complete inline values
-
-This design is intentionally inefficient for complex nested data. Programmers requiring high-performance data structures with GC-traced references should use native Coex structs, lists, and maps instead of JSON. JSON is optimized for serialization and FFI, not for internal data manipulation.
-
-**Assignment Rule**: When assigning to a `json`-typed variable:
-- `json_var = <expr>` — RHS must already be type `json` (e.g., JSON literal, `json.parse()` result, or another json variable)
-- `json_var := <expr>` — Any type allowed; value is deep-copied and serialized to JSON
-
-```coex
-# JSON literals are already json type
-j: json = { name: "Alice", age: 30 }    # OK - literal is json
-
-# json.parse() returns json
-j: json = json.parse(str)               # OK - parse returns json
-
-# json-to-json assignment is OK with =
-j2: json = j.get("name")                # OK - .get() returns json
-
-# Non-JSON to JSON requires :=
-my_list = [1, 2, 3]
-j: json = my_list                       # ERROR: must use :=
-j: json := my_list                      # OK: deep-copy to JSON
-
-# UDT to JSON requires :=
-p: Person = Person(name: "Bob", age: 25)
-j: json = p                             # ERROR: must use :=
-j: json := p                            # OK: serialize UDT to JSON
-```
 
 **Function Parameters and Return Types**: When a function parameter or return type is `json`, conversion happens automatically without requiring `:=` at the call site—the function signature already declares the intent to serialize.
 

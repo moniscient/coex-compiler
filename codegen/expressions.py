@@ -1298,6 +1298,12 @@ class ExpressionGenerator:
                 cg.builder.call(cg.gc.gc_dump_shadow_stacks, [])
                 return ir.Constant(ir.IntType(64), 0)
 
+            if name == "gc_validate_handle_storage":
+                # Debug function to validate handle storage invariant
+                # Returns count of violations (values that look like pointers, not handles)
+                result = cg.builder.call(cg.gc.gc_validate_handle_storage, [])
+                return result
+
             if name == "print":
                 if expr.args:
                     value = self.generate_expression(expr.args[0])
