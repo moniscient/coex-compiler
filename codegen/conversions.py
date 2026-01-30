@@ -27,7 +27,7 @@ class ConversionGenerator:
     def __init__(self, cg: 'CodeGenerator'):
         self.cg = cg
 
-    def list_to_array(self, list_ptr: ir.Value) -> ir.Value:
+    def list_to_array(self, list_ptr: ir.Value, is_ref_type: bool = False) -> ir.Value:
         """Convert a List to an Array (List.packed() -> Array).
 
         Creates a new Array with the same elements as the List.
@@ -42,6 +42,10 @@ class ConversionGenerator:
             Field 4: offset (i64) - byte offset for views
             Field 5: elem_size (i64) - element size
             Field 6: type_id (i64) - element type
+
+        Args:
+            list_ptr: Pointer to the List struct
+            is_ref_type: If True, use array_new_ref for GC-traced handle storage
         """
         func = self.cg.builder.function
         i32 = ir.IntType(32)
@@ -56,8 +60,11 @@ class ConversionGenerator:
         elem_size = self.cg.builder.load(elem_size_ptr)
 
         # Create new Array with same length as List
-        # array_new initializes all fields including shape[0]=len, strides[0]=elem_size
-        array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, elem_size])
+        # Use array_new_ref if elements are reference types for proper GC tracing
+        if is_ref_type:
+            array_ptr = self.cg.builder.call(self.cg.array_new_ref, [list_len, elem_size])
+        else:
+            array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, elem_size])
 
         # Array data: compute handle + offset
         # Field 0: handle, Field 4: offset

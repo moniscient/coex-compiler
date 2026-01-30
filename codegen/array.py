@@ -112,6 +112,11 @@ class ArrayGenerator:
         array_filled_ty = ir.FunctionType(array_ptr, [i64, i64])
         cg.array_filled = ir.Function(cg.module, array_filled_ty, name="coex_array_filled")
 
+        # array_new_ref(len: i64, elem_size: i64) -> Array*
+        # Creates a new 1D array for reference type elements (data tracked by GC for handle tracing)
+        array_new_ref_ty = ir.FunctionType(array_ptr, [i64, i64])
+        cg.array_new_ref = ir.Function(cg.module, array_new_ref_ty, name="coex_array_new_ref")
+
         # array_set_inplace(arr: Array*, index: i64, value: i8*, elem_size: i64) -> void
         # Mutates the array in place (only safe when array is unique/unaliased)
         array_set_inplace_ty = ir.FunctionType(ir.VoidType(), [array_ptr, i64, i8_ptr, i64])
@@ -144,6 +149,7 @@ class ArrayGenerator:
         # Implement all functions
         self._implement_array_new()
         self._implement_array_filled()
+        self._implement_array_new_ref()
         self._implement_array_set_inplace()
         self._implement_array_get()
         self._implement_array_set()
@@ -327,6 +333,41 @@ class ArrayGenerator:
 
         # Initialize all fields for 1D array
         self._init_1d_array_fields(builder, array_ptr, size, elem_size, data_ptr)
+
+        builder.ret(array_ptr)
+
+    def _implement_array_new_ref(self):
+        """Implement array_new_ref: allocate a new 1D array for reference type elements.
+
+        Same as array_new but uses TYPE_ARRAY_DATA_REF for the data buffer,
+        enabling GC to trace handles stored in the buffer.
+        """
+        cg = self.cg
+
+        func = cg.array_new_ref
+        func.args[0].name = "len"
+        func.args[1].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        length = func.args[0]
+        elem_size = func.args[1]
+        i64 = ir.IntType(64)
+
+        # Allocate Array struct (104 bytes)
+        array_size_const = ir.Constant(i64, ARRAY_STRUCT_SIZE)
+        type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
+        array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
+
+        # Allocate data buffer: len * elem_size with TYPE_ARRAY_DATA_REF for GC tracing
+        data_size = builder.mul(length, elem_size)
+        array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA_REF)
+        data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
+
+        # Initialize all fields for 1D array
+        self._init_1d_array_fields(builder, array_ptr, length, elem_size, data_ptr)
 
         builder.ret(array_ptr)
 
@@ -952,6 +993,7 @@ class ArrayGenerator:
         }
 
         cg.functions["coex_array_new"] = cg.array_new
+        cg.functions["coex_array_new_ref"] = cg.array_new_ref
         cg.functions["coex_array_get"] = cg.array_get
         cg.functions["coex_array_set"] = cg.array_set
         cg.functions["coex_array_append"] = cg.array_append

@@ -512,9 +512,14 @@ class CodeGenerator:
     # Array helpers moved to codegen/array.py - ArrayGenerator class
     # Conversion helpers moved to codegen/conversions.py - ConversionGenerator class
 
-    def _list_to_array(self, list_ptr: ir.Value) -> ir.Value:
-        """Delegate to ConversionGenerator."""
-        return self._conversions.list_to_array(list_ptr)
+    def _list_to_array(self, list_ptr: ir.Value, is_ref_type: bool = False) -> ir.Value:
+        """Delegate to ConversionGenerator.
+
+        Args:
+            list_ptr: Pointer to the List struct
+            is_ref_type: If True, use array_new_ref for GC-traced handle storage
+        """
+        return self._conversions.list_to_array(list_ptr, is_ref_type)
 
     def _set_to_array(self, set_ptr: ir.Value) -> ir.Value:
         """Delegate to ConversionGenerator."""
@@ -3470,7 +3475,16 @@ class CodeGenerator:
             if isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
                 if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                    return self._list_to_array(obj)
+                    # Check if List has reference type elements for proper GC tracing
+                    is_ref_type = False
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in self.var_coex_types:
+                            coex_type = self.var_coex_types[var_name]
+                            if isinstance(coex_type, ListType):
+                                elem_coex_type = coex_type.element_type
+                                is_ref_type = self._is_reference_type(elem_coex_type)
+                    return self._list_to_array(obj, is_ref_type)
                 if hasattr(pointee, 'name') and pointee.name == "struct.Set":
                     return self._set_to_array(obj)
             return ir.Constant(ir.IntType(64), 0)

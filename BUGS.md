@@ -1425,14 +1425,23 @@ func main() -> int
   Currently, Array operations still use the old pointer-based approach, causing mismatches when interacting with handle-based Lists.
 
 - **Files**:
-  - `codegen/array_nd.py` (array_get, array_set implementations)
-  - `codegen/core.py` (Array method dispatch, literal generation)
+  - `codegen/array.py` (array_new_ref implementation)
+  - `codegen/core.py` (Array method dispatch, _list_to_array)
   - `codegen/expressions.py` (Array.get, Array.set handlers)
   - `codegen/loops.py` (generate_array_for)
-  - `coex_gc.py` (mark_array section)
-- **Status**: Open
-- **Workaround**: Avoid using `Array<string>` or other reference type Arrays. Use `List<string>` instead which has correct handle storage.
-- **Note**: This is part of the broader handle storage migration. Maps and Sets have been updated; Arrays need the same treatment.
+  - `codegen/conversions.py` (list_to_array)
+  - `coex_gc.py` (TYPE_ARRAY_DATA_REF, mark_array_data_ref)
+- **Status**: Fixed (2026-01-30)
+- **Resolution**:
+  1. Added `TYPE_ARRAY_DATA_REF` GC type constant for array data buffers containing reference type handles
+  2. Added `array_new_ref()` helper function that allocates data buffer with TYPE_ARRAY_DATA_REF
+  3. Added `mark_array_data_ref` block in `_implement_gc_mark_object` to iterate through and mark handles
+  4. Updated `list_to_array()` to accept `is_ref_type` parameter and call `array_new_ref` for reference types
+  5. Updated `.packed()` method call sites to detect if List has reference type elements
+  6. Updated `Array.set` in expressions.py to convert pointers to handles for reference types
+  7. Updated `generate_array_for` in loops.py to dereference handles when iterating reference type arrays
+  8. Added `get_array_element_coex_type()` method to determine element type for iteration
+- **Tests**: `tests/test_array_ref_types.py` - 8 passing, 2 xfail (parser issue with nested generics)
 
 ### BUG-078: JSON variables not properly rooted in shadow stack, crash on GC
 - **Discovered**: 2026-01-30, during BUG-076 verification

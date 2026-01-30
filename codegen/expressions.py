@@ -2375,7 +2375,14 @@ class ExpressionGenerator:
                     elem_val = self.generate_expression(expr.args[1])
                     elem_type = elem_val.type
 
-                    if isinstance(elem_type, ir.IntType):
+                    # Check if element is a reference type - if so, store handle instead of pointer
+                    elem_coex_type = cg._infer_type_from_expr(expr.args[1])
+                    is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
+                    # Reference types store handles (always 8 bytes)
+                    if is_ref_type:
+                        size = 8
+                    elif isinstance(elem_type, ir.IntType):
                         size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
@@ -2391,10 +2398,20 @@ class ExpressionGenerator:
 
                     elem_size = ir.Constant(ir.IntType(64), size)
 
-                    with cg.builder.goto_entry_block():
-                        temp = cg.builder.alloca(elem_type, name="array_set_elem")
-                    cg.builder.store(elem_val, temp)
-                    temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    if is_ref_type:
+                        # Reference types: convert pointer to handle, store handle
+                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(ir.IntType(64), name="array_set_elem_handle")
+                        cg.builder.store(elem_handle, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    else:
+                        # Non-reference types: store value directly
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(elem_type, name="array_set_elem")
+                        cg.builder.store(elem_val, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
                     if index.type != ir.IntType(64):
                         index = cg.builder.sext(index, ir.IntType(64))
@@ -2421,7 +2438,17 @@ class ExpressionGenerator:
             if isinstance(obj.type, ir.PointerType):
                 pointee = obj.type.pointee
                 if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                    return cg._list_to_array(obj)
+                    # Check if List has reference type elements for proper GC tracing
+                    is_ref_type = False
+                    if isinstance(expr.object, Identifier):
+                        var_name = expr.object.name
+                        if var_name in cg.var_coex_types:
+                            from ast_nodes import ListType
+                            coex_type = cg.var_coex_types[var_name]
+                            if isinstance(coex_type, ListType):
+                                elem_coex_type = coex_type.element_type
+                                is_ref_type = cg._is_reference_type(elem_coex_type)
+                    return cg._list_to_array(obj, is_ref_type)
                 if hasattr(pointee, 'name') and pointee.name == "struct.Set":
                     return cg._set_to_array(obj)
             return ir.Constant(ir.IntType(64), 0)

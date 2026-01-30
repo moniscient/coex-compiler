@@ -17,7 +17,7 @@ from ast_nodes import (
     Assignment, ExprStmt, ReturnStmt, CallExpr, Identifier, MemberExpr,
     MethodCallExpr, BinaryExpr, UnaryExpr, TernaryExpr, IndexExpr,
     SliceExpr, ListExpr, TupleExpr, RangeExpr, LambdaExpr, MapExpr,
-    IdentifierPattern, WildcardPattern, TuplePattern, Type, ListType,
+    IdentifierPattern, WildcardPattern, TuplePattern, Type, ListType, ArrayType,
     PrimitiveType, IntLiteral, FloatLiteral, BoolLiteral, FunctionKind,
     FunctionDecl, Parameter, KindFunctionDecl
 )
@@ -767,12 +767,29 @@ class LoopGenerator:
         elem_ptr = cg.builder.call(cg.array_get, [array_ptr, current_idx])
 
         # Determine element type from pattern or tracked type
+        elem_coex_type = self.get_array_element_coex_type(stmt)
         elem_type = self.get_array_element_type_for_pattern(stmt)
-        typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
-        elem_val = cg.builder.load(typed_ptr)
+
+        # Reference types are stored as handles - need to load handle and dereference
+        if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+            # Derive correct LLVM type from Coex type for reference types
+            elem_type = cg._get_llvm_type(elem_coex_type)
+            handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+            handle = cg.builder.load(handle_ptr)
+            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+            elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+        else:
+            # Non-reference types: load directly - arrays store values inline
+            typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
+            elem_val = cg.builder.load(typed_ptr)
 
         # Bind pattern variables (supports destructuring)
         cg._bind_pattern(stmt.pattern, elem_val)
+
+        # Track Coex type for loop variable (enables method calls on string, etc.)
+        if isinstance(stmt.pattern, IdentifierPattern):
+            if elem_coex_type:
+                cg.var_coex_types[stmt.pattern.name] = elem_coex_type
 
         # Generate body statements
         for s in stmt.body:
@@ -2897,6 +2914,52 @@ class LoopGenerator:
             if isinstance(stmt.iterable.callee, MemberExpr):
                 if stmt.iterable.callee.member == "split":
                     return PrimitiveType("string")
+
+        return None
+
+    def get_array_element_coex_type(self, stmt: ForStmt) -> Optional[Type]:
+        """Get the Coex AST type for array elements (for reference type checking)."""
+        cg = self.cg
+        # Check iterable identifier in var_coex_types
+        if isinstance(stmt.iterable, Identifier):
+            var_name = stmt.iterable.name
+            if var_name in cg.var_coex_types:
+                coex_type = cg.var_coex_types[var_name]
+                if isinstance(coex_type, ArrayType):
+                    return coex_type.element_type
+
+        # Handle field access iterables (e.g., item.values)
+        if isinstance(stmt.iterable, MemberExpr):
+            # Get the object's type
+            if isinstance(stmt.iterable.object, Identifier):
+                obj_name = stmt.iterable.object.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if hasattr(obj_type, 'name') and obj_type.name in cg.type_fields:
+                        # Look up field type
+                        for field_name, field_type in cg.type_fields[obj_type.name]:
+                            if field_name == stmt.iterable.member:
+                                if isinstance(field_type, ArrayType):
+                                    return field_type.element_type
+
+        # Handle method call iterables (e.g., list.packed())
+        if isinstance(stmt.iterable, MethodCallExpr):
+            if stmt.iterable.method == "packed" and isinstance(stmt.iterable.object, Identifier):
+                list_var = stmt.iterable.object.name
+                if list_var in cg.var_coex_types:
+                    list_type = cg.var_coex_types[list_var]
+                    if isinstance(list_type, ListType):
+                        return list_type.element_type
+        elif isinstance(stmt.iterable, CallExpr):
+            # CallExpr with MemberExpr callee (e.g., list.packed())
+            if isinstance(stmt.iterable.callee, MemberExpr):
+                if stmt.iterable.callee.member == "packed":
+                    if isinstance(stmt.iterable.callee.object, Identifier):
+                        list_var = stmt.iterable.callee.object.name
+                        if list_var in cg.var_coex_types:
+                            list_type = cg.var_coex_types[list_var]
+                            if isinstance(list_type, ListType):
+                                return list_type.element_type
 
         return None
 

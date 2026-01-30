@@ -65,7 +65,8 @@ class GarbageCollector:
     TYPE_ARRAY_DATA = 13     # Array element data buffer
     TYPE_JSON = 14           # JSON value (tagged union: i8 tag, i64 value)
     TYPE_LIST_TAIL_REF = 15  # List tail buffer (reference type elements - handles)
-    TYPE_FIRST_USER = 16     # First ID for user-defined types
+    TYPE_ARRAY_DATA_REF = 16 # Array element data buffer (reference type elements - handles)
+    TYPE_FIRST_USER = 17     # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -2829,6 +2830,11 @@ class GarbageCollector:
         list_tail_ref_check = func.append_basic_block("list_tail_ref_check")
         list_tail_ref_mark = func.append_basic_block("list_tail_ref_mark")
         list_tail_ref_next = func.append_basic_block("list_tail_ref_next")
+        mark_array_data_ref = func.append_basic_block("mark_array_data_ref")
+        array_data_ref_loop = func.append_basic_block("array_data_ref_loop")
+        array_data_ref_check = func.append_basic_block("array_data_ref_check")
+        array_data_ref_mark = func.append_basic_block("array_data_ref_mark")
+        array_data_ref_next = func.append_basic_block("array_data_ref_next")
         pv_node_loop = func.append_basic_block("pv_node_loop")
         pv_node_check = func.append_basic_block("pv_node_check")
         pv_node_mark_child = func.append_basic_block("pv_node_mark_child")
@@ -2991,6 +2997,7 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), mark_pv_node)
         switch.add_case(ir.Constant(self.i64, self.TYPE_JSON), mark_json)
         switch.add_case(ir.Constant(self.i64, self.TYPE_LIST_TAIL_REF), mark_list_tail_ref)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY_DATA_REF), mark_array_data_ref)
 
         # Actual map marking (in builtin_switch block)
         builder.position_at_end(builtin_switch)
@@ -3222,6 +3229,64 @@ class GarbageCollector:
         next_idx_ref = builder.add(idx_ref4, ir.Constant(self.i64, 1))
         builder.store(next_idx_ref, idx_alloca_ref)
         builder.branch(list_tail_ref_loop)
+
+        # Mark ARRAY_DATA_REF: buffer containing handles to reference type elements
+        # Identical to LIST_TAIL_REF - each element is an i64 handle that needs to be marked
+        builder.position_at_end(mark_array_data_ref)
+        # Get object size from header to calculate element count
+        # Header is at ptr - HEADER_SIZE
+        header_ptr_arr = builder.inttoptr(
+            builder.sub(builder.ptrtoint(ptr, self.i64), ir.Constant(self.i64, self.HEADER_SIZE)),
+            self.header_type.as_pointer()
+        )
+        size_ptr_arr = builder.gep(header_ptr_arr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        buffer_size_arr = builder.load(size_ptr_arr)
+        # Element count = size / 8 (handles are i64 = 8 bytes)
+        elem_count_arr = builder.udiv(buffer_size_arr, ir.Constant(self.i64, 8))
+        # Cast buffer to i64 array
+        handles_ptr_arr = builder.bitcast(ptr, self.i64_ptr)
+        # Store for loop
+        handles_ptr_arr_alloca = builder.alloca(self.i64_ptr, name="handles_ptr_arr")
+        builder.store(handles_ptr_arr, handles_ptr_arr_alloca)
+        elem_count_arr_alloca = builder.alloca(self.i64, name="elem_count_arr")
+        builder.store(elem_count_arr, elem_count_arr_alloca)
+        # Index for loop
+        idx_arr_alloca = builder.alloca(self.i64, name="idx_arr")
+        builder.store(ir.Constant(self.i64, 0), idx_arr_alloca)
+        builder.branch(array_data_ref_loop)
+
+        # Loop header: check if index < element count
+        builder.position_at_end(array_data_ref_loop)
+        idx_arr = builder.load(idx_arr_alloca)
+        count_arr = builder.load(elem_count_arr_alloca)
+        done_arr = builder.icmp_unsigned(">=", idx_arr, count_arr)
+        builder.cbranch(done_arr, done, array_data_ref_check)
+
+        # Check if handle is non-zero
+        builder.position_at_end(array_data_ref_check)
+        handles_ptr_arr_val = builder.load(handles_ptr_arr_alloca)
+        idx_arr2 = builder.load(idx_arr_alloca)
+        handle_ptr_arr = builder.gep(handles_ptr_arr_val, [idx_arr2], inbounds=False)
+        elem_handle_arr = builder.load(handle_ptr_arr)
+        is_zero_arr = builder.icmp_unsigned("==", elem_handle_arr, ir.Constant(self.i64, 0))
+        builder.cbranch(is_zero_arr, array_data_ref_next, array_data_ref_mark)
+
+        # Mark the handle
+        builder.position_at_end(array_data_ref_mark)
+        # Reload the handle for this block (SSA requirement)
+        handles_ptr_arr_val2 = builder.load(handles_ptr_arr_alloca)
+        idx_arr3 = builder.load(idx_arr_alloca)
+        handle_ptr_arr2 = builder.gep(handles_ptr_arr_val2, [idx_arr3], inbounds=False)
+        elem_handle_arr2 = builder.load(handle_ptr_arr2)
+        builder.call(self.gc_mark_push, [elem_handle_arr2])
+        builder.branch(array_data_ref_next)
+
+        # Increment index and continue
+        builder.position_at_end(array_data_ref_next)
+        idx_arr4 = builder.load(idx_arr_alloca)
+        next_idx_arr = builder.add(idx_arr4, ir.Constant(self.i64, 1))
+        builder.store(next_idx_arr, idx_arr_alloca)
+        builder.branch(array_data_ref_loop)
 
         builder.position_at_end(done)
         builder.ret_void()
