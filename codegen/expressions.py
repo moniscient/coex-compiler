@@ -451,8 +451,15 @@ class ExpressionGenerator:
         first_elem = self.generate_expression(expr.elements[0])
         elem_type = first_elem.type
 
+        # Check if elements are reference types - if so, store handles instead of pointers
+        elem_coex_type = cg._infer_type_from_expr(expr.elements[0])
+        is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
         # Calculate element size (min 1 byte for sub-byte types like bool)
-        if isinstance(elem_type, ir.IntType):
+        # Reference types store handles (always 8 bytes)
+        if is_ref_type:
+            size = 8  # Handles are always i64
+        elif isinstance(elem_type, ir.IntType):
             size = max(1, elem_type.width // 8)
         elif isinstance(elem_type, ir.DoubleType):
             size = 8
@@ -479,12 +486,18 @@ class ExpressionGenerator:
             else:
                 elem_val = self.generate_expression(elem_expr)
 
-            # Store element to a temporary location
-            temp = cg.builder.alloca(elem_type, name=f"list_elem_{i}")
-            cg.builder.store(elem_val, temp)
-
-            # Cast temp to i8*
-            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+            if is_ref_type:
+                # Reference types: convert pointer to handle, store handle
+                elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                temp = cg.builder.alloca(ir.IntType(64), name=f"list_elem_{i}_handle")
+                cg.builder.store(elem_handle, temp)
+                temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+            else:
+                # Non-reference types: store value directly
+                temp = cg.builder.alloca(elem_type, name=f"list_elem_{i}")
+                cg.builder.store(elem_val, temp)
+                temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
             # Append - list_append returns a NEW list; update our reference
             list_ptr = cg.builder.call(cg.list_append, [list_ptr, temp_ptr, elem_size])
@@ -2115,15 +2128,26 @@ class ExpressionGenerator:
                 # Special handling for List.get and Array.get
                 if (type_name == "List" or type_name == "Array") and method == "get":
                     elem_llvm_type = ir.IntType(64)
+                    elem_coex_type = None
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in cg.var_coex_types:
                             from ast_nodes import ListType, ArrayType
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
-                                elem_llvm_type = cg._get_llvm_type(coex_type.element_type)
-                    typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
-                    return cg.builder.load(typed_ptr)
+                                elem_coex_type = coex_type.element_type
+                                elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+
+                    # Reference types are stored as handles - load handle and dereference
+                    if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                        handle_ptr = cg.builder.bitcast(result, ir.IntType(64).as_pointer())
+                        handle = cg.builder.load(handle_ptr)
+                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                        return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                    else:
+                        # Non-reference types: load directly
+                        typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
+                        return cg.builder.load(typed_ptr)
 
                 # Special handling for Map.get
                 if type_name == "Map" and method == "get":
@@ -2164,7 +2188,14 @@ class ExpressionGenerator:
                     elem_val = self.generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
-                    if isinstance(elem_type, ir.IntType):
+                    # Check if element is a reference type - if so, store handle instead of pointer
+                    elem_coex_type = cg._infer_type_from_expr(expr.args[0])
+                    is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
+                    # Reference types store handles (always 8 bytes)
+                    if is_ref_type:
+                        size = 8
+                    elif isinstance(elem_type, ir.IntType):
                         size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
@@ -2180,10 +2211,20 @@ class ExpressionGenerator:
 
                     elem_size = ir.Constant(ir.IntType(64), size)
 
-                    with cg.builder.goto_entry_block():
-                        temp = cg.builder.alloca(elem_type, name="append_elem")
-                    cg.builder.store(elem_val, temp)
-                    temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    if is_ref_type:
+                        # Reference types: convert pointer to handle, store handle
+                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(ir.IntType(64), name="append_elem_handle")
+                        cg.builder.store(elem_handle, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    else:
+                        # Non-reference types: store value directly
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(elem_type, name="append_elem")
+                        cg.builder.store(elem_val, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
                     return cg.builder.call(cg.list_append, [obj, temp_ptr, elem_size])
 
@@ -2225,7 +2266,14 @@ class ExpressionGenerator:
                     elem_val = self.generate_expression(expr.args[1])
                     elem_type = elem_val.type
 
-                    if isinstance(elem_type, ir.IntType):
+                    # Check if element is a reference type - if so, store handle instead of pointer
+                    elem_coex_type = cg._infer_type_from_expr(expr.args[1])
+                    is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
+                    # Reference types store handles (always 8 bytes)
+                    if is_ref_type:
+                        size = 8
+                    elif isinstance(elem_type, ir.IntType):
                         size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
@@ -2241,10 +2289,20 @@ class ExpressionGenerator:
 
                     elem_size = ir.Constant(ir.IntType(64), size)
 
-                    with cg.builder.goto_entry_block():
-                        temp = cg.builder.alloca(elem_type, name="list_set_elem")
-                    cg.builder.store(elem_val, temp)
-                    temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    if is_ref_type:
+                        # Reference types: convert pointer to handle, store handle
+                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(ir.IntType(64), name="list_set_elem_handle")
+                        cg.builder.store(elem_handle, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    else:
+                        # Non-reference types: store value directly
+                        with cg.builder.goto_entry_block():
+                            temp = cg.builder.alloca(elem_type, name="list_set_elem")
+                        cg.builder.store(elem_val, temp)
+                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
                     if index.type != ir.IntType(64):
                         index = cg.builder.sext(index, ir.IntType(64))

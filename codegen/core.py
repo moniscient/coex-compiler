@@ -3104,15 +3104,25 @@ class CodeGenerator:
                 if (type_name == "List" or type_name == "Array") and method == "get":
                     # Try to get element type from Coex type tracking
                     elem_llvm_type = ir.IntType(64)  # default
+                    elem_coex_type = None
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in self.var_coex_types:
                             coex_type = self.var_coex_types[var_name]
                             if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
-                                elem_llvm_type = self._get_llvm_type(coex_type.element_type)
-                    # Result is i8*, bitcast to proper element type pointer and load
-                    typed_ptr = self.builder.bitcast(result, elem_llvm_type.as_pointer())
-                    return self.builder.load(typed_ptr)
+                                elem_coex_type = coex_type.element_type
+                                elem_llvm_type = self._get_llvm_type(elem_coex_type)
+
+                    # Reference types are stored as handles - load handle and dereference
+                    if elem_coex_type is not None and self._is_reference_type(elem_coex_type):
+                        handle_ptr = self.builder.bitcast(result, ir.IntType(64).as_pointer())
+                        handle = self.builder.load(handle_ptr)
+                        ptr_i8 = self.builder.call(self.gc.gc_handle_deref, [handle])
+                        return self.builder.bitcast(ptr_i8, elem_llvm_type)
+                    else:
+                        # Non-reference types: load directly
+                        typed_ptr = self.builder.bitcast(result, elem_llvm_type.as_pointer())
+                        return self.builder.load(typed_ptr)
 
                 # Special handling for Map.get - returns i64 that may be a pointer
                 if type_name == "Map" and method == "get":
@@ -3155,8 +3165,15 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
+                    # Check if element is a reference type - if so, store handle instead of pointer
+                    elem_coex_type = self._infer_type_from_expr(expr.args[0])
+                    is_ref_type = elem_coex_type is not None and self._is_reference_type(elem_coex_type)
+
                     # Calculate element size (min 1 byte for sub-byte types like bool)
-                    if isinstance(elem_type, ir.IntType):
+                    # Reference types store handles (always 8 bytes)
+                    if is_ref_type:
+                        size = 8  # Handles are always i64
+                    elif isinstance(elem_type, ir.IntType):
                         size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
@@ -3175,10 +3192,20 @@ class CodeGenerator:
 
                     # Store element to temp and get pointer
                     # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
-                    with self.builder.goto_entry_block():
-                        temp = self.builder.alloca(elem_type, name="append_elem")
-                    self.builder.store(elem_val, temp)
-                    temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    if is_ref_type:
+                        # Reference types: convert pointer to handle, store handle
+                        elem_i8 = self.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                        elem_handle = self.builder.call(self.gc.gc_ptr_to_handle, [elem_i8])
+                        with self.builder.goto_entry_block():
+                            temp = self.builder.alloca(ir.IntType(64), name="append_elem_handle")
+                        self.builder.store(elem_handle, temp)
+                        temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    else:
+                        # Non-reference types: store value directly
+                        with self.builder.goto_entry_block():
+                            temp = self.builder.alloca(elem_type, name="append_elem")
+                        self.builder.store(elem_val, temp)
+                        temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
                     # Call list_append which returns a NEW list (value semantics)
                     return self.builder.call(self.list_append, [obj, temp_ptr, elem_size])
@@ -3228,8 +3255,15 @@ class CodeGenerator:
                     elem_val = self._generate_expression(expr.args[1])
                     elem_type = elem_val.type
 
+                    # Check if element is a reference type - if so, store handle instead of pointer
+                    elem_coex_type = self._infer_type_from_expr(expr.args[1])
+                    is_ref_type = elem_coex_type is not None and self._is_reference_type(elem_coex_type)
+
                     # Calculate element size (min 1 byte for sub-byte types like bool)
-                    if isinstance(elem_type, ir.IntType):
+                    # Reference types store handles (always 8 bytes)
+                    if is_ref_type:
+                        size = 8  # Handles are always i64
+                    elif isinstance(elem_type, ir.IntType):
                         size = max(1, elem_type.width // 8)
                     elif isinstance(elem_type, ir.DoubleType):
                         size = 8
@@ -3247,10 +3281,20 @@ class CodeGenerator:
 
                     # Store element to temp and get pointer
                     # IMPORTANT: Place alloca in entry block to avoid stack growth in loops
-                    with self.builder.goto_entry_block():
-                        temp = self.builder.alloca(elem_type, name="list_set_elem")
-                    self.builder.store(elem_val, temp)
-                    temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    if is_ref_type:
+                        # Reference types: convert pointer to handle, store handle
+                        elem_i8 = self.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                        elem_handle = self.builder.call(self.gc.gc_ptr_to_handle, [elem_i8])
+                        with self.builder.goto_entry_block():
+                            temp = self.builder.alloca(ir.IntType(64), name="list_set_elem_handle")
+                        self.builder.store(elem_handle, temp)
+                        temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                    else:
+                        # Non-reference types: store value directly
+                        with self.builder.goto_entry_block():
+                            temp = self.builder.alloca(elem_type, name="list_set_elem")
+                        self.builder.store(elem_val, temp)
+                        temp_ptr = self.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
                     # Cast index to i64 if needed
                     if index.type != ir.IntType(64):

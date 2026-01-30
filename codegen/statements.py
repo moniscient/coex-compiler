@@ -821,6 +821,10 @@ class StatementGenerator:
                     if stmt.initializer.method in ("set", "append", "remove", "pop", "insert"):
                         inferred_coex_type = receiver_type
                         cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif stmt.initializer.method == "get" and isinstance(receiver_type, (ListType, ArrayType)):
+                        # .get() on List/Array returns the element type
+                        inferred_coex_type = receiver_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
                     elif stmt.initializer.method == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
                         inferred_coex_type = ListType(PrimitiveType("string"))
                         cg.var_coex_types[stmt.name] = inferred_coex_type
@@ -852,6 +856,12 @@ class StatementGenerator:
 
         # Track if we need to mark source as moved (see BUG-017)
         move_source_name = None
+
+        # Update type tracking for collection literal reassignments
+        # This is needed when the type changes (e.g., level = [level] changes List<T> to List<List<T>>)
+        if isinstance(stmt.initializer, (MapExpr, ListExpr, SetExpr)):
+            inferred_coex_type = cg._infer_type_from_expr(stmt.initializer)
+            cg.var_coex_types[stmt.name] = inferred_coex_type
 
         # Track aliasing for in-place optimization safety
         # = operator shares pointer (both source and target may alias)
