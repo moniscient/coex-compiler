@@ -96,11 +96,18 @@ class GarbageCollector:
     TYPE_STRING_DATA = 11    # String character data buffer (raw bytes)
     TYPE_CHANNEL_BUFFER = 12 # Channel data buffer
     TYPE_ARRAY_DATA = 13     # Array data buffer - PRIMITIVE elements (int, float, etc.)
-    TYPE_JSON = 14           # JSON value (tagged union: i8 tag, i64 value)
+    # ---- JSON variant types (first-class tagged union) ----
+    TYPE_JSON_NULL = 14      # JSON null - no payload (8 bytes for alignment)
+    TYPE_JSON_BOOL = 15      # JSON bool - i64 value (0/1)
+    TYPE_JSON_INT = 16       # JSON int - i64 value
+    TYPE_JSON_FLOAT = 17     # JSON float - i64 (f64 bitcast)
+    TYPE_JSON_STRING = 18    # JSON string - i64 handle to String
+    TYPE_JSON_ARRAY = 19     # JSON array - i64 handle to List
+    TYPE_JSON_OBJECT = 20    # JSON object - i64 handle to Map
     # ---- Reference-type buffers (elements are HANDLES, not raw data) ----
-    TYPE_LIST_TAIL_REF = 15  # List tail buffer - REFERENCE elements (each i64 is a handle)
-    TYPE_ARRAY_DATA_REF = 16 # Array data buffer - REFERENCE elements (each i64 is a handle)
-    TYPE_FIRST_USER = 17     # First ID for user-defined types
+    TYPE_LIST_TAIL_REF = 21  # List tail buffer - REFERENCE elements (each i64 is a handle)
+    TYPE_ARRAY_DATA_REF = 22 # Array data buffer - REFERENCE elements (each i64 is a handle)
+    TYPE_FIRST_USER = 23     # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -1471,11 +1478,20 @@ class GarbageCollector:
         # For slice views, handle points to shared data buffer (traced via mark_array)
         self.type_info[self.TYPE_ARRAY] = {'size': 104, 'ref_offsets': [0]}
         self.type_descriptors['Array'] = self.TYPE_ARRAY
-        # JSON: { i8 tag, i64 value } = 16 bytes (with padding)
-        # The value field at offset 8 may be a pointer (for string/array/object)
-        # We use gc_mark_json to handle the dynamic tracing based on tag
-        self.type_info[self.TYPE_JSON] = {'size': 16, 'ref_offsets': []}
-        self.type_descriptors['Json'] = self.TYPE_JSON
+        # JSON variant types - first-class tagged union with distinct type IDs
+        # Each variant has 8 bytes payload (even null, for alignment simplicity)
+        # - Null/Bool/Int/Float: no GC tracing needed (value is inline)
+        # - String/Array/Object: value is i64 HANDLE (traced by GC)
+        self.type_info[self.TYPE_JSON_NULL] = {'size': 8, 'ref_offsets': []}
+        self.type_info[self.TYPE_JSON_BOOL] = {'size': 8, 'ref_offsets': []}
+        self.type_info[self.TYPE_JSON_INT] = {'size': 8, 'ref_offsets': []}
+        self.type_info[self.TYPE_JSON_FLOAT] = {'size': 8, 'ref_offsets': []}
+        # Handle-based JSON types - value at offset 0 is an i64 handle
+        self.type_info[self.TYPE_JSON_STRING] = {'size': 8, 'ref_offsets': [0]}
+        self.type_info[self.TYPE_JSON_ARRAY] = {'size': 8, 'ref_offsets': [0]}
+        self.type_info[self.TYPE_JSON_OBJECT] = {'size': 8, 'ref_offsets': [0]}
+        # Register 'Json' as a placeholder - actual type determined at runtime
+        self.type_descriptors['Json'] = self.TYPE_JSON_NULL  # Default to null for type lookup
 
     def register_type(self, type_name: str, size: int, ref_offsets: PyList[int]) -> int:
         """Register a user-defined type and return its type_id"""
@@ -2864,9 +2880,10 @@ class GarbageCollector:
         mark_string = func.append_basic_block("mark_string")
         mark_channel = func.append_basic_block("mark_channel")
         mark_pv_node = func.append_basic_block("mark_pv_node")
-        mark_json = func.append_basic_block("mark_json")
-        mark_json_ptr = func.append_basic_block("mark_json_ptr")
-        mark_json_done = func.append_basic_block("mark_json_done")
+        # JSON variant type marking blocks
+        mark_json_string = func.append_basic_block("mark_json_string")
+        mark_json_array = func.append_basic_block("mark_json_array")
+        mark_json_object = func.append_basic_block("mark_json_object")
         mark_list_tail_ref = func.append_basic_block("mark_list_tail_ref")
         list_tail_ref_loop = func.append_basic_block("list_tail_ref_loop")
         list_tail_ref_check = func.append_basic_block("list_tail_ref_check")
@@ -3037,7 +3054,15 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), mark_string)
         switch.add_case(ir.Constant(self.i64, self.TYPE_CHANNEL), mark_channel)
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), mark_pv_node)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON), mark_json)
+        # JSON variant types - null/bool/int/float fall through to done (no children)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_NULL), done)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_BOOL), done)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_INT), done)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_FLOAT), done)
+        # JSON reference types - mark the contained handle
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_STRING), mark_json_string)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_ARRAY), mark_json_array)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_OBJECT), mark_json_object)
         switch.add_case(ir.Constant(self.i64, self.TYPE_LIST_TAIL_REF), mark_list_tail_ref)
         switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY_DATA_REF), mark_array_data_ref)
 
@@ -3186,32 +3211,38 @@ class GarbageCollector:
         builder.store(next_idx, pv_idx)
         builder.branch(pv_node_loop)
 
-        # Mark JSON: check tag, if string/array/object then mark the value pointer
-        # JSON struct: { i64 tag (0), i64 value (1) } - both fields are i64 for alignment!
-        # (BUG-061 fix: was incorrectly using {i8, i64} which misread the tag on non-little-endian)
-        # Tags 4 (string), 5 (array), 6 (object) have pointer values
-        builder.position_at_end(mark_json)
-        json_ptr_type = ir.LiteralStructType([self.i64, self.i64]).as_pointer()
-        json_typed = builder.bitcast(ptr, json_ptr_type)
-        json_tag_ptr = builder.gep(json_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        json_tag = builder.load(json_tag_ptr)
-        # Check if tag >= 4 (string, array, or object - all have pointer values)
-        is_ptr_type = builder.icmp_unsigned(">=", json_tag, ir.Constant(self.i64, 4))
-        builder.cbranch(is_ptr_type, mark_json_ptr, mark_json_done)
+        # ============================================================
+        # Mark JSON variant types (first-class tagged union)
+        # ============================================================
+        # Each JSON variant is now a separate type with its own type ID.
+        # Payload is 8 bytes (i64): primitives store value inline, reference
+        # types store an i64 HANDLE that must be marked.
+        #
+        # TYPE_JSON_NULL/BOOL/INT/FLOAT: Fall through to done (no children)
+        # TYPE_JSON_STRING/ARRAY/OBJECT: Mark the handle at offset 0
+        # ============================================================
 
-        # Mark the pointer value
-        builder.position_at_end(mark_json_ptr)
-        # Reload json pointer (SSA requirement)
-        json_typed2 = builder.bitcast(ptr, json_ptr_type)
-        json_value_ptr = builder.gep(json_typed2, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        json_value_i64 = builder.load(json_value_ptr)
-        json_child_ptr = builder.inttoptr(json_value_i64, self.i8_ptr)
-        json_child_handle = builder.call(self.gc_ptr_to_handle, [json_child_ptr])
-        builder.call(self.gc_mark_push, [json_child_handle])  # Push to worklist
-        builder.branch(mark_json_done)
+        # Mark JSON String: load handle at offset 0, push to worklist
+        builder.position_at_end(mark_json_string)
+        # ptr points to user data area (8 bytes containing i64 handle)
+        json_str_handle_ptr = builder.bitcast(ptr, self.i64_ptr)
+        json_str_handle = builder.load(json_str_handle_ptr)
+        # Push handle to worklist (gc_mark_push handles null/0 handles)
+        builder.call(self.gc_mark_push, [json_str_handle])
+        builder.branch(done)
 
-        # JSON marking done
-        builder.position_at_end(mark_json_done)
+        # Mark JSON Array: load handle at offset 0, push to worklist
+        builder.position_at_end(mark_json_array)
+        json_arr_handle_ptr = builder.bitcast(ptr, self.i64_ptr)
+        json_arr_handle = builder.load(json_arr_handle_ptr)
+        builder.call(self.gc_mark_push, [json_arr_handle])
+        builder.branch(done)
+
+        # Mark JSON Object: load handle at offset 0, push to worklist
+        builder.position_at_end(mark_json_object)
+        json_obj_handle_ptr = builder.bitcast(ptr, self.i64_ptr)
+        json_obj_handle = builder.load(json_obj_handle_ptr)
+        builder.call(self.gc_mark_push, [json_obj_handle])
         builder.branch(done)
 
         # ============================================================
