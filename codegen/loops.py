@@ -670,10 +670,16 @@ class LoopGenerator:
         elem_coex_type = self.get_list_element_coex_type(stmt)
         elem_type = self.get_list_element_type_for_pattern(stmt)
 
-        # Load element directly - lists store values/pointers inline
-        # For reference types like String*, the list stores the pointer directly
-        typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
-        elem_val = cg.builder.load(typed_ptr)
+        # Reference types are stored as handles - need to load handle and dereference
+        if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+            handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+            handle = cg.builder.load(handle_ptr)
+            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+            elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+        else:
+            # Non-reference types: load directly - lists store values inline
+            typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
+            elem_val = cg.builder.load(typed_ptr)
 
         # Bind pattern variables (supports destructuring)
         cg._bind_pattern(stmt.pattern, elem_val)

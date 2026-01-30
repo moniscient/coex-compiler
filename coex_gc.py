@@ -2675,15 +2675,15 @@ class GarbageCollector:
         builder.cbranch(value_needs_mark, mark_value, after_value)
 
         # Mark value as heap object
+        # NOTE: Values are now stored as HANDLES (not raw pointers) for reference types.
+        # The stored i64 IS the handle - we can pass it directly to gc_mark_object.
         builder.position_at_end(mark_value)
-        value_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        value_as_int = builder.load(value_ptr_ptr)
-        value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
-        # Null check for value
-        value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
-        with builder.if_then(builder.not_(value_is_null)):
-            # Convert pointer to handle for gc_mark_object
-            value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
+        value_handle_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        value_handle = builder.load(value_handle_ptr)
+        # Null check for handle (handle 0 = null)
+        handle_is_null = builder.icmp_unsigned("==", value_handle, ir.Constant(self.i64, 0))
+        with builder.if_then(builder.not_(handle_is_null)):
+            # Value is already a handle - mark directly
             builder.call(self.gc_mark_object, [value_handle])
         builder.branch(after_value)
 

@@ -524,22 +524,36 @@ class ExpressionGenerator:
         for key_expr, value_expr in expr.entries:
             key = self.generate_expression(key_expr)
             value = self.generate_expression(value_expr)
+            value_coex_type = cg._infer_type_from_expr(value_expr)
 
             # Check if key is a string pointer
             is_string_key = (isinstance(key.type, ir.PointerType) and
                             hasattr(key.type.pointee, 'name') and
                             key.type.pointee.name == "struct.String")
 
+            # Check if value is a reference type - if so, store handle instead of pointer
+            is_ref_value = value_coex_type is not None and cg._is_reference_type(value_coex_type)
+
             if is_string_key:
                 # Use string-aware map_set
-                value_i64 = cg._cast_value(value, ir.IntType(64))
-                map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value_i64])
+                if is_ref_value:
+                    value_i8 = cg.builder.bitcast(value, ir.IntType(8).as_pointer())
+                    value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+                    map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value_handle])
+                else:
+                    value_i64 = cg._cast_value(value, ir.IntType(64))
+                    map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value_i64])
             else:
                 # Cast to i64 for map storage
                 key_i64 = cg._cast_value(key, ir.IntType(64))
-                value_i64 = cg._cast_value(value, ir.IntType(64))
-                # map_set returns a NEW map; update our reference
-                map_ptr = cg.builder.call(cg.map_set, [map_ptr, key_i64, value_i64])
+                if is_ref_value:
+                    value_i8 = cg.builder.bitcast(value, ir.IntType(8).as_pointer())
+                    value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+                    map_ptr = cg.builder.call(cg.map_set, [map_ptr, key_i64, value_handle])
+                else:
+                    value_i64 = cg._cast_value(value, ir.IntType(64))
+                    # map_set returns a NEW map; update our reference
+                    map_ptr = cg.builder.call(cg.map_set, [map_ptr, key_i64, value_i64])
 
         return map_ptr
 
@@ -560,6 +574,7 @@ class ExpressionGenerator:
         # Add each element (set_add returns a new set with value semantics)
         for elem_expr in expr.elements:
             elem = self.generate_expression(elem_expr)
+            elem_coex_type = cg._infer_type_from_expr(elem_expr)
 
             # Check if element is a string
             is_string_elem = (isinstance(elem.type, ir.PointerType) and
@@ -567,13 +582,20 @@ class ExpressionGenerator:
                             elem.type.pointee.name == "struct.String")
 
             if is_string_elem:
-                # Use string-aware set_add
+                # Use string-aware set_add (strings stored as pointers for content comparison)
                 set_ptr = cg.builder.call(cg.set_add_string, [set_ptr, elem])
             else:
-                # Cast to i64 for set storage
-                elem_i64 = cg._cast_value(elem, ir.IntType(64))
-                # set_add returns a NEW set; update our reference
-                set_ptr = cg.builder.call(cg.set_add, [set_ptr, elem_i64])
+                # Check if element is a reference type - if so, store handle instead of pointer
+                is_ref_elem = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+                if is_ref_elem:
+                    elem_i8 = cg.builder.bitcast(elem, ir.IntType(8).as_pointer())
+                    elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                    set_ptr = cg.builder.call(cg.set_add, [set_ptr, elem_handle])
+                else:
+                    # Cast to i64 for set storage
+                    elem_i64 = cg._cast_value(elem, ir.IntType(64))
+                    # set_add returns a NEW set; update our reference
+                    set_ptr = cg.builder.call(cg.set_add, [set_ptr, elem_i64])
 
         return set_ptr
 
@@ -2064,22 +2086,37 @@ class ExpressionGenerator:
             if is_string_key:
                 if method == "get":
                     result = cg.builder.call(cg.map_get_string, [obj, key_arg])
+                    # Convert result to proper type if value is a reference type
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in cg.var_coex_types:
                             from ast_nodes import MapType
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, MapType):
-                                value_llvm_type = cg._get_llvm_type(coex_type.value_type)
+                                value_coex_type = coex_type.value_type
+                                value_llvm_type = cg._get_llvm_type(value_coex_type)
                                 if isinstance(value_llvm_type, ir.PointerType):
-                                    return cg.builder.inttoptr(result, value_llvm_type)
+                                    # Reference types are stored as handles - dereference
+                                    if cg._is_reference_type(value_coex_type):
+                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
+                                        return cg.builder.bitcast(ptr_i8, value_llvm_type)
+                                    else:
+                                        return cg.builder.inttoptr(result, value_llvm_type)
                     return result
                 elif method == "has":
                     return cg.builder.call(cg.map_has_string, [obj, key_arg])
                 elif method == "set":
                     value_arg = self.generate_expression(expr.args[1])
-                    value_i64 = cg._cast_value(value_arg, ir.IntType(64))
-                    return cg.builder.call(cg.map_set_string, [obj, key_arg, value_i64])
+                    # Check if value is a reference type - if so, store handle instead of pointer
+                    value_coex_type = cg._infer_type_from_expr(expr.args[1])
+                    if value_coex_type is not None and cg._is_reference_type(value_coex_type):
+                        # Convert pointer to handle for storage
+                        value_i8 = cg.builder.bitcast(value_arg, ir.IntType(8).as_pointer())
+                        value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+                        return cg.builder.call(cg.map_set_string, [obj, key_arg, value_handle])
+                    else:
+                        value_i64 = cg._cast_value(value_arg, ir.IntType(64))
+                        return cg.builder.call(cg.map_set_string, [obj, key_arg, value_i64])
 
         # Special handling for Set with string elements
         if type_name == "Set" and method in ("has", "add") and expr.args:
@@ -2093,6 +2130,21 @@ class ExpressionGenerator:
                     return cg.builder.call(cg.set_has_string, [obj, elem_arg])
                 elif method == "add":
                     return cg.builder.call(cg.set_add_string, [obj, elem_arg])
+
+        # Special handling for Map.set with non-string keys
+        if type_name == "Map" and method == "set" and len(expr.args) >= 2:
+            key_arg = self.generate_expression(expr.args[0])
+            value_arg = self.generate_expression(expr.args[1])
+            key_i64 = cg._cast_value(key_arg, ir.IntType(64))
+            # Check if value is a reference type - if so, store handle instead of pointer
+            value_coex_type = cg._infer_type_from_expr(expr.args[1])
+            if value_coex_type is not None and cg._is_reference_type(value_coex_type):
+                value_i8 = cg.builder.bitcast(value_arg, ir.IntType(8).as_pointer())
+                value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+                return cg.builder.call(cg.map_set, [obj, key_i64, value_handle])
+            else:
+                value_i64 = cg._cast_value(value_arg, ir.IntType(64))
+                return cg.builder.call(cg.map_set, [obj, key_i64, value_i64])
 
         # Special handling for Channel methods
         if type_name == "Channel" and method in ("send", "receive"):
@@ -2149,7 +2201,7 @@ class ExpressionGenerator:
                         typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
                         return cg.builder.load(typed_ptr)
 
-                # Special handling for Map.get
+                # Special handling for Map.get - returns i64 that may be a handle
                 if type_name == "Map" and method == "get":
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
@@ -2157,9 +2209,16 @@ class ExpressionGenerator:
                             from ast_nodes import MapType
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, MapType):
-                                value_llvm_type = cg._get_llvm_type(coex_type.value_type)
+                                value_coex_type = coex_type.value_type
+                                value_llvm_type = cg._get_llvm_type(value_coex_type)
+                                # If value type is a pointer, the i64 result is a handle
                                 if isinstance(value_llvm_type, ir.PointerType):
-                                    return cg.builder.inttoptr(result, value_llvm_type)
+                                    # Reference types are stored as handles - dereference
+                                    if cg._is_reference_type(value_coex_type):
+                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
+                                        return cg.builder.bitcast(ptr_i8, value_llvm_type)
+                                    else:
+                                        return cg.builder.inttoptr(result, value_llvm_type)
                     return result
 
                 # Special handling for Result.unwrap and Result.unwrap_or

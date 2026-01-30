@@ -1339,3 +1339,93 @@ func main() -> int
 - **Status**: Open
 - **Workaround**: Use explicit intermediate variables at each nesting level instead of reassigning the same variable in a loop. Works correctly up to ~3-4 levels of nesting.
 - **Note**: This is an edge case. Normal usage patterns (2-3 levels of nesting) work correctly after the Phase 7 handle conversion fixes.
+
+### BUG-076: List<json> elements not surviving GC due to PVNode marking not tracing handles
+- **Discovered**: 2026-01-30, during Map/Set handle storage implementation
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**:
+```coex
+func main() -> int
+    base: json = { value: 42 }
+    results: List<json> = []
+
+    for i in 0..5
+        modified: json = base.set("value", i)
+        results = results.append(modified)
+
+        if i % 2 == 0
+            gc()
+        ~
+    ~
+
+    # This crashes - JSON elements not properly marked
+    for i in 0..5
+        print(results.get(i).get("value").as_int())
+    ~
+    return 0
+~
+```
+- **Observed**: Segmentation fault after GC runs. The JSON objects stored in the List are freed because they weren't marked.
+- **Expected**: JSON elements should survive GC and be accessible after collection.
+- **Root Cause**: After the handle storage conversion, reference type elements in Lists are stored as handles (i64 indices) rather than raw pointers. The List uses a Persistent Vector (PV) structure where:
+  1. Internal PVNodes contain pointers to child PVNodes
+  2. Leaf PVNodes contain the actual element data
+
+  The `gc_mark_object` for TYPE_PV_NODE iterates through 32 children and calls `gc_ptr_to_handle` on each, assuming they are all pointers to more PVNodes. However, for leaf nodes containing reference type elements, those "children" are now handles (small integers), not pointers.
+
+  When `gc_ptr_to_handle` is called on a handle value (like 5), it tries to dereference that small address to read the object's forward field, causing undefined behavior or returning an invalid handle. The underlying JSON objects don't get marked and are freed.
+
+  The GC doesn't have element type information for PVNodes, so it can't distinguish between:
+  - Internal nodes (children are PVNode pointers - mark as objects)
+  - Leaf nodes with primitive elements (no marking needed)
+  - Leaf nodes with reference type elements (children are handles - mark directly)
+
+- **Files**:
+  - `coex_gc.py` (`_implement_gc_mark_object`, mark_pv_node section)
+  - `codegen/persistent_vector.py` (PV structure)
+- **Status**: Open
+- **Potential Fix**: Several approaches possible:
+  1. Add element type flags to List struct (bit indicating if elements are reference types)
+  2. Pass element type info when marking PVNodes
+  3. Store a "flags" field in PVNode header indicating leaf vs internal
+  4. Check if child value looks like a valid heap pointer vs handle before calling gc_ptr_to_handle
+- **Note**: This bug only affects Lists containing reference types (json, strings, nested lists, UDTs) when GC runs. Lists with primitive types (int, float, bool) work correctly.
+
+### BUG-077: Array<string> and other reference type Arrays need handle storage updates
+- **Discovered**: 2026-01-30, during Map/Set handle storage implementation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**:
+```coex
+func main() -> int
+    list: List<string> = ["hello", "world"]
+    a: Array<string> = list.packed()
+    b: Array<string> = a
+    b = b.set(0, "goodbye")
+    print(a.get(0))   # Works, prints "hello"
+    print(b.get(0))   # Crashes
+    return 0
+~
+```
+- **Observed**: First `a.get(0)` works, but `b.get(0)` after `.set()` causes segmentation fault.
+- **Expected**: Both prints should work, showing COW (copy-on-write) semantics.
+- **Root Cause**: After implementing handle storage for Lists, Maps, and Sets, the Array type also needs similar updates:
+  1. Array.set for reference types should store handles, not raw pointers
+  2. Array.get for reference types should dereference handles
+  3. Array literal generation should store handles for reference elements
+  4. Array iteration (`for elem in arr`) should dereference handles
+  5. list.packed() conversion should convert pointers to handles when building the Array
+  6. gc_mark_array should trace handle elements appropriately
+
+  Currently, Array operations still use the old pointer-based approach, causing mismatches when interacting with handle-based Lists.
+
+- **Files**:
+  - `codegen/array_nd.py` (array_get, array_set implementations)
+  - `codegen/core.py` (Array method dispatch, literal generation)
+  - `codegen/expressions.py` (Array.get, Array.set handlers)
+  - `codegen/loops.py` (generate_array_for)
+  - `coex_gc.py` (mark_array section)
+- **Status**: Open
+- **Workaround**: Avoid using `Array<string>` or other reference type Arrays. Use `List<string>` instead which has correct handle storage.
+- **Note**: This is part of the broader handle storage migration. Maps and Sets have been updated; Arrays need the same treatment.
