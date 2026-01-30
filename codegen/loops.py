@@ -1612,8 +1612,8 @@ class LoopGenerator:
         list_len = cg.builder.call(cg.list_len, [iterable_val])
 
         # Create result and error lists
-        results_list = cg.builder.call(cg.list_new, [elem_size])
-        errors_list = cg.builder.call(cg.list_new, [elem_size])
+        results_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Allocate result variables
         if stmt.results_target in cg.locals:
@@ -1786,7 +1786,7 @@ class LoopGenerator:
             body_expr=body_expr
         )
         result_list = self._generate_parallel_for_assign(for_assign)
-        errors_list = cg.builder.call(cg.list_new, [elem_size])
+        errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Store results and errors
         if stmt.results_target in cg.locals:
@@ -1811,7 +1811,7 @@ class LoopGenerator:
 
         # Create result list
         elem_size = ir.Constant(i64, 8)  # Results are i64 handles
-        result_list = cg.builder.call(cg.list_new, [elem_size])
+        result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
         result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
         cg.builder.store(result_list, result_alloca)
 
@@ -2057,7 +2057,7 @@ class LoopGenerator:
         # Phase 3: Collect loop - gather results into list
         # =====================================================================
         elem_size = ir.Constant(i64, 8)
-        result_list = cg.builder.call(cg.list_new, [elem_size])
+        result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
         result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
         cg.builder.store(result_list, result_alloca)
 
@@ -2507,7 +2507,7 @@ class LoopGenerator:
                 body_expr=body_expr
             )
             result_list = self._generate_parallel_for_assign(for_assign)
-            errors_list = cg.builder.call(cg.list_new, [elem_size])
+            errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
             # Store results and errors
             if stmt.results_target in cg.locals:
@@ -2646,11 +2646,11 @@ class LoopGenerator:
         # Use list struct pointer type so method calls work
         list_ptr_type = cg.list_struct.as_pointer()
 
-        results_list = cg.builder.call(cg.list_new, [elem_size], name="most_results")
+        results_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="most_results")
         results_alloca = cg.builder.alloca(list_ptr_type, name="most_results_ptr")
         cg.builder.store(results_list, results_alloca)
 
-        errors_list = cg.builder.call(cg.list_new, [elem_size], name="most_errors")
+        errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="most_errors")
         errors_alloca = cg.builder.alloca(list_ptr_type, name="most_errors_ptr")
         cg.builder.store(errors_list, errors_alloca)
 
@@ -2749,8 +2749,8 @@ class LoopGenerator:
 
         # Empty block: no tasks
         cg.builder.position_at_end(empty_block)
-        empty_results_list = cg.builder.call(cg.list_new, [elem_size], name="empty_results")
-        empty_errors_list = cg.builder.call(cg.list_new, [elem_size], name="empty_errors")
+        empty_results_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="empty_results")
+        empty_errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="empty_errors")
         cg.builder.branch(after_wait)
 
         # Merge with phi nodes - using list pointer type

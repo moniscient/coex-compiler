@@ -365,7 +365,7 @@ class CodeGenerator:
 
         # Create list struct type using Persistent Vector structure
         # Phase 4: All fields are i64 for handle-based GC
-        # struct List { i64 root_handle, i64 len, i64 depth, i64 tail_handle, i64 tail_len, i64 elem_size }
+        # struct List { i64 root_handle, i64 len, i64 depth, i64 tail_handle, i64 tail_len, i64 elem_size, i64 flags }
         # Tail optimization: rightmost 1-32 elements stored separately for fast append
         self.list_struct = ir.global_context.get_identified_type("struct.List")
         self.list_struct.set_body(
@@ -375,7 +375,11 @@ class CodeGenerator:
             ir.IntType(64),   # tail_handle - rightmost leaf array handle (field 3) - Phase 4
             ir.IntType(64),   # tail_len - elements in tail (1-32) (field 4) - Phase 4: widened to i64
             ir.IntType(64),   # elem_size (field 5)
+            ir.IntType(64),   # flags (field 6) - bit 0: elements are reference types (handles)
         )
+
+        # List flags constant
+        self.LIST_FLAG_ELEM_IS_REF = 1
         
         # Create list helper functions
         self._list = ListGenerator(self)
@@ -3882,16 +3886,24 @@ class CodeGenerator:
     def _generate_list(self, expr: ListExpr) -> ir.Value:
         """Generate code for list literal: [1, 2, 3]"""
         if not expr.elements:
-            # Empty list - default to i64 element size
+            # Empty list - default to i64 element size, flags = 0
             elem_size = ir.Constant(ir.IntType(64), 8)
-            return self.builder.call(self.list_new, [elem_size])
-        
+            flags = ir.Constant(ir.IntType(64), 0)
+            return self.builder.call(self.list_new, [elem_size, flags])
+
         # Generate first element to determine type
         first_elem = self._generate_expression(expr.elements[0])
         elem_type = first_elem.type
 
+        # Check if elements are reference types
+        elem_coex_type = self._infer_type_from_expr(expr.elements[0])
+        is_ref_type = elem_coex_type is not None and self._is_reference_type(elem_coex_type)
+
         # Calculate element size (min 1 byte for sub-byte types like bool)
-        if isinstance(elem_type, ir.IntType):
+        # Reference types store handles (always 8 bytes)
+        if is_ref_type:
+            size = 8  # Handles are always i64
+        elif isinstance(elem_type, ir.IntType):
             size = max(1, elem_type.width // 8)
         elif isinstance(elem_type, ir.DoubleType):
             size = 8
@@ -3907,9 +3919,10 @@ class CodeGenerator:
             size = 8
 
         elem_size = ir.Constant(ir.IntType(64), size)
-        
-        # Create new list
-        list_ptr = self.builder.call(self.list_new, [elem_size])
+
+        # Create new list with appropriate flags
+        list_flags = ir.Constant(ir.IntType(64), self.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
+        list_ptr = self.builder.call(self.list_new, [elem_size, list_flags])
         
         # Append each element (list_append returns a new list with value semantics)
         for i, elem_expr in enumerate(expr.elements):

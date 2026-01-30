@@ -1728,7 +1728,7 @@ class StringGenerator:
 
         builder.position_at_end(copy_bytes)
 
-        byte_list = builder.call(cg.list_new, [ir.Constant(i64, 1)])
+        byte_list = builder.call(cg.list_new, [ir.Constant(i64, 1), ir.Constant(i64, 0)])
 
         idx_ptr = builder.alloca(i64, name="idx")
         list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="list")
@@ -1762,7 +1762,7 @@ class StringGenerator:
         builder.ret(final_list)
 
         builder.position_at_end(done)
-        empty_list = builder.call(cg.list_new, [ir.Constant(i64, 1)])
+        empty_list = builder.call(cg.list_new, [ir.Constant(i64, 1), ir.Constant(i64, 0)])
         builder.ret(empty_list)
 
     def _implement_string_split(self):
@@ -1792,7 +1792,8 @@ class StringGenerator:
         delim_size_ptr = builder.gep(delim, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         delim_size = builder.load(delim_size_ptr)
 
-        result_list = builder.call(cg.list_new, [ir.Constant(i64, 8)])
+        # List of strings - reference types need FLAG_ELEM_IS_REF
+        result_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
         list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
         builder.store(result_list, list_ptr)
 
@@ -1942,7 +1943,7 @@ class StringGenerator:
         new_size = builder.add(byte_size, one)
 
         # Create a new byte array list with capacity for size + 1 bytes
-        byte_list = builder.call(cg.list_new, [one])  # elem_size = 1 for bytes
+        byte_list = builder.call(cg.list_new, [one, zero])  # elem_size = 1 for bytes, flags = 0
 
         # We need to append all bytes one at a time, then append null
         # Store list pointer for updates

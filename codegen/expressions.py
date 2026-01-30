@@ -443,9 +443,10 @@ class ExpressionGenerator:
         cg = self.cg
 
         if not expr.elements:
-            # Empty list - default to i64 element size
+            # Empty list - default to i64 element size, flags = 0 (no reference types)
             elem_size = ir.Constant(ir.IntType(64), 8)
-            return cg.builder.call(cg.list_new, [elem_size])
+            flags = ir.Constant(ir.IntType(64), 0)
+            return cg.builder.call(cg.list_new, [elem_size, flags])
 
         # Generate first element to determine type
         first_elem = self.generate_expression(expr.elements[0])
@@ -476,8 +477,9 @@ class ExpressionGenerator:
 
         elem_size = ir.Constant(ir.IntType(64), size)
 
-        # Create new list
-        list_ptr = cg.builder.call(cg.list_new, [elem_size])
+        # Create new list with appropriate flags
+        list_flags = ir.Constant(ir.IntType(64), cg.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
+        list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
 
         # Append each element (list_append returns a new list with value semantics)
         for i, elem_expr in enumerate(expr.elements):

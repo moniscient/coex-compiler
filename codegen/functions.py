@@ -389,8 +389,8 @@ class FunctionGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty list with element size 8 (for String* pointers)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8)])
+        # Create empty list with element size 8 (for String* handles)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Append each string pointer
         for s in strings:
@@ -418,8 +418,8 @@ class FunctionGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty list with element size 8 (for Json* pointers)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8)])
+        # Create empty list with element size 8 (for Json* handles)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Wrap each parameter value in json and append
         for param in params:
@@ -558,9 +558,9 @@ class FunctionGenerator:
             argc = c_main.args[0]
             argv = c_main.args[1]
 
-            # Create new list for strings (elem_size = 8 for pointers)
+            # Create new list for strings (elem_size = 8 for handles)
             elem_size = ir.Constant(i64, 8)
-            args_list = builder.call(cg.list_new, [elem_size])
+            args_list = builder.call(cg.list_new, [elem_size, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
             # Store in alloca for list_append (which returns new list)
             args_alloca = builder.alloca(cg.list_struct.as_pointer(), name="args_list")

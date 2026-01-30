@@ -437,7 +437,7 @@ class PosixGenerator:
 
         # Create new list with elem_size = 1 (byte)
         elem_size = ir.Constant(i64, 1)
-        byte_list = builder.call(cg.list_new, [elem_size])
+        byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get the tail pointer from the new list and copy data there (Phase 4: handle)
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -795,7 +795,7 @@ class PosixGenerator:
 
         # Create new list with elem_size = 1 (byte)
         elem_size = ir.Constant(i64, 1)
-        byte_list = builder.call(cg.list_new, [elem_size])
+        byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get the tail pointer and read directly into it - Phase 4: handle
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)

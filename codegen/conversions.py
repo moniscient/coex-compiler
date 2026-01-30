@@ -199,8 +199,8 @@ class ConversionGenerator:
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
-        # Create new empty List with same elem_size
-        list_ptr = self.cg.builder.call(self.cg.list_new, [elem_size])
+        # Create new empty List with same elem_size (primitive array elements, no reference types)
+        list_ptr = self.cg.builder.call(self.cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Store list_ptr in alloca since list_append returns new list
         list_alloca = self.cg.builder.alloca(self.cg.list_struct.as_pointer(), name="arr_to_list")

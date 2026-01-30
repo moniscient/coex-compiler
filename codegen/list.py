@@ -47,8 +47,9 @@ class ListGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # list_new(elem_size: i64) -> List*
-        list_new_ty = ir.FunctionType(list_ptr, [i64])
+        # list_new(elem_size: i64, flags: i64) -> List*
+        # flags bit 0: elements are reference types (need GC tracing)
+        list_new_ty = ir.FunctionType(list_ptr, [i64, i64])
         cg.list_new = ir.Function(cg.module, list_new_ty, name="coex_list_new")
 
         # list_append(list: List*, elem: i8*, elem_size: i64) -> List*
@@ -111,20 +112,25 @@ class ListGenerator:
         - field 3: tail_handle (i64) - rightmost leaf array handle
         - field 4: tail_len (i64) - elements in tail (0-32)
         - field 5: elem_size (i64)
+        - field 6: flags (i64) - bit 0: elements are reference types
         """
         cg = self.cg
 
         func = cg.list_new
         func.args[0].name = "elem_size"
+        func.args[1].name = "flags"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
+        elem_size_arg = func.args[0]
+        flags_arg = func.args[1]
+
         # Allocate List struct via GC
-        # Size: 6 * 8 = 48 bytes (all i64 fields)
-        list_size = ir.Constant(i64, 48)
+        # Size: 7 * 8 = 56 bytes (all i64 fields including flags)
+        list_size = ir.Constant(i64, 56)
         type_id = ir.Constant(i32, cg.gc.TYPE_LIST)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, list_size, type_id)
         list_ptr = builder.bitcast(raw_ptr, cg.list_struct.as_pointer())
@@ -144,10 +150,24 @@ class ListGenerator:
 
         # tail = allocate space for 32 elements (field 3)
         # Initial allocation: 32 * elem_size bytes
+        # Use TYPE_LIST_TAIL_REF if flags & 1, else TYPE_LIST_TAIL
         tail_capacity = ir.Constant(i64, 32)
-        tail_size = builder.mul(tail_capacity, func.args[0])
-        tail_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+        tail_size = builder.mul(tail_capacity, elem_size_arg)
+
+        # Check if elements are reference types (flags & 1)
+        is_ref = builder.and_(flags_arg, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
+        is_ref_bool = builder.icmp_unsigned("!=", is_ref, ir.Constant(i64, 0))
+        tail_type_ref = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
+        tail_type_prim = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+        tail_type_id = builder.select(is_ref_bool, tail_type_ref, tail_type_prim)
+
         tail_ptr = cg.gc.alloc_arena_or_gc(builder, tail_size, tail_type_id)
+
+        # Zero-initialize tail buffer for reference types to prevent GC from
+        # tracing uninitialized slots as handles (BUG-076 fix)
+        with builder.if_then(is_ref_bool) as then:
+            builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(8), 0), tail_size])
+
         # Phase 4: Store as i64 handle
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.ptrtoint(tail_ptr, i64)
@@ -159,7 +179,11 @@ class ListGenerator:
 
         # elem_size (field 5)
         elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
-        builder.store(func.args[0], elem_size_ptr)
+        builder.store(elem_size_arg, elem_size_ptr)
+
+        # flags (field 6)
+        flags_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        builder.store(flags_arg, flags_ptr)
 
         builder.ret(list_ptr)
 
@@ -212,13 +236,17 @@ class ListGenerator:
         old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         old_elem_size = builder.load(old_elem_size_ptr)
 
+        # flags (field 6) - for propagating reference type info
+        old_flags_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        old_flags = builder.load(old_flags_ptr)
+
         # root_handle (field 0) - Phase 4: i64 handle
         old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         old_root_handle = builder.load(old_root_handle_ptr)
         old_root = builder.inttoptr(old_root_handle, cg.pv_node_struct.as_pointer())
 
-        # Create new list
-        new_list = builder.call(cg.list_new, [old_elem_size])
+        # Create new list with same flags
+        new_list = builder.call(cg.list_new, [old_elem_size, old_flags])
 
         # Set new len = old_len + 1
         new_len = builder.add(old_len, ir.Constant(i64, 1))
@@ -279,7 +307,13 @@ class ListGenerator:
 
         pv_node_size = ir.Constant(i64, 32 * 8)  # 32 pointers (no refcount - GC handles it)
         pv_node_type_id = ir.Constant(i32, cg.gc.TYPE_PV_NODE)
-        leaf_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+
+        # Determine leaf type ID based on flags (use TYPE_LIST_TAIL_REF if elements are reference types)
+        is_ref = builder.and_(old_flags, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
+        is_ref_bool = builder.icmp_unsigned("!=", is_ref, ir.Constant(i64, 0))
+        leaf_type_ref = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
+        leaf_type_prim = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+        leaf_type_id = builder.select(is_ref_bool, leaf_type_ref, leaf_type_prim)
 
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
@@ -774,6 +808,10 @@ class ListGenerator:
         old_elem_size_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         stored_elem_size = builder.load(old_elem_size_ptr)
 
+        # flags (field 6) - for propagating reference type info
+        old_flags_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        old_flags = builder.load(old_flags_ptr)
+
         # root_handle (field 0) - Phase 4: i64 handle
         old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         old_root_handle = builder.load(old_root_handle_ptr)
@@ -791,8 +829,8 @@ class ListGenerator:
         # --- CASE 1: Index is in tail ---
         builder.position_at_end(tail_set_block)
 
-        # Create new list
-        new_list_tail = builder.call(cg.list_new, [stored_elem_size])
+        # Create new list with same flags
+        new_list_tail = builder.call(cg.list_new, [stored_elem_size, old_flags])
 
         # Share the root (Phase 4: store i64 handle)
         new_root_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -828,8 +866,8 @@ class ListGenerator:
         # --- CASE 2: Index is in tree - path copy ---
         builder.position_at_end(tree_set_block)
 
-        # Create new list
-        new_list_tree = builder.call(cg.list_new, [stored_elem_size])
+        # Create new list with same flags
+        new_list_tree = builder.call(cg.list_new, [stored_elem_size, old_flags])
 
         # Copy len and depth - Phase 4: depth is i64
         new_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -852,7 +890,13 @@ class ListGenerator:
 
         pv_node_size = ir.Constant(i64, 32 * 8)  # 32 pointers (no refcount - GC handles it)
         pv_node_type_id = ir.Constant(i32, cg.gc.TYPE_PV_NODE)
-        leaf_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+
+        # Determine leaf type ID based on flags (use TYPE_LIST_TAIL_REF if elements are reference types)
+        is_ref_tr = builder.and_(old_flags, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
+        is_ref_bool_tr = builder.icmp_unsigned("!=", is_ref_tr, ir.Constant(i64, 0))
+        leaf_type_ref_tr = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
+        leaf_type_prim_tr = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
+        leaf_type_id = builder.select(is_ref_bool_tr, leaf_type_ref_tr, leaf_type_prim_tr)
 
         # Check if root is null - Phase 4: compare handle to 0
         root_null_check = builder.icmp_unsigned("==", old_root_handle, ir.Constant(i64, 0))
@@ -1074,10 +1118,10 @@ class ListGenerator:
         elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # Size = 48 (header) + 32 * elem_size (tail capacity)
+        # Size = 56 (header with 7 fields) + 32 * elem_size (tail capacity)
         tail_len_64 = builder.zext(tail_len, i64)
         tail_size = builder.mul(ir.Constant(i64, 32), elem_size)
-        total_size = builder.add(ir.Constant(i64, 48), tail_size)
+        total_size = builder.add(ir.Constant(i64, 56), tail_size)
 
         builder.ret(total_size)
 
@@ -1123,10 +1167,12 @@ class ListGenerator:
         start = func.args[1]
         end = func.args[2]
 
-        # Get source list length and element size
+        # Get source list length, element size, and flags
         src_len = builder.call(cg.list_len, [src_list])
         elem_size_ptr = builder.gep(src_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
+        flags_ptr = builder.gep(src_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        flags = builder.load(flags_ptr)
 
         # Clamp start to [0, len]
         start_neg = builder.icmp_signed("<", start, zero)
@@ -1141,8 +1187,8 @@ class ListGenerator:
         # Calculate result length
         result_len = builder.sub(end_clamped, start_clamped)
 
-        # Create new empty list
-        new_list = builder.call(cg.list_new, [elem_size])
+        # Create new empty list with same flags
+        new_list = builder.call(cg.list_new, [elem_size, flags])
 
         # Loop: copy elements from start to end
         loop_header = func.append_basic_block("loop_header")
@@ -1198,11 +1244,13 @@ class ListGenerator:
         end = func.args[2]
         source = func.args[3]
 
-        # Get lengths and element size
+        # Get lengths, element size, and flags
         orig_len = builder.call(cg.list_len, [orig_list])
         source_len = builder.call(cg.list_len, [source])
         elem_size_ptr = builder.gep(orig_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
+        flags_ptr = builder.gep(orig_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        flags = builder.load(flags_ptr)
 
         # Clamp bounds
         start_neg = builder.icmp_signed("<", start, zero)
@@ -1221,8 +1269,8 @@ class ListGenerator:
             range_len
         )
 
-        # Create result list
-        result = builder.call(cg.list_new, [elem_size])
+        # Create result list with same flags
+        result = builder.call(cg.list_new, [elem_size, flags])
         result_ptr = builder.alloca(list_ptr_type, name="result")
         builder.store(result, result_ptr)
 

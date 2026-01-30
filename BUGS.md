@@ -1383,14 +1383,18 @@ func main() -> int
 
 - **Files**:
   - `coex_gc.py` (`_implement_gc_mark_object`, mark_pv_node section)
-  - `codegen/persistent_vector.py` (PV structure)
-- **Status**: Open
-- **Potential Fix**: Several approaches possible:
-  1. Add element type flags to List struct (bit indicating if elements are reference types)
-  2. Pass element type info when marking PVNodes
-  3. Store a "flags" field in PVNode header indicating leaf vs internal
-  4. Check if child value looks like a valid heap pointer vs handle before calling gc_ptr_to_handle
-- **Note**: This bug only affects Lists containing reference types (json, strings, nested lists, UDTs) when GC runs. Lists with primitive types (int, float, bool) work correctly.
+  - `codegen/list.py` (list_new, list_append)
+  - `codegen/core.py` (list_struct definition)
+- **Status**: Fixed (Partial)
+- **Fix Implemented**:
+  1. Added `TYPE_LIST_TAIL_REF` (type ID 15) for tail/leaf buffers containing reference type handles
+  2. Added `flags` field (field 6) to List struct with `LIST_FLAG_ELEM_IS_REF` bit
+  3. Updated `list_new` to allocate tail with correct type based on flags and zero-initialize for ref types
+  4. Updated `list_append`, `list_set`, `list_getrange`, `list_setrange` to propagate flags
+  5. Added `mark_list_tail_ref` block in GC to iterate and mark handles in ref-type buffers
+  6. Updated all `list_new` call sites to pass appropriate flags
+- **Remaining Issue**: The fix works for `List<string>` and `List<List<T>>`, but `List<json>` still crashes during GC due to a separate issue: json variables themselves are not being properly rooted in the shadow stack. This is a different bug that affects any json variable + gc() combination, not specific to Lists.
+- **Note**: This bug only affects Lists containing reference types (json, strings, nested lists, UDTs) when GC runs. Lists with primitive types (int, float, bool) work correctly. The List structure and GC marking for reference type elements is now correct, but json has an independent rooting issue.
 
 ### BUG-077: Array<string> and other reference type Arrays need handle storage updates
 - **Discovered**: 2026-01-30, during Map/Set handle storage implementation
@@ -1429,3 +1433,33 @@ func main() -> int
 - **Status**: Open
 - **Workaround**: Avoid using `Array<string>` or other reference type Arrays. Use `List<string>` instead which has correct handle storage.
 - **Note**: This is part of the broader handle storage migration. Maps and Sets have been updated; Arrays need the same treatment.
+
+### BUG-078: JSON variables not properly rooted in shadow stack, crash on GC
+- **Discovered**: 2026-01-30, during BUG-076 verification
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**:
+```coex
+func main() -> int
+    j: json = { value: 42 }
+    gc()
+    print(j.get("value").as_int())
+    return 0
+~
+```
+- **Observed**: Segmentation fault during or after gc() call. The json object `j` is not properly rooted.
+- **Expected**: JSON variable should survive GC and be accessible after collection.
+- **Root Cause**: JSON values are not being registered in the shadow stack as GC roots. When gc() runs, it doesn't find the json handle in the shadow stack and doesn't mark the json object as live. The object is then swept and freed, causing a use-after-free when accessed.
+
+  This is likely because:
+  1. JSON pointers are stored in local allocas but not registered via gc_set_root
+  2. JSON values may be using stack allocation (i8* alloca) instead of GC allocation
+  3. The codegen for json variable declarations may not be calling gc_segment_set_root
+
+- **Files**:
+  - `codegen/statements.py` (json variable declaration handling)
+  - `codegen/json_type.py` (json value construction)
+  - `coex_gc.py` (shadow stack registration)
+- **Status**: Open
+- **Workaround**: Avoid calling gc() when JSON variables are in scope. The GC will still run automatically when memory pressure is high, so this is not a complete workaround.
+- **Note**: This bug is independent of BUG-076 (List<json> GC marking). Even a simple json variable crashes with explicit gc() call, without any List involvement.

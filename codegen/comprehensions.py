@@ -45,9 +45,14 @@ class ComprehensionGenerator:
         __result
         """
         cg = self.cg
-        # Create result list
+        # Infer element type to determine if elements are reference types
+        elem_coex_type = cg._infer_type_from_expr(expr.value)
+        is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
+        # Create result list with appropriate flags
         elem_size = ir.Constant(ir.IntType(64), 8)
-        list_ptr = cg.builder.call(cg.list_new, [elem_size])
+        list_flags = ir.Constant(ir.IntType(64), cg.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
+        list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
 
         # Store result list in a temporary
         result_var = f"__comp_result_{cg.lambda_counter}"

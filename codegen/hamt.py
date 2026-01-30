@@ -2449,7 +2449,7 @@ class HamtGenerator:
 
         # Create empty result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
-        empty_list = builder.call(cg.list_new, [elem_size])
+        empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get HAMT root (stored as i64, convert to pointer)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2476,7 +2476,7 @@ class HamtGenerator:
 
         # Create empty result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
-        empty_list = builder.call(cg.list_new, [elem_size])
+        empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get HAMT root (stored as i64, convert to pointer)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2942,7 +2942,7 @@ class HamtGenerator:
 
         # Create result list with 8-byte elements
         elem_size = ir.Constant(i64, 8)
-        result_list = builder.call(cg.list_new, [elem_size])
+        result_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get root from the set (stored as i64, convert to pointer)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)

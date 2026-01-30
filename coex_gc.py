@@ -58,13 +58,14 @@ class GarbageCollector:
     TYPE_SET_ENTRY = 6
     TYPE_CHANNEL = 7
     TYPE_ARRAY = 8
-    TYPE_LIST_TAIL = 9       # List tail buffer (element data)
+    TYPE_LIST_TAIL = 9       # List tail buffer (primitive element data)
     TYPE_PV_NODE = 10        # Persistent vector tree node
     TYPE_STRING_DATA = 11    # String character data buffer
     TYPE_CHANNEL_BUFFER = 12 # Channel data buffer
     TYPE_ARRAY_DATA = 13     # Array element data buffer
     TYPE_JSON = 14           # JSON value (tagged union: i8 tag, i64 value)
-    TYPE_FIRST_USER = 15     # First ID for user-defined types
+    TYPE_LIST_TAIL_REF = 15  # List tail buffer (reference type elements - handles)
+    TYPE_FIRST_USER = 16     # First ID for user-defined types
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -2823,6 +2824,11 @@ class GarbageCollector:
         mark_json = func.append_basic_block("mark_json")
         mark_json_ptr = func.append_basic_block("mark_json_ptr")
         mark_json_done = func.append_basic_block("mark_json_done")
+        mark_list_tail_ref = func.append_basic_block("mark_list_tail_ref")
+        list_tail_ref_loop = func.append_basic_block("list_tail_ref_loop")
+        list_tail_ref_check = func.append_basic_block("list_tail_ref_check")
+        list_tail_ref_mark = func.append_basic_block("list_tail_ref_mark")
+        list_tail_ref_next = func.append_basic_block("list_tail_ref_next")
         pv_node_loop = func.append_basic_block("pv_node_loop")
         pv_node_check = func.append_basic_block("pv_node_check")
         pv_node_mark_child = func.append_basic_block("pv_node_mark_child")
@@ -2984,6 +2990,7 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_CHANNEL), mark_channel)
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), mark_pv_node)
         switch.add_case(ir.Constant(self.i64, self.TYPE_JSON), mark_json)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_LIST_TAIL_REF), mark_list_tail_ref)
 
         # Actual map marking (in builtin_switch block)
         builder.position_at_end(builtin_switch)
@@ -3004,10 +3011,10 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark List: root (field 0) and tail (field 3) pointers
-        # List struct: { i64 root (0), i64 len (1), i64 depth (2), i64 tail (3), i64 tail_len (4), i64 elem_size (5) }
+        # List struct: { i64 root (0), i64 len (1), i64 depth (2), i64 tail (3), i64 tail_len (4), i64 elem_size (5), i64 flags (6) }
         # Root and tail store raw pointers as i64 (via ptrtoint), need inttoptr to get pointers
         builder.position_at_end(mark_list)
-        list_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
+        list_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
         list_typed = builder.bitcast(ptr, list_ptr_type)
         # Mark root - push to worklist
         root_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
@@ -3157,6 +3164,64 @@ class GarbageCollector:
         # JSON marking done
         builder.position_at_end(mark_json_done)
         builder.branch(done)
+
+        # Mark LIST_TAIL_REF: buffer containing handles to reference type elements
+        # Each element is an i64 handle that needs to be marked
+        builder.position_at_end(mark_list_tail_ref)
+        # Get object size from header to calculate element count
+        # Header is at ptr - HEADER_SIZE
+        header_ptr_ref = builder.inttoptr(
+            builder.sub(builder.ptrtoint(ptr, self.i64), ir.Constant(self.i64, self.HEADER_SIZE)),
+            self.header_type.as_pointer()
+        )
+        size_ptr_ref = builder.gep(header_ptr_ref, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        buffer_size = builder.load(size_ptr_ref)
+        # Element count = size / 8 (handles are i64 = 8 bytes)
+        elem_count_ref = builder.udiv(buffer_size, ir.Constant(self.i64, 8))
+        # Cast buffer to i64 array
+        handles_ptr = builder.bitcast(ptr, self.i64_ptr)
+        # Store for loop
+        handles_ptr_alloca = builder.alloca(self.i64_ptr, name="handles_ptr_ref")
+        builder.store(handles_ptr, handles_ptr_alloca)
+        elem_count_alloca = builder.alloca(self.i64, name="elem_count_ref")
+        builder.store(elem_count_ref, elem_count_alloca)
+        # Index for loop
+        idx_alloca_ref = builder.alloca(self.i64, name="idx_ref")
+        builder.store(ir.Constant(self.i64, 0), idx_alloca_ref)
+        builder.branch(list_tail_ref_loop)
+
+        # Loop header: check if index < element count
+        builder.position_at_end(list_tail_ref_loop)
+        idx_ref = builder.load(idx_alloca_ref)
+        count_ref = builder.load(elem_count_alloca)
+        done_ref = builder.icmp_unsigned(">=", idx_ref, count_ref)
+        builder.cbranch(done_ref, done, list_tail_ref_check)
+
+        # Check if handle is non-zero
+        builder.position_at_end(list_tail_ref_check)
+        handles_ptr_val = builder.load(handles_ptr_alloca)
+        idx_ref2 = builder.load(idx_alloca_ref)
+        handle_ptr_ref = builder.gep(handles_ptr_val, [idx_ref2], inbounds=False)
+        elem_handle = builder.load(handle_ptr_ref)
+        is_zero = builder.icmp_unsigned("==", elem_handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_zero, list_tail_ref_next, list_tail_ref_mark)
+
+        # Mark the handle
+        builder.position_at_end(list_tail_ref_mark)
+        # Reload the handle for this block (SSA requirement)
+        handles_ptr_val2 = builder.load(handles_ptr_alloca)
+        idx_ref3 = builder.load(idx_alloca_ref)
+        handle_ptr_ref2 = builder.gep(handles_ptr_val2, [idx_ref3], inbounds=False)
+        elem_handle2 = builder.load(handle_ptr_ref2)
+        builder.call(self.gc_mark_push, [elem_handle2])
+        builder.branch(list_tail_ref_next)
+
+        # Increment index and continue
+        builder.position_at_end(list_tail_ref_next)
+        idx_ref4 = builder.load(idx_alloca_ref)
+        next_idx_ref = builder.add(idx_ref4, ir.Constant(self.i64, 1))
+        builder.store(next_idx_ref, idx_alloca_ref)
+        builder.branch(list_tail_ref_loop)
 
         builder.position_at_end(done)
         builder.ret_void()
