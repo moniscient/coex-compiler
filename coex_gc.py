@@ -2979,15 +2979,18 @@ class GarbageCollector:
         builder.cbranch(value_needs_mark, mark_value, after_value)
 
         # Mark value as heap object
-        # NOTE: Values are now stored as HANDLES (not raw pointers) for reference types.
-        # The stored i64 IS the handle - we can pass it directly to gc_mark_object.
+        # BUG-078 FIX: Map values are stored as raw pointers (via ptrtoint), NOT handles.
+        # We must convert pointer to handle via gc_ptr_to_handle before marking,
+        # just like we do for keys above.
         builder.position_at_end(mark_value)
-        value_handle_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        value_handle = builder.load(value_handle_ptr)
-        # Null check for handle (handle 0 = null)
-        handle_is_null = builder.icmp_unsigned("==", value_handle, ir.Constant(self.i64, 0))
-        with builder.if_then(builder.not_(handle_is_null)):
-            # Value is already a handle - mark directly
+        value_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        value_as_int = builder.load(value_ptr_ptr)
+        value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
+        # Null check for value pointer
+        value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
+        with builder.if_then(builder.not_(value_is_null)):
+            # Convert pointer to handle for gc_mark_object
+            value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
             builder.call(self.gc_mark_object, [value_handle])
         builder.branch(after_value)
 
@@ -5460,6 +5463,10 @@ class GarbageCollector:
 
         Called by gc_scan_roots to mark reachable objects.
         Walks from base segment to current, scanning all slots.
+
+        BUG-078 FIX: Use ThreadEntry via pthread TLS instead of tls_segment_base.
+        The llvmlite thread_local attribute is silently ignored (BUG-023), so we
+        must use pthread TLS for all per-thread state.
         """
         func = self.gc_segment_scan_roots
 
@@ -5478,8 +5485,19 @@ class GarbageCollector:
         curr_segment_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="curr_seg")
         slot_idx_alloca = builder.alloca(self.i64, name="slot_idx")
 
-        # Start from base segment
-        base = builder.load(self.tls_segment_base)
+        # BUG-078 FIX: Get ThreadEntry via pthread TLS (this actually works, unlike LLVM thread_local)
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+
+        # Get segment_base from ThreadEntry field 12
+        seg_base_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 12)  # segment_base field
+        ], inbounds=True)
+        segment_base_i8 = builder.load(seg_base_ptr)
+        base = builder.bitcast(segment_base_i8, self.stack_segment_type.as_pointer())
+
         base_int = builder.ptrtoint(base, self.i64)
         has_segments = builder.icmp_unsigned("!=", base_int, ir.Constant(self.i64, 0))
 

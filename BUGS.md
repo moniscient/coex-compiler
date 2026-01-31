@@ -1447,7 +1447,7 @@ func main() -> int
   8. Added `get_array_element_coex_type()` method to determine element type for iteration
 - **Tests**: `tests/test_array_ref_types.py` - 8 passing, 2 xfail (parser issue with nested generics)
 
-### BUG-078: JSON variables not properly rooted in shadow stack, crash on GC
+### BUG-078: JSON variables crash on GC - Map values treated as handles instead of pointers
 - **Discovered**: 2026-01-30, during BUG-076 verification
 - **Category**: GC
 - **Severity**: High
@@ -1460,19 +1460,33 @@ func main() -> int
     return 0
 ~
 ```
-- **Observed**: Segmentation fault during or after gc() call. The json object `j` is not properly rooted.
+- **Observed**: Segmentation fault during gc() when marking JSON object children. Crash in `gc_handle_deref` with pointer-sized value (e.g., 0x9403c8680) being treated as handle.
 - **Expected**: JSON variable should survive GC and be accessible after collection.
-- **Root Cause**: JSON values are not being registered in the shadow stack as GC roots. When gc() runs, it doesn't find the json handle in the shadow stack and doesn't mark the json object as live. The object is then swept and freed, causing a use-after-free when accessed.
+- **Root Cause**: **Mismatch between map value storage and GC marking expectation**.
 
-  This is likely because:
-  1. JSON pointers are stored in local allocas but not registered via gc_set_root
-  2. JSON values may be using stack allocation (i8* alloca) instead of GC allocation
-  3. The codegen for json variable declarations may not be calling gc_segment_set_root
+  In `generate_json_object()` (json_type.py), JSON values are stored in maps using:
+  ```python
+  json_i64 = builder.ptrtoint(json_value, i64)  # Convert pointer to i64
+  map_ptr = builder.call(cg.map_set_string, [..., json_i64])  # Store raw pointer as i64
+  ```
+
+  But in `_implement_gc_mark_hamt()` (coex_gc.py), the marking code assumed values were already handles:
+  ```python
+  value_handle = builder.load(value_handle_ptr)  # Reads raw pointer value
+  builder.call(self.gc_mark_object, [value_handle])  # Passes pointer to handle-expecting function!
+  ```
+
+  This caused gc_mark_object to treat a raw pointer as a handle, then gc_handle_deref tried to index into the handle table at an absurdly large index, causing the crash.
 
 - **Files**:
-  - `codegen/statements.py` (json variable declaration handling)
-  - `codegen/json_type.py` (json value construction)
-  - `coex_gc.py` (shadow stack registration)
-- **Status**: Open
-- **Workaround**: Avoid calling gc() when JSON variables are in scope. The GC will still run automatically when memory pressure is high, so this is not a complete workaround.
-- **Note**: This bug is independent of BUG-076 (List<json> GC marking). Even a simple json variable crashes with explicit gc() call, without any List involvement.
+  - `coex_gc.py` (_implement_gc_mark_hamt - value marking)
+  - `codegen/json_type.py` (generate_json_object - stores pointers in maps)
+- **Status**: Fixed (2026-01-30)
+- **Resolution**:
+  Fixed `_implement_gc_mark_hamt()` to convert map value pointers to handles before marking, matching the pattern already used for map keys:
+  ```python
+  value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
+  value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
+  builder.call(self.gc_mark_object, [value_handle])
+  ```
+- **Tests**: 109 tests pass (tests/test_gc.py + tests/test_json.py)
