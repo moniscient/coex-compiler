@@ -37,18 +37,6 @@
 
 -->
 
-### BUG-004: GC race condition with parallel Set allocations
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: GC
-- **Severity**: Critical
-- **Reproduction**: Run parallel tasks that allocate Sets (e.g., parallel sieve tests)
-- **Observed**: Non-deterministic crashes during concurrent Set allocation
-- **Expected**: Concurrent Set allocations should be thread-safe
-- **Hypothesis**: GC allocation list or Set internals lack proper synchronization
-- **Files**: `coex_gc.py`, `tests/test_thread_stress.py`
-- **Status**: Open
-
-
 ### BUG-015: Non-blocking safepoints require shadow stack changes
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: GC
@@ -152,6 +140,28 @@
 ---
 
 ## Resolved Bugs
+
+### BUG-004: GC race condition with parallel Set allocations
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run parallel tasks that allocate Sets (e.g., parallel sieve tests)
+- **Observed**: Non-deterministic crashes during concurrent Set allocation
+- **Expected**: Concurrent Set allocations should be thread-safe
+- **Root Cause**: The TLAB (Thread-Local Allocation Buffer) bump-pointer allocation was not
+  thread-safe. Multiple threads could read the same cursor value, compute their new positions,
+  and both store their values - with one overwriting the other. Both threads would then think
+  they had valid memory at the same address, causing data corruption.
+- **Fix**: Replaced the non-atomic load-compute-store pattern in `_implement_gc_tlab_alloc`
+  with an atomic compare-and-swap (CAS) loop:
+  1. Load current cursor
+  2. Calculate new cursor = cursor + size
+  3. CAS: atomically update cursor only if it hasn't changed
+  4. If CAS fails (another thread modified cursor), retry from step 1
+- **Files**: `coex_gc.py` (`_implement_gc_tlab_alloc`)
+- **Status**: Fixed (2026-01-30)
+- **Testing**: Verified with parallel sieve tests (8 threads, 10000 elements), parallel Set
+  allocation stress tests (8 threads × 5000 insertions each), all passing consistently.
 
 ### BUG-064: Library modules cannot call ui.render() with String values in JSON
 - **Discovered**: 2026-01-28, during heapwatch implementation
@@ -961,8 +971,8 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-30)
-- **Open**: 12 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
-- **Resolved**: 47 bugs (including BUG-064: String.from() in JSON via Universal Tagged Values)
+- **Open**: 11 bugs (BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
+- **Resolved**: 48 bugs (including BUG-004: CAS-based thread-safe TLAB allocation)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX

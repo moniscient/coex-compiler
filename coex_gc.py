@@ -5666,20 +5666,31 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_tlab_alloc(self):
-        """Fast-path TLAB bump-pointer allocation.
+        """Fast-path TLAB bump-pointer allocation (lock-free, thread-safe).
 
         Attempts to allocate `size` bytes from the current thread's TLAB.
         Returns pointer to allocated memory, or NULL if TLAB is full.
 
-        This is the hot path - no locks, just a bump pointer increment.
+        Uses atomic compare-and-swap (CAS) to safely update the cursor when
+        multiple threads may be allocating concurrently. This fixes BUG-004:
+        GC race condition with parallel Set allocations.
+
+        CAS loop pattern:
+        1. Load current cursor
+        2. Calculate new cursor = cursor + size
+        3. Atomically: if cursor unchanged, update to new cursor
+        4. If CAS fails (another thread modified cursor), retry
         """
         func = self.gc_tlab_alloc
         func.args[0].name = "size"
 
         entry = func.append_basic_block("entry")
         have_tlab = func.append_basic_block("have_tlab")
+        cas_loop = func.append_basic_block("cas_loop")
+        check_cursor = func.append_basic_block("check_cursor")
         check_space = func.append_basic_block("check_space")
-        do_alloc = func.append_basic_block("do_alloc")
+        do_cas = func.append_basic_block("do_cas")
+        cas_success = func.append_basic_block("cas_success")
         no_space = func.append_basic_block("no_space")
 
         builder = ir.IRBuilder(entry)
@@ -5688,9 +5699,12 @@ class GarbageCollector:
 
         # Align size to 8 bytes
         seven = ir.Constant(self.i64, 7)
-        eight = ir.Constant(self.i64, 8)
         aligned_size = builder.add(size, seven)
         aligned_size = builder.and_(aligned_size, builder.not_(seven))
+
+        # Allocate stack space to pass aligned_size to CAS loop
+        aligned_size_alloca = builder.alloca(self.i64, name="aligned_size_slot")
+        builder.store(aligned_size, aligned_size_alloca)
 
         # Get current thread entry (use pthread TLS)
         tls_key = builder.load(self.tls_thread_entry_key)
@@ -5702,46 +5716,74 @@ class GarbageCollector:
         is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
         builder.cbranch(is_null_entry, no_space, have_tlab)
 
+        # --- have_tlab: Get TLAB pointers and limit ---
         builder.position_at_end(have_tlab)
-        thread_entry_typed = thread_entry  # Already correctly typed
 
-        # Load tlab_cursor (field 7)
-        tlab_cursor_ptr = builder.gep(thread_entry_typed, [
+        # Get pointer to tlab_cursor (field 7) - this is where CAS operates
+        tlab_cursor_ptr = builder.gep(thread_entry, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 7)
         ], inbounds=True)
-        cursor = builder.load(tlab_cursor_ptr)
 
-        # Load tlab_limit (field 8)
-        tlab_limit_ptr = builder.gep(thread_entry_typed, [
+        # Load tlab_limit (field 8) - limit doesn't change during allocation
+        tlab_limit_ptr = builder.gep(thread_entry, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 8)
         ], inbounds=True)
         limit = builder.load(tlab_limit_ptr)
+        limit_int = builder.ptrtoint(limit, self.i64)
 
-        # Check if cursor is valid (not NULL)
+        # Store limit and cursor_ptr for use in CAS loop
+        limit_alloca = builder.alloca(self.i64, name="limit_slot")
+        builder.store(limit_int, limit_alloca)
+        cursor_ptr_alloca = builder.alloca(self.i8_ptr.as_pointer(), name="cursor_ptr_slot")
+        builder.store(tlab_cursor_ptr, cursor_ptr_alloca)
+
+        builder.branch(cas_loop)
+
+        # --- CAS loop: atomically allocate from TLAB ---
+        builder.position_at_end(cas_loop)
+
+        # Load current cursor value
+        cursor_ptr = builder.load(cursor_ptr_alloca)
+        cursor = builder.load(cursor_ptr)
+        builder.branch(check_cursor)
+
+        # --- check_cursor: Verify cursor is valid ---
+        builder.position_at_end(check_cursor)
         cursor_int = builder.ptrtoint(cursor, self.i64)
         is_null_cursor = builder.icmp_unsigned("==", cursor_int, ir.Constant(self.i64, 0))
         builder.cbranch(is_null_cursor, no_space, check_space)
 
+        # --- check_space: Verify we have space for allocation ---
         builder.position_at_end(check_space)
+
         # Calculate new cursor position
-        new_cursor = builder.gep(cursor, [aligned_size])
+        alloc_size = builder.load(aligned_size_alloca)
+        new_cursor = builder.gep(cursor, [alloc_size])
 
         # Check if new_cursor <= limit
         new_cursor_int = builder.ptrtoint(new_cursor, self.i64)
-        limit_int = builder.ptrtoint(limit, self.i64)
-        has_space = builder.icmp_unsigned("<=", new_cursor_int, limit_int)
-        builder.cbranch(has_space, do_alloc, no_space)
+        limit_val = builder.load(limit_alloca)
+        has_space = builder.icmp_unsigned("<=", new_cursor_int, limit_val)
+        builder.cbranch(has_space, do_cas, no_space)
 
-        # Allocate from TLAB
-        builder.position_at_end(do_alloc)
-        # Update cursor
-        builder.store(new_cursor, tlab_cursor_ptr)
-        # Return old cursor (the allocated memory)
+        # --- do_cas: Atomically try to update cursor ---
+        builder.position_at_end(do_cas)
+
+        # Atomic compare-and-swap: if *cursor_ptr == cursor, set *cursor_ptr = new_cursor
+        # Returns {old_value, success_flag}
+        cmpxchg_result = builder.cmpxchg(cursor_ptr, cursor, new_cursor, 'acq_rel', 'acquire')
+        success = builder.extract_value(cmpxchg_result, 1)
+
+        # If CAS succeeded, we got the allocation; otherwise retry
+        builder.cbranch(success, cas_success, cas_loop)
+
+        # --- cas_success: Return the allocated memory (old cursor value) ---
+        builder.position_at_end(cas_success)
         builder.ret(cursor)
 
-        # No space in TLAB - return NULL
+        # --- no_space: TLAB full or invalid, return NULL ---
         builder.position_at_end(no_space)
         builder.ret(ir.Constant(self.i8_ptr, None))
 

@@ -193,7 +193,7 @@ func main() -> int
 ''', "666\n")
 
 
-@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
+# BUG-004 fixed: CAS-based thread-safe TLAB allocation
 class TestParallelSieveSmall:
     """Small-scale parallel sieve tests."""
 
@@ -272,7 +272,7 @@ func main() -> int
 ''', "25\n")
 
 
-@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
+# BUG-004 fixed: CAS-based thread-safe TLAB allocation
 class TestParallelSieve:
     """Parallel sieve of Eratosthenes tests."""
 
@@ -441,7 +441,7 @@ func main() -> int
 ''', "1229\n")
 
 
-@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
+# BUG-004 fixed: CAS-based thread-safe TLAB allocation
 class TestParallelSieveStress:
     """Stress tests for parallel sieve at scale."""
 
@@ -664,7 +664,7 @@ func main() -> int
 
 
 @skip_on_ci
-@pytest.mark.xfail(reason="BUG-004: GC race condition with parallel Set allocations")
+# BUG-004 fixed: CAS-based thread-safe TLAB allocation
 class TestParallelSieve100M:
     """100 million element stress test."""
 
