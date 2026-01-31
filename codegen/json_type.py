@@ -190,12 +190,42 @@ class JsonGenerator:
         is_number_bool = builder.icmp_unsigned("!=", is_number, ir.Constant(i32, 0))
         builder.cbranch(is_number_bool, return_number, check_string)
 
-        # Return number as float JSON (cJSON stores all numbers as double)
+        # BUG-072 FIX: Check if number is an integer and create appropriate JSON type
+        # cJSON stores all numbers as double, but we want to preserve integer types
         builder.position_at_end(return_number)
         valuedouble_ptr = builder.gep(cjson, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         valuedouble = builder.load(valuedouble_ptr)
-        number_result = builder.call(cg.json_new_float, [valuedouble])
-        builder.ret(number_result)
+
+        # Convert to i64 and back to double to check if it's an integer
+        as_int = builder.fptosi(valuedouble, i64)
+        back_to_double = builder.sitofp(as_int, ir.DoubleType())
+
+        # Check if conversion is lossless (original == reconverted)
+        is_integer = builder.fcmp_ordered("==", valuedouble, back_to_double)
+
+        # Also check the value is within safe integer range for i64
+        # (avoid overflow on very large floats)
+        int_max = ir.Constant(ir.DoubleType(), float(2**63 - 1))
+        int_min = ir.Constant(ir.DoubleType(), float(-2**63))
+        in_upper = builder.fcmp_ordered("<=", valuedouble, int_max)
+        in_lower = builder.fcmp_ordered(">=", valuedouble, int_min)
+        in_range = builder.and_(in_upper, in_lower)
+        is_safe_int = builder.and_(is_integer, in_range)
+
+        # Create appropriate JSON type
+        return_int = func.append_basic_block("return_int")
+        return_float = func.append_basic_block("return_float")
+        builder.cbranch(is_safe_int, return_int, return_float)
+
+        # Return as JSON int
+        builder.position_at_end(return_int)
+        int_result = builder.call(cg.json_new_int, [as_int])
+        builder.ret(int_result)
+
+        # Return as JSON float
+        builder.position_at_end(return_float)
+        float_result = builder.call(cg.json_new_float, [valuedouble])
+        builder.ret(float_result)
 
         # Check for cJSON_String (type & 16)
         builder.position_at_end(check_string)
@@ -1079,34 +1109,111 @@ class JsonGenerator:
         """Implement as_int(): return the integer value from json.
 
         For first-class JSON variants, value is stored at offset 0 (8 bytes).
+
+        BUG-072 FIX: Check the type and convert floats to ints properly.
+        - TYPE_JSON_INT: return the raw i64 value
+        - TYPE_JSON_FLOAT: convert f64 to i64 via fptosi
+        - Other types: return 0
         """
         cg = self.cg
         func = cg.json_as_int
-        entry = func.append_basic_block("entry")
-        builder = ir.IRBuilder(entry)
-        i64 = ir.IntType(64)
+        func.args[0].name = "json"
 
-        # Load value from offset 0 (stored directly as i64)
-        value_ptr = builder.bitcast(func.args[0], i64.as_pointer())
-        value = builder.load(value_ptr)
-        builder.ret(value)
+        entry = func.append_basic_block("entry")
+        is_int = func.append_basic_block("is_int")
+        check_float = func.append_basic_block("check_float")
+        is_float = func.append_basic_block("is_float")
+        return_zero = func.append_basic_block("return_zero")
+
+        builder = ir.IRBuilder(entry)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        json_ptr = func.args[0]
+
+        # Get type_id from GC header
+        type_id = self._get_json_type_id(builder, json_ptr)
+
+        # Check if TYPE_JSON_INT (16)
+        is_int_type = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TYPE_JSON_INT))
+        builder.cbranch(is_int_type, is_int, check_float)
+
+        # TYPE_JSON_INT: return the raw i64 value
+        builder.position_at_end(is_int)
+        value_ptr_int = builder.bitcast(json_ptr, i64.as_pointer())
+        int_value = builder.load(value_ptr_int)
+        builder.ret(int_value)
+
+        # Check if TYPE_JSON_FLOAT (17)
+        builder.position_at_end(check_float)
+        is_float_type = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TYPE_JSON_FLOAT))
+        builder.cbranch(is_float_type, is_float, return_zero)
+
+        # TYPE_JSON_FLOAT: convert f64 to i64
+        builder.position_at_end(is_float)
+        value_ptr_float = builder.bitcast(json_ptr, i64.as_pointer())
+        float_bits = builder.load(value_ptr_float)
+        float_value = builder.bitcast(float_bits, ir.DoubleType())
+        converted_int = builder.fptosi(float_value, i64)
+        builder.ret(converted_int)
+
+        # Other types: return 0
+        builder.position_at_end(return_zero)
+        builder.ret(ir.Constant(i64, 0))
 
     def _implement_json_as_float(self):
         """Implement as_float(): return the float value from json.
 
         For first-class JSON variants, value is stored at offset 0 (f64 bitcast to i64).
+
+        BUG-072 FIX: Check the type and convert ints to floats properly.
+        - TYPE_JSON_FLOAT: return the raw f64 value (bitcast from i64)
+        - TYPE_JSON_INT: convert i64 to f64 via sitofp
+        - Other types: return 0.0
         """
         cg = self.cg
         func = cg.json_as_float
+        func.args[0].name = "json"
+
         entry = func.append_basic_block("entry")
+        is_float = func.append_basic_block("is_float")
+        check_int = func.append_basic_block("check_int")
+        is_int = func.append_basic_block("is_int")
+        return_zero = func.append_basic_block("return_zero")
+
         builder = ir.IRBuilder(entry)
         i64 = ir.IntType(64)
+        f64 = ir.DoubleType()
+        json_ptr = func.args[0]
 
-        # Load value from offset 0 (stored as bitcast i64) and bitcast back to double
-        value_ptr = builder.bitcast(func.args[0], i64.as_pointer())
-        value_i64 = builder.load(value_ptr)
-        value = builder.bitcast(value_i64, ir.DoubleType())
-        builder.ret(value)
+        # Get type_id from GC header
+        type_id = self._get_json_type_id(builder, json_ptr)
+
+        # Check if TYPE_JSON_FLOAT (17)
+        is_float_type = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TYPE_JSON_FLOAT))
+        builder.cbranch(is_float_type, is_float, check_int)
+
+        # TYPE_JSON_FLOAT: return the raw f64 value
+        builder.position_at_end(is_float)
+        value_ptr_float = builder.bitcast(json_ptr, i64.as_pointer())
+        float_bits = builder.load(value_ptr_float)
+        float_value = builder.bitcast(float_bits, f64)
+        builder.ret(float_value)
+
+        # Check if TYPE_JSON_INT (16)
+        builder.position_at_end(check_int)
+        is_int_type = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TYPE_JSON_INT))
+        builder.cbranch(is_int_type, is_int, return_zero)
+
+        # TYPE_JSON_INT: convert i64 to f64
+        builder.position_at_end(is_int)
+        value_ptr_int = builder.bitcast(json_ptr, i64.as_pointer())
+        int_value = builder.load(value_ptr_int)
+        converted_float = builder.sitofp(int_value, f64)
+        builder.ret(converted_float)
+
+        # Other types: return 0.0
+        builder.position_at_end(return_zero)
+        builder.ret(ir.Constant(f64, 0.0))
 
     def _implement_json_as_bool(self):
         """Implement as_bool(): return the boolean value from json.

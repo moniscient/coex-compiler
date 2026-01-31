@@ -1248,23 +1248,36 @@
 
 ### BUG-072: json.parse() stores all numbers as floats, as_int() doesn't convert
 - **Discovered**: 2026-01-29, during JSON value semantics test development
-- **Category**: Runtime
+- **Category**: Codegen
 - **Severity**: High
 - **Reproduction**:
 ```coex
 func main() -> int
     j: json = json.parse("[1,2,3]")
     e0: json = j[0]
-    print(e0.as_int())    # Prints 4607182418800017408 (float bits for 1.0)
+    print(e0.as_int())    # Was printing 4607182418800017408 (float bits for 1.0)
     return 0
 ~
 ```
-- **Observed**: `as_int()` returns garbage (IEEE 754 bit representation of float value)
+- **Observed**: `as_int()` returned garbage (IEEE 754 bit representation of float value)
 - **Expected**: `as_int()` should return the integer value (1)
-- **Root Cause**: `json.parse()` stores all numbers as floats (JSON_TYPE_FLOAT) even integers. However, `json_as_int()` doesn't check the type and convert - it just reinterprets the raw bits as int64.
-- **Files**: `runtime/coex_json.c` (json_parse, json_as_int)
-- **Status**: Open
-- **Workaround**: Use `as_float()` and cast to int, or avoid parsing + extracting integers
+- **Root Cause**: `json.parse()` stored all numbers as floats (TYPE_JSON_FLOAT) because cJSON uses doubles internally. However, `json_as_int()` didn't check the type - it just read the raw bits as int64, misinterpreting float bit patterns.
+- **Files**: `codegen/json_type.py` (_implement_json_from_cjson, _implement_json_as_int, _implement_json_as_float)
+- **Status**: Fixed (2026-01-30)
+- **Resolution**:
+  1. Updated `_implement_json_from_cjson` to detect integer values when parsing:
+     - Convert double to int64 via fptosi, then back to double via sitofp
+     - If values are equal and in int64 range, create TYPE_JSON_INT
+     - Otherwise create TYPE_JSON_FLOAT
+  2. Updated `_implement_json_as_int` to check type before returning:
+     - TYPE_JSON_INT: return raw i64 value
+     - TYPE_JSON_FLOAT: convert f64 to i64 via fptosi
+     - Other types: return 0
+  3. Updated `_implement_json_as_float` to handle both types:
+     - TYPE_JSON_FLOAT: return raw f64 value (bitcast from i64)
+     - TYPE_JSON_INT: convert i64 to f64 via sitofp
+     - Other types: return 0.0
+- **Tests**: All 74 JSON tests pass
 
 ### BUG-073: json.as_string() returns quoted form for parsed strings
 - **Discovered**: 2026-01-29, during JSON value semantics test development
@@ -1389,7 +1402,7 @@ func main() -> int
   - `coex_gc.py` (`_implement_gc_mark_object`, mark_pv_node section)
   - `codegen/list.py` (list_new, list_append)
   - `codegen/core.py` (list_struct definition)
-- **Status**: Fixed (Partial)
+- **Status**: Fixed (2026-01-30)
 - **Fix Implemented**:
   1. Added `TYPE_LIST_TAIL_REF` (type ID 15) for tail/leaf buffers containing reference type handles
   2. Added `flags` field (field 6) to List struct with `LIST_FLAG_ELEM_IS_REF` bit
@@ -1397,8 +1410,7 @@ func main() -> int
   4. Updated `list_append`, `list_set`, `list_getrange`, `list_setrange` to propagate flags
   5. Added `mark_list_tail_ref` block in GC to iterate and mark handles in ref-type buffers
   6. Updated all `list_new` call sites to pass appropriate flags
-- **Remaining Issue**: The fix works for `List<string>` and `List<List<T>>`, but `List<json>` still crashes during GC due to a separate issue: json variables themselves are not being properly rooted in the shadow stack. This is a different bug that affects any json variable + gc() combination, not specific to Lists.
-- **Note**: This bug only affects Lists containing reference types (json, strings, nested lists, UDTs) when GC runs. Lists with primitive types (int, float, bool) work correctly. The List structure and GC marking for reference type elements is now correct, but json has an independent rooting issue.
+- **Final Resolution**: The remaining `List<json>` issue was resolved by BUG-078 fix, which corrected map value marking in `gc_mark_hamt`. All List types with reference elements now work correctly with GC.
 
 ### BUG-077: Array<string> and other reference type Arrays need handle storage updates
 - **Discovered**: 2026-01-30, during Map/Set handle storage implementation
