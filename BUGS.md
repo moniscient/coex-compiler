@@ -1312,10 +1312,15 @@ func main() -> int
 ```
 - **Observed**: Compilation error `Type of #2 arg mismatch: i64 != %"struct.String"*`
 - **Expected**: `j.set(1, 42)` should dispatch to `json_set_index` and work correctly
-- **Root Cause**: Method dispatch in `codegen/expressions.py` routes all `.set()` calls to `json_set_field` which expects a string key. There's no overload resolution to call `json_set_index` when the first argument is an integer.
+- **Root Cause**: Two issues:
+  1. Method dispatch in `codegen/expressions.py` routed all `.set()` calls to `json_set_field`
+  2. `json_set_index` stored raw Json* pointers (8 bytes) instead of TaggedValues with handles
 - **Files**: `codegen/expressions.py` (generate_method_call), `codegen/json_type.py`
-- **Status**: Open
-- **Workaround**: Use bracket notation for reading (`j[i]`), but there's no workaround for setting by index - must rebuild array with append
+- **Status**: Fixed (2026-01-30)
+- **Resolution**:
+  1. Added special handling in `expressions.py:generate_method_call` to detect `Json.set` and dispatch based on argument type (int → `json_set_index`, string → `json_set_field`)
+  2. Fixed `_implement_json_set_index` in `json_type.py` to use TaggedValue with GC handle, matching `json_get_index` expectations
+- **Tests**: All 74 JSON tests + 35 GC tests pass
 
 ### BUG-075: Deep nested list type inference fails after ~3 levels in loops
 - **Discovered**: 2026-01-29, during Phase 7 list handle conversion implementation

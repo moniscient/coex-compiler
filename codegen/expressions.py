@@ -2335,6 +2335,32 @@ class ExpressionGenerator:
             elif method == "receive":
                 return cg._channel.generate_channel_receive(obj, cg.builder)
 
+        # BUG-074 FIX: Special handling for Json.set - dispatch based on key type
+        # json.set(int_index, value) -> json_set_index
+        # json.set(string_key, value) -> json_set_field
+        if type_name == "Json" and method == "set" and len(expr.args) >= 2:
+            key_arg = self.generate_expression(expr.args[0])
+            value_arg = self.generate_expression(expr.args[1])
+
+            # Convert value to json if needed
+            if not (isinstance(value_arg.type, ir.PointerType) and
+                    hasattr(value_arg.type.pointee, 'name') and
+                    value_arg.type.pointee.name == "struct.Json"):
+                value_arg = cg._convert_to_json(value_arg, expr.args[1])
+
+            # Check if key is a string
+            is_string_key = (isinstance(key_arg.type, ir.PointerType) and
+                            hasattr(key_arg.type.pointee, 'name') and
+                            key_arg.type.pointee.name == "struct.String")
+
+            if is_string_key:
+                # String key: call json_set_field(json*, string*, json*)
+                return cg.builder.call(cg.json_set_field, [obj, key_arg, value_arg])
+            else:
+                # Integer index: call json_set_index(json*, i64, json*)
+                key_i64 = cg._cast_value(key_arg, ir.IntType(64))
+                return cg.builder.call(cg.json_set_index, [obj, key_i64, value_arg])
+
         if type_name and type_name in cg.type_methods:
             method_map = cg.type_methods[type_name]
             if method in method_map:

@@ -1477,7 +1477,7 @@ class JsonGenerator:
         """Implement set(index, value): return new json with array element set.
 
         Uses type_id from header. Value (list handle) is at offset 0.
-        Now stores Json* pointers (8 bytes) instead of full structs.
+        Stores TaggedValue {type_id, handle} like json_get_index expects.
         """
         cg = self.cg
         func = cg.json_set_index
@@ -1503,12 +1503,18 @@ class JsonGenerator:
         list_i8 = builder.call(cg.gc.gc_handle_deref, [list_handle])
         list_ptr = builder.bitcast(list_i8, cg.list_struct.as_pointer())
 
-        # Convert json value to i8* for list storage
+        # Convert Json* to handle for storage (HANDLE STORAGE INVARIANT)
+        # This matches what json_get_index expects: TaggedValue with handle
         json_val = func.args[2]
-        json_as_i8ptr = builder.bitcast(json_val, i8.as_pointer())
+        json_val_i8 = builder.bitcast(json_val, i8.as_pointer())
+        json_handle = builder.call(cg.gc.gc_ptr_to_handle, [json_val_i8])
 
-        # Store Json* pointer (8 bytes) instead of the full struct
-        new_list = builder.call(cg.list_set, [list_ptr, func.args[1], json_as_i8ptr, ir.Constant(i64, 8)])
+        # Create TaggedValue with JSON handle (matches json_append and json_get_index)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, json_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
+
+        # Call list_set with TaggedValue size
+        new_list = builder.call(cg.list_set, [list_ptr, func.args[1], tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
         # Create new json array with new list
         result = builder.call(cg.json_new_array, [new_list])
