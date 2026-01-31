@@ -633,16 +633,28 @@ class StatementGenerator:
                 init_value = cg.builder.insert_value(init_value, ir.Constant(inner_type, None), 1)
         elif isinstance(stmt.initializer, ListExpr) and len(stmt.initializer.elements) == 0 \
                 and isinstance(stmt.type_annotation, ListType):
-            # Empty list [] with List<T> type annotation - use element type to set flags
+            # Empty list [] with List<T> type annotation
             i64 = ir.IntType(64)
             elem_type = stmt.type_annotation.element_type
-            is_ref = cg._is_reference_type(elem_type)
-            elem_size = i64.width // 8  # default 8 bytes
-            list_flags = cg.LIST_FLAG_ELEM_IS_REF if is_ref else 0
-            init_value = cg.builder.call(cg.list_new, [
-                ir.Constant(i64, elem_size),
-                ir.Constant(i64, list_flags)
-            ])
+
+            # Check if TaggedValue mode is enabled
+            use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+            if use_tagged:
+                # TaggedValue mode: always 16 bytes, flags=0 (type is in each element)
+                init_value = cg.builder.call(cg.list_new, [
+                    ir.Constant(i64, cg.TAGGED_VALUE_SIZE),
+                    ir.Constant(i64, 0)
+                ])
+            else:
+                # Legacy mode: use element type to set flags
+                is_ref = cg._is_reference_type(elem_type)
+                elem_size = i64.width // 8  # default 8 bytes
+                list_flags = cg.LIST_FLAG_ELEM_IS_REF if is_ref else 0
+                init_value = cg.builder.call(cg.list_new, [
+                    ir.Constant(i64, elem_size),
+                    ir.Constant(i64, list_flags)
+                ])
         elif (isinstance(stmt.initializer, MapExpr) and len(stmt.initializer.entries) == 0) or \
              (isinstance(stmt.initializer, JsonObjectExpr) and len(stmt.initializer.entries) == 0):
             if isinstance(stmt.type_annotation, SetType):

@@ -670,16 +670,74 @@ class LoopGenerator:
         elem_coex_type = self.get_list_element_coex_type(stmt)
         elem_type = self.get_list_element_type_for_pattern(stmt)
 
-        # Reference types are stored as handles - need to load handle and dereference
-        if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
-            handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-            handle = cg.builder.load(handle_ptr)
-            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-            elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+        if use_tagged:
+            # TaggedValue mode: elem_ptr points to TaggedValue {i64 type_id, i64 value}
+            tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+            type_id, raw_value = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+
+            # Check if this is a heap reference (type_id >= TYPE_HEAP_BASE)
+            is_heap = cg.builder.icmp_unsigned('>=', type_id,
+                ir.Constant(ir.IntType(64), cg.gc.TYPE_HEAP_BASE))
+
+            # Create basic blocks for conditional handling
+            func = cg.builder.function
+            heap_bb = func.append_basic_block("listfor_heap")
+            value_bb = func.append_basic_block("listfor_value")
+            merge_bb = func.append_basic_block("listfor_merge")
+
+            cg.builder.cbranch(is_heap, heap_bb, value_bb)
+
+            # Heap path: raw_value is a handle, dereference it
+            cg.builder.position_at_end(heap_bb)
+            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
+            # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+            if isinstance(elem_type, ir.PointerType):
+                heap_result = cg.builder.bitcast(ptr_i8, elem_type)
+            else:
+                # This branch won't be taken for primitives, but IR must be valid
+                heap_result = cg.builder.ptrtoint(ptr_i8, elem_type)
+            cg.builder.branch(merge_bb)
+            heap_bb_final = cg.builder.block
+
+            # Value path: raw_value is the actual value
+            cg.builder.position_at_end(value_bb)
+            # Convert raw_value (i64) to target type
+            if elem_type == ir.IntType(64):
+                value_result = raw_value
+            elif isinstance(elem_type, ir.IntType):
+                if elem_type.width < 64:
+                    value_result = cg.builder.trunc(raw_value, elem_type)
+                else:
+                    value_result = raw_value
+            elif isinstance(elem_type, ir.DoubleType):
+                value_result = cg.builder.bitcast(raw_value, elem_type)
+            elif isinstance(elem_type, ir.PointerType):
+                value_result = cg.builder.inttoptr(raw_value, elem_type)
+            else:
+                value_result = cg.builder.inttoptr(raw_value, elem_type)
+            cg.builder.branch(merge_bb)
+            value_bb_final = cg.builder.block
+
+            # Merge
+            cg.builder.position_at_end(merge_bb)
+            phi = cg.builder.phi(elem_type, "listfor_elem")
+            phi.add_incoming(heap_result, heap_bb_final)
+            phi.add_incoming(value_result, value_bb_final)
+            elem_val = phi
         else:
-            # Non-reference types: load directly - lists store values inline
-            typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
-            elem_val = cg.builder.load(typed_ptr)
+            # Legacy mode: Reference types are stored as handles - need to load handle and dereference
+            if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                handle = cg.builder.load(handle_ptr)
+                ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+            else:
+                # Non-reference types: load directly - lists store values inline
+                typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
+                elem_val = cg.builder.load(typed_ptr)
 
         # Bind pattern variables (supports destructuring)
         cg._bind_pattern(stmt.pattern, elem_val)
@@ -871,9 +929,17 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         elem_ptr = cg.builder.call(cg.list_get, [keys_list, current_idx])
 
-        # Keys are stored as i64 - load and bind
-        typed_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-        key_val = cg.builder.load(typed_ptr)
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+        if use_tagged:
+            # TaggedValue mode: extract value from {type_id, value} struct
+            tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+            type_id, key_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+        else:
+            # Keys are stored as i64 - load and bind
+            typed_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+            key_val = cg.builder.load(typed_ptr)
 
         # Get variable name from pattern
         var_name = stmt.var_name if stmt.var_name else "__loop_key"
@@ -964,9 +1030,17 @@ class LoopGenerator:
         current_idx = cg.builder.load(index_var)
         elem_ptr = cg.builder.call(cg.list_get, [elems_list, current_idx])
 
-        # Elements are stored as i64 - load and bind
-        typed_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-        elem_val = cg.builder.load(typed_ptr)
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+        if use_tagged:
+            # TaggedValue mode: extract value from {type_id, value} struct
+            tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+            type_id, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+        else:
+            # Elements are stored as i64 - load and bind
+            typed_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+            elem_val = cg.builder.load(typed_ptr)
 
         # Get variable name from pattern
         var_name = stmt.var_name if stmt.var_name else "__loop_elem"
@@ -1601,7 +1675,8 @@ class LoopGenerator:
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
         i8_ptr = ir.IntType(8).as_pointer()
-        elem_size = ir.Constant(i64, 8)
+        # Use TaggedValue size for list elements
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
 
         # Get task call info
         call_expr = body_expr
@@ -1764,14 +1839,14 @@ class LoopGenerator:
         result_ptr = cg.builder.gep(result_arr_typed, [ci], inbounds=True)
         result_val = cg.builder.load(result_ptr)
 
-        # Append to results list - list_append takes (list, elem_ptr, elem_size)
+        # Append to results list using TaggedValue
         current_results_list = cg.builder.load(cg.locals[stmt.results_target])
-        temp_ptr = cg.builder.alloca(i64, name="result_temp")
-        cg.builder.store(result_val, temp_ptr)
-        temp_i8_ptr = cg.builder.bitcast(temp_ptr, i8_ptr)
-        elem_size = ir.Constant(i64, 8)
+        # Create TaggedValue with TV_TYPE_INT for task result
+        tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, result_val)
+        tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         new_results_list = cg.builder.call(
-            cg.list_append, [current_results_list, temp_i8_ptr, elem_size]
+            cg.list_append, [current_results_list, tv_i8, elem_size]
         )
         cg.builder.store(new_results_list, cg.locals[stmt.results_target])
 

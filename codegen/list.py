@@ -150,23 +150,19 @@ class ListGenerator:
 
         # tail = allocate space for 32 elements (field 3)
         # Initial allocation: 32 * elem_size bytes
-        # Use TYPE_LIST_TAIL_REF if flags & 1, else TYPE_LIST_TAIL
+        # With TaggedValues enabled, all elements are TaggedValues (16 bytes each)
+        # and the GC uses tv_mark_array to check each element's type_id
         tail_capacity = ir.Constant(i64, 32)
         tail_size = builder.mul(tail_capacity, elem_size_arg)
 
-        # Check if elements are reference types (flags & 1)
-        is_ref = builder.and_(flags_arg, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
-        is_ref_bool = builder.icmp_unsigned("!=", is_ref, ir.Constant(i64, 0))
-        tail_type_ref = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
-        tail_type_prim = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
-        tail_type_id = builder.select(is_ref_bool, tail_type_ref, tail_type_prim)
-
+        # All tail buffers use TYPE_LIST_TAIL - the GC will iterate through
+        # TaggedValues and only mark heap references (type_id >= TYPE_HEAP_BASE)
+        tail_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
         tail_ptr = cg.gc.alloc_arena_or_gc(builder, tail_size, tail_type_id)
 
-        # Zero-initialize tail buffer for reference types to prevent GC from
-        # tracing uninitialized slots as handles (BUG-076 fix)
-        with builder.if_then(is_ref_bool) as then:
-            builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(8), 0), tail_size])
+        # Always zero-initialize tail buffer since GC iterates through all
+        # TaggedValues and we don't want uninitialized type_id values
+        builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(8), 0), tail_size])
 
         # Phase 4: Store as i64 handle
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -308,12 +304,9 @@ class ListGenerator:
         pv_node_size = ir.Constant(i64, 32 * 8)  # 32 pointers (no refcount - GC handles it)
         pv_node_type_id = ir.Constant(i32, cg.gc.TYPE_PV_NODE)
 
-        # Determine leaf type ID based on flags (use TYPE_LIST_TAIL_REF if elements are reference types)
-        is_ref = builder.and_(old_flags, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
-        is_ref_bool = builder.icmp_unsigned("!=", is_ref, ir.Constant(i64, 0))
-        leaf_type_ref = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
-        leaf_type_prim = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
-        leaf_type_id = builder.select(is_ref_bool, leaf_type_ref, leaf_type_prim)
+        # All leaf buffers use TYPE_LIST_TAIL - the GC will iterate through
+        # TaggedValues and only mark heap references (type_id >= TYPE_HEAP_BASE)
+        leaf_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
 
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
@@ -891,12 +884,9 @@ class ListGenerator:
         pv_node_size = ir.Constant(i64, 32 * 8)  # 32 pointers (no refcount - GC handles it)
         pv_node_type_id = ir.Constant(i32, cg.gc.TYPE_PV_NODE)
 
-        # Determine leaf type ID based on flags (use TYPE_LIST_TAIL_REF if elements are reference types)
-        is_ref_tr = builder.and_(old_flags, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF))
-        is_ref_bool_tr = builder.icmp_unsigned("!=", is_ref_tr, ir.Constant(i64, 0))
-        leaf_type_ref_tr = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL_REF)
-        leaf_type_prim_tr = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
-        leaf_type_id = builder.select(is_ref_bool_tr, leaf_type_ref_tr, leaf_type_prim_tr)
+        # All leaf buffers use TYPE_LIST_TAIL - the GC will iterate through
+        # TaggedValues and only mark heap references (type_id >= TYPE_HEAP_BASE)
+        leaf_type_id = ir.Constant(i32, cg.gc.TYPE_LIST_TAIL)
 
         # Check if root is null - Phase 4: compare handle to 0
         root_null_check = builder.icmp_unsigned("==", old_root_handle, ir.Constant(i64, 0))

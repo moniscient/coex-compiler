@@ -55,16 +55,26 @@ class ConversionGenerator:
         # Get List length
         list_len = self.cg.builder.call(self.cg.list_len, [list_ptr])
 
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
+
         # Get List elem_size (field 5 in PV structure)
         elem_size_ptr = self.cg.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
-        elem_size = self.cg.builder.load(elem_size_ptr)
+        list_elem_size = self.cg.builder.load(elem_size_ptr)
+
+        # For Arrays, we store raw values (8 bytes), not TaggedValues
+        # If List uses TaggedValue, we'll extract just the value when copying
+        if use_tagged:
+            array_elem_size = ir.Constant(i64, 8)  # Arrays store raw i64 values
+        else:
+            array_elem_size = list_elem_size
 
         # Create new Array with same length as List
         # Use array_new_ref if elements are reference types for proper GC tracing
         if is_ref_type:
-            array_ptr = self.cg.builder.call(self.cg.array_new_ref, [list_len, elem_size])
+            array_ptr = self.cg.builder.call(self.cg.array_new_ref, [list_len, array_elem_size])
         else:
-            array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, elem_size])
+            array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, array_elem_size])
 
         # Array data: compute handle + offset
         # Field 0: handle, Field 4: offset
@@ -102,11 +112,19 @@ class ConversionGenerator:
         elem_ptr = self.cg.builder.call(self.cg.list_get, [list_ptr, idx])
 
         # Calculate destination in array
-        offset = self.cg.builder.mul(idx, elem_size)
+        offset = self.cg.builder.mul(idx, array_elem_size)
         dest_ptr = self.cg.builder.gep(array_data, [offset])
 
-        # Copy element
-        self.cg.builder.call(self.cg.memcpy, [dest_ptr, elem_ptr, elem_size])
+        if use_tagged:
+            # TaggedValue mode: extract value from {type_id, value} struct
+            tv_ptr = self.cg.builder.bitcast(elem_ptr, self.cg.gc.tagged_value_ptr_type)
+            type_id, elem_val = self.cg.gc.extract_tagged_value(self.cg.builder, tv_ptr)
+            # Store just the value (8 bytes) to array
+            typed_dest = self.cg.builder.bitcast(dest_ptr, i64.as_pointer())
+            self.cg.builder.store(elem_val, typed_dest)
+        else:
+            # Legacy mode: copy element directly
+            self.cg.builder.call(self.cg.memcpy, [dest_ptr, elem_ptr, list_elem_size])
 
         # Increment index
         next_idx = self.cg.builder.add(idx, ir.Constant(i64, 1))
@@ -122,7 +140,7 @@ class ConversionGenerator:
         """Convert a Set to an Array (Set.packed() -> Array).
 
         Creates a new Array with the elements from the HAMT-based Set.
-        Uses set_to_list to collect keys, then copies to array.
+        Uses set_to_list to collect keys, then iterates and extracts values.
 
         N-D Array struct layout:
             Field 0: handle (i64) - GC handle for data buffer
@@ -142,16 +160,14 @@ class ConversionGenerator:
         set_len = self.cg.builder.call(self.cg.set_len, [set_ptr])
 
         # Create Array with len = set_len, elem_size = 8 (i64 keys)
-        elem_size = ir.Constant(i64, 8)
-        array_ptr = self.cg.builder.call(self.cg.array_new, [set_len, elem_size])
+        array_elem_size = ir.Constant(i64, 8)
+        array_ptr = self.cg.builder.call(self.cg.array_new, [set_len, array_elem_size])
 
         # Get list of keys from set using set_to_list (HAMT-based)
         key_list = self.cg.builder.call(self.cg.set_to_list, [set_ptr])
 
-        # Get list data pointer (field 3 in List struct) - Phase 4: handle
-        list_data_handle_ptr = self.cg.builder.gep(key_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        list_data_handle = self.cg.builder.load(list_data_handle_ptr)
-        list_data = self.cg.builder.inttoptr(list_data_handle, i8_ptr)
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
 
         # Get array data pointer: compute handle + offset
         # Field 0: handle, Field 4: offset
@@ -162,9 +178,56 @@ class ConversionGenerator:
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
-        # Copy list data to array: len * 8 bytes
-        copy_size = self.cg.builder.mul(set_len, elem_size)
-        self.cg.builder.call(self.cg.memcpy, [array_data, list_data, copy_size])
+        # Iterate through list and copy each element to array
+        # This is needed because list may contain TaggedValues (16 bytes each)
+        # while array stores raw values (8 bytes each)
+        idx_alloca = self.cg.builder.alloca(i64, name="set_to_arr_idx")
+        self.cg.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = func.append_basic_block("set_to_arr_cond")
+        body_block = func.append_basic_block("set_to_arr_body")
+        end_block = func.append_basic_block("set_to_arr_end")
+
+        self.cg.builder.branch(cond_block)
+
+        # Condition: idx < set_len
+        self.cg.builder.position_at_end(cond_block)
+        idx = self.cg.builder.load(idx_alloca)
+        cond = self.cg.builder.icmp_signed("<", idx, set_len)
+        self.cg.builder.cbranch(cond, body_block, end_block)
+
+        # Body: copy element from list to array
+        self.cg.builder.position_at_end(body_block)
+        idx = self.cg.builder.load(idx_alloca)
+
+        # Get element from list
+        elem_ptr = self.cg.builder.call(self.cg.list_get, [key_list, idx])
+
+        # Calculate destination in array
+        offset = self.cg.builder.mul(idx, array_elem_size)
+        dest_ptr = self.cg.builder.gep(array_data, [offset])
+
+        if use_tagged:
+            # TaggedValue mode: extract value from {type_id, value} struct
+            tv_ptr = self.cg.builder.bitcast(elem_ptr, self.cg.gc.tagged_value_ptr_type)
+            type_id, elem_val = self.cg.gc.extract_tagged_value(self.cg.builder, tv_ptr)
+            # Store just the value (8 bytes) to array
+            typed_dest = self.cg.builder.bitcast(dest_ptr, i64.as_pointer())
+            self.cg.builder.store(elem_val, typed_dest)
+        else:
+            # Legacy mode: copy element directly
+            typed_src = self.cg.builder.bitcast(elem_ptr, i64.as_pointer())
+            elem_val = self.cg.builder.load(typed_src)
+            typed_dest = self.cg.builder.bitcast(dest_ptr, i64.as_pointer())
+            self.cg.builder.store(elem_val, typed_dest)
+
+        # Increment index
+        next_idx = self.cg.builder.add(idx, ir.Constant(i64, 1))
+        self.cg.builder.store(next_idx, idx_alloca)
+        self.cg.builder.branch(cond_block)
+
+        # End
+        self.cg.builder.position_at_end(end_block)
 
         return array_ptr
 
@@ -193,9 +256,12 @@ class ConversionGenerator:
         # Get Array length (shape[0] for 1D arrays)
         array_len = self.cg.builder.call(self.cg.array_len, [array_ptr])
 
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
+
         # Get Array elem_size (field 5 in N-D Array layout)
         elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
-        elem_size = self.cg.builder.load(elem_size_ptr)
+        array_elem_size = self.cg.builder.load(elem_size_ptr)
 
         # Get Array data: compute handle + offset
         # Field 0: handle, Field 4: offset
@@ -206,8 +272,12 @@ class ConversionGenerator:
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
-        # Create new empty List with same elem_size (primitive array elements, no reference types)
-        list_ptr = self.cg.builder.call(self.cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        # Create new empty List - use TaggedValue size if enabled
+        if use_tagged:
+            list_elem_size = ir.Constant(i64, self.cg.TAGGED_VALUE_SIZE)
+        else:
+            list_elem_size = array_elem_size
+        list_ptr = self.cg.builder.call(self.cg.list_new, [list_elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Store list_ptr in alloca since list_append returns new list
         list_alloca = self.cg.builder.alloca(self.cg.list_struct.as_pointer(), name="arr_to_list")
@@ -234,12 +304,23 @@ class ConversionGenerator:
         idx = self.cg.builder.load(idx_alloca)
 
         # Calculate source address in array
-        offset = self.cg.builder.mul(idx, elem_size)
+        offset = self.cg.builder.mul(idx, array_elem_size)
         elem_ptr = self.cg.builder.gep(array_data, [offset])
 
         # Append element to list
         current_list = self.cg.builder.load(list_alloca)
-        new_list = self.cg.builder.call(self.cg.list_append, [current_list, elem_ptr, elem_size])
+
+        if use_tagged:
+            # TaggedValue mode: Load raw value and wrap in TaggedValue
+            typed_ptr = self.cg.builder.bitcast(elem_ptr, i64.as_pointer())
+            elem_val = self.cg.builder.load(typed_ptr)
+            tv_ptr = self.cg.gc.create_tagged_value(self.cg.builder, self.cg.gc.TV_TYPE_INT, elem_val)
+            tv_i8 = self.cg.builder.bitcast(tv_ptr, i8_ptr)
+            new_list = self.cg.builder.call(self.cg.list_append, [current_list, tv_i8, list_elem_size])
+        else:
+            # Legacy mode: append raw element
+            new_list = self.cg.builder.call(self.cg.list_append, [current_list, elem_ptr, array_elem_size])
+
         self.cg.builder.store(new_list, list_alloca)
 
         # Increment index
@@ -382,9 +463,18 @@ class ConversionGenerator:
 
         # Get element from list using list_get
         elem_ptr = self.cg.builder.call(self.cg.list_get, [list_ptr, idx])
-        # Load element as i64 (assuming elements are stored as i64)
-        typed_ptr = self.cg.builder.bitcast(elem_ptr, i64.as_pointer())
-        elem_val = self.cg.builder.load(typed_ptr)
+
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
+
+        if use_tagged:
+            # TaggedValue mode: extract value from {type_id, value} struct
+            tv_ptr = self.cg.builder.bitcast(elem_ptr, self.cg.gc.tagged_value_ptr_type)
+            type_id, elem_val = self.cg.gc.extract_tagged_value(self.cg.builder, tv_ptr)
+        else:
+            # Legacy mode: load element as i64 (assuming elements are stored as i64)
+            typed_ptr = self.cg.builder.bitcast(elem_ptr, i64.as_pointer())
+            elem_val = self.cg.builder.load(typed_ptr)
 
         # Add element to set (set_add returns new set)
         current_set = self.cg.builder.load(set_alloca)

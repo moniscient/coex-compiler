@@ -49,39 +49,76 @@ class GarbageCollector:
     GC_TRACE_ALL = 4         # Everything including pointer traversals
 
     # ============================================================
-    # Built-in Type IDs
+    # Tagged Value Type System
     # ============================================================
     #
-    # HANDLE STORAGE INVARIANT (Critical for GC correctness):
-    # All stored references to GC-managed objects must be HANDLES (i64 indices
-    # into the handle table), never raw pointers. This applies to:
-    #   - Collection elements that are reference types (strings, nested lists, etc.)
-    #   - Struct fields containing reference types
-    #   - Map/Set keys and values that are reference types
+    # Universal Tagged Values: Every value stored in collections is a
+    # TaggedValue = { i64 type_id, i64 value }. This makes values self-
+    # describing, allowing the GC to trace references correctly without
+    # depending on compile-time type inference.
     #
-    # Types with _REF suffix (TYPE_LIST_TAIL_REF, TYPE_ARRAY_DATA_REF) indicate
-    # buffers where each element is an i64 handle that needs GC marking. The GC
-    # marks these by iterating through the buffer and pushing each handle onto
-    # the mark worklist.
+    # Type ID Scheme:
+    #   - Primitive types (0-9): value field is raw data, no GC tracing
+    #   - Heap types (64+): value field is GC handle, needs tracing
+    #   - Internal types (80-99): only in object headers, not TaggedValue
+    #   - User types (128+): all heap-allocated
     #
-    # Types without _REF suffix (TYPE_LIST_TAIL, TYPE_ARRAY_DATA) contain raw
-    # primitive data (int, float, bool, byte) that the GC ignores during marking.
+    # The key invariant: is_heap_value_type(type_id) = (type_id >= TYPE_HEAP_BASE)
     #
-    # Pattern for storing reference types in collections:
-    #   1. Allocate buffer with TYPE_*_REF type ID
-    #   2. For each element: handle = gc_ptr_to_handle(ptr); store handle
-    #   3. For retrieval: handle = load; ptr = gc_handle_deref(handle)
-    #
-    # Why handles, not pointers?
-    #   - Handles are stable across GC cycles; pointers may become invalid
-    #   - The handle table is the single source of truth for object locations
-    #   - Concurrent GC requires handle indirection for safe pointer fixup
-    #   - Raw pointers may "work" temporarily without compaction, but will fail
-    #     under GC pressure when objects move or are collected
-    #
-    # Debug: Use gc_validate_handle_storage() to detect invariant violations
+    # OLD TYPE IDS (for backward compatibility during migration):
+    # The legacy type IDs (1-22) are still used for object headers.
+    # During migration, we map between old and new IDs as needed.
     # ============================================================
 
+    # ------------------------------------------------------------
+    # NEW TYPE IDS - TaggedValue Compatible
+    # ------------------------------------------------------------
+    # Primitive types: value field is raw data, no GC handle
+    TV_TYPE_UNKNOWN = 0
+    TV_TYPE_INT = 1
+    TV_TYPE_FLOAT = 2
+    TV_TYPE_BOOL = 3
+    TV_TYPE_BYTE = 4
+    TV_TYPE_CHAR = 5
+    TV_TYPE_JSON_NULL = 6    # value = 0
+    TV_TYPE_JSON_BOOL = 7    # value = 0 or 1
+    TV_TYPE_JSON_INT = 8     # value = raw i64
+    TV_TYPE_JSON_FLOAT = 9   # value = f64 bitcast to i64
+
+    # Heap reference threshold - all types >= this have GC handles
+    TYPE_HEAP_BASE = 64
+
+    # Heap types: value field is GC handle, needs tracing
+    TV_TYPE_STRING = 64
+    TV_TYPE_LIST = 65
+    TV_TYPE_MAP = 66
+    TV_TYPE_SET = 67
+    TV_TYPE_ARRAY = 68
+    TV_TYPE_CHANNEL = 69
+    TV_TYPE_JSON_STRING = 70  # value = handle to String
+    TV_TYPE_JSON_ARRAY = 71   # value = handle to List
+    TV_TYPE_JSON_OBJECT = 72  # value = handle to Map
+    TV_TYPE_TUPLE = 73
+
+    # Internal structural types (only in object headers, not in TaggedValue)
+    TV_TYPE_STRING_DATA = 80
+    TV_TYPE_LIST_TAIL = 81
+    TV_TYPE_PV_NODE = 82
+    TV_TYPE_CHANNEL_BUFFER = 83
+    TV_TYPE_ARRAY_DATA = 84
+    TV_TYPE_HAMT_NODE = 85
+    TV_TYPE_HAMT_LEAF = 86
+    TV_TYPE_MAP_ENTRY = 87
+    TV_TYPE_SET_ENTRY = 88
+
+    # User-defined types start here (all heap-allocated)
+    TV_TYPE_FIRST_USER = 128
+
+    # ------------------------------------------------------------
+    # LEGACY TYPE IDS (for backward compatibility)
+    # ------------------------------------------------------------
+    # These are used by existing object headers and GC marking.
+    # Will be phased out as collections migrate to TaggedValue.
     TYPE_UNKNOWN = 0
     TYPE_LIST = 1            # List struct (root_handle, len, depth, tail_handle, ...)
     TYPE_STRING = 2          # String struct (data_handle, len, ...)
@@ -105,9 +142,34 @@ class GarbageCollector:
     TYPE_JSON_ARRAY = 19     # JSON array - i64 handle to List
     TYPE_JSON_OBJECT = 20    # JSON object - i64 handle to Map
     # ---- Reference-type buffers (elements are HANDLES, not raw data) ----
-    TYPE_LIST_TAIL_REF = 21  # List tail buffer - REFERENCE elements (each i64 is a handle)
-    TYPE_ARRAY_DATA_REF = 22 # Array data buffer - REFERENCE elements (each i64 is a handle)
+    # DEPRECATED: These type IDs are kept for backward compatibility only.
+    # With USE_TAGGED_VALUES=True, all list tails use TYPE_LIST_TAIL and store
+    # TaggedValues {type_id, value} where the GC reads type_id from each element
+    # to determine if it's a heap reference. These _REF type IDs are no longer
+    # used for new allocations.
+    TYPE_LIST_TAIL_REF = 21  # [DEPRECATED] List tail buffer - REFERENCE elements
+    TYPE_ARRAY_DATA_REF = 22 # [DEPRECATED] Array data buffer - REFERENCE elements
     TYPE_FIRST_USER = 23     # First ID for user-defined types
+
+    # ------------------------------------------------------------
+    # Type ID Mapping (Legacy <-> TaggedValue)
+    # ------------------------------------------------------------
+    # Maps legacy object header type IDs to TaggedValue type IDs
+    LEGACY_TO_TV_TYPE = {
+        1: 65,   # TYPE_LIST -> TV_TYPE_LIST
+        2: 64,   # TYPE_STRING -> TV_TYPE_STRING
+        3: 66,   # TYPE_MAP -> TV_TYPE_MAP
+        5: 67,   # TYPE_SET -> TV_TYPE_SET
+        7: 69,   # TYPE_CHANNEL -> TV_TYPE_CHANNEL
+        8: 68,   # TYPE_ARRAY -> TV_TYPE_ARRAY
+        14: 6,   # TYPE_JSON_NULL -> TV_TYPE_JSON_NULL
+        15: 7,   # TYPE_JSON_BOOL -> TV_TYPE_JSON_BOOL
+        16: 8,   # TYPE_JSON_INT -> TV_TYPE_JSON_INT
+        17: 9,   # TYPE_JSON_FLOAT -> TV_TYPE_JSON_FLOAT
+        18: 70,  # TYPE_JSON_STRING -> TV_TYPE_JSON_STRING
+        19: 71,  # TYPE_JSON_ARRAY -> TV_TYPE_JSON_ARRAY
+        20: 72,  # TYPE_JSON_OBJECT -> TV_TYPE_JSON_OBJECT
+    }
 
     def __init__(self, module: ir.Module, codegen: 'CodeGenerator'):
         self.module = module
@@ -131,6 +193,17 @@ class GarbageCollector:
         # GC-specific LLVM types
         self.header_type = None
         self.gc_frame_type = None
+
+        # TaggedValue type: { i64 type_id, i64 value }
+        # Every collection element will be stored as a TaggedValue
+        self.tagged_value_type = ir.LiteralStructType([self.i64, self.i64])
+        self.tagged_value_ptr_type = self.tagged_value_type.as_pointer()
+
+        # TaggedValue helper functions
+        self.tv_new = None           # Create TaggedValue from type_id and value
+        self.tv_get_type = None      # Extract type_id from TaggedValue
+        self.tv_get_value = None     # Extract value from TaggedValue
+        self.tv_is_heap = None       # Check if type_id indicates heap reference
 
         # GC global variables
         self.gc_frame_top = None      # Top of shadow stack frame chain
@@ -282,6 +355,10 @@ class GarbageCollector:
         self._implement_gc_sweep()
         self._implement_gc_collect()
         self._implement_gc_safepoint()
+        # TaggedValue helper functions
+        self._implement_tv_is_heap_type()
+        self._implement_tv_mark()
+        self._implement_tv_mark_array()
         self._add_nursery_stubs()  # Disabled nursery context stubs for compatibility
         # Dual-heap async GC implementations
         self._implement_gc_capture_snapshot()
@@ -973,6 +1050,28 @@ class GarbageCollector:
         gc_sweep_ty = ir.FunctionType(self.void, [])
         self.gc_sweep = ir.Function(self.module, gc_sweep_ty, name="coex_gc_sweep")
 
+        # ============================================================
+        # TaggedValue Helper Functions
+        # ============================================================
+        # TaggedValue = { i64 type_id, i64 value }
+        # Used for self-describing collection elements
+
+        # tv_is_heap_type(type_id: i64) -> i1
+        # Check if a type_id indicates a heap reference (>= TYPE_HEAP_BASE)
+        tv_is_heap_ty = ir.FunctionType(self.i1, [self.i64])
+        self.tv_is_heap = ir.Function(self.module, tv_is_heap_ty, name="coex_tv_is_heap_type")
+        self.tv_is_heap.attributes.add('alwaysinline')
+
+        # tv_mark(tv_ptr: {i64, i64}*) -> void
+        # Mark the value in a TaggedValue if it's a heap reference
+        tv_mark_ty = ir.FunctionType(self.void, [self.tagged_value_ptr_type])
+        self.tv_mark = ir.Function(self.module, tv_mark_ty, name="coex_tv_mark")
+
+        # tv_mark_array(data: {i64, i64}*, count: i64) -> void
+        # Mark all TaggedValues in an array
+        tv_mark_array_ty = ir.FunctionType(self.void, [self.tagged_value_ptr_type, self.i64])
+        self.tv_mark_array = ir.Function(self.module, tv_mark_array_ty, name="coex_tv_mark_array")
+
         # gc_safepoint() -> void
         # Check allocation threshold and trigger GC if needed
         # Safe to call at function entry (before any allocations in the function)
@@ -1511,6 +1610,151 @@ class GarbageCollector:
     def get_type_id(self, type_name: str) -> int:
         """Get type_id for a type name, defaulting to TYPE_UNKNOWN"""
         return self.type_descriptors.get(type_name, self.TYPE_UNKNOWN)
+
+    # ========================================================================
+    # TaggedValue Helper Methods (for codegen)
+    # ========================================================================
+
+    def get_tv_type_id(self, coex_type) -> int:
+        """Get the TaggedValue type ID for a Coex type.
+
+        Maps Coex types to the new TaggedValue type ID scheme:
+        - Primitives (int, float, bool, byte, char) -> TV_TYPE_INT/FLOAT/BOOL/BYTE/CHAR
+        - Heap types (string, List, Map, etc.) -> TV_TYPE_STRING/LIST/MAP/etc.
+        - JSON variants -> TV_TYPE_JSON_*
+        - User-defined types -> TV_TYPE_FIRST_USER + offset
+
+        Args:
+            coex_type: A Coex type (PrimitiveType, ListType, NamedType, etc.)
+
+        Returns:
+            The TaggedValue type ID constant
+        """
+        from ast_nodes import PrimitiveType, ListType, MapType, SetType, ArrayType, NamedType
+
+        if isinstance(coex_type, PrimitiveType):
+            name = coex_type.name
+            if name == "int":
+                return self.TV_TYPE_INT
+            elif name == "float":
+                return self.TV_TYPE_FLOAT
+            elif name == "bool":
+                return self.TV_TYPE_BOOL
+            elif name == "byte":
+                return self.TV_TYPE_BYTE
+            elif name == "char":
+                return self.TV_TYPE_CHAR
+            elif name == "string":
+                return self.TV_TYPE_STRING
+            elif name == "json":
+                # JSON is always a heap-allocated pointer - use a heap type ID
+                # (actual JSON variant type is stored in the object's header)
+                return self.TV_TYPE_JSON_OBJECT
+        elif isinstance(coex_type, ListType):
+            return self.TV_TYPE_LIST
+        elif isinstance(coex_type, MapType):
+            return self.TV_TYPE_MAP
+        elif isinstance(coex_type, SetType):
+            return self.TV_TYPE_SET
+        elif isinstance(coex_type, ArrayType):
+            return self.TV_TYPE_ARRAY
+        elif isinstance(coex_type, NamedType):
+            name = coex_type.name
+            if name == "string":
+                return self.TV_TYPE_STRING
+            elif name == "json":
+                # JSON is always a heap-allocated pointer
+                return self.TV_TYPE_JSON_OBJECT
+            elif name == "Channel":
+                return self.TV_TYPE_CHANNEL
+            elif name in self.type_descriptors:
+                # User-defined type - map legacy ID to TV ID
+                legacy_id = self.type_descriptors[name]
+                if legacy_id >= self.TYPE_FIRST_USER:
+                    # User type: TV_TYPE_FIRST_USER + (legacy_id - TYPE_FIRST_USER)
+                    return self.TV_TYPE_FIRST_USER + (legacy_id - self.TYPE_FIRST_USER)
+        return self.TV_TYPE_UNKNOWN
+
+    def is_tv_heap_type(self, tv_type_id: int) -> bool:
+        """Check if a TaggedValue type ID represents a heap type.
+
+        Returns True if tv_type_id >= TYPE_HEAP_BASE (64).
+        """
+        return tv_type_id >= self.TYPE_HEAP_BASE
+
+    def create_tagged_value(self, builder: ir.IRBuilder, type_id: int, value: ir.Value) -> ir.Value:
+        """Create a TaggedValue struct on the stack.
+
+        Args:
+            builder: LLVM IR builder
+            type_id: The TaggedValue type ID constant
+            value: The value (raw primitive or GC handle)
+
+        Returns:
+            Pointer to the TaggedValue struct (stack-allocated)
+        """
+        tv_ptr = builder.alloca(self.tagged_value_type, name="tagged_val")
+
+        # Store type_id (field 0)
+        type_id_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, type_id), type_id_ptr)
+
+        # Store value (field 1) - may need casting
+        value_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+
+        # Cast value to i64 if needed
+        if value.type == self.i64:
+            builder.store(value, value_ptr)
+        elif isinstance(value.type, ir.IntType):
+            # Extend or truncate to i64
+            if value.type.width < 64:
+                val64 = builder.zext(value, self.i64)
+            else:
+                val64 = builder.trunc(value, self.i64)
+            builder.store(val64, value_ptr)
+        elif isinstance(value.type, ir.DoubleType):
+            # Bitcast float to i64
+            val64 = builder.bitcast(value, self.i64)
+            builder.store(val64, value_ptr)
+        elif isinstance(value.type, ir.PointerType):
+            # Convert pointer to i64
+            val64 = builder.ptrtoint(value, self.i64)
+            builder.store(val64, value_ptr)
+        else:
+            # Try direct store and hope for the best
+            builder.store(value, value_ptr)
+
+        return tv_ptr
+
+    def extract_tagged_value(self, builder: ir.IRBuilder, tv_ptr: ir.Value) -> tuple:
+        """Extract type_id and value from a TaggedValue pointer.
+
+        Args:
+            builder: LLVM IR builder
+            tv_ptr: Pointer to TaggedValue struct
+
+        Returns:
+            Tuple of (type_id: ir.Value, value: ir.Value) both as i64
+        """
+        type_id_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+
+        value_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        value = builder.load(value_ptr)
+
+        return type_id, value
 
     def finalize_type_tables(self):
         """Create global offset arrays for registered user types.
@@ -2884,6 +3128,9 @@ class GarbageCollector:
         mark_json_string = func.append_basic_block("mark_json_string")
         mark_json_array = func.append_basic_block("mark_json_array")
         mark_json_object = func.append_basic_block("mark_json_object")
+        # TaggedValue-based list tail marking (USE_TAGGED_VALUES = True)
+        mark_list_tail_tagged = func.append_basic_block("mark_list_tail_tagged")
+        # Legacy ref-based list tail marking (backward compatibility)
         mark_list_tail_ref = func.append_basic_block("mark_list_tail_ref")
         list_tail_ref_loop = func.append_basic_block("list_tail_ref_loop")
         list_tail_ref_check = func.append_basic_block("list_tail_ref_check")
@@ -3063,6 +3310,9 @@ class GarbageCollector:
         switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_STRING), mark_json_string)
         switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_ARRAY), mark_json_array)
         switch.add_case(ir.Constant(self.i64, self.TYPE_JSON_OBJECT), mark_json_object)
+        # TaggedValue-based list tail (USE_TAGGED_VALUES = True)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_LIST_TAIL), mark_list_tail_tagged)
+        # Legacy ref-based marking (backward compatibility)
         switch.add_case(ir.Constant(self.i64, self.TYPE_LIST_TAIL_REF), mark_list_tail_ref)
         switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY_DATA_REF), mark_array_data_ref)
 
@@ -3246,17 +3496,33 @@ class GarbageCollector:
         builder.branch(done)
 
         # ============================================================
+        # Mark LIST_TAIL (TaggedValue mode): Each element is a TaggedValue
+        # ============================================================
+        # With USE_TAGGED_VALUES = True, list tail buffers contain TaggedValues
+        # {i64 type_id, i64 value}. We use tv_mark_array to iterate through
+        # all elements and mark only those where type_id >= TYPE_HEAP_BASE.
+        # ============================================================
+        builder.position_at_end(mark_list_tail_tagged)
+        # Get object size from header to calculate element count
+        header_ptr_tv = builder.inttoptr(
+            builder.sub(builder.ptrtoint(ptr, self.i64), ir.Constant(self.i64, self.HEADER_SIZE)),
+            self.header_type.as_pointer()
+        )
+        size_ptr_tv = builder.gep(header_ptr_tv, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        buffer_size_tv = builder.load(size_ptr_tv)
+        # Element count = size / 16 (TaggedValues are 16 bytes each)
+        elem_count_tv = builder.udiv(buffer_size_tv, ir.Constant(self.i64, 16))
+        # Cast buffer to TaggedValue pointer and call tv_mark_array
+        tv_ptr = builder.bitcast(ptr, self.tagged_value_ptr_type)
+        builder.call(self.tv_mark_array, [tv_ptr, elem_count_tv])
+        builder.branch(done)
+
+        # ============================================================
         # Mark LIST_TAIL_REF: Handle buffer for reference-type list elements
         # ============================================================
-        # HANDLE STORAGE INVARIANT: This buffer contains i64 HANDLES, not pointers.
-        # Each element was stored via: handle = gc_ptr_to_handle(obj); store handle
-        # We mark by iterating through and pushing each handle to the worklist.
-        #
-        # Pattern:
-        #   for i in 0..elem_count:
-        #       handle = buffer[i]
-        #       if handle != 0:  # skip null handles
-        #           gc_mark_push(handle)
+        # LEGACY: This was used before TaggedValues. Kept for backward
+        # compatibility with any old objects that might still exist.
+        # Each element is a raw i64 handle (8 bytes).
         # ============================================================
         builder.position_at_end(mark_list_tail_ref)
         # Get object size from header to calculate element count
@@ -3787,6 +4053,147 @@ class GarbageCollector:
         builder.branch(done)
 
         # Done - just return
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    # ========================================================================
+    # TaggedValue Helper Function Implementations
+    # ========================================================================
+
+    def _implement_tv_is_heap_type(self):
+        """Implement tv_is_heap_type(type_id) -> bool.
+
+        Returns true if type_id >= TYPE_HEAP_BASE (64), meaning the value
+        field of a TaggedValue with this type_id is a GC handle that needs tracing.
+        """
+        func = self.tv_is_heap
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        type_id = func.args[0]
+        is_heap = builder.icmp_unsigned('>=', type_id, ir.Constant(self.i64, self.TYPE_HEAP_BASE))
+        builder.ret(is_heap)
+
+    def _implement_tv_mark(self):
+        """Implement tv_mark(tv_ptr) -> void.
+
+        Marks the value in a TaggedValue if it's a heap reference.
+        Reads the type_id, and if >= TYPE_HEAP_BASE, calls gc_mark_object
+        on the value field (which is a GC handle).
+        """
+        func = self.tv_mark
+
+        entry = func.append_basic_block("entry")
+        do_mark = func.append_basic_block("do_mark")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        tv_ptr = func.args[0]
+
+        # Load type_id (field 0)
+        type_id_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+
+        # Check if heap type
+        is_heap = builder.icmp_unsigned('>=', type_id, ir.Constant(self.i64, self.TYPE_HEAP_BASE))
+        builder.cbranch(is_heap, do_mark, done)
+
+        # Mark the handle
+        builder.position_at_end(do_mark)
+        value_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        handle = builder.load(value_ptr)
+
+        # Skip null handles
+        is_null = builder.icmp_unsigned('==', handle, ir.Constant(self.i64, 0))
+        with builder.if_then(builder.not_(is_null)):
+            builder.call(self.gc_mark_object, [handle])
+        builder.branch(done)
+
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_tv_mark_array(self):
+        """Implement tv_mark_array(data, count) -> void.
+
+        Iterates through an array of TaggedValues and marks any heap references.
+        This is the core function for GC tracing of collection elements.
+        """
+        func = self.tv_mark_array
+
+        entry = func.append_basic_block("entry")
+        loop_cond = func.append_basic_block("loop_cond")
+        loop_body = func.append_basic_block("loop_body")
+        check_heap = func.append_basic_block("check_heap")
+        do_mark = func.append_basic_block("do_mark")
+        loop_inc = func.append_basic_block("loop_inc")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        data_ptr = func.args[0]
+        count = func.args[1]
+
+        # Loop index
+        idx_ptr = builder.alloca(self.i64, name="idx")
+        builder.store(ir.Constant(self.i64, 0), idx_ptr)
+        builder.branch(loop_cond)
+
+        # Loop condition: idx < count
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        cond = builder.icmp_unsigned('<', idx, count)
+        builder.cbranch(cond, loop_body, done)
+
+        # Loop body: get element and check type
+        builder.position_at_end(loop_body)
+        idx = builder.load(idx_ptr)
+
+        # Get pointer to TaggedValue at index
+        tv_ptr = builder.gep(data_ptr, [idx], inbounds=True)
+
+        # Load type_id (field 0)
+        type_id_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        type_id = builder.load(type_id_ptr)
+        builder.branch(check_heap)
+
+        # Check if heap type
+        builder.position_at_end(check_heap)
+        is_heap = builder.icmp_unsigned('>=', type_id, ir.Constant(self.i64, self.TYPE_HEAP_BASE))
+        builder.cbranch(is_heap, do_mark, loop_inc)
+
+        # Mark the handle
+        builder.position_at_end(do_mark)
+        value_ptr = builder.gep(tv_ptr, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        handle = builder.load(value_ptr)
+
+        # Skip null handles
+        is_null = builder.icmp_unsigned('==', handle, ir.Constant(self.i64, 0))
+        with builder.if_then(builder.not_(is_null)):
+            builder.call(self.gc_mark_object, [handle])
+        builder.branch(loop_inc)
+
+        # Increment index
+        builder.position_at_end(loop_inc)
+        idx = builder.load(idx_ptr)
+        next_idx = builder.add(idx, ir.Constant(self.i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        # Done
         builder.position_at_end(done)
         builder.ret_void()
 

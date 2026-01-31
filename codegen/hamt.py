@@ -1098,12 +1098,25 @@ class HamtGenerator:
         key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         key = builder.load(key_ptr)
 
-        temp = builder.alloca(i64, name="temp_key")
-        builder.store(key, temp)
-        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
-        elem_size = ir.Constant(i64, 8)
-        new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+        if use_tagged:
+            # Create TaggedValue for the key
+            # Use TV_TYPE_INT as default - keys in Map are either int or string
+            # String keys would be stored as handles but we use INT type here
+            # as the iteration returns raw values that the caller interprets
+            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, key)
+            tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+            new_list = builder.call(cg.list_append, [list_ptr, tv_i8, elem_size])
+        else:
+            temp = builder.alloca(i64, name="temp_key")
+            builder.store(key, temp)
+            temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+            elem_size = ir.Constant(i64, 8)
+            new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+
         builder.ret(new_list)
 
         # Node - recurse through children
@@ -1193,12 +1206,24 @@ class HamtGenerator:
         value_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         value = builder.load(value_ptr)
 
-        temp = builder.alloca(i64, name="temp_value")
-        builder.store(value, temp)
-        temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
-        elem_size = ir.Constant(i64, 8)
-        new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+        if use_tagged:
+            # Create TaggedValue for the value
+            # Use TV_TYPE_INT as default - values in Map are stored as raw i64
+            # The caller will interpret based on the Map's value type
+            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, value)
+            tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+            new_list = builder.call(cg.list_append, [list_ptr, tv_i8, elem_size])
+        else:
+            temp = builder.alloca(i64, name="temp_value")
+            builder.store(value, temp)
+            temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
+            elem_size = ir.Constant(i64, 8)
+            new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+
         builder.ret(new_list)
 
         # Node - recurse
@@ -2447,8 +2472,12 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty result list with 8-byte elements
-        elem_size = ir.Constant(i64, 8)
+        # Create empty result list - use TaggedValue size if enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+        if use_tagged:
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+        else:
+            elem_size = ir.Constant(i64, 8)
         empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get HAMT root (stored as i64, convert to pointer)
@@ -2474,8 +2503,12 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty result list with 8-byte elements
-        elem_size = ir.Constant(i64, 8)
+        # Create empty result list - use TaggedValue size if enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+        if use_tagged:
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+        else:
+            elem_size = ir.Constant(i64, 8)
         empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get HAMT root (stored as i64, convert to pointer)
@@ -2940,8 +2973,12 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Create result list with 8-byte elements
-        elem_size = ir.Constant(i64, 8)
+        # Create result list - use TaggedValue size if enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+        if use_tagged:
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+        else:
+            elem_size = ir.Constant(i64, 8)
         result_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Get root from the set (stored as i64, convert to pointer)

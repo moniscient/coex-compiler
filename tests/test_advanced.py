@@ -529,27 +529,27 @@ class TestCollectionSize:
 
     def test_list_size_empty(self, expect_output):
         """Empty list size (header + tail buffer)."""
-        # Persistent Vector: header 56 bytes (7 i64 fields including flags) + tail buffer 32*8 = 256 bytes
-        # Size = 56 + 256 = 312
+        # Persistent Vector with TaggedValue: header 56 bytes + tail buffer 32*16 = 512 bytes
+        # Size = 56 + 512 = 568
         expect_output('''
 func main() -> int
     lst: List<int> = []
     print(lst.size())
     return 0
 ~
-''', "312\n")
+''', "568\n")
 
     def test_list_size_with_elements(self, expect_output):
         """List size with some elements (still within tail)."""
-        # Persistent Vector: header 56 bytes (7 i64 fields including flags) + tail buffer 32*8 = 256 bytes
-        # Size = 56 + 256 = 312 (same as empty - tail buffer is fixed size)
+        # Persistent Vector with TaggedValue: header 56 bytes + tail buffer 32*16 = 512 bytes
+        # Size = 56 + 512 = 568 (same as empty - tail buffer is fixed size)
         expect_output('''
 func main() -> int
     lst: List<int> = [1, 2, 3]
     print(lst.size())
     return 0
 ~
-''', "312\n")
+''', "568\n")
 
     def test_string_size(self, expect_output):
         """String size (struct + data bytes)."""
@@ -618,7 +618,7 @@ func main() -> int
     print(lst.size())
     return 0
 ~
-''', "3\n312\n")
+''', "3\n568\n")
 
 
 class TestParameterValueSemantics:

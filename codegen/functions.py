@@ -389,21 +389,22 @@ class FunctionGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty list with element size 8 (for String* handles)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create empty list with TaggedValue (16 bytes per element)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
-        # Append each string pointer
+        # Append each string as a TaggedValue
         for s in strings:
-            # Create string and store its pointer
+            # Create string and get its handle
             string_ptr = cg._get_string_ptr(s)
+            string_i8 = cg.builder.bitcast(string_ptr, i8_ptr)
+            string_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [string_i8])
 
-            # Allocate temp storage for the pointer
-            ptr_alloca = cg.builder.alloca(cg.string_struct.as_pointer())
-            cg.builder.store(string_ptr, ptr_alloca)
-            ptr_i8 = cg.builder.bitcast(ptr_alloca, i8_ptr)
+            # Create TaggedValue with TV_TYPE_STRING (64)
+            tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_STRING, string_handle)
+            tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
-            # Append to list (8 bytes = size of pointer)
-            list_ptr = cg.builder.call(cg.list_append, [list_ptr, ptr_i8, ir.Constant(i64, 8)])
+            # Append TaggedValue to list
+            list_ptr = cg.builder.call(cg.list_append, [list_ptr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
         return list_ptr
 
@@ -418,10 +419,10 @@ class FunctionGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create empty list with element size 8 (for Json* handles)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create empty list with TaggedValue (16 bytes per element)
+        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
-        # Wrap each parameter value in json and append
+        # Wrap each parameter value in json and append as TaggedValue
         for param in params:
             # Load the parameter value
             param_alloca = cg.locals[param.name]
@@ -430,13 +431,17 @@ class FunctionGenerator:
             # Convert to json based on type
             json_ptr = cg._json.wrap_value_as_json(param_val, param.type_annotation)
 
-            # Allocate temp storage for the pointer
-            ptr_alloca = cg.builder.alloca(cg.json_struct.as_pointer())
-            cg.builder.store(json_ptr, ptr_alloca)
-            ptr_i8 = cg.builder.bitcast(ptr_alloca, i8_ptr)
+            # Get handle for json pointer
+            json_i8 = cg.builder.bitcast(json_ptr, i8_ptr)
+            json_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [json_i8])
 
-            # Append to list (8 bytes = size of pointer)
-            list_ptr = cg.builder.call(cg.list_append, [list_ptr, ptr_i8, ir.Constant(i64, 8)])
+            # Create TaggedValue with TV_TYPE_JSON_OBJECT (since wrap_value_as_json returns Json*)
+            # Note: The actual JSON type will vary, but TV_TYPE_LIST works for List<Json>
+            tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_LIST, json_handle)
+            tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
+
+            # Append TaggedValue to list
+            list_ptr = cg.builder.call(cg.list_append, [list_ptr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
         return list_ptr
 
@@ -558,8 +563,8 @@ class FunctionGenerator:
             argc = c_main.args[0]
             argv = c_main.args[1]
 
-            # Create new list for strings (elem_size = 8 for handles)
-            elem_size = ir.Constant(i64, 8)
+            # Create new list for strings using TaggedValue size
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
             args_list = builder.call(cg.list_new, [elem_size, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
             # Store in alloca for list_append (which returns new list)
@@ -594,14 +599,14 @@ class FunctionGenerator:
             # Convert C string to Coex string using string_from_literal
             coex_string = builder.call(cg.string_from_literal, [c_str])
 
-            # Append to list: we need to store the string pointer and pass its address
-            str_alloca = builder.alloca(cg.string_struct.as_pointer(), name="str_temp")
-            builder.store(coex_string, str_alloca)
+            # Get handle for string and create TaggedValue
+            string_i8 = builder.bitcast(coex_string, i8_ptr)
+            string_handle = builder.call(cg.gc.gc_ptr_to_handle, [string_i8])
+            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, string_handle)
+            tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
 
             current_list = builder.load(args_alloca)
-            new_list = builder.call(cg.list_append, [current_list,
-                                                      builder.bitcast(str_alloca, i8_ptr),
-                                                      elem_size])
+            new_list = builder.call(cg.list_append, [current_list, tv_i8, elem_size])
             builder.store(new_list, args_alloca)
 
             # Increment index

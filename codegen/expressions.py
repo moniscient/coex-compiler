@@ -439,25 +439,63 @@ class ExpressionGenerator:
     # ========================================================================
 
     def generate_list(self, expr: ListExpr) -> ir.Value:
-        """Generate code for list literal: [1, 2, 3]"""
+        """Generate code for list literal: [1, 2, 3]
+
+        With USE_TAGGED_VALUES enabled, each element is stored as a TaggedValue
+        = { i64 type_id, i64 value }. This makes elements self-describing,
+        allowing the GC to trace references correctly without compile-time type inference.
+        """
         cg = self.cg
+        i64 = ir.IntType(64)
+
+        # Check if TaggedValue mode is enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
         if not expr.elements:
-            # Empty list - default to i64 element size, flags = 0 (no reference types)
-            elem_size = ir.Constant(ir.IntType(64), 8)
-            flags = ir.Constant(ir.IntType(64), 0)
+            # Empty list
+            if use_tagged:
+                # TaggedValue elements are always 16 bytes, flags=0 (GC reads type from each element)
+                elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+                flags = ir.Constant(i64, 0)
+            else:
+                elem_size = ir.Constant(i64, 8)
+                flags = ir.Constant(i64, 0)
             return cg.builder.call(cg.list_new, [elem_size, flags])
 
         # Generate first element to determine type
         first_elem = self.generate_expression(expr.elements[0])
         elem_type = first_elem.type
 
-        # Check if elements are reference types - if so, store handles instead of pointers
+        # Infer Coex type for the element
         elem_coex_type = cg._infer_type_from_expr(expr.elements[0])
         is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
 
-        # Calculate element size (min 1 byte for sub-byte types like bool)
-        # Reference types store handles (always 8 bytes)
+        if use_tagged:
+            # TaggedValue mode: always 16 bytes, flags=0 (type is in each element)
+            elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+            list_flags = ir.Constant(i64, 0)  # No special flags needed - GC reads type_id from elements
+            list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
+
+            # Get TaggedValue type ID for this element type
+            tv_type_id = cg.gc.get_tv_type_id(elem_coex_type) if elem_coex_type else cg.gc.TV_TYPE_INT
+
+            # Append each element as TaggedValue
+            for i, elem_expr in enumerate(expr.elements):
+                if i == 0:
+                    elem_val = first_elem
+                else:
+                    elem_val = self.generate_expression(elem_expr)
+
+                # Create TaggedValue on stack
+                tv_ptr = cg.gc.create_tagged_value(cg.builder, tv_type_id, self._to_i64_value(elem_val, is_ref_type))
+
+                # Append - list_append copies the TaggedValue (16 bytes)
+                tv_i8 = cg.builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+                list_ptr = cg.builder.call(cg.list_append, [list_ptr, tv_i8, elem_size])
+
+            return list_ptr
+
+        # Legacy mode: variable elem_size based on type
         if is_ref_type:
             size = 8  # Handles are always i64
         elif isinstance(elem_type, ir.IntType):
@@ -467,7 +505,6 @@ class ExpressionGenerator:
         elif isinstance(elem_type, ir.PointerType):
             size = 8
         elif isinstance(elem_type, ir.LiteralStructType):
-            # For tuples/structs, sum up element sizes
             size = sum(
                 max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
                 for e in elem_type.elements
@@ -475,13 +512,10 @@ class ExpressionGenerator:
         else:
             size = 8
 
-        elem_size = ir.Constant(ir.IntType(64), size)
-
-        # Create new list with appropriate flags
-        list_flags = ir.Constant(ir.IntType(64), cg.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
+        elem_size = ir.Constant(i64, size)
+        list_flags = ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
         list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
 
-        # Append each element (list_append returns a new list with value semantics)
         for i, elem_expr in enumerate(expr.elements):
             if i == 0:
                 elem_val = first_elem
@@ -489,22 +523,71 @@ class ExpressionGenerator:
                 elem_val = self.generate_expression(elem_expr)
 
             if is_ref_type:
-                # Reference types: convert pointer to handle, store handle
                 elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
                 elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
-                temp = cg.builder.alloca(ir.IntType(64), name=f"list_elem_{i}_handle")
+                temp = cg.builder.alloca(i64, name=f"list_elem_{i}_handle")
                 cg.builder.store(elem_handle, temp)
                 temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
             else:
-                # Non-reference types: store value directly
                 temp = cg.builder.alloca(elem_type, name=f"list_elem_{i}")
                 cg.builder.store(elem_val, temp)
                 temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
-            # Append - list_append returns a NEW list; update our reference
             list_ptr = cg.builder.call(cg.list_append, [list_ptr, temp_ptr, elem_size])
 
         return list_ptr
+
+    def _to_i64_value(self, val: ir.Value, is_ref: bool) -> ir.Value:
+        """Convert a value to i64 for storage in TaggedValue.
+
+        For reference types, converts pointer to handle.
+        For primitives, converts/casts to i64.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+
+        if is_ref:
+            # Reference type: convert pointer to handle
+            val_i8 = cg.builder.bitcast(val, ir.IntType(8).as_pointer())
+            return cg.builder.call(cg.gc.gc_ptr_to_handle, [val_i8])
+        elif val.type == i64:
+            return val
+        elif isinstance(val.type, ir.IntType):
+            if val.type.width < 64:
+                return cg.builder.zext(val, i64)
+            else:
+                return cg.builder.trunc(val, i64)
+        elif isinstance(val.type, ir.DoubleType):
+            return cg.builder.bitcast(val, i64)
+        elif isinstance(val.type, ir.PointerType):
+            return cg.builder.ptrtoint(val, i64)
+        else:
+            # Fallback: try direct bitcast if same size
+            return cg.builder.bitcast(val, i64)
+
+    def _from_i64_value(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
+        """Convert an i64 value back to the target LLVM type.
+
+        This is the inverse of _to_i64_value for primitive types.
+        Note: For heap types, the caller should use gc_handle_deref instead.
+        """
+        cg = self.cg
+        i64 = ir.IntType(64)
+
+        if target_type == i64:
+            return val
+        elif isinstance(target_type, ir.IntType):
+            if target_type.width < 64:
+                return cg.builder.trunc(val, target_type)
+            else:
+                return val  # Already i64
+        elif isinstance(target_type, ir.DoubleType):
+            return cg.builder.bitcast(val, target_type)
+        elif isinstance(target_type, ir.PointerType):
+            return cg.builder.inttoptr(val, target_type)
+        else:
+            # For other types, try inttoptr (handles pointer-like things)
+            return cg.builder.inttoptr(val, target_type)
 
     def generate_map(self, expr: MapExpr) -> ir.Value:
         """Generate code for map literal: {key: value, ...}"""
@@ -848,9 +931,54 @@ class ExpressionGenerator:
                                                 elem_coex_type = field_type.element_type
                                                 elem_llvm_type = cg._get_llvm_type(elem_coex_type)
                                             break
-                    # Lists store values/pointers directly (not handles)
-                    typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
-                    return cg.builder.load(typed_ptr)
+
+                    # Check if TaggedValue mode is enabled (List only, not Array yet)
+                    use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False) and type_name == "List"
+
+                    if use_tagged:
+                        # TaggedValue mode: result (i8*) points to TaggedValue {i64 type_id, i64 value}
+                        tv_ptr = cg.builder.bitcast(result, cg.gc.tagged_value_ptr_type)
+                        type_id, raw_value = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+
+                        # Check if this is a heap reference (type_id >= TYPE_HEAP_BASE)
+                        is_heap = cg.builder.icmp_unsigned('>=', type_id,
+                            ir.Constant(ir.IntType(64), cg.gc.TYPE_HEAP_BASE))
+
+                        # Create basic blocks for conditional handling
+                        heap_bb = cg.builder.append_basic_block("listget_heap")
+                        value_bb = cg.builder.append_basic_block("listget_value")
+                        merge_bb = cg.builder.append_basic_block("listget_merge")
+
+                        cg.builder.cbranch(is_heap, heap_bb, value_bb)
+
+                        # Heap path: raw_value is a handle, dereference it
+                        cg.builder.position_at_end(heap_bb)
+                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
+                        # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                        if isinstance(elem_llvm_type, ir.PointerType):
+                            heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                        else:
+                            # This branch won't be taken for primitives, but IR must be valid
+                            heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
+                        cg.builder.branch(merge_bb)
+                        heap_bb_final = cg.builder.block
+
+                        # Value path: raw_value is the actual value
+                        cg.builder.position_at_end(value_bb)
+                        value_result = self._from_i64_value(raw_value, elem_llvm_type)
+                        cg.builder.branch(merge_bb)
+                        value_bb_final = cg.builder.block
+
+                        # Merge
+                        cg.builder.position_at_end(merge_bb)
+                        phi = cg.builder.phi(elem_llvm_type, "listget_elem")
+                        phi.add_incoming(heap_result, heap_bb_final)
+                        phi.add_incoming(value_result, value_bb_final)
+                        return phi
+                    else:
+                        # Legacy mode: element stored directly
+                        typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
+                        return cg.builder.load(typed_ptr)
 
                 return result
 
@@ -920,7 +1048,7 @@ class ExpressionGenerator:
 
                 elem_ptr = cg.builder.call(cg.list_get, [obj, index])
 
-                # Get element type from Coex type tracking
+                # Get element type from Coex type tracking (for type casting)
                 elem_llvm_type = ir.IntType(64)  # default
                 elem_coex_type = None
                 if isinstance(expr.object, Identifier):
@@ -946,17 +1074,62 @@ class ExpressionGenerator:
                                             elem_llvm_type = cg._get_llvm_type(elem_coex_type)
                                         break
 
-                # Reference types are stored as handles in lists - load and dereference
-                if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
-                    # Load the handle (i64)
-                    handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-                    handle = cg.builder.load(handle_ptr)
-                    # Dereference handle to get pointer
-                    ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                    return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                # Check if TaggedValue mode is enabled
+                use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+                if use_tagged:
+                    # TaggedValue mode: elem_ptr points to TaggedValue {i64 type_id, i64 value}
+                    tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+                    type_id, raw_value = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+
+                    # Check if this is a heap reference (type_id >= TYPE_HEAP_BASE)
+                    is_heap = cg.builder.icmp_unsigned('>=', type_id,
+                        ir.Constant(ir.IntType(64), cg.gc.TYPE_HEAP_BASE))
+
+                    # Create basic blocks for conditional handling
+                    heap_bb = cg.builder.append_basic_block("list_idx_heap")
+                    value_bb = cg.builder.append_basic_block("list_idx_value")
+                    merge_bb = cg.builder.append_basic_block("list_idx_merge")
+
+                    cg.builder.cbranch(is_heap, heap_bb, value_bb)
+
+                    # Heap path: raw_value is a handle, dereference it
+                    cg.builder.position_at_end(heap_bb)
+                    ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
+                    # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                    if isinstance(elem_llvm_type, ir.PointerType):
+                        heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                    else:
+                        # This branch won't be taken for primitives, but IR must be valid
+                        heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
+                    cg.builder.branch(merge_bb)
+                    heap_bb_final = cg.builder.block
+
+                    # Value path: raw_value is the actual value
+                    cg.builder.position_at_end(value_bb)
+                    value_result = self._from_i64_value(raw_value, elem_llvm_type)
+                    cg.builder.branch(merge_bb)
+                    value_bb_final = cg.builder.block
+
+                    # Merge
+                    cg.builder.position_at_end(merge_bb)
+                    phi = cg.builder.phi(elem_llvm_type, "list_elem")
+                    phi.add_incoming(heap_result, heap_bb_final)
+                    phi.add_incoming(value_result, value_bb_final)
+                    return phi
                 else:
-                    typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
-                    return cg.builder.load(typed_ptr)
+                    # Legacy mode: element is stored directly
+                    # Reference types are stored as handles in lists - load and dereference
+                    if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                        # Load the handle (i64)
+                        handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                        handle = cg.builder.load(handle_ptr)
+                        # Dereference handle to get pointer
+                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                        return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                    else:
+                        typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+                        return cg.builder.load(typed_ptr)
 
             # JSON indexing: j["key"] or j[0]
             if hasattr(pointee, 'name') and pointee.name == "struct.Json":
@@ -2198,16 +2371,60 @@ class ExpressionGenerator:
                                 elem_coex_type = coex_type.element_type
                                 elem_llvm_type = cg._get_llvm_type(elem_coex_type)
 
-                    # Reference types are stored as handles - load handle and dereference
-                    if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
-                        handle_ptr = cg.builder.bitcast(result, ir.IntType(64).as_pointer())
-                        handle = cg.builder.load(handle_ptr)
-                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                        return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                    # Check if TaggedValue mode is enabled (List only, not Array yet)
+                    use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False) and type_name == "List"
+
+                    if use_tagged:
+                        # TaggedValue mode: result (i8*) points to TaggedValue {i64 type_id, i64 value}
+                        tv_ptr = cg.builder.bitcast(result, cg.gc.tagged_value_ptr_type)
+                        type_id, raw_value = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+
+                        # Check if this is a heap reference (type_id >= TYPE_HEAP_BASE)
+                        is_heap = cg.builder.icmp_unsigned('>=', type_id,
+                            ir.Constant(ir.IntType(64), cg.gc.TYPE_HEAP_BASE))
+
+                        # Create basic blocks for conditional handling
+                        heap_bb = cg.builder.append_basic_block("listmget_heap")
+                        value_bb = cg.builder.append_basic_block("listmget_value")
+                        merge_bb = cg.builder.append_basic_block("listmget_merge")
+
+                        cg.builder.cbranch(is_heap, heap_bb, value_bb)
+
+                        # Heap path: raw_value is a handle, dereference it
+                        cg.builder.position_at_end(heap_bb)
+                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
+                        # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                        if isinstance(elem_llvm_type, ir.PointerType):
+                            heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                        else:
+                            # This branch won't be taken for primitives, but IR must be valid
+                            heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
+                        cg.builder.branch(merge_bb)
+                        heap_bb_final = cg.builder.block
+
+                        # Value path: raw_value is the actual value
+                        cg.builder.position_at_end(value_bb)
+                        value_result = self._from_i64_value(raw_value, elem_llvm_type)
+                        cg.builder.branch(merge_bb)
+                        value_bb_final = cg.builder.block
+
+                        # Merge
+                        cg.builder.position_at_end(merge_bb)
+                        phi = cg.builder.phi(elem_llvm_type, "listmget_elem")
+                        phi.add_incoming(heap_result, heap_bb_final)
+                        phi.add_incoming(value_result, value_bb_final)
+                        return phi
                     else:
-                        # Non-reference types: load directly
-                        typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
-                        return cg.builder.load(typed_ptr)
+                        # Legacy mode: Reference types are stored as handles - load handle and dereference
+                        if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                            handle_ptr = cg.builder.bitcast(result, ir.IntType(64).as_pointer())
+                            handle = cg.builder.load(handle_ptr)
+                            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                            return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                        else:
+                            # Non-reference types: load directly
+                            typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
+                            return cg.builder.load(typed_ptr)
 
                 # Special handling for Map.get - returns i64 that may be a handle
                 if type_name == "Map" and method == "get":
@@ -2259,41 +2476,59 @@ class ExpressionGenerator:
                     elem_coex_type = cg._infer_type_from_expr(expr.args[0])
                     is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
 
-                    # Reference types store handles (always 8 bytes)
-                    if is_ref_type:
-                        size = 8
-                    elif isinstance(elem_type, ir.IntType):
-                        size = max(1, elem_type.width // 8)
-                    elif isinstance(elem_type, ir.DoubleType):
-                        size = 8
-                    elif isinstance(elem_type, ir.PointerType):
-                        size = 8
-                    elif isinstance(elem_type, ir.LiteralStructType):
-                        size = sum(
-                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
-                            for e in elem_type.elements
-                        )
+                    # Check if TaggedValue mode is enabled
+                    use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+                    if use_tagged:
+                        # TaggedValue mode: always 16 bytes, store as {type_id, value}
+                        elem_size = ir.Constant(ir.IntType(64), cg.TAGGED_VALUE_SIZE)
+
+                        # Get TaggedValue type ID for this element type
+                        tv_type_id = cg.gc.get_tv_type_id(elem_coex_type) if elem_coex_type else cg.gc.TV_TYPE_INT
+
+                        # Create TaggedValue on stack
+                        tv_ptr = cg.gc.create_tagged_value(cg.builder, tv_type_id, self._to_i64_value(elem_val, is_ref_type))
+
+                        # Append - list_append copies the TaggedValue (16 bytes)
+                        tv_i8 = cg.builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+                        return cg.builder.call(cg.list_append, [obj, tv_i8, elem_size])
                     else:
-                        size = 8
+                        # Legacy mode: variable elem_size based on type
+                        # Reference types store handles (always 8 bytes)
+                        if is_ref_type:
+                            size = 8
+                        elif isinstance(elem_type, ir.IntType):
+                            size = max(1, elem_type.width // 8)
+                        elif isinstance(elem_type, ir.DoubleType):
+                            size = 8
+                        elif isinstance(elem_type, ir.PointerType):
+                            size = 8
+                        elif isinstance(elem_type, ir.LiteralStructType):
+                            size = sum(
+                                max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
+                                for e in elem_type.elements
+                            )
+                        else:
+                            size = 8
 
-                    elem_size = ir.Constant(ir.IntType(64), size)
+                        elem_size = ir.Constant(ir.IntType(64), size)
 
-                    if is_ref_type:
-                        # Reference types: convert pointer to handle, store handle
-                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
-                        with cg.builder.goto_entry_block():
-                            temp = cg.builder.alloca(ir.IntType(64), name="append_elem_handle")
-                        cg.builder.store(elem_handle, temp)
-                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
-                    else:
-                        # Non-reference types: store value directly
-                        with cg.builder.goto_entry_block():
-                            temp = cg.builder.alloca(elem_type, name="append_elem")
-                        cg.builder.store(elem_val, temp)
-                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                        if is_ref_type:
+                            # Reference types: convert pointer to handle, store handle
+                            elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                            elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                            with cg.builder.goto_entry_block():
+                                temp = cg.builder.alloca(ir.IntType(64), name="append_elem_handle")
+                            cg.builder.store(elem_handle, temp)
+                            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                        else:
+                            # Non-reference types: store value directly
+                            with cg.builder.goto_entry_block():
+                                temp = cg.builder.alloca(elem_type, name="append_elem")
+                            cg.builder.store(elem_val, temp)
+                            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
-                    return cg.builder.call(cg.list_append, [obj, temp_ptr, elem_size])
+                        return cg.builder.call(cg.list_append, [obj, temp_ptr, elem_size])
 
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     elem_val = self.generate_expression(expr.args[0])
@@ -2337,44 +2572,66 @@ class ExpressionGenerator:
                     elem_coex_type = cg._infer_type_from_expr(expr.args[1])
                     is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
 
-                    # Reference types store handles (always 8 bytes)
-                    if is_ref_type:
-                        size = 8
-                    elif isinstance(elem_type, ir.IntType):
-                        size = max(1, elem_type.width // 8)
-                    elif isinstance(elem_type, ir.DoubleType):
-                        size = 8
-                    elif isinstance(elem_type, ir.PointerType):
-                        size = 8
-                    elif isinstance(elem_type, ir.LiteralStructType):
-                        size = sum(
-                            max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
-                            for e in elem_type.elements
-                        )
+                    # Check if TaggedValue mode is enabled
+                    use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+                    if use_tagged:
+                        # TaggedValue mode: always 16 bytes, store as {type_id, value}
+                        elem_size = ir.Constant(ir.IntType(64), cg.TAGGED_VALUE_SIZE)
+
+                        # Get TaggedValue type ID for this element type
+                        tv_type_id = cg.gc.get_tv_type_id(elem_coex_type) if elem_coex_type else cg.gc.TV_TYPE_INT
+
+                        # Create TaggedValue on stack
+                        tv_ptr = cg.gc.create_tagged_value(cg.builder, tv_type_id, self._to_i64_value(elem_val, is_ref_type))
+
+                        # Set - list_set copies the TaggedValue (16 bytes)
+                        tv_i8 = cg.builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+
+                        if index.type != ir.IntType(64):
+                            index = cg.builder.sext(index, ir.IntType(64))
+
+                        return cg.builder.call(cg.list_set, [obj, index, tv_i8, elem_size])
                     else:
-                        size = 8
+                        # Legacy mode: variable elem_size based on type
+                        # Reference types store handles (always 8 bytes)
+                        if is_ref_type:
+                            size = 8
+                        elif isinstance(elem_type, ir.IntType):
+                            size = max(1, elem_type.width // 8)
+                        elif isinstance(elem_type, ir.DoubleType):
+                            size = 8
+                        elif isinstance(elem_type, ir.PointerType):
+                            size = 8
+                        elif isinstance(elem_type, ir.LiteralStructType):
+                            size = sum(
+                                max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
+                                for e in elem_type.elements
+                            )
+                        else:
+                            size = 8
 
-                    elem_size = ir.Constant(ir.IntType(64), size)
+                        elem_size = ir.Constant(ir.IntType(64), size)
 
-                    if is_ref_type:
-                        # Reference types: convert pointer to handle, store handle
-                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
-                        with cg.builder.goto_entry_block():
-                            temp = cg.builder.alloca(ir.IntType(64), name="list_set_elem_handle")
-                        cg.builder.store(elem_handle, temp)
-                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
-                    else:
-                        # Non-reference types: store value directly
-                        with cg.builder.goto_entry_block():
-                            temp = cg.builder.alloca(elem_type, name="list_set_elem")
-                        cg.builder.store(elem_val, temp)
-                        temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                        if is_ref_type:
+                            # Reference types: convert pointer to handle, store handle
+                            elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
+                            elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                            with cg.builder.goto_entry_block():
+                                temp = cg.builder.alloca(ir.IntType(64), name="list_set_elem_handle")
+                            cg.builder.store(elem_handle, temp)
+                            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                        else:
+                            # Non-reference types: store value directly
+                            with cg.builder.goto_entry_block():
+                                temp = cg.builder.alloca(elem_type, name="list_set_elem")
+                            cg.builder.store(elem_val, temp)
+                            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
-                    if index.type != ir.IntType(64):
-                        index = cg.builder.sext(index, ir.IntType(64))
+                        if index.type != ir.IntType(64):
+                            index = cg.builder.sext(index, ir.IntType(64))
 
-                    return cg.builder.call(cg.list_set, [obj, index, temp_ptr, elem_size])
+                        return cg.builder.call(cg.list_set, [obj, index, temp_ptr, elem_size])
 
                 if hasattr(pointee, 'name') and pointee.name == "struct.Array":
                     index = self.generate_expression(expr.args[0])

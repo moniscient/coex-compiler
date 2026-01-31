@@ -219,8 +219,8 @@ class JsonGenerator:
 
         # Process array: create list, iterate through child elements
         builder.position_at_end(process_array)
-        # First-class JSON variants: 8-byte elements (i64 handle to Json object)
-        list_val = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create list for JSON elements with TaggedValue size (16 bytes)
+        list_val = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
         list_ptr_alloca = builder.alloca(cg.list_struct.as_pointer(), name="list_ptr")
         builder.store(list_val, list_ptr_alloca)
 
@@ -244,15 +244,15 @@ class JsonGenerator:
         builder.position_at_end(array_body)
         child_json = builder.call(self.json_from_cjson, [current_child])
 
-        # Store as handle (gc_ptr_to_handle returns the object's handle)
+        # Create TaggedValue with JSON handle
         child_json_i8 = builder.bitcast(child_json, i8_ptr)
         child_handle = builder.call(cg.gc.gc_ptr_to_handle, [child_json_i8])
-        builder.store(child_handle, temp_handle_ptr)
-        temp_i8 = builder.bitcast(temp_handle_ptr, i8_ptr)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, child_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
 
-        # Append to list
+        # Append TaggedValue to list
         curr_list = builder.load(list_ptr_alloca)
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, list_ptr_alloca)
 
         # Move to next sibling
@@ -972,13 +972,12 @@ class JsonGenerator:
         valid = builder.and_(in_range, non_negative)
         builder.cbranch(valid, in_bounds, out_of_bounds)
 
-        # In bounds: get element
+        # In bounds: get element (TaggedValue {i64 type_id, i64 value})
         builder.position_at_end(in_bounds)
         result = builder.call(cg.list_get, [list_ptr, idx])
-        # Result is i8* pointing to the stored i64 HANDLE
-        # Load the handle and dereference to get Json*
-        handle_ptr = builder.bitcast(result, i64.as_pointer())
-        elem_handle = builder.load(handle_ptr)
+        # Extract value from TaggedValue - value is the GC handle
+        tv_ptr = builder.bitcast(result, cg.gc.tagged_value_ptr_type)
+        _, elem_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
         elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_handle])
         json_result = builder.bitcast(elem_i8, cg.json_struct.as_pointer())
         builder.ret(json_result)
@@ -1447,13 +1446,12 @@ class JsonGenerator:
         json_val_i8 = builder.bitcast(json_val, i8.as_pointer())
         json_handle = builder.call(cg.gc.gc_ptr_to_handle, [json_val_i8])
 
-        # Store handle in temp storage and pass address to list_append
-        temp_handle_ptr = builder.alloca(i64, name="temp_json_handle")
-        builder.store(json_handle, temp_handle_ptr)
-        temp_i8 = builder.bitcast(temp_handle_ptr, i8.as_pointer())
+        # Create TaggedValue with JSON handle
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, json_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
 
-        # Call list_append with elem_size = 8 for the handle
-        new_list = builder.call(cg.list_append, [list_ptr, temp_i8, ir.Constant(i64, 8)])
+        # Call list_append with TaggedValue size
+        new_list = builder.call(cg.list_append, [list_ptr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
         # Create new json array with new list
         result = builder.call(cg.json_new_array, [new_list])
@@ -1719,8 +1717,8 @@ class JsonGenerator:
         # Get list length
         list_len = builder.call(cg.list_len, [list_ptr])
 
-        # Create a new list to hold stringified elements (8 bytes per String* handle)
-        string_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create a new list to hold stringified elements (TaggedValue size)
+        string_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
         string_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="string_list")
         builder.store(string_list, string_list_ptr)
 
@@ -1746,9 +1744,9 @@ class JsonGenerator:
         # Loop body - stringify element and append to string list
         builder.position_at_end(body_block)
         elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
-        # Elements are stored as i64 HANDLES - load handle and dereference
-        elem_handle_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_handle = builder.load(elem_handle_ptr)
+        # Extract handle from TaggedValue {i64 type_id, i64 value}
+        tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
         elem_json_i8 = builder.call(cg.gc.gc_handle_deref, [elem_handle])
         elem_json = builder.bitcast(elem_json_i8, cg.json_struct.as_pointer())
         elem_str = builder.call(cg.json_stringify, [elem_json])
@@ -1756,9 +1754,10 @@ class JsonGenerator:
         # Append to string list (reuse pre-allocated temp_ptr)
         curr_list = builder.load(string_list_ptr)
         elem_str_i64 = builder.ptrtoint(elem_str, i64)
-        builder.store(elem_str_i64, temp_ptr)
-        temp_i8 = builder.bitcast(temp_ptr, ir.IntType(8).as_pointer())
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        # Create TaggedValue with TV_TYPE_STRING for string elements
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, elem_str_i64)
+        tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+        new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, string_list_ptr)
 
         # Increment and loop
@@ -1801,8 +1800,8 @@ class JsonGenerator:
         keys_list = builder.call(cg.map_keys, [map_ptr])
         list_len = builder.call(cg.list_len, [keys_list])
 
-        # Create a new list to hold "key":value strings (8 bytes per String* handle)
-        string_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create a new list to hold "key":value strings (TaggedValue size)
+        string_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
         string_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="kv_string_list")
         builder.store(string_list, string_list_ptr)
 
@@ -1828,10 +1827,10 @@ class JsonGenerator:
         # Loop body - build "key":value string and append to list
         builder.position_at_end(body_block)
 
-        # Get key string (list_get returns i8* to stored i64, need to load and inttoptr)
+        # Get key string - list_get returns i8* to TaggedValue {i64 type_id, i64 value}
         key_data_ptr = builder.call(cg.list_get, [keys_list, idx])
-        key_i64_ptr = builder.bitcast(key_data_ptr, i64.as_pointer())
-        key_i64 = builder.load(key_i64_ptr)
+        tv_ptr = builder.bitcast(key_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, key_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
         key_str = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
 
         # Build "key": string
@@ -1849,9 +1848,10 @@ class JsonGenerator:
         # Append to string list (reuse pre-allocated temp_ptr)
         curr_list = builder.load(string_list_ptr)
         kv_str_i64 = builder.ptrtoint(kv_str, i64)
-        builder.store(kv_str_i64, temp_ptr)
-        temp_i8 = builder.bitcast(temp_ptr, ir.IntType(8).as_pointer())
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        # Create TaggedValue with TV_TYPE_STRING for string elements
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, kv_str_i64)
+        tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+        new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, string_list_ptr)
 
         # Increment and loop
@@ -2122,9 +2122,12 @@ class JsonGenerator:
         # Add child indent
         curr_str = builder.call(cg.string_concat, [curr_str, child_indent])
 
-        # Get element and pretty-print it (elements are Json* pointers, 8 bytes)
+        # Get element and pretty-print it - extract handle from TaggedValue
         elem_data_ptr = builder.call(cg.list_get, [list_ptr, idx])
-        elem_json = builder.bitcast(elem_data_ptr, cg.json_struct.as_pointer())
+        tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
+        elem_json_i8 = builder.call(cg.gc.gc_handle_deref, [elem_handle])
+        elem_json = builder.bitcast(elem_json_i8, cg.json_struct.as_pointer())
         elem_str = builder.call(cg.json_pretty_internal, [elem_json, indent_size, child_depth])
         curr_str = builder.call(cg.string_concat, [curr_str, elem_str])
         builder.store(curr_str, result_str_ptr)
@@ -2219,10 +2222,10 @@ class JsonGenerator:
         # Add child indent
         curr_str = builder.call(cg.string_concat, [curr_str, child_indent])
 
-        # Get key string
+        # Get key string - extract from TaggedValue
         key_data_ptr = builder.call(cg.list_get, [keys_list, idx])
-        key_i64_ptr = builder.bitcast(key_data_ptr, i64.as_pointer())
-        key_i64 = builder.load(key_i64_ptr)
+        tv_ptr = builder.bitcast(key_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, key_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
         key_str = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
 
         # Add quoted key: "key":
@@ -2693,11 +2696,8 @@ class JsonGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # First-class JSON variants: 8-byte elements (i64 handle to Json object)
-        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
-
-        # Allocate temp storage for element handles outside loop
-        temp_handle_ptr = builder.alloca(i64, name="temp_json_handle")
+        # Create list for JSON elements with TaggedValue size (16 bytes)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Convert each element at compile time
         for elem_expr in expr.elements:
@@ -2707,12 +2707,12 @@ class JsonGenerator:
             # Convert to JSON using the expression for proper type handling
             json_elem = self.convert_to_json(elem_value, elem_expr)
 
-            # Store as handle (gc_ptr_to_handle returns the object's handle)
-            json_elem_i8 = builder.bitcast(json_elem, ir.IntType(8).as_pointer())
+            # Create TaggedValue with JSON handle
+            json_elem_i8 = builder.bitcast(json_elem, i8_ptr)
             json_handle = builder.call(cg.gc.gc_ptr_to_handle, [json_elem_i8])
-            builder.store(json_handle, temp_handle_ptr)
-            temp_i8 = builder.bitcast(temp_handle_ptr, i8_ptr)
-            json_list = builder.call(cg.list_append, [json_list, temp_i8, ir.Constant(i64, 8)])
+            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, json_handle)
+            tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
+            json_list = builder.call(cg.list_append, [json_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
         return builder.call(cg.json_new_array, [json_list])
 
@@ -2731,8 +2731,8 @@ class JsonGenerator:
         # Get source list length
         src_len = builder.call(cg.list_len, [list_ptr])
 
-        # First-class JSON variants: 8-byte elements (i64 handle to Json object)
-        json_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # Create list for JSON elements with TaggedValue size (16 bytes)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Store pointers for loop
         json_list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="json_list_ptr")
@@ -2764,14 +2764,15 @@ class JsonGenerator:
         # Convert element based on known element type
         json_elem = self._convert_list_element_to_json(elem_data_ptr, elem_type)
 
-        # Store as handle (gc_ptr_to_handle returns the object's handle)
+        # Store as handle in TaggedValue (gc_ptr_to_handle returns the object's handle)
         json_elem_i8 = builder.bitcast(json_elem, ir.IntType(8).as_pointer())
         json_handle = builder.call(cg.gc.gc_ptr_to_handle, [json_elem_i8])
-        builder.store(json_handle, temp_handle_ptr)
-        temp_i8 = builder.bitcast(temp_handle_ptr, i8_ptr)
+        # Create TaggedValue with TV_TYPE_JSON_ARRAY (71) for JSON elements
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, json_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
 
         curr_list = builder.load(json_list_ptr)
-        new_list = builder.call(cg.list_append, [curr_list, temp_i8, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, json_list_ptr)
 
         # Increment and loop
@@ -2791,9 +2792,9 @@ class JsonGenerator:
         builder = cg.builder
         i64 = ir.IntType(64)
 
-        # Load element value as i64 (all list elements are 8 bytes)
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
+        # Extract value from TaggedValue {i64 type_id, i64 value}
+        tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
 
         # Convert based on type
         if elem_type is None:
@@ -2908,8 +2909,8 @@ class JsonGenerator:
         elems_list = builder.call(cg.set_to_list, [set_ptr])
         list_len = builder.call(cg.list_len, [elems_list])
 
-        # Create JSON array for elements (16-byte inline Json structs)
-        json_list = builder.call(cg.list_new, [ir.Constant(i64, 16), ir.Constant(i64, 0)])
+        # Create JSON array for elements (TaggedValue size with ref flag)
+        json_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Loop to convert each element
         index_var = builder.alloca(i64, name="set_conv_idx")
@@ -2936,10 +2937,10 @@ class JsonGenerator:
         builder.position_at_end(body_block)
         current_idx = builder.load(index_var)
 
-        # Get element from list
+        # Get element from list - extract from TaggedValue
         elem_ptr = builder.call(cg.list_get, [elems_list, current_idx])
-        typed_ptr = builder.bitcast(elem_ptr, i64.as_pointer())
-        elem_val = builder.load(typed_ptr)
+        tv_ptr = builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(builder, tv_ptr)
 
         # Convert element to JSON based on inferred type
         if elem_type is not None and isinstance(elem_type, PrimitiveType):
@@ -2960,10 +2961,13 @@ class JsonGenerator:
             # Default: treat as int
             json_elem = builder.call(cg.json_new_int, [elem_val])
 
-        # Append to json_list
+        # Append to json_list with TaggedValue
         json_list_current = builder.load(json_list_var)
         json_elem_i8 = builder.bitcast(json_elem, i8_ptr)
-        json_list_new = builder.call(cg.list_append, [json_list_current, json_elem_i8, ir.Constant(i64, 16)])
+        json_handle = builder.call(cg.gc.gc_ptr_to_handle, [json_elem_i8])
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_JSON_ARRAY, json_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
+        json_list_new = builder.call(cg.list_append, [json_list_current, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(json_list_new, json_list_var)
 
         # Increment index

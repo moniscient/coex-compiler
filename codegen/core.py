@@ -379,8 +379,20 @@ class CodeGenerator:
         )
 
         # List flags constant
+        # DEPRECATED: With USE_TAGGED_VALUES=True, this flag is no longer needed
+        # for GC tracing. The GC now reads the type_id from each TaggedValue element
+        # to determine if it's a heap reference (type_id >= TYPE_HEAP_BASE).
+        # This flag is kept for backward compatibility but may be removed in future.
         self.LIST_FLAG_ELEM_IS_REF = 1
-        
+
+        # TaggedValue feature flag - when True, lists store TaggedValue elements
+        # TaggedValue = { i64 type_id, i64 value } - 16 bytes per element
+        # This makes elements self-describing for GC tracing without compile-time type inference
+        self.USE_TAGGED_VALUES = True
+
+        # TaggedValue element size (always 16 bytes)
+        self.TAGGED_VALUE_SIZE = 16
+
         # Create list helper functions
         self._list = ListGenerator(self)
         self._list.create_list_helpers()

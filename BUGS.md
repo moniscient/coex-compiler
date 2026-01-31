@@ -149,38 +149,35 @@
 - **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
+---
+
+## Resolved Bugs
+
 ### BUG-064: Library modules cannot call ui.render() with String values in JSON
 - **Discovered**: 2026-01-28, during heapwatch implementation
 - **Category**: Codegen
 - **Severity**: Medium
-- **Reproduction**: Create a library that imports ui and calls ui.render() with a JSON panel
-  containing String struct values (from String.from()):
+- **Reproduction**:
   ```coex
-  import ui
-
-  func render_panel() -> int
+  func main() -> int
       value = String.from(42)
       panel: json = {
           type: "text",
           text: value  # String struct, not string literal
       }
-      ui.render(panel, "{}")  # CRASH
-      return 1
+      print(panel.stringify())  # Expected: {"type":"text","text":"42"}
+      return 0
   ~
   ```
-- **Observed**: Segmentation fault (signal 11) when running the compiled program
+- **Observed**: Segmentation fault or incorrect output when String struct values were used in JSON
 - **Expected**: String struct values should be convertible to JSON string values
-- **Hypothesis**: When a String struct (not a string literal) is used as a JSON field value,
-  the struct pointer is embedded directly instead of extracting the string value. This causes
-  issues when the JSON is serialized via stringify() for the C runtime.
-- **Workaround**: Use console output via print() instead of ui.render() for library modules
-  that need to display dynamic values
-- **Files**: `codegen/json_type.py` (JSON literal construction), `codegen/expressions.py`
-- **Status**: Open
-
----
-
-## Resolved Bugs
+- **Root Cause**: The JSON codegen was not properly handling String struct values (from `String.from()`). The type inference for json element types returned `TV_TYPE_JSON_NULL` (6), which is below `TYPE_HEAP_BASE` (64), causing reference values to be treated as primitives and not properly dereferenced.
+- **Files**: `coex_gc.py` (`get_tv_type_id`), `codegen/json_type.py`
+- **Status**: Fixed (2026-01-30)
+- **Resolution**:
+  1. Fixed `get_tv_type_id` in coex_gc.py to return `TV_TYPE_JSON_OBJECT` (72) for json type instead of `TV_TYPE_JSON_NULL` (6)
+  2. This ensures json values are recognized as heap types (type_id >= 64) and properly dereferenced when stored in collections
+  3. Part of the Universal Tagged Values implementation for consistent reference type handling
 
 ### BUG-066: Promoted arena values not surviving GC after formula return
 - **Discovered**: 2026-01-29, during BUG-065 fix verification
@@ -964,8 +961,8 @@
 - llvmlite TLS issue: See BUG-023
 
 ### Bug Count Summary (as of 2026-01-30)
-- **Open**: 13 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058, BUG-064)
-- **Resolved**: 46 bugs (including BUG-066: arena promotion type inference fix)
+- **Open**: 12 bugs (BUG-004, BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
+- **Resolved**: 47 bugs (including BUG-064: String.from() in JSON via Universal Tagged Values)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX

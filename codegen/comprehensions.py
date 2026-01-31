@@ -50,7 +50,12 @@ class ComprehensionGenerator:
         is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
 
         # Create result list with appropriate flags
-        elem_size = ir.Constant(ir.IntType(64), 8)
+        # Use TaggedValue size if enabled
+        use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+        if use_tagged:
+            elem_size = ir.Constant(ir.IntType(64), cg.TAGGED_VALUE_SIZE)
+        else:
+            elem_size = ir.Constant(ir.IntType(64), 8)
         list_flags = ir.Constant(ir.IntType(64), cg.LIST_FLAG_ELEM_IS_REF if is_ref_type else 0)
         list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
 
@@ -179,8 +184,17 @@ class ComprehensionGenerator:
 
             # Get element and bind to pattern
             elem_ptr = cg.builder.call(cg.list_get, [iterable, idx])
-            elem_ptr_cast = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-            elem_val = cg.builder.load(elem_ptr_cast)
+
+            # Check if TaggedValue mode is enabled
+            use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
+
+            if use_tagged:
+                # TaggedValue mode: extract value from {type_id, value} struct
+                tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+                type_id, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
+            else:
+                elem_ptr_cast = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
+                elem_val = cg.builder.load(elem_ptr_cast)
 
             # Bind pattern variables
             cg._bind_pattern(clause.pattern, elem_val)
@@ -439,16 +453,28 @@ class ComprehensionGenerator:
             # Evaluate body expression
             val = cg._generate_expression(body)
 
-            # Reuse pre-allocated temp from generate_list_comprehension to avoid stack overflow
-            temp = self._comp_temp_alloca
-            stored_val = cg._cast_value(val, ir.IntType(64))
-            cg.builder.store(stored_val, temp)
-            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+            # Check if TaggedValue mode is enabled
+            use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
             result_list = cg.builder.load(result_alloca)
-            elem_size = ir.Constant(ir.IntType(64), 8)
-            # list_append returns a NEW list (value semantics); store it back
-            new_list = cg.builder.call(cg.list_append, [result_list, temp_ptr, elem_size])
+
+            if use_tagged:
+                # Create TaggedValue and append
+                stored_val = cg._cast_value(val, ir.IntType(64))
+                tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, stored_val)
+                tv_i8 = cg.builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
+                elem_size = ir.Constant(ir.IntType(64), cg.TAGGED_VALUE_SIZE)
+                new_list = cg.builder.call(cg.list_append, [result_list, tv_i8, elem_size])
+            else:
+                # Reuse pre-allocated temp from generate_list_comprehension to avoid stack overflow
+                temp = self._comp_temp_alloca
+                stored_val = cg._cast_value(val, ir.IntType(64))
+                cg.builder.store(stored_val, temp)
+                temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+                elem_size = ir.Constant(ir.IntType(64), 8)
+                # list_append returns a NEW list (value semantics); store it back
+                new_list = cg.builder.call(cg.list_append, [result_list, temp_ptr, elem_size])
+
             cg.builder.store(new_list, result_alloca)
 
         elif comp_type == "set":

@@ -742,8 +742,9 @@ class StringGenerator:
 
         builder.position_at_end(size_loop_body)
         elem_data_ptr = builder.call(cg.list_get, [strings_list, idx])
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
+        # Extract value from TaggedValue {i64 type_id, i64 value}
+        tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
         elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
 
         elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -837,8 +838,9 @@ class StringGenerator:
         write_pos = builder.load(write_pos_ptr)
 
         elem_data_ptr = builder.call(cg.list_get, [strings_list, idx])
-        elem_i64_ptr = builder.bitcast(elem_data_ptr, i64.as_pointer())
-        elem_i64 = builder.load(elem_i64_ptr)
+        # Extract value from TaggedValue {i64 type_id, i64 value}
+        tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
         elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
 
         elem_owner_handle_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -1792,8 +1794,8 @@ class StringGenerator:
         delim_size_ptr = builder.gep(delim, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         delim_size = builder.load(delim_size_ptr)
 
-        # List of strings - reference types need FLAG_ELEM_IS_REF
-        result_list = builder.call(cg.list_new, [ir.Constant(i64, 8), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        # List of strings - using TaggedValue (16 bytes per element)
+        result_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
         list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
         builder.store(result_list, list_ptr)
 
@@ -1808,14 +1810,14 @@ class StringGenerator:
         builder.cbranch(delim_empty, empty_delim_block, scan_loop)
 
         builder.position_at_end(empty_delim_block)
-        # Convert string pointer to handle for storage in List
+        # Convert string pointer to handle for TaggedValue storage
         s_i8 = builder.bitcast(s, i8.as_pointer())
         s_handle = builder.call(cg.gc.gc_ptr_to_handle, [s_i8])
-        temp_handle_ptr = builder.alloca(i64, name="temp_handle")
-        builder.store(s_handle, temp_handle_ptr)
-        temp_i8 = builder.bitcast(temp_handle_ptr, i8.as_pointer())
+        # Create TaggedValue with TV_TYPE_STRING (64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, s_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
-        result = builder.call(cg.list_append, [curr, temp_i8, ir.Constant(i64, 8)])
+        result = builder.call(cg.list_append, [curr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.ret(result)
 
         builder.position_at_end(scan_loop)
@@ -1871,14 +1873,14 @@ class StringGenerator:
         start = builder.load(start_ptr)
 
         slice_val = builder.call(cg.string_slice, [s, start, idx])
-        # Convert string pointer to handle for storage in List
+        # Convert string pointer to handle for TaggedValue storage
         slice_i8_ptr = builder.bitcast(slice_val, i8.as_pointer())
         slice_handle = builder.call(cg.gc.gc_ptr_to_handle, [slice_i8_ptr])
-        slice_handle_temp = builder.alloca(i64, name="slice_handle_temp")
-        builder.store(slice_handle, slice_handle_temp)
-        slice_i8 = builder.bitcast(slice_handle_temp, i8.as_pointer())
+        # Create TaggedValue with TV_TYPE_STRING (64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, slice_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
-        new_list = builder.call(cg.list_append, [curr, slice_i8, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, list_ptr)
 
         new_pos = builder.add(idx, delim_size)
@@ -1895,14 +1897,14 @@ class StringGenerator:
         builder.position_at_end(add_final)
         start = builder.load(start_ptr)
         final_slice = builder.call(cg.string_slice, [s, start, src_size])
-        # Convert string pointer to handle for storage in List
+        # Convert string pointer to handle for TaggedValue storage
         final_i8_ptr = builder.bitcast(final_slice, i8.as_pointer())
         final_handle = builder.call(cg.gc.gc_ptr_to_handle, [final_i8_ptr])
-        final_handle_temp = builder.alloca(i64, name="final_handle_temp")
-        builder.store(final_handle, final_handle_temp)
-        final_i8 = builder.bitcast(final_handle_temp, i8.as_pointer())
+        # Create TaggedValue with TV_TYPE_STRING (64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, final_handle)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
-        new_list = builder.call(cg.list_append, [curr, final_i8, ir.Constant(i64, 8)])
+        new_list = builder.call(cg.list_append, [curr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, list_ptr)
         builder.branch(done)
 
