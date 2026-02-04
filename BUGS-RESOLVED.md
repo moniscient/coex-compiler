@@ -4,6 +4,28 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-081: Galaxian crash - raw pointers stored where GC handles expected
+- **Discovered**: 2026-01-31, during Galaxian stress testing
+- **Category**: GC/Codegen
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian for extended play sessions
+- **Observed**: Segfault in `coex_gc_handle_deref` when GC tries to mark TaggedValues containing raw pointers
+- **Expected**: Should run indefinitely without crash
+- **Root Cause**: Multiple code paths stored raw pointers (via `ptrtoint`) where the GC expects handles. Key violations found in:
+  1. Array<ref_type> subscript access - loading handles as pointers
+  2. json_stringify storing raw pointers in temp string lists
+  3. string_join_list reading handles as pointers
+  4. `_to_i64_value` fallback for pointer types
+  5. Channel send/receive not using handle storage invariant
+- **Fix**: Systematic conversion to handle storage invariant across codegen:
+  - `codegen/expressions.py` - Array subscript now uses `gc_handle_deref`
+  - `codegen/json_type.py` - String list storage uses handles
+  - `codegen/strings.py` - string_join_list properly dereferences handles
+  - `codegen/channel.py` - Channel send uses `gc_ptr_to_handle` for heap types
+  - `codegen/loops.py` - Parallel task results use TaggedValue with handles
+- **Files**: `codegen/expressions.py`, `codegen/json_type.py`, `codegen/strings.py`, `codegen/loops.py`, `codegen/channel.py`
+- **Status**: Fixed (2026-02-04)
+
 ### BUG-095: json.parse() truncates floats to integers
 - **Discovered**: 2026-02-04, during xfail test cleanup
 - **Category**: Codegen
