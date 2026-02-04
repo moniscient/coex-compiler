@@ -656,3 +656,61 @@ func main() -> int
     return 0
 ~
 ''', "3\n1\n")
+
+
+class TestGCSafepointDelegation:
+    """Tests for BUG-080: safepoint delegates collection to GC thread."""
+
+    def test_safepoint_triggered_gc_preserves_data(self, expect_output):
+        """Test that automatic GC triggered via safepoint preserves live data.
+
+        Creates enough allocations to exceed GC_THRESHOLD (100000), triggering
+        an automatic GC via safepoint. Verifies that live data survives the
+        collection that is now delegated to the GC thread.
+        """
+        expect_output('''
+func allocate_garbage(n: int) -> int
+    for i in 0..n
+        temp: List<int> = [i, i + 1, i + 2]
+    ~
+    return n
+~
+
+func main() -> int
+    live_data: List<int> = [10, 20, 30, 40, 50]
+    allocate_garbage(50000)
+    print(live_data.len())
+    print(live_data.get(2))
+    allocate_garbage(50000)
+    print(live_data.len())
+    print(live_data.get(4))
+    return 0
+~
+''', "5\n30\n5\n50\n")
+
+    def test_safepoint_gc_with_nested_structures(self, expect_output):
+        """Test safepoint-triggered GC with nested heap structures.
+
+        Allocates enough to trigger safepoint GC while keeping nested
+        structures (maps, lists) alive. Verifies the GC thread correctly
+        traces through nested references.
+        """
+        expect_output('''
+func make_garbage() -> int
+    for i in 0..60000
+        temp: List<int> = [i]
+    ~
+    return 0
+~
+
+func main() -> int
+    m: Map<int, int> = {1: 100, 2: 200, 3: 300}
+    make_garbage()
+    print(m.get(2))
+    s: List<int> = [7, 8, 9]
+    make_garbage()
+    print(s.get(1))
+    print(m.get(3))
+    return 0
+~
+''', "200\n8\n300\n")

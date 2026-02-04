@@ -137,9 +137,84 @@
 - **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
+### BUG-081: Galaxian crash - raw pointers stored where GC handles expected
+- **Discovered**: 2026-01-31, during Galaxian stress testing
+- **Category**: GC/Codegen
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian for 2000+ frames (previously crashed at ~1000 frames)
+- **Observed**: Segfault in `coex_gc_handle_deref` when GC tries to mark TaggedValues containing raw pointers
+- **Expected**: Should run indefinitely without crash
+- **Root Cause**: Multiple code paths store raw pointers (via `ptrtoint`) where the GC expects handles
+
+**PARTIAL FIX APPLIED (2026-01-31)** - Game now runs 3x longer (2000 frames vs 1000):
+
+1. **Array<ref_type> subscript access** (`codegen/expressions.py:1023-1051`)
+   - Arrays of reference types (string, List, etc.) store handles, not raw pointers
+   - Retrieval code was loading handle as if it were a pointer
+   - **Fix**: Load handle (i64), then call `gc_handle_deref` to get pointer
+   - Also fixed 2D array indexing at lines 1000-1035
+
+2. **Previous fixes in this session**:
+   - `codegen/json_type.py:1867-1873, 1961-1971` - json_stringify storing raw pointers in temp string lists
+   - `codegen/strings.py:743-751, 840-848` - string_join_list reading handles as pointers
+   - `codegen/expressions.py:562-566` - `_to_i64_value` fallback for pointer types
+
+**REMAINING ISSUE**: Game still crashes at ~2000 frames. Additional raw pointer storage likely exists.
+
+**Investigation Strategy** (for future session):
+- Focus on **low-frequency/rare code paths** (input handling, event callbacks)
+- Search for `ptrtoint` patterns that store into TaggedValues or collections
+- Key files with `ptrtoint` usage to audit:
+  - `codegen/json_type.py` - lines 339, 870, 891, 1463, 2705, 2999, 3108, 3127, 3142, 3186, 3193, 3206, 3568
+  - `codegen/posix.py` - Result<T,E> returns using ptrtoint (lines 202, 210, 273, 281, 340, 388, 462, 471, 533, 591)
+  - `codegen/loops.py` - parallel task results (lines 2187, 2493, 2790, 2807)
+  - `codegen/core.py` - field initialization (lines 2864, 2917)
+
+**Handle Storage Invariant** (from CLAUDE.md):
+- All stored references to GC-managed objects must be **handles** (i64 indices), never raw pointers
+- Pattern: `gc_ptr_to_handle(ptr)` to store, `gc_handle_deref(handle)` to retrieve
+- Type IDs >= 64 (TYPE_HEAP_BASE) indicate heap references needing GC tracing
+
+- **Files**: `codegen/expressions.py`, `codegen/json_type.py`, `codegen/strings.py`, `codegen/loops.py`, `codegen/posix.py`
+- **Status**: Partially fixed (2026-01-31) - 3x improvement, more work needed
+
 ---
 
 ## Resolved Bugs
+
+### BUG-080: Memory leak in extern string returns
+- **Discovered**: 2026-01-31, during Galaxian investigation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Call extern function returning string in a loop
+- **Observed**: C-allocated string from extern return was never freed after copying to Coex string
+- **Root Cause**: `_convert_from_c_type` called `string_from_literal` which copies the C string
+  but never freed the original malloc'd memory.
+- **Fix**: Added `free()` call after `string_from_literal` to release the C string
+- **Files**: `codegen/core.py:1338-1355`
+- **Status**: Resolved (2026-01-31)
+
+### BUG-079: Variables assigned from method calls not GC-rooted
+- **Discovered**: 2026-01-31, during Galaxian segfault investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Assign result of method call on typed variable without explicit type annotation:
+  ```coex
+  layout: json = {...}
+  layout_str = layout.stringify()  # layout_str not rooted!
+  gc()
+  print(layout_str.len())  # Crash - string was collected
+  ```
+- **Observed**: String returned from `json.stringify()` was collected by GC
+- **Root Cause**: `collect_heap_vars_from_body` runs at function setup before code generation.
+  When inferring the type of `layout.stringify()`, it needed to know `layout` is type `json`,
+  but `var_coex_types` wasn't populated yet because variable declarations hadn't been processed.
+  Type inference fell back to `int`, so `layout_str` wasn't added to heap vars.
+- **Fix**: Added pre-pass in `collect_heap_vars_from_body` to collect explicit type annotations
+  from all VarDecls before doing the inference pass. This allows method call return type
+  inference to work correctly.
+- **Files**: `codegen/functions.py:645-735`
+- **Status**: Resolved (2026-01-31)
 
 ### BUG-004: GC race condition with parallel Set allocations
 - **Discovered**: 2025-01-17, during codebase scan
@@ -1507,3 +1582,102 @@ func main() -> int
   builder.call(self.gc_mark_object, [value_handle])
   ```
 - **Tests**: 109 tests pass (tests/test_gc.py + tests/test_json.py)
+
+### BUG-079: GC crashes on uninitialized buffer contents after TLAB recycling
+- **Discovered**: 2026-02-03, during Galaxian game debugging
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian example (`galaxian_debug`) for several thousand frames under heavy allocation pressure (~3,500 allocations/frame). Crash occurs non-deterministically, typically after debug dump output to console.
+- **Observed**: Segmentation fault in `gc_handle_deref` during concurrent GC mark phase. The GC dereferences a random/stale value from a handle buffer as if it were a valid handle index.
+- **Expected**: GC should only trace valid handles. Newly allocated buffers should contain zeroes (null handles) in unused slots.
+- **Root Cause**: **`alloc_arena_or_gc` does not zero user data area.** The GC's mark routines scan buffer contents based on buffer *capacity* (derived from the object header size field), not actual element count:
+
+  - `mark_list_tail_tagged`: Scans `buffer_size / 16` slots (full capacity)
+  - `mark_pv_node`: Scans all 32 children slots regardless of occupancy
+  - `mark_hamt_node`: Scans children based on bitmap popcount (correct)
+  - `TYPE_ARRAY_DATA_REF`: Scans `size / 8` slots (full capacity)
+
+  When TLAB memory is recycled after churn, stale non-zero data from previously freed objects remains in the allocated buffer. The GC interprets these stale values as live handles and attempts to dereference them, causing a crash.
+
+  Fresh TLAB pages from `mmap` are zero-filled by the OS, so the bug only manifests after enough allocation churn to recycle TLAB memory — explaining why it takes thousands of frames to appear.
+
+  Debug dumps accelerate the crash because: (1) string formatting causes additional allocations that churn TLAB memory faster, and (2) I/O blocking changes thread scheduling, giving the GC thread more CPU time to race against the mutator.
+
+- **Affected Allocation Sites (11 unzeroed sites found by audit)**:
+  - `codegen/list.py:332` — PV_NODE `create_root_block` (children[1..31] unzeroed)
+  - `codegen/list.py:427` — PV_NODE `copy_and_insert` (memcpy from source, but new slots unzeroed)
+  - `codegen/list.py:515` — PV_NODE `push_down_block` (memcpy from source)
+  - `codegen/list.py:910` — PV_NODE in `_implement_list_set` (memcpy from source)
+  - `codegen/list.py:1015` — PV_NODE in `_implement_list_set` update path (memcpy from source)
+  - `codegen/list.py:953` — TYPE_LIST_TAIL leaf in set path (memcpy full 32 elements)
+  - `codegen/list.py:1054` — TYPE_LIST_TAIL leaf in set update path (memcpy full 32 elements)
+  - `codegen/array.py:367` — TYPE_ARRAY_DATA_REF buffer (GC scans size/8 slots)
+  - `codegen/hamt.py:316` — HAMT node allocation
+  - `codegen/hamt.py:335` — HAMT children array
+  - `codegen/hamt.py:362` — HAMT leaf allocation
+
+- **Files**:
+  - `coex_gc.py` (`_implement_gc_alloc_arena_or_gc` — allocation function)
+  - `codegen/list.py` (`create_root_block` — PV_NODE allocation)
+  - `codegen/array.py` (TYPE_ARRAY_DATA_REF allocation)
+  - `codegen/hamt.py` (HAMT node/children/leaf allocations)
+- **Status**: Fixed (2026-02-03)
+- **Resolution**:
+  Two fixes applied:
+
+  1. **Site-specific fix** (`codegen/list.py:332`): Added memset to zero PV_NODE children array in `create_root_block`, matching the pattern already used in `depth_increase_block` (line 371) and `create_child_block` (line 495).
+
+  2. **Comprehensive fix** (`coex_gc.py:6229`): Added `memset(user_ptr, 0, size)` at the phi merge point in `alloc_arena_or_gc`, zeroing ALL user data areas for every allocation regardless of type. This follows the standard approach used by Java, .NET, and Go garbage collectors. Covers all 11 affected sites and prevents future regressions from new allocation sites.
+
+  ```python
+  # Zero the user data area to prevent the GC from tracing
+  # uninitialized memory.
+  builder.call(self.codegen.memset, [
+      user_ptr, ir.Constant(ir.IntType(8), 0), size
+  ])
+  ```
+- **Tests**: 291 passed, 2 xfailed (pre-existing). 1 pre-existing timeout in `test_first_with_multiple_conditions` (unrelated).
+
+### BUG-080: gc_safepoint runs collection on calling thread instead of delegating to GC thread
+- **Discovered**: 2026-02-03, during Galaxian crash analysis
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Any program that triggers GC via safepoint threshold. The safepoint function (`coex_gc_safepoint`) calls `gc_collect()` directly on the calling thread (e.g. main thread) rather than signaling the dedicated GC thread (#1) to perform collection.
+- **Observed**: When `gc_alloc_count >= GC_THRESHOLD` at a safepoint, the calling thread (often main) enters `gc_collect` directly. This means the main thread performs root scanning, marking, and sweeping — work that should be handled by the GC thread. macOS crash reports show `coex_gc_mark_object` and `coex_gc_handle_deref` on thread #0 (main), while the GC thread (#1) sleeps on `psynch_cvwait`.
+- **Expected**: All GC collection should be performed by the dedicated GC thread (#1). Calling threads should only signal the GC thread to wake up, then either wait for completion or continue (depending on whether stop-the-world is needed).
+- **Root Cause**: `_implement_gc_safepoint()` at line 4347 calls `gc_collect()` directly:
+  ```python
+  builder.position_at_end(do_gc)
+  builder.call(self.gc_collect, [])  # Runs collection on calling thread!
+  ```
+  The GC thread (`gc_thread_main`) also calls `gc_collect()`. While a CAS on `gc_in_progress` prevents concurrent collection, running GC on the mutator thread is architecturally wrong — the mutator is both scanning its own shadow stack (which it was just modifying) and running collection logic, which increases the risk of subtle race conditions.
+- **Files**:
+  - `coex_gc.py` (`_implement_gc_safepoint` line 4347, `_implement_gc_thread_main` line 4925)
+- **Status**: Fixed (2026-02-03)
+- **Fix**: Replaced the direct `gc_collect()` call in `_implement_gc_safepoint()` with delegation to the GC thread. The safepoint now:
+  1. Locks the GC mutex
+  2. Sets `gc_complete = 0` (prevents `gc_wait_for_completion` from returning early)
+  3. Sets `gc_trigger_requested = 1`
+  4. Signals `gc_cond_start` to wake the GC thread
+  5. Unlocks the mutex
+  6. Calls `gc_wait_for_completion()` to block until the GC thread finishes
+
+  The GC thread (`gc_thread_main`) already checks `gc_trigger_requested` in its main loop, so no changes were needed there. All 37 GC tests pass including 2 new tests for safepoint delegation.
+
+### BUG-081: Stack overflow from tagged_val allocas emitted inside loop bodies
+- **Discovered**: 2026-02-03, during Galaxian crash analysis (lldb showed `EXC_BAD_ACCESS code=2` at stack guard page)
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian example (`./galaxian_debug`) for ~4000 frames. Crash is `EXC_BAD_ACCESS (code=2)` — stack guard page hit. The `stp` instruction in Metal driver's `endCommand()` writes past the stack limit.
+- **Observed**: Stack overflow after ~4000 game loop iterations. `create_tagged_value()` in `coex_gc.py:1696` emitted `alloca` at the current builder position (inside loop body). In LLVM IR, `alloca` inside a loop allocates new stack space every iteration without freeing. With 248 tagged_val allocas per iteration × 16 bytes = 3,968 bytes/frame, the 8MB stack exhausts after ~2,000 frames.
+- **Expected**: Stack usage should be constant regardless of loop iterations.
+- **Root Cause**: `coex_gc.py:1696`:
+  ```python
+  tv_ptr = builder.alloca(self.tagged_value_type, name="tagged_val")
+  ```
+  This emits the `alloca` at whatever basic block the builder is positioned in. When called from within a loop body (e.g., list literal construction inside the game loop), the alloca ends up in a loop block, causing unbounded stack growth.
+- **Files**:
+  - `coex_gc.py` (`create_tagged_value` line 1696)
+- **Status**: Fixed (2026-02-03)
+- **Resolution**: Modified `create_tagged_value` to save the builder position, position at the function's entry block, emit the alloca there, then restore the builder position. This places all tagged_val allocas in the entry block where they're allocated once at function entry, not per loop iteration.
+- **Tests**: Verified via `--emit-ir`: all 248 tagged_val allocas in main are now before the first `br` instruction (entry block). Galaxian compiles and runs past the previous crash point.

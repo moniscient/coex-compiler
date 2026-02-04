@@ -1693,7 +1693,21 @@ class GarbageCollector:
         Returns:
             Pointer to the TaggedValue struct (stack-allocated)
         """
+        # Allocate in the function entry block to avoid stack growth when
+        # called inside loops.  The struct is written before every use so
+        # a single alloca per function is sufficient.
+        func = builder.function
+        entry_block = func.entry_basic_block
+        saved_block = builder.block
+
+        if entry_block.is_terminated:
+            builder.position_before(entry_block.terminator)
+        else:
+            builder.position_at_end(entry_block)
+
         tv_ptr = builder.alloca(self.tagged_value_type, name="tagged_val")
+
+        builder.position_at_end(saved_block)
 
         # Store type_id (field 0)
         type_id_ptr = builder.gep(tv_ptr, [
@@ -2723,9 +2737,14 @@ class GarbageCollector:
 
         header = builder.bitcast(block, self.header_type.as_pointer())
 
-        # Size field (offset 0)
+        # Size field (offset 0) — store USER size, not total allocation size.
+        # Marking functions (mark_list_tail_tagged, mark_array_data_ref, etc.)
+        # divide this value by element size to compute element count.
+        # Storing aligned_size (which includes HEADER_SIZE) would cause the
+        # GC to over-scan by HEADER_SIZE/elem_size phantom elements past
+        # the buffer, reading into adjacent objects or freed memory.
         size_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        builder.store(aligned_size, size_ptr)
+        builder.store(user_size, size_ptr)
 
         # Type ID field (offset 8) - extend i32 to i64
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
@@ -2758,6 +2777,13 @@ class GarbageCollector:
         block_int = builder.ptrtoint(block_for_ptr, self.i64)
         user_ptr_int = builder.add(block_int, header_size)
         user_ptr = builder.inttoptr(user_ptr_int, self.i8_ptr)
+
+        # Zero user data to prevent GC from tracing stale TLAB/heap contents.
+        # The GC marks buffer elements based on capacity (header size / elem_size),
+        # not actual element count, so all slots must be zeroed.
+        builder.call(self.codegen.memset, [
+            user_ptr, ir.Constant(ir.IntType(8), 0), user_size
+        ])
 
         # Allocate stack slot to store handle across blocks
         handle_alloca = builder.alloca(self.i64, name="handle")
@@ -4327,10 +4353,36 @@ class GarbageCollector:
         should_gc = builder.icmp_unsigned(">=", claimed_count, threshold)
         builder.cbranch(should_gc, do_gc, done)
 
-        # Trigger GC synchronously
-        # gc_collect has internal gc_in_progress check to prevent re-entrancy
+        # Delegate GC to the dedicated GC thread (BUG-080 fix)
+        # Instead of calling gc_collect() directly on the mutator thread,
+        # signal the GC thread and wait for it to complete.
         builder.position_at_end(do_gc)
-        builder.call(self.gc_collect, [])
+
+        # Lock mutex to atomically set gc_complete=0 and signal
+        gc_mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [gc_mutex_ptr])
+
+        # Set gc_complete = 0 so gc_wait_for_completion will actually wait
+        # (prevents race where GC thread hasn't started yet and gc_complete
+        # is still 1 from a previous cycle)
+        gc_complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), gc_complete_ptr)
+
+        # Set trigger flag to request collection
+        builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
+
+        # Signal the GC thread's condition variable to wake it up
+        gc_cond_start = builder.load(self.gc_cond_start)
+        builder.call(self.pthread_cond_signal, [gc_cond_start])
+
+        # Unlock mutex
+        builder.call(self.pthread_mutex_unlock, [gc_mutex_ptr])
+
+        # Wait for GC thread to complete collection before resuming
+        builder.call(self.gc_wait_for_completion, [])
+
         builder.branch(done)
 
         builder.position_at_end(done)
@@ -6230,6 +6282,16 @@ class GarbageCollector:
         user_ptr = builder.phi(self.i8_ptr, name="user_ptr")
         user_ptr.add_incoming(user_ptr_arena, arena_ok)
         user_ptr.add_incoming(user_ptr_gc, arena_fallback)
+
+        # Zero the user data area to prevent the GC from tracing
+        # uninitialized memory. The GC scans buffer contents based on
+        # type_id (e.g. TYPE_LIST_TAIL scans all capacity slots,
+        # TYPE_PV_NODE scans all 32 children). Without zeroing,
+        # stale TLAB/heap data appears as random handles/pointers.
+        builder.call(self.codegen.memset, [
+            user_ptr, ir.Constant(ir.IntType(8), 0), size
+        ])
+
         builder.ret(user_ptr)
 
     def _implement_gc_promote_to_heap(self):
