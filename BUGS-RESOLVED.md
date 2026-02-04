@@ -1540,3 +1540,19 @@ func main() -> int
   5. Updated `codegen/expressions.py` to check for module constants during identifier lookup and substitute the constant value expression
   6. Supports int, float, bool, and string constants
   7. Constants are compile-time substituted (no runtime storage)
+
+### BUG-096: posix.open creates files with wrong permissions on ARM64 macOS
+- **Discovered**: 2026-02-04, during test_posix_write failure investigation
+- **Category**: Codegen/Stdlib
+- **Severity**: Medium
+- **Reproduction**: Any posix.open() call with mode "w" on ARM64 macOS
+- **Observed**: Files created with permissions `-------r--` (0004) instead of `-rw-r--r--` (0644)
+- **Expected**: Files should have permissions 0644 (or 0644 & ~umask)
+- **Root Cause**: Two issues:
+  1. **Wrong flag values**: Code used Linux O_CREAT|O_TRUNC flags (577) instead of macOS values (1537)
+  2. **Calling convention mismatch**: `open()` is a variadic function on POSIX, but was declared as non-variadic in LLVM IR. On ARM64 Darwin, variadic arguments use a different calling convention than fixed arguments, so the mode value was being read from the wrong location.
+- **Fix**:
+  1. Updated O_WRONLY|O_CREAT|O_TRUNC from 577 (Linux) to 1537 (macOS)
+  2. Changed `open()` declaration from `FunctionType(i32, [i8_ptr, i32, i32])` to `FunctionType(i32, [i8_ptr, i32], var_arg=True)` so LLVM generates correct variadic call code
+- **Files**: `codegen/posix.py:49, 176-177`
+- **Status**: Fixed (2026-02-04)

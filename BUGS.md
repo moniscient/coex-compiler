@@ -199,6 +199,21 @@
 - **Status**: Open
 - **Note**: This is a systematic audit bug. Each violation found should be fixed and noted here until all are resolved.
 
+**Investigation Notes (2026-02-04)**:
+1. **False positives in strings.py**: String data buffer storage (`owner_handle` field) intentionally uses raw pointers via `ptrtoint`. These are NOT violations because:
+   - String data can be arena-allocated (FLAG_ARENA, no handle, bulk-freed)
+   - Arena allocations don't support `gc_ptr_to_handle` - they have no forward field
+   - The string struct tracks the data buffer; data is read back via `inttoptr`
+
+2. **Result type complexity**: Result stores reference types via `_cast_value(ptr, i64)` which uses `ptrtoint`. Fixing this requires:
+   - Change `_cast_value` to use `gc_ptr_to_handle` when target is i64 and source is a reference type pointer
+   - Update `Result.unwrap` and similar to use `gc_handle_deref` instead of `inttoptr`
+   - Both changes must happen together or the code will crash
+
+3. **Audit criteria refinement**: Only flag `ptrtoint` on GC-allocated objects (not arena-allocated data buffers). Key distinction:
+   - GC-allocated: TYPE_STRING, TYPE_LIST, TYPE_MAP, TYPE_ARRAY, user types → need handles
+   - Arena-allocated data: TYPE_STRING_DATA, TYPE_LIST_TAIL, etc. → raw pointers OK
+
 ---
 
 ### BUG-093: Replace compile-time type inference with runtime TYPE_ID lookup where appropriate
@@ -388,4 +403,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-096**
+**Next valid BUG ID: BUG-097**

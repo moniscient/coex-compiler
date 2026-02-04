@@ -45,8 +45,9 @@ class PosixGenerator:
         i8_ptr = ir.IntType(8).as_pointer()
 
         # Declare POSIX file functions
-        # int open(const char *pathname, int flags, mode_t mode)
-        open_ty = ir.FunctionType(i32, [i8_ptr, i32, i32])
+        # int open(const char *pathname, int flags, ...) - variadic function
+        # On ARM64 Darwin, variadic args have different calling convention
+        open_ty = ir.FunctionType(i32, [i8_ptr, i32], var_arg=True)
         cg.posix_open_syscall = ir.Function(cg.module, open_ty, name="open")
 
         # ssize_t read(int fd, void *buf, size_t count)
@@ -173,7 +174,9 @@ class PosixGenerator:
         # Check if mode is 'r' (114) or 'w' (119)
         is_read = builder.icmp_unsigned("==", first_char, ir.Constant(ir.IntType(8), ord('r')))
         read_flags = ir.Constant(i32, 0)  # O_RDONLY
-        write_flags = ir.Constant(i32, 577)  # O_WRONLY | O_CREAT | O_TRUNC
+        # O_WRONLY | O_CREAT | O_TRUNC: macOS = 1537, Linux = 577
+        # Use macOS values since we're on Darwin
+        write_flags = ir.Constant(i32, 1537)  # O_WRONLY(1) | O_CREAT(512) | O_TRUNC(1024)
         flags = builder.select(is_read, read_flags, write_flags)
 
         # Call open(path, flags, 0644)
@@ -198,7 +201,7 @@ class PosixGenerator:
         fd_field = builder.gep(posix_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(fd, fd_field)
 
-        # Return Result.ok(posix) - store posix pointer as i64
+        # Return Result.ok(posix)
         posix_as_i64 = builder.ptrtoint(posix_ptr_val, i64)
         ok_result = builder.call(cg.result_ok, [posix_as_i64])
         builder.ret(ok_result)
@@ -337,7 +340,7 @@ class PosixGenerator:
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
         err_result = builder.call(cg.result_err, [err_as_i64])
         builder.ret(err_result)
 
@@ -385,7 +388,7 @@ class PosixGenerator:
         builder.position_at_end(close_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to close file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
         err_result = builder.call(cg.result_err, [err_as_i64])
         builder.ret(err_result)
 
@@ -530,7 +533,7 @@ class PosixGenerator:
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
         err_result = builder.call(cg.result_err, [err_as_i64])
         builder.ret(err_result)
 
@@ -588,7 +591,7 @@ class PosixGenerator:
         builder.position_at_end(seek_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to seek in file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
+        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
         err_result = builder.call(cg.result_err, [err_as_i64])
         builder.ret(err_result)
 

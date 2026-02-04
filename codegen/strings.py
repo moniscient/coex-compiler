@@ -315,7 +315,7 @@ class StringGenerator:
         null_ptr = builder.gep(data_raw, [byte_len])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
-        # Store owner_handle (ptrtoint for Phase 4 compatibility)
+        # Store owner_handle - pointer to data buffer
         owner_handle = builder.ptrtoint(data_raw, i64)
         owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
@@ -404,7 +404,7 @@ class StringGenerator:
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
 
-        # Store owner_handle at field 0
+        # Store owner_handle at field 0 - pointer to data buffer
         owner_handle = builder.ptrtoint(data_buf, i64)
         owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
