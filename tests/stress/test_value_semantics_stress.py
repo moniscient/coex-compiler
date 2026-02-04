@@ -42,7 +42,6 @@ func main() -> int
 ~
 ''', "0\n")
 
-    @pytest.mark.xfail(reason="BUG-075: Deep nested list type inference fails after ~3 levels in loops")
     def test_invariant_list_deep_nesting(self, expect_output):
         """Verify List independence with 20 levels of nesting."""
         expect_output('''

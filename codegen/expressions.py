@@ -955,15 +955,78 @@ class ExpressionGenerator:
                         cg.builder.cbranch(is_heap, heap_bb, value_bb)
 
                         # Heap path: raw_value is a handle, dereference it
+                        # Use runtime type_id to determine correct pointer type (fixes BUG-075)
                         cg.builder.position_at_end(heap_bb)
                         ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-                        # For pointer types: bitcast; for primitives: convert via i64
+
+                        # Switch on runtime type_id to get correct struct pointer type
+                        # This handles deeply nested lists where compile-time inference fails
+                        heap_list_bb = cg.builder.append_basic_block("listget_heap_list")
+                        heap_string_bb = cg.builder.append_basic_block("listget_heap_string")
+                        heap_map_bb = cg.builder.append_basic_block("listget_heap_map")
+                        heap_set_bb = cg.builder.append_basic_block("listget_heap_set")
+                        heap_array_bb = cg.builder.append_basic_block("listget_heap_array")
+                        heap_default_bb = cg.builder.append_basic_block("listget_heap_default")
+                        heap_merge_bb = cg.builder.append_basic_block("listget_heap_merge")
+
+                        # Switch on type_id (TV_TYPE_* constants)
+                        switch = cg.builder.switch(type_id, heap_default_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_LIST), heap_list_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_STRING), heap_string_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_MAP), heap_map_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_SET), heap_set_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_ARRAY), heap_array_bb)
+                        # Other heap types (JSON, etc.) fall through to default
+
+                        # Each type case: bitcast to correct struct pointer, then to i8*
+                        # We use i8* as unified return type for heap objects
+                        cg.builder.position_at_end(heap_list_bb)
+                        list_ptr = cg.builder.bitcast(ptr_i8, cg.list_struct.as_pointer())
+                        list_as_i8 = cg.builder.bitcast(list_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_string_bb)
+                        str_ptr = cg.builder.bitcast(ptr_i8, cg.string_struct.as_pointer())
+                        str_as_i8 = cg.builder.bitcast(str_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_map_bb)
+                        map_ptr = cg.builder.bitcast(ptr_i8, cg.map_struct.as_pointer())
+                        map_as_i8 = cg.builder.bitcast(map_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_set_bb)
+                        set_ptr = cg.builder.bitcast(ptr_i8, cg.set_struct.as_pointer())
+                        set_as_i8 = cg.builder.bitcast(set_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_array_bb)
+                        arr_ptr = cg.builder.bitcast(ptr_i8, cg.array_struct.as_pointer())
+                        arr_as_i8 = cg.builder.bitcast(arr_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_default_bb)
+                        # Unknown heap type - return as i8*
+                        cg.builder.branch(heap_merge_bb)
+
+                        # Merge heap type cases
+                        cg.builder.position_at_end(heap_merge_bb)
+                        heap_phi = cg.builder.phi(ir.IntType(8).as_pointer(), "heap_typed_ptr")
+                        heap_phi.add_incoming(list_as_i8, heap_list_bb)
+                        heap_phi.add_incoming(str_as_i8, heap_string_bb)
+                        heap_phi.add_incoming(map_as_i8, heap_map_bb)
+                        heap_phi.add_incoming(set_as_i8, heap_set_bb)
+                        heap_phi.add_incoming(arr_as_i8, heap_array_bb)
+                        heap_phi.add_incoming(ptr_i8, heap_default_bb)
+
+                        # Convert to final elem_llvm_type for outer merge
                         if isinstance(elem_llvm_type, ir.PointerType):
-                            heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                            heap_result = cg.builder.bitcast(heap_phi, elem_llvm_type)
                         else:
-                            # This branch won't be taken for primitives, but IR must be valid
-                            heap_i64 = cg.builder.ptrtoint(ptr_i8, ir.IntType(64))
-                            heap_result = self._from_i64_value(heap_i64, elem_llvm_type)
+                            # Compile-time thinks it's primitive but runtime says heap
+                            # Return ptr as i64 - caller must handle this case
+                            heap_result = cg.builder.ptrtoint(heap_phi, ir.IntType(64))
+                            heap_result = self._from_i64_value(heap_result, elem_llvm_type)
                         cg.builder.branch(merge_bb)
                         heap_bb_final = cg.builder.block
 
@@ -2448,15 +2511,76 @@ class ExpressionGenerator:
                         cg.builder.cbranch(is_heap, heap_bb, value_bb)
 
                         # Heap path: raw_value is a handle, dereference it
+                        # Use runtime type_id to determine correct pointer type (fixes BUG-075)
                         cg.builder.position_at_end(heap_bb)
                         ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-                        # For pointer types: bitcast; for primitives: convert via i64
+
+                        # Switch on runtime type_id to get correct struct pointer type
+                        # This handles deeply nested lists where compile-time inference fails
+                        heap_list_bb = cg.builder.append_basic_block("listmget_heap_list")
+                        heap_string_bb = cg.builder.append_basic_block("listmget_heap_string")
+                        heap_map_bb = cg.builder.append_basic_block("listmget_heap_map")
+                        heap_set_bb = cg.builder.append_basic_block("listmget_heap_set")
+                        heap_array_bb = cg.builder.append_basic_block("listmget_heap_array")
+                        heap_default_bb = cg.builder.append_basic_block("listmget_heap_default")
+                        heap_merge_bb = cg.builder.append_basic_block("listmget_heap_merge")
+
+                        # Switch on type_id (TV_TYPE_* constants)
+                        switch = cg.builder.switch(type_id, heap_default_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_LIST), heap_list_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_STRING), heap_string_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_MAP), heap_map_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_SET), heap_set_bb)
+                        switch.add_case(ir.Constant(ir.IntType(64), cg.gc.TV_TYPE_ARRAY), heap_array_bb)
+                        # Other heap types (JSON, etc.) fall through to default
+
+                        # Each type case: bitcast to correct struct pointer, then to i8*
+                        cg.builder.position_at_end(heap_list_bb)
+                        list_ptr = cg.builder.bitcast(ptr_i8, cg.list_struct.as_pointer())
+                        list_as_i8 = cg.builder.bitcast(list_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_string_bb)
+                        str_ptr = cg.builder.bitcast(ptr_i8, cg.string_struct.as_pointer())
+                        str_as_i8 = cg.builder.bitcast(str_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_map_bb)
+                        map_ptr = cg.builder.bitcast(ptr_i8, cg.map_struct.as_pointer())
+                        map_as_i8 = cg.builder.bitcast(map_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_set_bb)
+                        set_ptr = cg.builder.bitcast(ptr_i8, cg.set_struct.as_pointer())
+                        set_as_i8 = cg.builder.bitcast(set_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_array_bb)
+                        arr_ptr = cg.builder.bitcast(ptr_i8, cg.array_struct.as_pointer())
+                        arr_as_i8 = cg.builder.bitcast(arr_ptr, ir.IntType(8).as_pointer())
+                        cg.builder.branch(heap_merge_bb)
+
+                        cg.builder.position_at_end(heap_default_bb)
+                        cg.builder.branch(heap_merge_bb)
+
+                        # Merge heap type cases
+                        cg.builder.position_at_end(heap_merge_bb)
+                        heap_phi = cg.builder.phi(ir.IntType(8).as_pointer(), "heap_typed_ptr")
+                        heap_phi.add_incoming(list_as_i8, heap_list_bb)
+                        heap_phi.add_incoming(str_as_i8, heap_string_bb)
+                        heap_phi.add_incoming(map_as_i8, heap_map_bb)
+                        heap_phi.add_incoming(set_as_i8, heap_set_bb)
+                        heap_phi.add_incoming(arr_as_i8, heap_array_bb)
+                        heap_phi.add_incoming(ptr_i8, heap_default_bb)
+
+                        # Convert to final elem_llvm_type for outer merge
                         if isinstance(elem_llvm_type, ir.PointerType):
-                            heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                            heap_result = cg.builder.bitcast(heap_phi, elem_llvm_type)
                         else:
-                            # This branch won't be taken for primitives, but IR must be valid
-                            heap_i64 = cg.builder.ptrtoint(ptr_i8, ir.IntType(64))
-                            heap_result = self._from_i64_value(heap_i64, elem_llvm_type)
+                            # Compile-time thinks it's primitive but runtime says heap
+                            # Return ptr as i64 - caller must handle this case
+                            heap_result = cg.builder.ptrtoint(heap_phi, ir.IntType(64))
+                            heap_result = self._from_i64_value(heap_result, elem_llvm_type)
                         cg.builder.branch(merge_bb)
                         heap_bb_final = cg.builder.block
 

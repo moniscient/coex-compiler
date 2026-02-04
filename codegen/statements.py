@@ -920,6 +920,33 @@ class StatementGenerator:
             inferred_coex_type = cg._infer_type_from_expr(stmt.initializer)
             cg.var_coex_types[stmt.name] = inferred_coex_type
 
+        # Compute deferred type update for method calls (BUG-075 fix)
+        # When doing `current = current.get(0)`, the type changes from List<T> to T
+        # We compute this BEFORE expression generation but apply AFTER
+        deferred_type_update = None
+
+        # Check for MethodCallExpr (obj.method(args) form)
+        if isinstance(stmt.initializer, MethodCallExpr):
+            method = stmt.initializer.method
+            if method == "get" and isinstance(stmt.initializer.object, Identifier):
+                obj_name = stmt.initializer.object.name
+                if obj_name in cg.var_coex_types:
+                    obj_type = cg.var_coex_types[obj_name]
+                    if isinstance(obj_type, (ListType, ArrayType)):
+                        deferred_type_update = obj_type.element_type
+
+        # Also check for CallExpr with MemberExpr callee (parsed as CallExpr(callee=MemberExpr))
+        elif isinstance(stmt.initializer, CallExpr):
+            if isinstance(stmt.initializer.callee, MemberExpr):
+                member_expr = stmt.initializer.callee
+                method = member_expr.member
+                if method == "get" and isinstance(member_expr.object, Identifier):
+                    obj_name = member_expr.object.name
+                    if obj_name in cg.var_coex_types:
+                        obj_type = cg.var_coex_types[obj_name]
+                        if isinstance(obj_type, (ListType, ArrayType)):
+                            deferred_type_update = obj_type.element_type
+
         # Track aliasing for in-place optimization safety
         # = operator shares pointer (both source and target may alias)
         # := operator creates deep copy (no aliasing)
@@ -986,6 +1013,11 @@ class StatementGenerator:
                         cg.aliased_vars.add(stmt.name)
 
         cg.builder.store(value, alloca)
+
+        # Apply deferred type update for method calls (BUG-075 fix)
+        # This updates var_coex_types AFTER expression generation and store
+        if deferred_type_update is not None:
+            cg.var_coex_types[stmt.name] = deferred_type_update
 
         if stmt.name in cg.gc_root_indices and cg.gc is not None:
             root_idx = cg.gc_root_indices[stmt.name]

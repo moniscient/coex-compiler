@@ -4,6 +4,29 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-075: Deep nested list type inference fails after reassignment
+- **Discovered**: 2026-01-29, during value semantics stress testing
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+  ```coex
+  level = [42]
+  level = [level]    # level is now List<List<int>>
+  current = level
+  current = current.get(0)   # current should be List<int>, but type tracking fails
+  print(current.get(0))       # Crashes or wrong value
+  ```
+- **Observed**: After reassigning a variable using its own `.get()` method, the type tracker used stale information, causing incorrect code generation for nested list access.
+- **Root Cause**: Two issues:
+  1. **Compile-time**: When processing `current = current.get(0)`, the type update happened BEFORE expression generation. This caused the expression generator to use the NEW type (inner element) instead of the OLD type (outer list) when generating the `.get()` call.
+  2. **Runtime fallback**: For deeply nested lists where compile-time type inference fails, there was no runtime type switch to handle the TaggedValue type_id field.
+- **Fix**:
+  1. **Deferred type update** in `codegen/statements.py`: Compute the new element type BEFORE expression generation but apply the type update AFTER the store completes. This ensures `.get()` uses the correct outer-list type during code generation.
+  2. **Runtime TYPE_ID switch** in `codegen/expressions.py`: Added switch on `type_id` from TaggedValue to handle TV_TYPE_LIST, TV_TYPE_STRING, TV_TYPE_MAP, TV_TYPE_SET, TV_TYPE_ARRAY at runtime. This provides a fallback when compile-time inference can't determine the exact nested type.
+  3. **CallExpr handling**: Added handling for `CallExpr` with `MemberExpr` callee (in addition to `MethodCallExpr`) since the parser produces both forms for `obj.method(args)`.
+- **Files**: `codegen/statements.py:350-410`, `codegen/expressions.py:957-1010, 2520-2570`
+- **Status**: Fixed (2026-02-04)
+
 ### BUG-081: Galaxian crash - raw pointers stored where GC handles expected
 - **Discovered**: 2026-01-31, during Galaxian stress testing
 - **Category**: GC/Codegen
