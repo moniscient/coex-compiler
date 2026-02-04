@@ -540,17 +540,40 @@ int64_t coex_ui_shell_init(const char* title, int64_t width, int64_t height, int
 void coex_ui_shell_shutdown(void) {
     if (!_ui_state.initialized) return;
 
+    /* Free clipboard text (plain C memory) */
+    if (_ui_state.clipboard_text) {
+        free(_ui_state.clipboard_text);
+        _ui_state.clipboard_text = NULL;
+    }
+
     @autoreleasepool {
-        if (_ui_state.clipboard_text) {
-            free(_ui_state.clipboard_text);
+        /* Clear any pending drawable first */
+        _ui_state.current_drawable = nil;
+
+        /* Wait for any pending GPU work to complete */
+        if (_ui_state.command_queue) {
+            id<MTLCommandBuffer> syncBuffer = [_ui_state.command_queue commandBuffer];
+            [syncBuffer commit];
+            [syncBuffer waitUntilCompleted];
         }
 
-        [_ui_state.window close];
-        _ui_state.window = nil;
-        _ui_state.view = nil;
+        /* Clear metal_layer reference before releasing view.
+         * The view owns the layer, we just have a reference. */
         _ui_state.metal_layer = nil;
-        _ui_state.metal_device = nil;
+
+        /* Release Metal resources */
         _ui_state.command_queue = nil;
+        _ui_state.metal_device = nil;
+
+        /* Release view first (it's a child of window) */
+        _ui_state.view = nil;
+
+        /* Release window - this will close it properly.
+         * NOTE: Do NOT call [window close] explicitly before releasing,
+         * as it corrupts the window state and causes a crash on release. */
+        _ui_state.window = nil;
+
+        /* Release app delegate */
         _ui_state.app_delegate = nil;
     }
 

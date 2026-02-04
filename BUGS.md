@@ -130,18 +130,6 @@
 - **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
-### BUG-050: UI library shutdown segfault
-- **Discovered**: 2026-01-21, during UI performance test
-- **Category**: Runtime
-- **Severity**: Low
-- **Reproduction**: Run any UI test program (e.g., `./test_ui_performance`) and let it complete
-- **Observed**: Segmentation fault (signal 11) occurs after test prints success message during `coex_ui_shutdown()`
-- **Expected**: Clean shutdown without crash
-- **Hypothesis**: Cleanup ordering issue - ImGui context may be destroyed before Metal renderer releases resources that depend on it, or macOS Cocoa objects are being released in wrong order
-- **Files**: `runtime/coex_ui.c:coex_ui_shutdown()`, `runtime/coex_ui_imgui.c:coex_imgui_shutdown()`, `runtime/coex_ui_metal.m:coex_ui_metal_shutdown()`, `runtime/coex_ui_shell_macos.m:coex_ui_shell_shutdown()`
-- **Status**: Open
-- **Note**: Does not affect functionality - crash occurs after all test work completes successfully. Performance test achieves 103 FPS with 100 widgets before the shutdown crash.
-
 ### BUG-057: Module-level constant declarations not supported
 - **Discovered**: 2026-01-28, during Galaxian game implementation
 - **Category**: Parser

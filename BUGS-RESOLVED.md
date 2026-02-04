@@ -1496,3 +1496,19 @@ func main() -> int
 - **Status**: Fixed (2026-02-04)
 - **Resolution**: Implemented `convert_map_to_json_object()` which iterates the source map via `map_keys()`/`map_values()`, converts each key to String* (using `inttoptr` for string keys or `string_from_int` for int keys), converts each value to Json* based on the inferred value type, and builds a new JSON-compatible map with proper `MAP_FLAG_KEY_IS_PTR | MAP_FLAG_VALUE_IS_PTR` flags. Also added `_convert_map_value_to_json()` helper for type-based value conversion (int, float, bool, string, list, nested map).
 
+
+### BUG-050: UI library shutdown segfault
+- **Discovered**: 2026-01-21, during UI performance test
+- **Category**: Runtime
+- **Severity**: Low
+- **Reproduction**: Run any UI test program (e.g., `./test_ui_performance`) and let it complete
+- **Observed**: Segmentation fault (signal 11) occurs after test prints success message during `coex_ui_shutdown()`
+- **Expected**: Clean shutdown without crash
+- **Root Cause**: Two issues in shutdown sequence:
+  1. **Metal renderer**: Missing `@autoreleasepool` block and font texture pointer not cleared in ImGui before releasing
+  2. **Shell (macOS)**: Calling `[window close]` explicitly before releasing the window corrupted the window state, causing a crash when ARC tried to release it via `window = nil`
+- **Files**: `runtime/coex_ui_metal.m`, `runtime/coex_ui_shell_macos.m`
+- **Status**: Fixed (2026-02-04)
+- **Resolution**:
+  1. **Metal shutdown**: Added `@autoreleasepool` block and call to `coex_imgui_set_font_tex_id(NULL)` before releasing font texture
+  2. **Shell shutdown**: Removed explicit `[window close]` call. Instead, just release the window by setting `window = nil` - ARC handles closing properly. Also added GPU sync before releasing Metal resources, and proper ordering (release metal_layer before view since view owns the layer)

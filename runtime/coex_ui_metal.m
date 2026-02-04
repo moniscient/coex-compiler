@@ -188,14 +188,25 @@ int64_t coex_ui_metal_init(void* metal_device) {
 void coex_ui_metal_shutdown(void) {
     if (!_renderer.initialized) return;
 
-    _renderer.pipeline = nil;
-    _renderer.depthStencil = nil;
-    _renderer.sampler = nil;
-    _renderer.fontTexture = nil;
-    _renderer.vertexBuffer = nil;
-    _renderer.indexBuffer = nil;
-    _renderer.uniformBuffer = nil;
-    _renderer.device = nil;
+    @autoreleasepool {
+        /* Clear ImGui's font texture pointer before releasing the texture
+         * to prevent dangling pointer access during ImGui context destruction */
+#ifdef COEX_UI_HAS_IMGUI
+        coex_imgui_set_font_tex_id(NULL);
+#endif
+
+        /* Release Metal resources in dependency order:
+         * First release resources that were created using the device,
+         * then clear the device reference last */
+        _renderer.pipeline = nil;
+        _renderer.depthStencil = nil;
+        _renderer.sampler = nil;
+        _renderer.fontTexture = nil;
+        _renderer.vertexBuffer = nil;
+        _renderer.indexBuffer = nil;
+        _renderer.uniformBuffer = nil;
+        _renderer.device = nil;
+    }
 
     _renderer.initialized = 0;
 }
