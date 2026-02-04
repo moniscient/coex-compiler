@@ -887,8 +887,14 @@ typedef struct {
 /* ImDrawList is opaque - we just need a pointer */
 typedef void ImDrawList;
 
+/* BUG-081 diagnostic: Track total SVG render calls */
+static int64_t _svg_render_count = 0;
+static int64_t _svg_render_frame = 0;
+
 static void render_svg_image(cJSON* widget, cJSON* state, cJSON* new_state) {
     (void)state; (void)new_state;
+
+    _svg_render_count++;
 
     /* Get SVG handle - required */
     int64_t handle = (int64_t)get_number(widget, "handle", 0);
@@ -911,6 +917,14 @@ static void render_svg_image(cJSON* widget, cJSON* state, cJSON* new_state) {
     void* texture_id = coex_svg_get_texture_id(handle);
     if (!texture_id) return;
 
+    /* BUG-081 diagnostic: Validate texture_id looks reasonable */
+    uint64_t tex_val = (uint64_t)(uintptr_t)texture_id;
+    if (tex_val < 0x1000 || tex_val == 0xDEADBEEF || tex_val == 0xFEEDFACE) {
+        fprintf(stderr, "BUG-081: Invalid texture_id %p at svg_render #%lld\n",
+                texture_id, (long long)_svg_render_count);
+        return;
+    }
+
     /* Get current cursor screen position for rendering */
     extern ImVec2_c igGetCursorScreenPos(void);
     ImVec2_c cursor_pos = igGetCursorScreenPos();
@@ -921,7 +935,11 @@ static void render_svg_image(cJSON* widget, cJSON* state, cJSON* new_state) {
     /* Get the window draw list */
     extern ImDrawList* igGetWindowDrawList(void);
     ImDrawList* draw_list = igGetWindowDrawList();
-    if (!draw_list) return;
+    if (!draw_list) {
+        fprintf(stderr, "BUG-081: NULL draw_list at svg_render #%lld\n",
+                (long long)_svg_render_count);
+        return;
+    }
 
     /* Create ImTextureRef for user texture */
     ImTextureRef_c tex_ref;
@@ -1295,8 +1313,21 @@ const char* coex_ui_render_json(const char* layout_json, const char* state_json)
     cJSON_Delete(_ui_state.pending_events);
     _ui_state.pending_events = cJSON_CreateArray();
 
+    /* BUG-081 diagnostic: Track SVG renders per frame */
+    int64_t svg_count_before = _svg_render_count;
+    _svg_render_frame++;
+
     /* Render layout */
     render_widget(layout, state, new_state);
+
+    /* BUG-081 diagnostic: Report every 500 frames */
+    int64_t svg_this_frame = _svg_render_count - svg_count_before;
+    if (_svg_render_frame % 500 == 0) {
+        fprintf(stderr, "BUG-081 diag: frame=%lld, svg_this_frame=%lld, total_svg=%lld\n",
+                (long long)_svg_render_frame, (long long)svg_this_frame,
+                (long long)_svg_render_count);
+        fflush(stderr);
+    }
 
     /* End frame */
     coex_ui_end_frame();

@@ -332,6 +332,13 @@ class ListGenerator:
         new_root_raw_create = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root_create = builder.bitcast(new_root_raw_create, cg.pv_node_struct.as_pointer())
 
+        # Zero out children array to prevent GC from tracing uninitialized slots.
+        # alloc_arena_or_gc does NOT zero user data, so children[1..31] would contain
+        # stale TLAB data that the GC's mark_pv_node would interpret as live pointers.
+        create_children_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        create_children_i8 = builder.bitcast(create_children_ptr, ir.IntType(8).as_pointer())
+        builder.call(cg.memset, [create_children_i8, ir.Constant(ir.IntType(8), 0), ir.Constant(i64, 32 * 8)])
+
         # Store leaf_data pointer in children[0] (field 0 is now children)
         create_child0_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(leaf_data, create_child0_ptr)

@@ -117,6 +117,17 @@ class ArrayGenerator:
         array_new_ref_ty = ir.FunctionType(array_ptr, [i64, i64])
         cg.array_new_ref = ir.Function(cg.module, array_new_ref_ty, name="coex_array_new_ref")
 
+        # array_set_ref(arr: Array*, index: i64, value: i8*, elem_size: i64) -> Array*
+        # Like array_set but allocates data buffer with TYPE_ARRAY_DATA_REF
+        # so the GC traces element handles. Must be used for Array<string>, etc.
+        array_set_ref_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i8_ptr, i64])
+        cg.array_set_ref = ir.Function(cg.module, array_set_ref_ty, name="coex_array_set_ref")
+
+        # array_append_ref(arr: Array*, value: i8*, elem_size: i64) -> Array*
+        # Like array_append but for reference type elements.
+        array_append_ref_ty = ir.FunctionType(array_ptr, [array_ptr, i8_ptr, i64])
+        cg.array_append_ref = ir.Function(cg.module, array_append_ref_ty, name="coex_array_append_ref")
+
         # array_set_inplace(arr: Array*, index: i64, value: i8*, elem_size: i64) -> void
         # Mutates the array in place (only safe when array is unique/unaliased)
         array_set_inplace_ty = ir.FunctionType(ir.VoidType(), [array_ptr, i64, i8_ptr, i64])
@@ -153,7 +164,9 @@ class ArrayGenerator:
         self._implement_array_set_inplace()
         self._implement_array_get()
         self._implement_array_set()
+        self._implement_array_set_ref()
         self._implement_array_append()
+        self._implement_array_append_ref()
         self._implement_array_len()
         self._implement_array_size()
         self._implement_array_copy()
@@ -472,6 +485,42 @@ class ArrayGenerator:
 
         builder.ret(new_arr)
 
+    def _implement_array_set_ref(self):
+        """Like array_set but uses array_new_ref for the data buffer.
+
+        Must be used for Array<string>, Array<List<T>>, etc. so that
+        the GC traces element handles via TYPE_ARRAY_DATA_REF.
+        """
+        cg = self.cg
+
+        func = cg.array_set_ref
+        func.args[0].name = "arr"
+        func.args[1].name = "index"
+        func.args[2].name = "value"
+        func.args[3].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        old_arr = func.args[0]
+        index = func.args[1]
+        value_ptr = func.args[2]
+        elem_size = func.args[3]
+
+        old_len = self._get_array_len(builder, old_arr)
+        new_arr = builder.call(cg.array_new_ref, [old_len, elem_size])
+
+        old_data = self._get_array_data_ptr(builder, old_arr)
+        new_data = self._get_array_data_ptr(builder, new_arr)
+        copy_size = builder.mul(old_len, elem_size)
+        builder.call(cg.memcpy, [new_data, old_data, copy_size])
+
+        elem_offset = builder.mul(index, elem_size)
+        dest = builder.gep(new_data, [elem_offset])
+        builder.call(cg.memcpy, [dest, value_ptr, elem_size])
+
+        builder.ret(new_arr)
+
     def _implement_array_append(self):
         """Implement array_append: return a NEW 1D array with element appended.
 
@@ -508,6 +557,41 @@ class ArrayGenerator:
         builder.call(cg.memcpy, [new_data, old_data, copy_size])
 
         # Append the new element
+        elem_offset = builder.mul(old_len, elem_size)
+        dest = builder.gep(new_data, [elem_offset])
+        builder.call(cg.memcpy, [dest, value_ptr, elem_size])
+
+        builder.ret(new_arr)
+
+    def _implement_array_append_ref(self):
+        """Like array_append but uses array_new_ref for the data buffer.
+
+        Must be used for Array<string>, Array<List<T>>, etc.
+        """
+        cg = self.cg
+
+        func = cg.array_append_ref
+        func.args[0].name = "arr"
+        func.args[1].name = "value"
+        func.args[2].name = "elem_size"
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        old_arr = func.args[0]
+        value_ptr = func.args[1]
+        elem_size = func.args[2]
+        i64 = ir.IntType(64)
+
+        old_len = self._get_array_len(builder, old_arr)
+        new_len = builder.add(old_len, ir.Constant(i64, 1))
+        new_arr = builder.call(cg.array_new_ref, [new_len, elem_size])
+
+        old_data = self._get_array_data_ptr(builder, old_arr)
+        new_data = self._get_array_data_ptr(builder, new_arr)
+        copy_size = builder.mul(old_len, elem_size)
+        builder.call(cg.memcpy, [new_data, old_data, copy_size])
+
         elem_offset = builder.mul(old_len, elem_size)
         dest = builder.gep(new_data, [elem_offset])
         builder.call(cg.memcpy, [dest, value_ptr, elem_size])
@@ -997,6 +1081,8 @@ class ArrayGenerator:
         cg.functions["coex_array_get"] = cg.array_get
         cg.functions["coex_array_set"] = cg.array_set
         cg.functions["coex_array_append"] = cg.array_append
+        cg.functions["coex_array_set_ref"] = cg.array_set_ref
+        cg.functions["coex_array_append_ref"] = cg.array_append_ref
         cg.functions["coex_array_len"] = cg.array_len
         cg.functions["coex_array_size"] = cg.array_size
         cg.functions["coex_array_copy"] = cg.array_copy

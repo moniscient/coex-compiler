@@ -230,7 +230,7 @@ func main() -> int
         ~
 
         # GC every frame to manage memory
-        gc()
+        # gc()  # DISABLED: Investigating GC segfault bug
 
         # ---------------------------------------------------------------------
         # Input Handling

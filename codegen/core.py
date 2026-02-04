@@ -1345,7 +1345,12 @@ class CodeGenerator:
             if coex_type.name == "string":
                 # Convert C char* to Coex String using string_from_literal
                 # This handles null-terminated C strings and creates a proper Coex String
-                return self.builder.call(self.string_from_literal, [value])
+                coex_string = self.builder.call(self.string_from_literal, [value])
+                # BUG-080 FIX: Free the C-allocated string after copying
+                # Extern functions returning strings allocate via malloc/strdup
+                # string_from_literal copies the data, so we can free the original
+                self.builder.call(self.free, [value])
+                return coex_string
         # For other types, no conversion needed
         return value
 

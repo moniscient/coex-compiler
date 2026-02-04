@@ -742,10 +742,12 @@ class StringGenerator:
 
         builder.position_at_end(size_loop_body)
         elem_data_ptr = builder.call(cg.list_get, [strings_list, idx])
-        # Extract value from TaggedValue {i64 type_id, i64 value}
+        # Extract handle from TaggedValue {i64 type_id, i64 value}
+        # BUG-081 FIX: Value is a handle, not raw pointer - use gc_handle_deref
         tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
-        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
-        elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
+        _, elem_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
+        elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_handle])
+        elem_str = builder.bitcast(elem_i8, string_ptr_ty)
 
         elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
@@ -838,10 +840,12 @@ class StringGenerator:
         write_pos = builder.load(write_pos_ptr)
 
         elem_data_ptr = builder.call(cg.list_get, [strings_list, idx])
-        # Extract value from TaggedValue {i64 type_id, i64 value}
+        # Extract handle from TaggedValue {i64 type_id, i64 value}
+        # BUG-081 FIX: Value is a handle, not raw pointer - use gc_handle_deref
         tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
-        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
-        elem_str = builder.inttoptr(elem_i64, string_ptr_ty)
+        _, elem_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
+        elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_handle])
+        elem_str = builder.bitcast(elem_i8, string_ptr_ty)
 
         elem_owner_handle_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         elem_owner_handle = builder.load(elem_owner_handle_ptr)

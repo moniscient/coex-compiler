@@ -647,9 +647,41 @@ class FunctionGenerator:
 
         Recursively traverses the AST to find all VarDecl statements with heap types.
         Returns a list of variable names that need GC root tracking.
+
+        BUG-079 FIX: Do a pre-pass to collect explicit type annotations first,
+        so that type inference can see the types of variables declared earlier.
+        Without this, infer_type_from_expr fails for method calls on typed vars
+        because var_coex_types isn't populated yet during collection.
         """
         cg = self.cg
         heap_vars = []
+
+        # Save and initialize var_coex_types for type inference during collection
+        saved_var_coex_types = getattr(cg, 'var_coex_types', {}).copy()
+        if not hasattr(cg, 'var_coex_types'):
+            cg.var_coex_types = {}
+
+        # Pre-pass: Collect explicit type annotations to enable inference
+        def collect_type_annotations(statements):
+            for stmt in statements:
+                if isinstance(stmt, VarDecl) and stmt.type_annotation:
+                    cg.var_coex_types[stmt.name] = stmt.type_annotation
+                # Recurse into nested blocks
+                if isinstance(stmt, IfStmt):
+                    collect_type_annotations(stmt.then_body)
+                    for _, elif_body in stmt.else_if_clauses:
+                        collect_type_annotations(elif_body)
+                    if stmt.else_body:
+                        collect_type_annotations(stmt.else_body)
+                elif isinstance(stmt, ForStmt):
+                    collect_type_annotations(stmt.body)
+                elif isinstance(stmt, WhileStmt):
+                    collect_type_annotations(stmt.body)
+                elif isinstance(stmt, MatchStmt):
+                    for arm in stmt.arms:
+                        collect_type_annotations(arm.body)
+
+        collect_type_annotations(stmts)
 
         def visit_stmts(statements):
             for stmt in statements:
@@ -694,6 +726,10 @@ class FunctionGenerator:
                                             heap_vars.append(name)
 
         visit_stmts(stmts)
+
+        # Restore var_coex_types (BUG-079 FIX)
+        cg.var_coex_types = saved_var_coex_types
+
         return heap_vars
 
     def generate_function(self, func: FunctionDecl):

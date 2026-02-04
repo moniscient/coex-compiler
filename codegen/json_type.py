@@ -1866,9 +1866,11 @@ class JsonGenerator:
 
         # Append to string list (reuse pre-allocated temp_ptr)
         curr_list = builder.load(string_list_ptr)
-        elem_str_i64 = builder.ptrtoint(elem_str, i64)
+        # BUG-081 FIX: Store handle, not raw pointer, for GC safety
+        elem_str_i8 = builder.bitcast(elem_str, ir.IntType(8).as_pointer())
+        elem_str_handle = builder.call(cg.gc.gc_ptr_to_handle, [elem_str_i8])
         # Create TaggedValue with TV_TYPE_STRING for string elements
-        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, elem_str_i64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, elem_str_handle)
         tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
         new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, string_list_ptr)
@@ -1960,9 +1962,11 @@ class JsonGenerator:
 
         # Append to string list (reuse pre-allocated temp_ptr)
         curr_list = builder.load(string_list_ptr)
-        kv_str_i64 = builder.ptrtoint(kv_str, i64)
+        # BUG-081 FIX: Store handle, not raw pointer, for GC safety
+        kv_str_i8 = builder.bitcast(kv_str, ir.IntType(8).as_pointer())
+        kv_str_handle = builder.call(cg.gc.gc_ptr_to_handle, [kv_str_i8])
         # Create TaggedValue with TV_TYPE_STRING for string elements
-        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, kv_str_i64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, kv_str_handle)
         tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
         new_list = builder.call(cg.list_append, [curr_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, string_list_ptr)

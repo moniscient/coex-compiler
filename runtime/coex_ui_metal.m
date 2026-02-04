@@ -487,7 +487,18 @@ void coex_ui_metal_render(
                 /* Bind texture - use ImDrawCmd_GetTexID for cimgui */
                 ImTextureID texId = ImDrawCmd_GetTexID(pcmd);
                 if (texId) {
+                    /* BUG-081 diagnostic: Validate texId before casting */
+                    if (texId < 0x1000) {
+                        fprintf(stderr, "BUG-081: Invalid texId %llu in Metal render\n",
+                                (unsigned long long)texId);
+                        continue;
+                    }
                     id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)(uintptr_t)texId;
+                    if (texture == nil) {
+                        fprintf(stderr, "BUG-081: nil texture from texId %llu\n",
+                                (unsigned long long)texId);
+                        continue;
+                    }
                     [encoder setFragmentTexture:texture atIndex:0];
                 }
 
