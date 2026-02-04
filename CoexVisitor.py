@@ -14,6 +14,11 @@ class CoexVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by CoexParser#moduleConstDecl.
+    def visitModuleConstDecl(self, ctx:CoexParser.ModuleConstDeclContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by CoexParser#importDecl.
     def visitImportDecl(self, ctx:CoexParser.ImportDeclContext):
         return self.visitChildren(ctx)

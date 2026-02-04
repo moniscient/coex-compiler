@@ -25,7 +25,13 @@ grammar Coex;
 // ----------------------------------------------------------------------------
 
 program
-    : NEWLINE* ((importDecl | replaceDecl | replaceKindDecl | directiveDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
+    : NEWLINE* ((importDecl | replaceDecl | replaceKindDecl | directiveDecl | moduleConstDecl) NEWLINE*)* (NEWLINE* declaration)* NEWLINE* EOF
+    ;
+
+// Module-level constant: const NAME = value
+// These are compile-time constants that get substituted during codegen
+moduleConstDecl
+    : CONST IDENTIFIER ASSIGN expression
     ;
 
 // Module imports: import module_name or import "path/to/library.cxz"

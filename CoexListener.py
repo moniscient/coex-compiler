@@ -17,6 +17,15 @@ class CoexListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by CoexParser#moduleConstDecl.
+    def enterModuleConstDecl(self, ctx:CoexParser.ModuleConstDeclContext):
+        pass
+
+    # Exit a parse tree produced by CoexParser#moduleConstDecl.
+    def exitModuleConstDecl(self, ctx:CoexParser.ModuleConstDeclContext):
+        pass
+
+
     # Enter a parse tree produced by CoexParser#importDecl.
     def enterImportDecl(self, ctx:CoexParser.ImportDeclContext):
         pass

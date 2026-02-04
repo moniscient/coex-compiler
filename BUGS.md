@@ -130,27 +130,6 @@
 - **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
-### BUG-057: Module-level constant declarations not supported
-- **Discovered**: 2026-01-28, during Galaxian game implementation
-- **Category**: Parser
-- **Severity**: Medium
-- **Reproduction**:
-  ```coex
-  # At module level, outside any function:
-  KEY_LEFT = 263
-  KEY_RIGHT = 262
-
-  func main() -> int
-      print(KEY_LEFT)
-      return 0
-  ~
-  ```
-- **Observed**: Parser error: `Syntax error: Line X:Y - mismatched input '=' expecting IDENTIFIER`
-- **Expected**: Module-level constant assignments should be allowed for defining named constants
-- **Hypothesis**: The grammar only allows variable declarations inside function bodies. Top-level statements are restricted to function/type definitions and imports.
-- **Files**: `Coex.g4` (grammar rules for top-level declarations), `ast_builder.py`
-- **Workaround**: Define constants as local variables in each function that needs them, or use literal values directly
-- **Status**: Open
 
 
 

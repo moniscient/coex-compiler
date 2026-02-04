@@ -1512,3 +1512,31 @@ func main() -> int
 - **Resolution**:
   1. **Metal shutdown**: Added `@autoreleasepool` block and call to `coex_imgui_set_font_tex_id(NULL)` before releasing font texture
   2. **Shell shutdown**: Removed explicit `[window close]` call. Instead, just release the window by setting `window = nil` - ARC handles closing properly. Also added GPU sync before releasing Metal resources, and proper ordering (release metal_layer before view since view owns the layer)
+
+### BUG-057: Module-level constant declarations not supported
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: Parser
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  # At module level, outside any function:
+  KEY_LEFT = 263
+  KEY_RIGHT = 262
+
+  func main() -> int
+      print(KEY_LEFT)
+      return 0
+  ~
+  ```
+- **Observed**: Parser error: `Syntax error: Line X:Y - mismatched input '=' expecting IDENTIFIER`
+- **Expected**: Module-level constant assignments should be allowed for defining named constants
+- **Files**: `Coex.g4`, `ast_nodes.py`, `ast_builder.py`, `codegen/core.py`, `codegen/expressions.py`
+- **Status**: Fixed (2026-02-04)
+- **Resolution**: 
+  1. Added `moduleConstDecl` rule to grammar: `const IDENTIFIER ASSIGN expression`
+  2. Added `ModuleConstDecl` AST node and `module_consts` field to `Program`
+  3. Updated `ast_builder.py` to visit and collect module-level constants
+  4. Updated `codegen/core.py` to store constants in `self.module_constants` dictionary
+  5. Updated `codegen/expressions.py` to check for module constants during identifier lookup and substitute the constant value expression
+  6. Supports int, float, bool, and string constants
+  7. Constants are compile-time substituted (no runtime storage)

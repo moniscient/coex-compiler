@@ -605,3 +605,96 @@ func main() -> int
     return x
 ~
 ''')
+
+
+class TestModuleLevelConstants:
+    """Tests for module-level const declarations."""
+
+    def test_int_constant(self, expect_output):
+        """Integer constants at module level."""
+        expect_output('''
+const KEY_LEFT = 263
+const KEY_RIGHT = 262
+
+func main() -> int
+    print(KEY_LEFT)
+    print(KEY_RIGHT)
+    return 0
+~
+''', "263\n262\n")
+
+    def test_float_constant(self, expect_output):
+        """Float constants at module level."""
+        expect_output('''
+const PI = 3.14159
+const E = 2.71828
+
+func main() -> int
+    print(PI)
+    print(E)
+    return 0
+~
+''', "3.141590\n2.718280\n")
+
+    def test_string_constant(self, expect_output):
+        """String constants at module level."""
+        expect_output('''
+const GREETING = "Hello"
+const NAME = "World"
+
+func main() -> int
+    print(GREETING)
+    print(NAME)
+    return 0
+~
+''', "Hello\nWorld\n")
+
+    def test_bool_constant(self, expect_output):
+        """Boolean constants at module level."""
+        expect_output('''
+const DEBUG = true
+const RELEASE = false
+
+func main() -> int
+    if DEBUG
+        print(1)
+    ~
+    if RELEASE
+        print(2)
+    else
+        print(3)
+    ~
+    return 0
+~
+''', "1\n3\n")
+
+    def test_constant_in_expression(self, expect_output):
+        """Constants can be used in expressions."""
+        expect_output('''
+const OFFSET = 100
+const MULTIPLIER = 2
+
+func main() -> int
+    x = OFFSET + 50
+    y = x * MULTIPLIER
+    print(x)
+    print(y)
+    return 0
+~
+''', "150\n300\n")
+
+    def test_constant_multiple_functions(self, expect_output):
+        """Constants are accessible from multiple functions."""
+        expect_output('''
+const VALUE = 42
+
+func helper() -> int
+    return VALUE
+~
+
+func main() -> int
+    print(VALUE)
+    print(helper())
+    return 0
+~
+''', "42\n42\n")

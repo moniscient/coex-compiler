@@ -54,6 +54,10 @@ class ASTBuilder:
                 directive = self.visit_directive_decl(child)
                 if directive:
                     program.directives.append(directive)
+            elif hasattr(CoexParser, 'ModuleConstDeclContext') and isinstance(child, CoexParser.ModuleConstDeclContext):
+                const = self.visit_module_const_decl(child)
+                if const:
+                    program.module_consts.append(const)
             elif isinstance(child, CoexParser.DeclarationContext):
                 decl = self.visit_declaration(child)
                 if isinstance(decl, (FunctionDecl, KindFunctionDecl)):
@@ -132,6 +136,12 @@ class ASTBuilder:
         # ON() is explicit but same as default
 
         return DirectiveDecl(name=name, enabled=enabled)
+
+    def visit_module_const_decl(self, ctx) -> Optional[ModuleConstDecl]:
+        """Visit a module-level constant declaration: const NAME = value"""
+        name = ctx.IDENTIFIER().getText()
+        value = self.visit_expression(ctx.expression())
+        return ModuleConstDecl(name=name, value=value)
 
     def _get_string_value(self, ctx) -> str:
         """Extract string value from string literal"""

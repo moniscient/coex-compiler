@@ -828,6 +828,17 @@ class DirectiveDecl:
 
 
 @dataclass
+class ModuleConstDecl:
+    """Module-level constant declaration: const NAME = value
+
+    These are compile-time constants that get substituted during codegen.
+    Only literal values (int, float, bool, string) are allowed.
+    """
+    name: str
+    value: 'Expr'  # The constant value expression
+
+
+@dataclass
 class KindDecl:
     """User-defined function kind declaration: kind NAME -> RETURN_TYPE via HANDLER
 
@@ -874,6 +885,7 @@ class Program:
     replaces: List['ReplaceDecl'] = field(default_factory=list)
     kind_replaces: List['ReplaceKindDecl'] = field(default_factory=list)
     directives: List['DirectiveDecl'] = field(default_factory=list)
+    module_consts: List['ModuleConstDecl'] = field(default_factory=list)
     kinds: List['KindDecl'] = field(default_factory=list)
     types: List[TypeDecl] = field(default_factory=list)
     traits: List[TraitDecl] = field(default_factory=list)

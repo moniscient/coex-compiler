@@ -238,6 +238,9 @@ class CodeGenerator:
         self.module_search_paths: PyList[str] = []
         self.current_module: Optional[str] = None  # Track which module we're compiling
 
+        # Module-level constants (compile-time substitution)
+        self.module_constants: Dict[str, 'Expr'] = {}  # const_name -> value expression
+
         # Print/Debug directive support
         self.printing_enabled: bool = True   # Default: print() enabled
         self.debugging_enabled: bool = False  # Default: debug() disabled
@@ -852,6 +855,10 @@ class CodeGenerator:
             self.printing_enabled = self.cli_printing
         if self.cli_debugging is not None:
             self.debugging_enabled = self.cli_debugging
+
+        # Register module-level constants (compile-time substitution)
+        for const in program.module_consts:
+            self.module_constants[const.name] = const.value
 
         # Register user-defined kinds (needed before function processing)
         for kind_decl in program.kinds:

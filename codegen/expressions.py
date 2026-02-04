@@ -145,6 +145,11 @@ class ExpressionGenerator:
         cg = self.cg
         name = expr.name
 
+        # Check for module-level constants (compile-time substitution)
+        if name in cg.module_constants:
+            # Generate the constant value expression directly
+            return self.generate_expression(cg.module_constants[name])
+
         # Check for use-after-move
         if name in cg.moved_vars:
             raise RuntimeError(
