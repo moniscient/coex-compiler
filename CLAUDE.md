@@ -27,7 +27,13 @@ Write benchmarks that show the possibility of pathologically long run time compa
 
 **MANDATORY**: When encountering any unexpected behavior, test failure, or anomaly during development—even if worked around or tangential to the current task—immediately append a bug report to `BUGS.md` before continuing. You must never continue past a discovered bug without first documenting it.
 
+### Bug File Structure
+- **`BUGS.md`**: Open/active bugs only. The last line contains the next valid BUG ID number.
+- **`BUGS-RESOLVED.md`**: Archive of all fixed/resolved bugs. Moved here from BUGS.md when resolved.
+
 ### Bug Report Format
+Use the BUG ID shown at the bottom of `BUGS.md`, then increment it after inserting the new bug.
+
 ```markdown
 ### BUG-XXX: One-line summary
 - **Discovered**: YYYY-MM-DD, during [context]
@@ -41,11 +47,15 @@ Write benchmarks that show the possibility of pathologically long run time compa
 - **Status**: Open
 ```
 
+### Bug Lifecycle
+1. **New bug discovered** → Append to `BUGS.md` above the "Next valid BUG ID" line. Use the ID shown, then increment it.
+2. **Bug fixed** → Update Status to "Fixed (date)", then move the entire entry from `BUGS.md` to `BUGS-RESOLVED.md`. Never reuse a BUG ID number.
+
 ### Session Protocol
-1. **Session Start**: Review BUGS.md and summarize current state
+1. **Session Start**: Review `BUGS.md` (open bugs only) and summarize current state
 2. **Pre-Task**: Check if any open bugs interact with planned work
 3. **During Development**: Bug-on-discovery rule applies (document immediately)
-4. **Session End**: Review work done, ensure all encountered bugs are recorded
+4. **Session End**: Review work done, ensure all encountered bugs are recorded. Move any newly resolved bugs to `BUGS-RESOLVED.md`.
 
 ### When to Report
 - Test failures that reveal unexpected behavior
