@@ -8,9 +8,6 @@ These tests verify the debugging infrastructure added in Phase 0:
 - Frame depth tracking
 """
 
-import pytest
-
-
 class TestGCTracing:
     """Tests for GC tracing framework"""
 
@@ -98,7 +95,6 @@ func main() -> int
 class TestGCHeapInspector:
     """Tests for heap inspector utilities"""
 
-    @pytest.mark.xfail(reason="BUG-014: gc_dump_heap reads from unused global alloc list")
     def test_heap_dump_shows_objects(self, expect_output):
         """Test that heap dump shows allocated objects"""
         expect_output('''

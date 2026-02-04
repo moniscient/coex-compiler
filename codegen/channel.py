@@ -142,11 +142,15 @@ class ChannelGenerator:
 
         Args:
             channel: Channel pointer
-            value: Value to send (will be cast to i64)
+            value: Value to send (will be cast to i64, handles for heap types)
             builder: LLVM IR builder
 
         Returns:
             void (returns i64 0 for consistency)
+
+        HANDLE STORAGE INVARIANT: For heap-allocated objects (List, Map, Set,
+        Array, String), we store the GC handle (i64 index), not the raw pointer.
+        This ensures the value remains valid across GC cycles.
         """
         self.declare_channel_functions()
         cg = self.cg
@@ -156,8 +160,23 @@ class ChannelGenerator:
         if channel.type != channel_ptr_type:
             channel = builder.bitcast(channel, channel_ptr_type)
 
-        # Cast value to i64
-        value_i64 = cg._cast_value(value, ir.IntType(64))
+        # Convert value to i64 - use handle for heap types, raw value for primitives
+        if isinstance(value.type, ir.PointerType):
+            # Check if it's a heap-allocated struct type
+            pointee = value.type.pointee
+            is_heap_type = (hasattr(pointee, 'name') and
+                           pointee.name in ("struct.List", "struct.Map", "struct.Set",
+                                           "struct.Array", "struct.String", "struct.Json"))
+            if is_heap_type:
+                # Convert pointer to handle for GC safety
+                value_i8 = builder.bitcast(value, ir.IntType(8).as_pointer())
+                value_i64 = builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+            else:
+                # Non-heap pointer (shouldn't happen often) - use ptrtoint
+                value_i64 = builder.ptrtoint(value, ir.IntType(64))
+        else:
+            # Primitive type - cast directly to i64
+            value_i64 = cg._cast_value(value, ir.IntType(64))
 
         # Call coex_channel_send
         builder.call(self._channel_send_fn, [channel, value_i64])

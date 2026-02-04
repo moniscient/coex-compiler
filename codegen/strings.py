@@ -1672,7 +1672,10 @@ class StringGenerator:
 
         builder.position_at_end(loop_body)
         elem_ptr = builder.call(cg.list_get, [bytes_list, idx])
-        byte_val = builder.load(builder.bitcast(elem_ptr, i8.as_pointer()))
+        # list_get returns i8* to TaggedValue {i64 type_id, i64 value}
+        tv_ptr = builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, int_val = cg.gc.extract_tagged_value(builder, tv_ptr)
+        byte_val = builder.trunc(int_val, i8)
 
         dest_ptr = builder.gep(data_buf, [idx])
         builder.store(byte_val, dest_ptr)
@@ -1734,7 +1737,7 @@ class StringGenerator:
 
         builder.position_at_end(copy_bytes)
 
-        byte_list = builder.call(cg.list_new, [ir.Constant(i64, 1), ir.Constant(i64, 0)])
+        byte_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, 0)])
 
         idx_ptr = builder.alloca(i64, name="idx")
         list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="list")
@@ -1754,9 +1757,15 @@ class StringGenerator:
 
         builder.position_at_end(loop_body)
         src_byte_ptr = builder.gep(data_ptr, [idx])
+        byte_val = builder.load(src_byte_ptr)
+        byte_as_i64 = builder.zext(byte_val, i64)
+
+        # Create TaggedValue {i64 type_id, i64 value} for the byte
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, byte_as_i64)
+        tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
 
         current_list = builder.load(list_ptr)
-        new_list = builder.call(cg.list_append, [current_list, src_byte_ptr, ir.Constant(i64, 1)])
+        new_list = builder.call(cg.list_append, [current_list, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
         builder.store(new_list, list_ptr)
 
         new_idx = builder.add(idx, ir.Constant(i64, 1))
@@ -1948,8 +1957,9 @@ class StringGenerator:
         # Calculate new size (size + 1 for null terminator)
         new_size = builder.add(byte_size, one)
 
-        # Create a new byte array list with capacity for size + 1 bytes
-        byte_list = builder.call(cg.list_new, [one, zero])  # elem_size = 1 for bytes, flags = 0
+        # Create a new byte array list with TaggedValue elements
+        tv_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
+        byte_list = builder.call(cg.list_new, [tv_size, zero])
 
         # We need to append all bytes one at a time, then append null
         # Store list pointer for updates
@@ -1972,11 +1982,15 @@ class StringGenerator:
         builder.cbranch(in_bounds, loop_body, loop_end)
 
         builder.position_at_end(loop_body)
-        # Get source byte pointer
+        # Get source byte and wrap in TaggedValue
         src_byte_ptr = builder.gep(data_ptr, [idx])
+        byte_val = builder.load(src_byte_ptr)
+        byte_as_i64 = builder.zext(byte_val, i64)
+        tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, byte_as_i64)
+        tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         # Append to list
         current_list = builder.load(list_ptr)
-        new_list = builder.call(cg.list_append, [current_list, src_byte_ptr, one])
+        new_list = builder.call(cg.list_append, [current_list, tv_i8, tv_size])
         builder.store(new_list, list_ptr)
         # Increment index
         new_idx = builder.add(idx, one)
@@ -1984,11 +1998,11 @@ class StringGenerator:
         builder.branch(loop_header)
 
         builder.position_at_end(loop_end)
-        # Append the null terminator
-        null_byte = builder.alloca(i8, name="null_byte")
-        builder.store(ir.Constant(i8, 0), null_byte)
+        # Append the null terminator as a TaggedValue
+        null_tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, zero)
+        null_tv_i8 = builder.bitcast(null_tv_ptr, i8.as_pointer())
         current_list = builder.load(list_ptr)
-        final_list = builder.call(cg.list_append, [current_list, null_byte, one])
+        final_list = builder.call(cg.list_append, [current_list, null_tv_i8, tv_size])
 
         builder.ret(final_list)
 

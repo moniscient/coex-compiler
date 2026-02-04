@@ -5,9 +5,6 @@ Phase 4, Step 11 of Task System implementation.
 Formulas must be pure: no I/O, no atomics, only call other formulas.
 """
 
-import pytest
-
-
 class TestFormulaPurity:
     """Tests that pure formulas compile correctly"""
 
@@ -202,7 +199,6 @@ func main() -> int
 ~
 ''', "30\n")
 
-    @pytest.mark.xfail(reason="BUG-013: Task-to-task suspension not implemented")
     def test_task_can_call_task(self, expect_output):
         """Task can call another task"""
         expect_output('''

@@ -40,7 +40,8 @@ class HamtGenerator:
 
     # Flag constants for Map/Set type info
     MAP_FLAG_KEY_IS_PTR = 0x01    # Key is a heap pointer (e.g., string)
-    MAP_FLAG_VALUE_IS_PTR = 0x02  # Value is a heap pointer
+    MAP_FLAG_VALUE_IS_PTR = 0x02  # Value is a heap pointer (stored as raw ptr)
+    MAP_FLAG_VALUE_IS_HANDLE = 0x04  # Value is a GC handle (stored via gc_ptr_to_handle)
 
     def __init__(self, codegen: 'CodeGenerator'):
         """Initialize with reference to parent CodeGenerator instance."""
@@ -88,6 +89,7 @@ class HamtGenerator:
         # Store flag constants on cg for access by other code
         cg.MAP_FLAG_KEY_IS_PTR = self.MAP_FLAG_KEY_IS_PTR
         cg.MAP_FLAG_VALUE_IS_PTR = self.MAP_FLAG_VALUE_IS_PTR
+        cg.MAP_FLAG_VALUE_IS_HANDLE = self.MAP_FLAG_VALUE_IS_HANDLE
 
         # Keep MapEntry for backward compatibility
         cg.map_entry_struct = ir.global_context.get_identified_type("struct.MapEntry")

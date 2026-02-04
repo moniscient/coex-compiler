@@ -4,6 +4,95 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-087: Cross-heap map references lost during GC swap
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: GC
+- **Severity**: Medium
+- **Root Cause**: Storage model mismatch between codegen and GC marking. After the handle storage conversion, `Map.set()` for reference-type values stores GC handles (via `gc_ptr_to_handle`), but the GC's `_implement_gc_mark_hamt` treated all heap-type values as raw pointers and called `gc_ptr_to_handle(inttoptr(value))`. When the value was already a handle (a small integer like 5), `inttoptr(5)` created a fake pointer and `gc_ptr_to_handle` crashed trying to read the object header at address 5.
+- **Fix**: Added `MAP_FLAG_VALUE_IS_HANDLE = 0x04` flag to distinguish handle-stored values (regular maps) from pointer-stored values (JSON maps). Updated `_implement_gc_mark_hamt` to branch: if HANDLE flag set, use i64 directly as handle for `gc_mark_object`; if PTR flag set, convert via `gc_ptr_to_handle` as before.
+- **Files**: `codegen/hamt.py:42-43`, `codegen/conversions.py:643-644`, `coex_gc.py:3001-3035`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-082: first/most/parallel-for return wrong values instead of task results
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: High
+- **Root Cause**: Two separate TaggedValue issues:
+  1. **Task-based paths (7 sites)**: `list_get` returns a pointer to a TaggedValue `{i64 type_id, i64 value}`, but the code loaded the first i64 (type_id, always 1) instead of extracting the value field. Fixed by using `extract_tagged_value` at lines 1496, 1608, 1764, 1936, 2049, 2313, 2677.
+  2. **Thread-based result collection (4 sites)**: Result lists were created with `elem_size = 8` (raw i64) but iterated by the standard for-loop path which expects 16-byte TaggedValue elements. This caused `extract_tagged_value` to read across element boundaries, shifting all results by one position. Fixed by changing to `TAGGED_VALUE_SIZE` (16) and wrapping results in TaggedValues before appending.
+- **Files**: `codegen/loops.py` (lines 1874, 1908, 2156, 2573 for elem_size; lines 1963-1971, 2193-2200, 2814-2821, 2825-2831 for TaggedValue wrapping)
+- **Status**: Fixed (2026-02-04)
+
+### BUG-084: GC stats don't reflect per-task allocation counts in concurrent programs
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: GC
+- **Severity**: Low
+- **Root Cause**: Not actually a GC stats issue. The tests used thread-based `for..in` parallel collection to spawn threads and sum results. The thread-based result collection had the same `elem_size = 8` TaggedValue bug as BUG-082. Once BUG-082's thread-based path was fixed, these tests passed — the GC stats were always reporting correctly.
+- **Files**: `codegen/loops.py` (same fix as BUG-082)
+- **Status**: Fixed (2026-02-04) — resolved by BUG-082 thread-path fix
+
+### BUG-083: User-defined kind handler substitution crashes at runtime
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Medium
+- **Root Cause**: The handler substitution code was already working correctly. The tests were incorrectly marked as xfail. The `KindFunctionDecl` code generation in `codegen/functions.py` properly builds a `KindCall` struct with name, param_names, param_values (as JSON list), and body fields, then calls the handler function. Both curly-brace (`{name}`) and positional (`$1`) substitution work via the user-defined handler function.
+- **Note**: A separate issue exists in `commentary_analyzer.py` which crashes on `KindFunctionDecl` objects (missing `.kind` attribute), but this only affects the CLI path, not the test infrastructure or core codegen.
+- **Files**: `codegen/functions.py:196-446`
+- **Status**: Fixed (2026-02-04) — tests were already passing, removed xfail markers
+
+### BUG-071: Map.remove() with string keys doesn't use string-aware function
+- **Discovered**: 2026-01-29, during JSON refactoring test implementation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Root Cause**: In `codegen/expressions.py:2289`, the special handling for Map with string keys only covered `get`, `has`, and `set` methods — not `remove`. The `remove` method fell through to `coex_map_remove` which expects an i64 key, not a string pointer.
+- **Fix**: Added `"remove"` to the method tuple and added a handler that calls `cg.map_remove_string` (which already existed in `codegen/hamt.py`).
+- **Files**: `codegen/expressions.py:2289-2330`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-085: String.from_bytes produces wrong characters (all bytes become 0x01)
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Medium
+- **Root Cause**: Two TaggedValue mismatches:
+  1. `String.from_bytes` (`codegen/strings.py:1675`): `list_get` returns a pointer to a TaggedValue `{i64 type_id, i64 value}`, but the code loaded a single i8 from the start, reading the type_id field (always 1 for TV_TYPE_INT) instead of the value field. Fix: use `extract_tagged_value` to get the i64 value, then `trunc` to i8.
+  2. `String.to_bytes` (`codegen/strings.py:1740-1762`): Created list with `elem_size=1` and appended raw bytes, but with `USE_TAGGED_VALUES=True` all lists expect 16-byte TaggedValue elements. Fix: create list with `TAGGED_VALUE_SIZE`, wrap each byte in a TaggedValue via `create_tagged_value`, and append with `TAGGED_VALUE_SIZE`.
+- **Files**: `codegen/strings.py:1674-1675, 1740-1762`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-058: LLVM domination error with repeated variable declarations in if-blocks
+- **Discovered**: 2026-01-28, during Galaxian game implementation
+- **Category**: Codegen
+- **Severity**: High
+- **Root Cause**: While-loop placeholder variable pre-allocation (in `codegen/loops.py`) now creates i64 allocas in the entry block before the loop body, and inner if-blocks reuse these allocas via `generate_var_reassignment()`. This prevents the domination error since all allocas are in the entry block.
+- **Status**: No longer reproducible (2026-02-04) — resolved by while-loop placeholder variable mechanism
+
+### BUG-073: json.as_string() returns quoted form for parsed strings
+- **Discovered**: 2026-01-29, during JSON value semantics test development
+- **Category**: Codegen
+- **Severity**: Medium
+- **Root Cause**: `_implement_json_parse()` in `codegen/json_type.py:2494-2498` stored the input string including surrounding quote characters. The `as_string()` method returned this verbatim.
+- **Fix**: Added `string_slice(str, 1, len-1)` to strip the surrounding quotes before calling `json_new_string`. This also fixed 5 json parse/roundtrip xfail tests and 5 json set_index xfail tests that depended on correct string parsing.
+- **Files**: `codegen/json_type.py:2494-2498`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-089: Float list values corrupted when returned from function
+- **Discovered**: 2025-01-18, during GEMM benchmark development
+- **Category**: Codegen
+- **Severity**: Critical
+- **Root Cause**: In TaggedValue mode, `list.get()` generates a heap path and a value path with a phi node. The heap path used `ptrtoint i8* to double`, which is invalid LLVM IR (can't ptrtoint to a floating-point type). This caused a compile-time error for any `[float]` list. Fix: convert i8* to i64 first via ptrtoint, then use `_from_i64_value` to bitcast i64 to double.
+- **Fix**: Changed both occurrences (index syntax path at line ~965 and method call path at line ~2457) to use `ptrtoint(ptr, i64)` then `_from_i64_value(i64, target_type)` instead of direct `ptrtoint(ptr, target_type)`.
+- **Files**: `codegen/expressions.py:960-965, 2452-2457`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-086: cstring slice returns zero for byte values at non-zero offsets
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Low
+- **Root Cause**: Same as BUG-085 — `_implement_string_cstring` created a list with `elem_size=1` and appended raw bytes, but with `USE_TAGGED_VALUES=True` all lists expect 16-byte TaggedValue elements. The `list.get()` method reads 16-byte TaggedValues, so it was reading garbage/zeros when the data was stored as 1-byte elements.
+- **Fix**: Changed list creation to use `TAGGED_VALUE_SIZE`, wrapped each byte in a TaggedValue via `create_tagged_value`, and appended with `TAGGED_VALUE_SIZE`.
+- **Files**: `codegen/strings.py:1961-2000`
+- **Status**: Fixed (2026-02-04)
+
 ### BUG-080: Memory leak in extern string returns
 - **Discovered**: 2026-01-31, during Galaxian investigation
 - **Category**: Codegen
@@ -1325,4 +1414,16 @@ func main() -> int
 - **Status**: Fixed (2026-02-03)
 - **Resolution**: Modified `create_tagged_value` to save the builder position, position at the function's entry block, emit the alloca there, then restore the builder position. This places all tagged_val allocas in the entry block where they're allocated once at function entry, not per loop iteration.
 - **Tests**: Verified via `--emit-ir`: all 248 tagged_val allocas in main are now before the first `br` instruction (entry block). Galaxian compiles and runs past the previous crash point.
+
+### BUG-091: Map-to-JSON conversion crashes at runtime (segfault)
+- **Discovered**: 2026-02-04, during stale xfail cleanup
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: `j: json := original_map` where original_map is `Map<string, int>` or `Map<int, int>`, then access `j.stringify()` or `j.get("key")`
+- **Observed**: Segmentation fault when accessing the converted JSON object
+- **Expected**: Map should be properly converted to a JSON object with string keys and JSON values
+- **Root Cause**: `convert_to_json()` in `codegen/json_type.py:2762` called `json_new_object(map_ptr)` directly, wrapping the user map as-is. But `json_new_object` expects a map where values are `ptrtoint(Json*)` pointers, not raw integers. When JSON code tried to access values (treating raw int 30 as a Json* pointer), it dereferenced an invalid address.
+- **Files**: `codegen/json_type.py`
+- **Status**: Fixed (2026-02-04)
+- **Resolution**: Implemented `convert_map_to_json_object()` which iterates the source map via `map_keys()`/`map_values()`, converts each key to String* (using `inttoptr` for string keys or `string_from_int` for int keys), converts each value to Json* based on the inferred value type, and builds a new JSON-compatible map with proper `MAP_FLAG_KEY_IS_PTR | MAP_FLAG_VALUE_IS_PTR` flags. Also added `_convert_map_value_to_json()` helper for type-based value conversion (int, float, bool, string, list, nested map).
 

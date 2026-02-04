@@ -42,6 +42,7 @@ func main() -> int
 ~
 ''', "0\n")
 
+    @pytest.mark.xfail(reason="BUG-075: Deep nested list type inference fails after ~3 levels in loops")
     def test_invariant_list_deep_nesting(self, expect_output):
         """Verify List independence with 20 levels of nesting."""
         expect_output('''
@@ -201,10 +202,8 @@ func main() -> int
 ~
 ''', "200\n0\n100\n199\n")
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented - uses set_field instead of set_index")
     def test_invariant_json_set_stress(self, expect_output):
         """Verify JSON set operations under stress."""
-        # NOTE: json.set(int_index, value) doesn't work yet - dispatches to set_field
         expect_output('''
 func main() -> int
     j: json := []

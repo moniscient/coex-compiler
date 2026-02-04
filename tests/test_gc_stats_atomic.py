@@ -34,7 +34,6 @@ func main() -> int
         # At minimum 100 list allocations, possibly more for internal array storage
         assert total_allocs >= 100, f"Expected at least 100 allocations, got {total_allocs}"
 
-    @pytest.mark.xfail(reason="task result aggregation doesn't match expected output format")
     def test_concurrent_allocations_stats_consistent(self, compile_coex):
         """Multi-threaded allocations: stats should still be consistent.
 
@@ -79,7 +78,6 @@ func main() -> int
             # After fix, should see at least 800
             assert total_allocs >= 800, f"Possible race condition: expected >= 800 allocations, got {total_allocs}"
 
-    @pytest.mark.xfail(reason="task result aggregation doesn't match expected output format")
     def test_stress_concurrent_allocations(self, compile_coex):
         """Stress test: many threads allocating aggressively.
 

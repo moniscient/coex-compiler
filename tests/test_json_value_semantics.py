@@ -7,9 +7,6 @@ JSON operations return new values; the original is unchanged.
 Includes test for BUG-070 fix (json_set_index elem_size).
 """
 
-import pytest
-
-
 class TestJsonValueSemantics:
     """Verify JSON maintains value semantics through immutability."""
 
@@ -33,7 +30,6 @@ func main() -> int
 ~
 ''', "1\n100\n")
 
-    @pytest.mark.xfail(reason="Map-to-JSON conversion crashes at runtime")
     def test_json_assignment_from_map_is_independent(self, expect_output):
         """JSON created from map is independent from original map."""
         expect_output('''
@@ -188,7 +184,6 @@ class TestJsonArraySetIndex:
     integer arguments.
     """
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented - uses set_field instead of set_index")
     def test_json_set_index_basic(self, expect_output):
         """Basic set(index, value) on JSON array works correctly."""
         expect_output('''
@@ -205,7 +200,7 @@ func main() -> int
 ~
 ''', "1\n42\n3\n")
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented")
+
     def test_json_set_index_preserves_original(self, expect_output):
         """set(index, value) preserves original array."""
         expect_output('''
@@ -225,7 +220,7 @@ func main() -> int
 ~
 ''', "10\n20\n30\n999\n")
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented")
+
     def test_json_set_index_with_nested_json(self, expect_output):
         """set(index, value) with nested JSON value."""
         expect_output('''
@@ -245,7 +240,7 @@ func main() -> int
 ~
 ''', "1\n42\n3\n")
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented")
+
     def test_json_set_index_multiple_operations(self, expect_output):
         """Multiple set operations create correct results."""
         expect_output('''
@@ -269,7 +264,7 @@ func main() -> int
 ~
 ''', "10\n0\n30\n0\n50\n")
 
-    @pytest.mark.xfail(reason="json.set() with int index not yet implemented")
+
     def test_json_set_index_stress(self, expect_output):
         """Stress test: many set operations on JSON array."""
         expect_output('''

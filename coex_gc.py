@@ -2998,26 +2998,43 @@ class GarbageCollector:
             builder.call(self.gc_mark_object, [key_handle])
         builder.branch(after_key)
 
-        # Check if value needs marking (flag bit 1)
+        # Check if value needs marking (flag bit 1 = raw ptr, flag bit 2 = handle)
         builder.position_at_end(after_key)
-        value_is_ptr = builder.and_(flags, ir.Constant(self.i32, 2))
-        value_needs_mark = builder.icmp_unsigned("!=", value_is_ptr, ir.Constant(self.i32, 0))
+        value_is_ptr = builder.and_(flags, ir.Constant(self.i32, 2))  # MAP_FLAG_VALUE_IS_PTR
+        value_is_handle = builder.and_(flags, ir.Constant(self.i32, 4))  # MAP_FLAG_VALUE_IS_HANDLE
+        value_any = builder.or_(value_is_ptr, value_is_handle)
+        value_needs_mark = builder.icmp_unsigned("!=", value_any, ir.Constant(self.i32, 0))
         builder.cbranch(value_needs_mark, mark_value, after_value)
 
         # Mark value as heap object
-        # BUG-078 FIX: Map values are stored as raw pointers (via ptrtoint), NOT handles.
-        # We must convert pointer to handle via gc_ptr_to_handle before marking,
-        # just like we do for keys above.
         builder.position_at_end(mark_value)
         value_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         value_as_int = builder.load(value_ptr_ptr)
+
+        # Check if value is stored as a handle (MAP_FLAG_VALUE_IS_HANDLE, bit 2)
+        is_handle = builder.icmp_unsigned("!=", value_is_handle, ir.Constant(self.i32, 0))
+        mark_as_handle = builder.function.append_basic_block("mark_val_handle")
+        mark_as_ptr = builder.function.append_basic_block("mark_val_ptr")
+        mark_val_done = builder.function.append_basic_block("mark_val_done")
+        builder.cbranch(is_handle, mark_as_handle, mark_as_ptr)
+
+        # Path 1: Value is a GC handle - use directly
+        builder.position_at_end(mark_as_handle)
+        value_not_null_h = builder.icmp_unsigned("!=", value_as_int, ir.Constant(self.i64, 0))
+        with builder.if_then(value_not_null_h):
+            builder.call(self.gc_mark_object, [value_as_int])
+        builder.branch(mark_val_done)
+
+        # Path 2: Value is a raw pointer - convert via gc_ptr_to_handle
+        builder.position_at_end(mark_as_ptr)
         value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
-        # Null check for value pointer
         value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
         with builder.if_then(builder.not_(value_is_null)):
-            # Convert pointer to handle for gc_mark_object
             value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
             builder.call(self.gc_mark_object, [value_handle])
+        builder.branch(mark_val_done)
+
+        builder.position_at_end(mark_val_done)
         builder.branch(after_value)
 
         builder.position_at_end(after_value)

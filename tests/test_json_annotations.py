@@ -36,10 +36,8 @@ func main() -> int
 ~
 ''', "1\n")
 
-    @pytest.mark.xfail(reason="List<any> type not supported in Coex")
     def test_json_function_annotation_in_list(self, expect_output):
         """Function in JSON list produces annotation."""
-        # NOTE: List<any> is not supported, so this test cannot work as written
         expect_output('''
 func add(a: int, b: int) -> int
     return a + b
@@ -153,13 +151,8 @@ func main() -> int
 class TestJsonMixedTypeAnnotation:
     """Tests for mixed types with annotations."""
 
-    @pytest.mark.xfail(reason="List<any> type not supported in Coex")
     def test_json_mixed_types_partial_annotation(self, expect_output):
-        """Mixed list with JSON-compatible and non-JSON types.
-
-        NOTE: List<any> is not a supported type in Coex, so mixed-type lists
-        cannot be created. Each list must have a homogeneous element type.
-        """
+        """Mixed list with JSON-compatible and non-JSON types."""
         expect_output('''
 func helper() -> int
     return 1

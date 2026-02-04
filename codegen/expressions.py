@@ -957,12 +957,13 @@ class ExpressionGenerator:
                         # Heap path: raw_value is a handle, dereference it
                         cg.builder.position_at_end(heap_bb)
                         ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-                        # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                        # For pointer types: bitcast; for primitives: convert via i64
                         if isinstance(elem_llvm_type, ir.PointerType):
                             heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
                         else:
                             # This branch won't be taken for primitives, but IR must be valid
-                            heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
+                            heap_i64 = cg.builder.ptrtoint(ptr_i8, ir.IntType(64))
+                            heap_result = self._from_i64_value(heap_i64, elem_llvm_type)
                         cg.builder.branch(merge_bb)
                         heap_bb_final = cg.builder.block
 
@@ -2286,7 +2287,7 @@ class ExpressionGenerator:
         type_name = cg._get_type_name_from_ptr(obj.type)
 
         # Special handling for Map with string keys
-        if type_name == "Map" and method in ("get", "has", "set") and expr.args:
+        if type_name == "Map" and method in ("get", "has", "set", "remove") and expr.args:
             key_arg = self.generate_expression(expr.args[0])
             is_string_key = (isinstance(key_arg.type, ir.PointerType) and
                             hasattr(key_arg.type.pointee, 'name') and
@@ -2326,6 +2327,8 @@ class ExpressionGenerator:
                     else:
                         value_i64 = cg._cast_value(value_arg, ir.IntType(64))
                         return cg.builder.call(cg.map_set_string, [obj, key_arg, value_i64])
+                elif method == "remove":
+                    return cg.builder.call(cg.map_remove_string, [obj, key_arg])
 
         # Special handling for Set with string elements
         if type_name == "Set" and method in ("has", "add") and expr.args:
@@ -2447,12 +2450,13 @@ class ExpressionGenerator:
                         # Heap path: raw_value is a handle, dereference it
                         cg.builder.position_at_end(heap_bb)
                         ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-                        # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                        # For pointer types: bitcast; for primitives: convert via i64
                         if isinstance(elem_llvm_type, ir.PointerType):
                             heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
                         else:
                             # This branch won't be taken for primitives, but IR must be valid
-                            heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
+                            heap_i64 = cg.builder.ptrtoint(ptr_i8, ir.IntType(64))
+                            heap_result = self._from_i64_value(heap_i64, elem_llvm_type)
                         cg.builder.branch(merge_bb)
                         heap_bb_final = cg.builder.block
 

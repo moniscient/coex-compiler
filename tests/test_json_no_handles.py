@@ -5,9 +5,6 @@ Phase 7 of JSON refactoring: Ensure JSON serialization outputs only values,
 never internal handles, pointers, or references.
 """
 
-import pytest
-
-
 class TestJsonNoHandlesInOutput:
     """Verify serialized JSON contains no internal handles."""
 
@@ -86,7 +83,6 @@ func main() -> int
 ~
 ''', "1\n")
 
-    @pytest.mark.xfail(reason="BUG-078: JSON variables not properly rooted in shadow stack, crash on GC")
     def test_no_handles_after_gc_cycle(self, expect_output):
         """After GC, serialized JSON still contains proper values."""
         # NOTE: Use bracket notation for array access, .get() for object fields
@@ -111,11 +107,8 @@ func main() -> int
 ~
 ''', "Alice\nBob\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_large_structure_no_handles(self, expect_output):
         """Large structure (100+ items) should not contain handles."""
-        # NOTE: Use := for append, bracket notation for array access
-        # BUG: json.parse() stores integers as floats but as_int() doesn't convert
         expect_output('''
 func main() -> int
     j: json := []
@@ -172,10 +165,8 @@ func main() -> int
 ~
 ''', "test\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_nested_values_recursive(self, expect_output):
         """Nested values should be recursively serialized as values."""
-        # BUG: json.parse() stores integers as floats but as_int() doesn't convert
         expect_output('''
 func main() -> int
     j: json = { a: { b: { c: 42 } } }

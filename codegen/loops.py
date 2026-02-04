@@ -1493,7 +1493,8 @@ class LoopGenerator:
         # Get first element
         first_idx = ir.Constant(i64, 0)
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, first_idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         # Bind loop variable
         pattern = stmt.pattern
@@ -1605,7 +1606,8 @@ class LoopGenerator:
 
         # Get element and bind loop variable
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         pattern = stmt.pattern
         if isinstance(pattern, str):
@@ -1761,7 +1763,8 @@ class LoopGenerator:
 
         # Get element and bind loop variable
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         pattern = stmt.pattern
         if isinstance(pattern, str):
@@ -1868,7 +1871,7 @@ class LoopGenerator:
         """Fallback for most when scheduler isn't available."""
         cg = self.cg
         i64 = ir.IntType(64)
-        elem_size = ir.Constant(i64, 8)
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
 
         # Use for-collection fallback
         for_assign = ForAssignStmt(
@@ -1901,8 +1904,8 @@ class LoopGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # Create result list
-        elem_size = ir.Constant(i64, 8)  # Results are i64 handles
+        # Create result list with TaggedValue elements
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
         result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
         cg.builder.store(result_list, result_alloca)
@@ -1933,7 +1936,8 @@ class LoopGenerator:
 
         # Get current element
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         # Bind loop variable
         pattern = stmt.pattern
@@ -1956,15 +1960,14 @@ class LoopGenerator:
         # Evaluate body expression
         body_result = cg._generate_expression(stmt.body_expr)
 
-        # Append to result list
-        temp = cg.builder.alloca(i64, name="temp")
+        # Append to result list as TaggedValue
         if body_result.type != i64:
             body_result = cg._cast_value(body_result, i64)
-        cg.builder.store(body_result, temp)
-        temp_ptr = cg.builder.bitcast(temp, i8_ptr)
+        tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, body_result)
+        tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
         current_list = cg.builder.load(result_alloca)
-        new_list = cg.builder.call(cg.list_append, [current_list, temp_ptr, elem_size])
+        new_list = cg.builder.call(cg.list_append, [current_list, tv_i8, elem_size])
         cg.builder.store(new_list, result_alloca)
 
         # Increment index
@@ -2046,7 +2049,8 @@ class LoopGenerator:
 
         # Get current element from iterable
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         # Bind loop variable for argument evaluation
         pattern = stmt.pattern
@@ -2148,7 +2152,7 @@ class LoopGenerator:
         # =====================================================================
         # Phase 3: Collect loop - gather results into list
         # =====================================================================
-        elem_size = ir.Constant(i64, 8)
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
         result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
         cg.builder.store(result_list, result_alloca)
@@ -2186,13 +2190,12 @@ class LoopGenerator:
         result_ptr = cg.builder.load(result_field)
         result_val = cg.builder.ptrtoint(result_ptr, i64)
 
-        # Append to result list
-        temp = cg.builder.alloca(i64, name="result_temp")
-        cg.builder.store(result_val, temp)
-        temp_ptr = cg.builder.bitcast(temp, i8_ptr)
+        # Append to result list as TaggedValue
+        tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, result_val)
+        tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
         current_list = cg.builder.load(result_alloca)
-        new_list = cg.builder.call(cg.list_append, [current_list, temp_ptr, elem_size])
+        new_list = cg.builder.call(cg.list_append, [current_list, tv_i8, elem_size])
         cg.builder.store(new_list, result_alloca)
 
         # Free the closure
@@ -2310,7 +2313,8 @@ class LoopGenerator:
 
         # Get element and bind loop variable
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         pattern = stmt.pattern
         if isinstance(pattern, str):
@@ -2564,7 +2568,7 @@ class LoopGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
-        elem_size = ir.Constant(i64, 8)
+        elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         list_ptr_type = cg.list_struct.as_pointer()
 
         # Extract body expression from block
@@ -2674,7 +2678,8 @@ class LoopGenerator:
 
         # Get current element from iterable
         elem_ptr = cg.builder.call(cg.list_get, [iterable_val, s_idx])
-        elem_val = cg.builder.load(cg.builder.bitcast(elem_ptr, i64.as_pointer()))
+        tv_ptr = cg.builder.bitcast(elem_ptr, cg.gc.tagged_value_ptr_type)
+        _, elem_val = cg.gc.extract_tagged_value(cg.builder, tv_ptr)
 
         # Bind loop variable for argument evaluation
         pattern = stmt.pattern
@@ -2806,22 +2811,20 @@ class LoopGenerator:
         result_ptr = cg.builder.load(result_field)
         result_val = cg.builder.ptrtoint(result_ptr, i64)
 
-        # Store to temp, bitcast to i8*, and append
-        result_temp = cg.builder.alloca(i64, name="result_temp")
-        cg.builder.store(result_val, result_temp)
-        result_temp_ptr = cg.builder.bitcast(result_temp, i8_ptr)
+        # Append result as TaggedValue
+        tv_result = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, result_val)
+        tv_result_i8 = cg.builder.bitcast(tv_result, i8_ptr)
         current_results = cg.builder.load(results_alloca)
-        new_results = cg.builder.call(cg.list_append, [current_results, result_temp_ptr, elem_size])
+        new_results = cg.builder.call(cg.list_append, [current_results, tv_result_i8, elem_size])
         cg.builder.store(new_results, results_alloca)
         cg.builder.branch(join_next)
 
         # Add to errors (has exception)
         cg.builder.position_at_end(add_to_errors)
-        error_temp = cg.builder.alloca(i64, name="error_temp")
-        cg.builder.store(exception_val, error_temp)
-        error_temp_ptr = cg.builder.bitcast(error_temp, i8_ptr)
+        tv_error = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, exception_val)
+        tv_error_i8 = cg.builder.bitcast(tv_error, i8_ptr)
         current_errors = cg.builder.load(errors_alloca)
-        new_errors = cg.builder.call(cg.list_append, [current_errors, error_temp_ptr, elem_size])
+        new_errors = cg.builder.call(cg.list_append, [current_errors, tv_error_i8, elem_size])
         cg.builder.store(new_errors, errors_alloca)
         cg.builder.branch(join_next)
 

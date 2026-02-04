@@ -23,7 +23,7 @@ from ast_nodes import (
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
     AssignOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
     OptionalType, PrimitiveType, NamedType, AtomicType, KindFunctionDecl, FunctionDecl,
-    FunctionType
+    FunctionType, ChannelType
 )
 
 # Import uniqueness analysis for in-place mutation optimization
@@ -513,6 +513,31 @@ class StatementGenerator:
             # Value semantics: deep copy collections
             inferred_coex_type = self._infer_coex_type_from_initializer(stmt)
 
+            # Handle i64 values that are actually handles to heap types
+            # This happens with Channel.receive() which returns handles (i64).
+            # Use the inferred Coex type to determine the correct pointer type,
+            # then dereference the handle via gc_handle_deref.
+            if isinstance(init_value.type, ir.IntType) and init_value.type.width == 64:
+                target_struct = None
+                if isinstance(inferred_coex_type, ListType):
+                    target_struct = cg.list_struct
+                elif isinstance(inferred_coex_type, MapType):
+                    target_struct = cg.map_struct
+                elif isinstance(inferred_coex_type, SetType):
+                    target_struct = cg.set_struct
+                elif isinstance(inferred_coex_type, ArrayType):
+                    target_struct = cg.array_struct
+                elif isinstance(inferred_coex_type, PrimitiveType) and inferred_coex_type.name == "string":
+                    target_struct = cg.string_struct
+
+                if target_struct is not None:
+                    # Convert handle (i64) to typed pointer via gc_handle_deref
+                    raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [init_value])
+                    init_value = cg.builder.bitcast(raw_ptr, target_struct.as_pointer())
+                    # Re-allocate local with correct pointer type
+                    alloca = cg.builder.alloca(init_value.type, name=stmt.name)
+                    cg.locals[stmt.name] = alloca
+
             # Track aliasing for in-place optimization safety:
             # When copying a collection from another variable (e.g., s2 = s1),
             # mark the source as aliased so in-place mutation is disabled.
@@ -852,6 +877,10 @@ class StatementGenerator:
                     elif stmt.initializer.method == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
                         inferred_coex_type = ListType(PrimitiveType("string"))
                         cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif stmt.initializer.method == "receive" and isinstance(receiver_type, ChannelType):
+                        # Channel.receive() returns the channel's element type
+                        inferred_coex_type = receiver_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
         elif isinstance(stmt.initializer, CallExpr):
             if isinstance(stmt.initializer.callee, Identifier):
                 callee_name = stmt.initializer.callee.name
@@ -869,6 +898,10 @@ class StatementGenerator:
                         cg.var_coex_types[stmt.name] = inferred_coex_type
                     elif method_name == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
                         inferred_coex_type = ListType(PrimitiveType("string"))
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name == "receive" and isinstance(receiver_type, ChannelType):
+                        # Channel.receive() returns the channel's element type
+                        inferred_coex_type = receiver_type.element_type
                         cg.var_coex_types[stmt.name] = inferred_coex_type
 
         return inferred_coex_type
@@ -1271,6 +1304,19 @@ class StatementGenerator:
             ret_val = cg._generate_expression(stmt.value)
             func = cg.builder.function
             ret_type = func.function_type.return_type
+
+            # Handle i64 values that are actually handles to heap types
+            # This happens with Channel.receive() which returns handles (i64).
+            if (isinstance(ret_val.type, ir.IntType) and ret_val.type.width == 64 and
+                isinstance(ret_type, ir.PointerType)):
+                pointee = ret_type.pointee
+                if hasattr(pointee, 'name') and pointee.name in (
+                    "struct.List", "struct.Map", "struct.Set",
+                    "struct.Array", "struct.String", "struct.Json"):
+                    # Convert handle (i64) to typed pointer via gc_handle_deref
+                    raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [ret_val])
+                    ret_val = cg.builder.bitcast(raw_ptr, ret_type)
+
             ret_val = cg._cast_value(ret_val, ret_type)
 
             # Join nursery tasks before return (structured concurrency guarantee)

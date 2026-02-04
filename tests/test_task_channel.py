@@ -148,7 +148,6 @@ func main() -> int
 class TestTaskChannelTypes:
     """Tests for different value types"""
 
-    @pytest.mark.xfail(reason="BUG-006: Channel<List<int>> receive() returns unknown type")
     def test_list_through_channel(self, expect_output):
         """List values through channel"""
         expect_output('''

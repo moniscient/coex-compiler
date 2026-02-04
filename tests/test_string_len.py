@@ -353,7 +353,6 @@ func main() -> int
 ~
 ''', "Value: 42, Count: 100\n")
 
-    @pytest.mark.xfail(reason="String.from_bytes/bytes for ASCII not fully working")
     def test_string_from_bytes_ascii(self, expect_output):
         """String.from_bytes converts byte array to string"""
         expect_output('''
@@ -376,7 +375,6 @@ func main() -> int
 ~
 ''', "len=0\n")
 
-    @pytest.mark.xfail(reason="String.from_bytes/bytes for ASCII not fully working")
     def test_string_bytes_ascii(self, expect_output):
         """string.bytes() converts string to byte array"""
         expect_output('''

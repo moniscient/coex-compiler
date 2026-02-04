@@ -2491,10 +2491,13 @@ class JsonGenerator:
         int_result = builder.call(cg.json_new_int, [int_val])
         builder.ret(int_result)
 
-        # Parse string (remove quotes)
+        # Parse string (remove surrounding quotes)
         builder.position_at_end(parse_string)
-        # For now, just wrap the string as-is (should remove quotes properly)
-        str_json = builder.call(cg.json_new_string, [str_ptr])
+        str_len = builder.call(cg.string_len, [str_ptr])
+        slice_start = ir.Constant(i64, 1)
+        slice_end = builder.sub(str_len, ir.Constant(i64, 1))
+        unquoted = builder.call(cg.string_slice, [str_ptr, slice_start, slice_end])
+        str_json = builder.call(cg.json_new_string, [unquoted])
         builder.ret(str_json)
 
         # Parse array/object using cJSON - both cases need to:
@@ -2755,8 +2758,8 @@ class JsonGenerator:
                     # List -> JSON array (need to convert elements to JSON)
                     return self.convert_list_to_json_array(value, expr)
                 elif struct_name == "struct.Map":
-                    # Map -> JSON object
-                    return builder.call(cg.json_new_object, [value])
+                    # Map -> JSON object (must convert entries to JSON format)
+                    return self.convert_map_to_json_object(value, expr)
                 elif struct_name == "struct.Set":
                     # Set -> JSON annotation {"@coex:set": [elements...]}
                     return self.convert_set_to_json_annotation(value, expr)
@@ -2901,6 +2904,142 @@ class JsonGenerator:
         builder.position_at_end(loop_done)
         final_list = builder.load(json_list_ptr)
         return builder.call(cg.json_new_array, [final_list])
+
+    def convert_map_to_json_object(self, map_ptr: ir.Value, expr: 'Expr' = None) -> ir.Value:
+        """Convert a Coex Map<K,V> to a JSON object by converting entries.
+
+        json_new_object expects a map with String* keys and Json* (ptrtoint) values.
+        User maps have raw key/value types, so we must iterate and convert each entry.
+        """
+        from ast_nodes import MapType, PrimitiveType, NamedType, ListType
+        cg = self.cg
+        builder = cg.builder
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Infer key and value types
+        key_type = None
+        value_type = None
+        if expr is not None:
+            inferred = cg._infer_type_from_expr(expr)
+            if isinstance(inferred, MapType):
+                key_type = inferred.key_type
+                value_type = inferred.value_type
+
+        # Get keys and values lists from the source map
+        keys_list = builder.call(cg.map_keys, [map_ptr])
+        values_list = builder.call(cg.map_values, [map_ptr])
+        num_entries = builder.call(cg.list_len, [keys_list])
+
+        # Create new JSON-compatible map
+        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR
+        json_map = builder.call(cg.map_new, [ir.Constant(i64, flags)])
+
+        # Store map pointer for loop mutation
+        json_map_ptr = builder.alloca(cg.map_struct.as_pointer(), name="json_map_ptr")
+        builder.store(json_map, json_map_ptr)
+        idx_ptr = builder.alloca(i64, name="map_conv_idx")
+        builder.store(ir.Constant(i64, 0), idx_ptr)
+
+        # Loop blocks
+        func = builder.function
+        loop_cond = func.append_basic_block("map_conv_cond")
+        loop_body = func.append_basic_block("map_conv_body")
+        loop_done = func.append_basic_block("map_conv_done")
+
+        builder.branch(loop_cond)
+
+        # Condition: idx < num_entries
+        builder.position_at_end(loop_cond)
+        idx = builder.load(idx_ptr)
+        cmp = builder.icmp_signed("<", idx, num_entries)
+        builder.cbranch(cmp, loop_body, loop_done)
+
+        # Body: extract key, convert to string; extract value, convert to JSON
+        builder.position_at_end(loop_body)
+
+        # Get key from keys list (TaggedValue)
+        key_data_ptr = builder.call(cg.list_get, [keys_list, idx])
+        key_tv_ptr = builder.bitcast(key_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, key_i64 = cg.gc.extract_tagged_value(builder, key_tv_ptr)
+
+        # Convert key to String*
+        is_string_key = (isinstance(key_type, PrimitiveType) and key_type.name == "string") or \
+                        (isinstance(key_type, NamedType) and key_type.name == "String")
+        if is_string_key:
+            # Key is already a String* stored as ptrtoint
+            string_key = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
+        else:
+            # Int or other key - convert to string
+            string_key = builder.call(cg.string_from_int, [key_i64])
+
+        # Get value from values list (TaggedValue)
+        val_data_ptr = builder.call(cg.list_get, [values_list, idx])
+        val_tv_ptr = builder.bitcast(val_data_ptr, cg.gc.tagged_value_ptr_type)
+        _, val_i64 = cg.gc.extract_tagged_value(builder, val_tv_ptr)
+
+        # Convert value to JSON based on value_type
+        json_val = self._convert_map_value_to_json(val_i64, value_type)
+
+        # Store JSON value as ptrtoint in the new map
+        json_val_i64 = builder.ptrtoint(json_val, i64)
+        curr_map = builder.load(json_map_ptr)
+        new_map = builder.call(cg.map_set_string, [curr_map, string_key, json_val_i64])
+        builder.store(new_map, json_map_ptr)
+
+        # Increment and loop
+        next_idx = builder.add(idx, ir.Constant(i64, 1))
+        builder.store(next_idx, idx_ptr)
+        builder.branch(loop_cond)
+
+        # Done: wrap the JSON-compatible map
+        builder.position_at_end(loop_done)
+        final_map = builder.load(json_map_ptr)
+        return builder.call(cg.json_new_object, [final_map])
+
+    def _convert_map_value_to_json(self, val_i64: ir.Value, value_type: 'Type') -> ir.Value:
+        """Convert a map value (as i64) to a Json* based on value_type."""
+        from ast_nodes import PrimitiveType, NamedType, ListType, MapType
+        cg = self.cg
+        builder = cg.builder
+
+        if value_type is None:
+            return builder.call(cg.json_new_int, [val_i64])
+
+        if isinstance(value_type, PrimitiveType):
+            if value_type.name == "int":
+                return builder.call(cg.json_new_int, [val_i64])
+            elif value_type.name == "float":
+                val_double = builder.bitcast(val_i64, ir.DoubleType())
+                return builder.call(cg.json_new_float, [val_double])
+            elif value_type.name == "bool":
+                val_bool = builder.trunc(val_i64, ir.IntType(1))
+                return builder.call(cg.json_new_bool, [val_bool])
+            elif value_type.name == "string":
+                val_str = builder.inttoptr(val_i64, cg.string_struct.as_pointer())
+                return builder.call(cg.json_new_string, [val_str])
+            elif value_type.name == "json":
+                return builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+
+        if isinstance(value_type, NamedType):
+            if value_type.name in ("Json", "json"):
+                return builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+            elif value_type.name == "String":
+                val_str = builder.inttoptr(val_i64, cg.string_struct.as_pointer())
+                return builder.call(cg.json_new_string, [val_str])
+            val_ptr = builder.inttoptr(val_i64, ir.IntType(8).as_pointer())
+            return self.convert_udt_to_json(val_ptr, value_type.name)
+
+        if isinstance(value_type, ListType):
+            val_list = builder.inttoptr(val_i64, cg.list_struct.as_pointer())
+            return self.convert_list_to_json_array(val_list, None)
+
+        if isinstance(value_type, MapType):
+            val_map = builder.inttoptr(val_i64, cg.map_struct.as_pointer())
+            return self.convert_map_to_json_object(val_map, None)
+
+        return builder.call(cg.json_new_int, [val_i64])
 
     def _convert_list_element_to_json(self, elem_data_ptr: ir.Value, elem_type: 'Type') -> ir.Value:
         """Convert a list element to JSON based on its known type."""

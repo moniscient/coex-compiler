@@ -641,7 +641,7 @@ class ConversionGenerator:
         if self.is_heap_type(key_type):
             flags |= self.cg.MAP_FLAG_KEY_IS_PTR
         if self.is_heap_type(value_type):
-            flags |= self.cg.MAP_FLAG_VALUE_IS_PTR
+            flags |= self.cg.MAP_FLAG_VALUE_IS_HANDLE
         return flags
 
     def compute_set_flags(self, elem_type: Type) -> int:

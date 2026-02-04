@@ -242,7 +242,6 @@ func main() -> int
 class TestHandlerSubstitution:
     """Tests for handlers that perform substitution."""
 
-    @pytest.mark.xfail(reason="user-defined kind handler substitution not fully implemented")
     def test_curly_brace_substitution(self, expect_output):
         """Handler can substitute {name} placeholders."""
         expect_output('''
@@ -305,7 +304,6 @@ func main() -> int
 ~
 ''', "Hello, World!\n")
 
-    @pytest.mark.xfail(reason="user-defined kind handler substitution not fully implemented")
     def test_positional_substitution(self, expect_output):
         """Handler can substitute $1, $2 positional placeholders."""
         expect_output('''

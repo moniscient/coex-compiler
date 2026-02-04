@@ -185,34 +185,7 @@
 
 ---
 
-## Resolved Bugs
-
-### BUG-089: Float list values corrupted when returned from function
-- **Discovered**: 2025-01-18, during GEMM benchmark development
-- **Category**: Codegen
-- **Severity**: Critical
-- **Reproduction**: 
-  ```coex
-  func gemm(a: [float], b: [float]) -> [float]
-      result: [float] = []
-      for i in 0..2
-          val: float = compute(a, b, i)  # val prints correctly here
-          result = result.append(val)
-      ~
-      return result
-  ~
-  
-  func main() -> int
-      c = gemm(a, b)
-      v: float = c.get(0)  # v is corrupted (e.g., 4620706744243609600.0)
-      return 0
-  ~
-  ```
-- **Observed**: Float values computed correctly inside function but read as corrupted values (appear to be bit-reinterpreted) after function returns
-- **Expected**: Float list values should maintain integrity across function boundaries
-- **Hypothesis**: Type confusion between float32/float64 or handle/pointer in list return path
-- **Files**: `codegen/core.py`, `codegen/collections.py`
-- **Status**: Open
+## Other Bugs (lower priority, not actively tracked above)
 
 ### BUG-050: UI library shutdown segfault
 - **Discovered**: 2026-01-21, during UI performance test
@@ -247,81 +220,6 @@
 - **Files**: `Coex.g4` (grammar rules for top-level declarations), `ast_builder.py`
 - **Workaround**: Define constants as local variables in each function that needs them, or use literal values directly
 - **Status**: Open
-
-### BUG-058: LLVM domination error with repeated variable declarations in if-blocks
-- **Discovered**: 2026-01-28, during Galaxian game implementation
-- **Category**: Codegen
-- **Severity**: High
-- **Reproduction**:
-  ```coex
-  func main() -> int
-      i = 0
-      while i < 10
-          if i % 2 == 0
-              row = i / 2
-              col = i % 5
-              print(row)
-          ~
-          if i % 3 == 0
-              row = i / 3    # Same variable name as above
-              col = i % 4    # Same variable name as above
-              print(col)
-          ~
-          i = i + 1
-      ~
-      return 0
-  ~
-  ```
-- **Observed**: LLVM IR verification error:
-  ```
-  Instruction does not dominate all uses!
-    %row = alloca i64, align 8
-    store i64 %.XXX, i64* %row, align 8
-  ```
-- **Expected**: Variables with the same name in different if-blocks should create separate allocas or be scoped correctly
-- **Hypothesis**: The codegen creates new allocas for each variable declaration inside if-blocks, but LLVM requires all allocas to be in the entry block for proper dominance. When the same variable name is used in multiple non-nested if-blocks within a loop, the allocas are placed in different basic blocks, causing dominance violations.
-- **Files**: `codegen/statements.py` (variable declaration handling), `codegen/flow_control.py` (if/while generation)
-- **Workaround**: Declare all loop-scoped variables once before the loop or at the top of the while body, then reassign them in the if-blocks rather than re-declaring
-- **Status**: Open
-
-### BUG-071: Map.remove() with string keys doesn't use string-aware function
-- **Discovered**: 2026-01-29, during JSON refactoring test implementation
-- **Category**: Codegen
-- **Severity**: Medium
-- **Reproduction**:
-  ```coex
-  func main() -> int
-      m: Map<string, int> = {"a": 1, "b": 2}
-      m2: Map<string, int> = m.remove("b")
-      print(m2.len())  # Still prints 2 instead of 1
-      return 0
-  ~
-  ```
-- **Observed**: `map.remove("b")` returns original map unchanged for string keys
-- **Expected**: Should return new map with key removed
-- **Root Cause**: In `codegen/expressions.py:2045`, the special handling for Map with string keys only covers `get`, `has`, and `set` methods - not `remove`. The `remove` method falls through to `coex_map_remove` which expects an i64 key, not a string pointer.
-- **Files**: `codegen/expressions.py:2045-2069`
-- **Status**: Open
-- **Workaround**: Use integer keys for maps when using `.remove()`
-
-### BUG-073: json.as_string() returns quoted form for parsed strings
-- **Discovered**: 2026-01-29, during JSON value semantics test development
-- **Category**: Runtime
-- **Severity**: Medium
-- **Reproduction**:
-```coex
-func main() -> int
-    j: json = json.parse("\"hello\"")
-    print(j.as_string())    # Prints "hello" (with quotes)
-    return 0
-~
-```
-- **Observed**: `as_string()` returns `"hello"` (with surrounding quotes)
-- **Expected**: `as_string()` should return `hello` (raw string value without quotes)
-- **Root Cause**: `json.parse()` likely stores the string with its JSON representation (including quotes), and `as_string()` returns this verbatim instead of stripping quotes.
-- **Files**: `runtime/coex_json.c` (json_parse, json_as_string)
-- **Status**: Open
-- **Note**: May be related to BUG-072 - parser may be storing raw JSON tokens instead of parsed values
 
 ### BUG-075: Deep nested list type inference fails after ~3 levels in loops
 - **Discovered**: 2026-01-29, during Phase 7 list handle conversion implementation
@@ -363,129 +261,263 @@ func main() -> int
 - **Workaround**: Use explicit intermediate variables at each nesting level instead of reassigning the same variable in a loop. Works correctly up to ~3-4 levels of nesting.
 - **Note**: This is an edge case. Normal usage patterns (2-3 levels of nesting) work correctly after the Phase 7 handle conversion fixes.
 
-### BUG-082: first/most/parallel-for return wrong values instead of task results
-- **Discovered**: 2026-02-04, during CI failure analysis
-- **Category**: Codegen
+
+
+
+
+---
+
+### BUG-092: Audit all heap pointer storage for handle invariant violations
+- **Discovered**: 2026-02-04, during Channel fix for BUG-006
+- **Category**: Codegen/GC
 - **Severity**: High
-- **Reproduction**: Any program using `first`, `most`, or `for..in` with task dispatch. Example:
-  ```coex
-  task double(x: int) -> int
-      return x * 2
-  ~
-  func main() -> int
-      result = first i in [21]
-          double(i)
-      ~
-      print(result)   # Prints "2" instead of "42"
-      return 0
-  ~
-  ```
-- **Observed**: `first` returns small integers (1, 2) unrelated to the computed result. `most` returns partial/wrong sums. Parallel `for..in` map returns 0 or the iteration count instead of accumulated results. The returned values suggest the iteration index or list length is being returned rather than the actual task result.
-- **Expected**: `first` should return the result of the first task to complete. `most` should return a list of results from all completed tasks. Parallel `for..in` should collect mapped results.
-- **Hypothesis**: The codegen for structured concurrency collection (`first`/`most`/`for..in`) is reading the wrong field from the task closure or result slot. The task result is being stored but the collection code reads the iteration variable or an internal counter instead.
-- **Files**: `codegen/core.py` or `codegen/expressions.py` (first/most/for-collection codegen), `runtime/coex_task.c` (task result storage)
-- **Affected Tests** (22 tests, marked xfail):
-  - `test_first_most.py`: test_first_single_element, test_first_with_computation, test_first_result_is_correct_value, test_most_single_element, test_most_multiple_elements, test_most_large_collection, test_most_sum_results
-  - `test_thread_concurrency.py`: test_parallel_map_simple, test_parallel_map_order_preserved, test_parallel_map_with_computation, test_parallel_map_single_element, test_first_single_item, test_first_larger_collection, test_most_larger_collection, test_most_single_item, test_first_with_loop_tasks
-  - `test_thread_kind.py`: test_thread_parallel_for, test_thread_first
-  - `test_fire_and_forget.py`: test_for_collection_unchanged, test_first_unchanged
-  - `test_complex_first_most.py`: test_first_with_if_else, test_first_with_multiple_conditions, test_first_with_local_computation, test_most_with_if_else, test_most_with_local_vars, test_first_with_computation_in_body (these 6 in CI-ignored file)
-- **Status**: Open
+- **Reproduction**: Any code path storing heap pointers that survives a GC cycle
+- **Observed**: Channel was storing raw pointers via `ptrtoint` instead of handles. Similar violations likely exist elsewhere.
+- **Expected**: All stored references to GC-managed objects must be handles (i64 indices), never raw pointers
+- **Hypothesis**: Multiple code paths use `ptrtoint` to store heap pointers where `gc_ptr_to_handle` should be used
 
-### BUG-083: User-defined kind handler substitution crashes at runtime
-- **Discovered**: 2026-02-04, during CI failure analysis
+**Audit Scope** - Search for these patterns in `codegen/`:
+
+1. **`ptrtoint` on heap struct pointers** - Check all uses of `builder.ptrtoint(value, i64)` where `value.type.pointee.name` is one of:
+   - `struct.List`, `struct.Map`, `struct.Set`, `struct.Array`, `struct.String`, `struct.Json`
+   - Any user-defined type struct
+
+2. **Storage locations requiring handles**:
+   - Collection elements (List, Array elements that are reference types)
+   - Map keys and values that are reference types
+   - Set elements that are reference types
+   - Channel send/receive (FIXED in this session)
+   - Struct fields containing reference types
+   - TaggedValue storage for heap types
+   - Any value persisted in heap-allocated structures
+
+3. **Known problem areas from BUG-081** (partially fixed):
+   - `codegen/json_type.py` - lines 339, 870, 891, 1463, 2705, 2999, 3108, 3127, 3142, 3186, 3193, 3206, 3568
+   - `codegen/posix.py` - Result<T,E> returns (lines 202, 210, 273, 281, 340, 388, 462, 471, 533, 591)
+   - `codegen/loops.py` - parallel task results (lines 2187, 2493, 2790, 2807)
+   - `codegen/core.py` - field initialization (lines 2864, 2917)
+
+4. **Correct pattern**:
+   ```python
+   # WRONG: Store raw pointer
+   value_i64 = builder.ptrtoint(heap_ptr, i64)
+
+   # CORRECT: Store handle
+   value_i8 = builder.bitcast(heap_ptr, i8_ptr)
+   value_handle = builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+   ```
+
+5. **Retrieval pattern**:
+   ```python
+   # For handle storage:
+   raw_ptr = builder.call(cg.gc.gc_handle_deref, [handle])
+   typed_ptr = builder.bitcast(raw_ptr, target_struct.as_pointer())
+
+   # NOT inttoptr (that's for raw pointer storage)
+   ```
+
+**Files to audit**:
+- `codegen/expressions.py` - collection access, struct field access
+- `codegen/statements.py` - assignments, variable storage
+- `codegen/loops.py` - parallel result collection
+- `codegen/json_type.py` - JSON value storage
+- `codegen/hamt.py` - Map/Set key/value storage
+- `codegen/strings.py` - string operations returning strings
+- `codegen/posix.py` - Result type returns
+- `codegen/channel.py` - FIXED this session
+- `codegen/core.py` - struct field initialization
+
+- **Files**: All files in `codegen/` directory
+- **Status**: Open
+- **Note**: This is a systematic audit bug. Each violation found should be fixed and noted here until all are resolved.
+
+---
+
+### BUG-093: Replace compile-time type inference with runtime TYPE_ID lookup where appropriate
+- **Discovered**: 2026-02-04, during Channel fix discussion
 - **Category**: Codegen
 - **Severity**: Medium
-- **Reproduction**: Define a `template` kind with curly-brace or positional substitution and call it:
-  ```coex
-  template greet(name: string) -> string:
-      Hello, {name}!
-  ~
-  func main() -> int
-      result = greet("World")
-      print(result)
-      return 0
-  ~
-  ```
-- **Observed**: Compiles successfully but crashes at runtime (execution failed, no output).
-- **Expected**: Should print `Hello, World!`
-- **Hypothesis**: The handler substitution codegen produces code that segfaults, likely due to incorrect string interpolation or missing runtime support for the template kind's body expansion.
-- **Files**: `codegen/core.py` or `codegen/functions.py` (user-defined kind handler dispatch)
-- **Affected Tests** (2 tests, marked xfail):
-  - `test_user_defined_kinds.py`: test_curly_brace_substitution, test_positional_substitution
-- **Status**: Open
+- **Reproduction**: Code paths that use `var_coex_types`, `_infer_type_from_expr`, or `_infer_coex_type_from_initializer` to determine heap object types
+- **Observed**: Many code paths use compile-time type inference to determine how to handle heap objects, but this information is already available at runtime via the TYPE_ID stored in each object's header
+- **Expected**: Use runtime TYPE_ID from object headers instead of fragile compile-time type inference where the object is already allocated
 
-### BUG-084: GC stats don't reflect per-task allocation counts in concurrent programs
-- **Discovered**: 2026-02-04, during CI failure analysis
-- **Category**: GC
-- **Severity**: Low
-- **Reproduction**: Spawn 8 tasks that each allocate 100 lists, then check gc_dump_stats output for total count matching 800.
-- **Observed**: `gc_dump_stats()` reports `total_allocations: 6436` (internal overhead) rather than a user-visible count of 800. The test expects `"800"` to appear in the output, but the stats report raw internal allocation counts that include GC infrastructure allocations.
-- **Expected**: Either the stats should report user-visible allocation counts, or the tests should match the actual stat format.
-- **Hypothesis**: The tests were written expecting a per-task result aggregation pattern that doesn't exist. The GC stats count all allocations (including internal PV nodes, tagged values, etc.), not just user-level list creations.
-- **Files**: `coex_gc.py` (gc_dump_stats), test expectations
-- **Affected Tests** (2 tests, marked xfail):
-  - `test_gc_stats_atomic.py`: test_concurrent_allocations_stats_consistent, test_stress_concurrent_allocations
-- **Status**: Open
+**Background**:
+Every GC-allocated object has a 32-byte header containing:
+- Offset 0: size (i64)
+- Offset 8: type_id (i64) - **this is the authoritative type**
+- Offset 16: flags (i64)
+- Offset 24: forward (i64)
 
-### BUG-085: String.from_bytes produces wrong characters (all bytes become 0x01)
-- **Discovered**: 2026-02-04, during CI failure analysis
-- **Category**: Codegen
+TYPE_ID constants (from `coex_gc.py`):
+```python
+TYPE_LIST = 1
+TYPE_STRING = 2
+TYPE_MAP = 3
+TYPE_SET = 5
+TYPE_ARRAY = 8
+TYPE_JSON_NULL = 17
+TYPE_JSON_BOOL = 18
+TYPE_JSON_INT = 19
+TYPE_JSON_FLOAT = 20
+TYPE_JSON_STRING = 21
+TYPE_JSON_ARRAY = 22
+TYPE_JSON_OBJECT = 23
+```
+
+**Audit Scope**:
+
+1. **Type inference mechanisms to review**:
+   - `var_coex_types` dictionary - tracks Coex types for variables
+   - `_infer_type_from_expr()` in `codegen/generics.py`
+   - `_infer_coex_type_from_initializer()` in `codegen/statements.py`
+   - `_get_type_name_from_ptr()` - inspects LLVM pointer type
+
+2. **When to use runtime TYPE_ID instead**:
+   - When receiving a value from a generic source (Channel, collection element, etc.)
+   - When the compile-time type is unknown or `any`
+   - When dispatching on type for serialization (JSON stringify)
+   - When the GC needs to trace/mark an object
+
+3. **When compile-time inference is still appropriate**:
+   - When the type is statically known from declarations
+   - When generating type-specific method calls
+   - When the value hasn't been allocated yet (literals, expressions)
+
+4. **Pattern for runtime TYPE_ID lookup**:
+   ```python
+   # Get TYPE_ID from object header
+   header = builder.bitcast(obj_ptr, cg.gc.header_type.as_pointer())
+   type_id_ptr = builder.gep(header, [i32(0), i32(1)])  # offset 8
+   type_id = builder.load(type_id_ptr)
+
+   # Switch on type_id
+   # TYPE_LIST (1) -> handle as List
+   # TYPE_STRING (2) -> handle as String
+   # etc.
+   ```
+
+5. **Specific code to review**:
+   - `codegen/statements.py:513-545` - handle conversion for Channel.receive() currently uses inferred type
+   - `codegen/statements.py:1303-1323` - return statement handle conversion
+   - `codegen/expressions.py:2287` - `_get_type_name_from_ptr` for method dispatch
+   - `codegen/json_type.py` - JSON serialization type dispatch
+   - Any code that does `isinstance(inferred_coex_type, ListType)` checks
+
+6. **Benefits of TYPE_ID approach**:
+   - More robust - doesn't depend on type inference correctness
+   - Works for dynamically-typed scenarios
+   - Single source of truth (object header)
+   - Already used by GC for marking
+
+7. **Potential downsides**:
+   - Slightly more runtime overhead (header read)
+   - May need switch/branch for type dispatch
+   - Some optimizations depend on static type knowledge
+
+- **Files**: `codegen/statements.py`, `codegen/expressions.py`, `codegen/generics.py`, `codegen/json_type.py`, `codegen/core.py`
+- **Status**: Open
+- **Note**: This is an architectural improvement. Each change should be evaluated for whether runtime TYPE_ID is more appropriate than compile-time inference for that specific use case.
+
+---
+
+### BUG-094: Create universal thread-safe C FFI for malloc'd string to Coex heap string conversion
+- **Discovered**: 2026-02-04, during FFI review
+- **Category**: Runtime/Stdlib
 - **Severity**: Medium
-- **Reproduction**:
-  ```coex
-  func main() -> int
-      bytes = [72, 101, 108, 108, 111]
-      s = String.from_bytes(bytes)
-      print(s)    # Prints "\x01\x01\x01\x01\x01" instead of "Hello"
-      return 0
-  ~
-  ```
-- **Observed**: All bytes in the output string are `0x01` regardless of input values. The string length is correct (5 chars) but every character is `\x01`.
-- **Expected**: `String.from_bytes([72, 101, 108, 108, 111])` should produce `"Hello"`.
-- **Hypothesis**: The byte-to-char conversion reads a boolean (nonzero → 1) or a type tag instead of the actual byte value. Likely the list element extraction is reading the TaggedValue type field (which would be 1 for TV_TYPE_INT) instead of the value field.
-- **Files**: `codegen/strings.py` (String.from_bytes implementation)
-- **Affected Tests** (2 tests, marked xfail):
-  - `test_string_len.py`: test_string_from_bytes_ascii, test_string_bytes_ascii
-- **Status**: Open
+- **Reproduction**: Any C FFI call that returns a malloc'd string (cJSON, file I/O, etc.)
+- **Observed**: Multiple FFI libraries have their own ad-hoc implementations for converting C strings to Coex strings, leading to inconsistency and potential memory leaks
+- **Expected**: Single universal function that safely converts malloc'd C strings to Coex heap strings
 
-### BUG-086: cstring slice returns zero for byte values at non-zero offsets
-- **Discovered**: 2026-02-04, during CI failure analysis
-- **Category**: Codegen
-- **Severity**: Low
-- **Reproduction**:
-  ```coex
-  func main() -> int
-      s = "world!"
-      cs = s.cstring()
-      print(cs.len())       # Correct: 6
-      print(cs.byte_at(0))  # Returns 0, expected 119 ('w')
-      print(cs.byte_at(3))  # Returns 0, expected 100 ('d')
-      print(cs.byte_at(6))  # Correct: 0 (null terminator)
-      return 0
-  ~
-  ```
-- **Observed**: `cstring.byte_at()` returns 0 for all positions except possibly the null terminator. The length is correctly reported as 6.
-- **Expected**: `byte_at(0)` should return 119 (`'w'`), `byte_at(3)` should return 100 (`'d'`).
-- **Hypothesis**: The `byte_at` implementation may be reading from the wrong base pointer (e.g., the cstring struct header instead of the character data), or the cstring slice view's data pointer offset is not applied correctly.
-- **Files**: `codegen/strings.py` (cstring byte_at or slice implementation)
-- **Affected Tests** (1 test, marked xfail):
-  - `test_cstring.py`: test_cstring_slice
-- **Status**: Open
+**Requirements**:
 
-### BUG-087: Cross-heap map references lost during GC swap
-- **Discovered**: 2026-02-04, during CI failure analysis
-- **Category**: GC
-- **Severity**: Medium
-- **Reproduction**: Create a map with heap-allocated values (strings), trigger gc_async() to swap heaps, then access the values.
-- **Observed**: Map values become inaccessible or corrupted after a heap swap triggered by gc_async().
-- **Expected**: Map values should survive GC heap swaps via proper cross-heap reference tracing.
-- **Hypothesis**: The cross-heap scanning in `gc_scan_cross_heap` doesn't fully trace through HAMT map node structures, missing references stored in branch nodes.
-- **Files**: `coex_gc.py` (`_implement_gc_scan_cross_heap`, `_implement_gc_mark_object`)
-- **Affected Tests** (1 test, marked xfail):
-  - `test_gc_async.py`: test_map_with_heap_values_across_gc
+1. **Function signature** (C side):
+   ```c
+   // Takes ownership of c_str (will free it), returns Coex String handle
+   // Returns 0 (null handle) if c_str is NULL
+   int64_t coex_string_from_cstring_take(char* c_str);
+   ```
+
+2. **Thread-safety requirements**:
+   - Must not acquire any global locks (non-blocking)
+   - Must use thread-local allocation (TLAB) when available
+   - Must be safe to call from any thread, including non-Coex threads
+   - Must handle the case where GC is in progress
+
+3. **Implementation approach**:
+   ```c
+   int64_t coex_string_from_cstring_take(char* c_str) {
+       if (c_str == NULL) return 0;
+
+       size_t len = strlen(c_str);
+
+       // Allocate Coex String struct (uses TLAB, non-blocking)
+       // This should use the thread-safe allocation path
+       int64_t string_handle = coex_gc_alloc_string(len);
+       if (string_handle == 0) {
+           free(c_str);  // Don't leak on allocation failure
+           return 0;
+       }
+
+       // Copy data to Coex string buffer
+       String* str = (String*)coex_gc_handle_deref(string_handle);
+       memcpy(str->data, c_str, len);
+       str->len = len;
+
+       // Free the original C string
+       free(c_str);
+
+       return string_handle;
+   }
+   ```
+
+4. **Variant for non-owned strings** (copy without free):
+   ```c
+   // Copies c_str, does NOT free it (caller retains ownership)
+   int64_t coex_string_from_cstring_copy(const char* c_str);
+   ```
+
+5. **Libraries to update**:
+   - `runtime/coex_json.c` - cJSON string returns
+   - `runtime/coex_posix.c` - file read returns, getenv, etc.
+   - `runtime/coex_string.c` - any C string conversions
+   - `codegen/posix.py` - generated FFI calls
+   - `codegen/json_type.py` - JSON parsing string extraction
+   - Any future FFI libraries
+
+6. **Current problematic patterns to replace**:
+   ```c
+   // WRONG: Manual allocation + copy + potential leak
+   char* c_result = some_c_function();
+   String* str = malloc(sizeof(String));  // Should use GC alloc
+   str->data = c_result;  // Ownership unclear
+   // Who frees c_result? Who frees str?
+
+   // CORRECT: Use universal function
+   char* c_result = some_c_function();
+   int64_t str_handle = coex_string_from_cstring_take(c_result);
+   // c_result is now freed, str_handle is GC-managed
+   ```
+
+7. **Edge cases to handle**:
+   - NULL input → return null handle (0)
+   - Empty string ("") → valid empty Coex string
+   - Very large strings → handle allocation failure gracefully
+   - Called from non-registered thread → must still work (register thread temporarily?)
+
+8. **Testing requirements**:
+   - Unit test for basic conversion
+   - Test NULL handling
+   - Test empty string
+   - Stress test with concurrent calls from multiple threads
+   - Test during GC pressure
+   - Valgrind/ASAN check for no memory leaks
+
+- **Files**:
+  - New: `runtime/coex_ffi.c`, `runtime/coex_ffi.h`
+  - Update: `runtime/coex_json.c`, `runtime/coex_posix.c`, `runtime/coex_string.c`
+  - Update: `codegen/posix.py`, `codegen/json_type.py`, `codegen/strings.py`
 - **Status**: Open
 
 ---
 
-**Next valid BUG ID: BUG-091**
+**Next valid BUG ID: BUG-095**

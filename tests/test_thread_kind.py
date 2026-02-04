@@ -94,7 +94,6 @@ func main() -> int
 class TestThreadParallelExecution:
     """Tests for parallel thread execution with for/first/most."""
 
-    @pytest.mark.xfail(reason="first/most/parallel-for returns incorrect values - task result collection bug")
     def test_thread_parallel_for(self, expect_output):
         """Parallel for loop with threads."""
         expect_output('''
@@ -114,7 +113,6 @@ func main() -> int
 ~
 ''', "30\n")
 
-    @pytest.mark.xfail(reason="first/most/parallel-for returns incorrect values - task result collection bug")
     def test_thread_first(self, expect_output):
         """First pattern returns first result."""
         expect_output('''

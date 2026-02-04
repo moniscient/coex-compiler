@@ -284,7 +284,6 @@ func main() -> int
 ~
 ''', "3.140000\n")
 
-    @pytest.mark.xfail(reason="json.as_string() returns quoted form instead of raw value - pre-existing bug")
     def test_parse_string(self, expect_output):
         """Parse string."""
         expect_output(r'''
@@ -305,7 +304,6 @@ func main() -> int
 ~
 ''', "0\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_parse_int_array(self, expect_output):
         """Parse integer array."""
         # NOTE: Use bracket notation j[i] for array access, not j.get(i)
@@ -378,7 +376,6 @@ func main() -> int
 ~
 ''', "42\n1\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_roundtrip_array(self, expect_output):
         """Roundtrip array."""
         # NOTE: Use bracket notation j[i] for array access, not j.get(i)
@@ -400,7 +397,6 @@ func main() -> int
 ~
 ''', "3\n1\n2\n3\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_roundtrip_object(self, expect_output):
         """Roundtrip object."""
         # BUG: json.parse() stores integers as floats but as_int() doesn't convert
@@ -439,7 +435,6 @@ func main() -> int
 ~
 ''', "2\nAlice\nBob\n")
 
-    @pytest.mark.xfail(reason="json.parse() stores all numbers as floats, but as_int() doesn't convert - pre-existing bug")
     def test_double_roundtrip(self, expect_output):
         """Double roundtrip: stringify -> parse -> stringify -> parse."""
         # BUG: json.parse() stores integers as floats but as_int() doesn't convert
