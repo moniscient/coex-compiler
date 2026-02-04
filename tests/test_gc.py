@@ -659,7 +659,7 @@ func main() -> int
 
 
 class TestGCSafepointDelegation:
-    """Tests for BUG-080: safepoint delegates collection to GC thread."""
+    """Tests for BUG-088: safepoint delegates collection to GC thread."""
 
     def test_safepoint_triggered_gc_preserves_data(self, expect_output):
         """Test that automatic GC triggered via safepoint preserves live data.

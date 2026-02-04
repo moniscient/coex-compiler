@@ -1638,7 +1638,7 @@ func main() -> int
   ```
 - **Tests**: 291 passed, 2 xfailed (pre-existing). 1 pre-existing timeout in `test_first_with_multiple_conditions` (unrelated).
 
-### BUG-080: gc_safepoint runs collection on calling thread instead of delegating to GC thread
+### BUG-088: gc_safepoint runs collection on calling thread instead of delegating to GC thread
 - **Discovered**: 2026-02-03, during Galaxian crash analysis
 - **Category**: GC
 - **Severity**: High

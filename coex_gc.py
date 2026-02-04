@@ -4353,7 +4353,7 @@ class GarbageCollector:
         should_gc = builder.icmp_unsigned(">=", claimed_count, threshold)
         builder.cbranch(should_gc, do_gc, done)
 
-        # Delegate GC to the dedicated GC thread (BUG-080 fix)
+        # Delegate GC to the dedicated GC thread (BUG-088 fix)
         # Instead of calling gc_collect() directly on the mutator thread,
         # signal the GC thread and wait for it to complete.
         builder.position_at_end(do_gc)
