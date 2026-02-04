@@ -4,6 +4,18 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-095: json.parse() truncates floats to integers
+- **Discovered**: 2026-02-04, during xfail test cleanup
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `json.parse("3.14").as_float()` returns `3.0` instead of `3.14`
+- **Observed**: All numeric strings were parsed using `string_to_int`, losing decimal values
+- **Expected**: Floats should be parsed as floats, integers as integers
+- **Root Cause**: In `_implement_json_parse()`, the `parse_number` block unconditionally used `string_to_int` and `json_new_int` for all numbers, ignoring decimal points and exponential notation.
+- **Fix**: Added a scan loop to check if the number string contains '.', 'e', or 'E'. If found, parse with `string_to_float` and create with `json_new_float`. Otherwise, use the existing integer path.
+- **Files**: `codegen/json_type.py:2486-2545` (`_implement_json_parse` number parsing)
+- **Status**: Fixed (2026-02-04)
+
 ### BUG-016: gc_async() race condition requires TLAB
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: GC

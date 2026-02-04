@@ -2483,13 +2483,66 @@ class JsonGenerator:
         false_result = builder.call(cg.json_new_bool, [ir.Constant(ir.IntType(1), 0)])
         builder.ret(false_result)
 
-        # Parse number (simple: use string_to_int or string_to_float)
+        # Parse number - check if it's a float (contains '.', 'e', or 'E')
         builder.position_at_end(parse_number)
-        # Try to parse as int first - string_to_int returns {i1, i64}
+
+        # Get string length for scanning
+        num_len = builder.call(cg.string_len, [str_ptr])
+
+        # Scan for float indicators: '.', 'e', 'E'
+        is_float_ptr = builder.alloca(ir.IntType(1), name="is_float")
+        builder.store(ir.Constant(ir.IntType(1), 0), is_float_ptr)
+        scan_idx_ptr = builder.alloca(i64, name="scan_idx")
+        builder.store(ir.Constant(i64, 0), scan_idx_ptr)
+
+        scan_loop = func.append_basic_block("num_scan_loop")
+        scan_body = func.append_basic_block("num_scan_body")
+        scan_done = func.append_basic_block("num_scan_done")
+        parse_as_int = func.append_basic_block("parse_as_int")
+        parse_as_float = func.append_basic_block("parse_as_float")
+
+        builder.branch(scan_loop)
+
+        # Loop condition: idx < len && !is_float
+        builder.position_at_end(scan_loop)
+        scan_idx = builder.load(scan_idx_ptr)
+        is_float_found = builder.load(is_float_ptr)
+        in_bounds = builder.icmp_signed("<", scan_idx, num_len)
+        not_found_yet = builder.not_(is_float_found)
+        continue_scan = builder.and_(in_bounds, not_found_yet)
+        builder.cbranch(continue_scan, scan_body, scan_done)
+
+        # Loop body: check current char
+        builder.position_at_end(scan_body)
+        char_ptr = builder.gep(data_ptr, [scan_idx])
+        curr_char = builder.load(char_ptr)
+        is_dot = builder.icmp_unsigned("==", curr_char, ir.Constant(i8, ord('.')))
+        is_e_lower = builder.icmp_unsigned("==", curr_char, ir.Constant(i8, ord('e')))
+        is_e_upper = builder.icmp_unsigned("==", curr_char, ir.Constant(i8, ord('E')))
+        is_float_char = builder.or_(is_dot, builder.or_(is_e_lower, is_e_upper))
+        builder.store(is_float_char, is_float_ptr)
+        next_idx = builder.add(scan_idx, ir.Constant(i64, 1))
+        builder.store(next_idx, scan_idx_ptr)
+        builder.branch(scan_loop)
+
+        # After scan: branch based on is_float
+        builder.position_at_end(scan_done)
+        final_is_float = builder.load(is_float_ptr)
+        builder.cbranch(final_is_float, parse_as_float, parse_as_int)
+
+        # Parse as integer
+        builder.position_at_end(parse_as_int)
         parse_result = builder.call(cg.string_to_int, [str_ptr])
-        int_val = builder.extract_value(parse_result, 1)  # Extract the i64 value
+        int_val = builder.extract_value(parse_result, 1)
         int_result = builder.call(cg.json_new_int, [int_val])
         builder.ret(int_result)
+
+        # Parse as float
+        builder.position_at_end(parse_as_float)
+        float_parse_result = builder.call(cg.string_to_float, [str_ptr])
+        float_val = builder.extract_value(float_parse_result, 1)
+        float_result = builder.call(cg.json_new_float, [float_val])
+        builder.ret(float_result)
 
         # Parse string (remove surrounding quotes)
         builder.position_at_end(parse_string)

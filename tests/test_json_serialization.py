@@ -273,7 +273,6 @@ func main() -> int
 ~
 ''', "42\n")
 
-    @pytest.mark.xfail(reason="JSON parser truncates float to int - pre-existing bug")
     def test_parse_float(self, expect_output):
         """Parse float."""
         expect_output(r'''
