@@ -1681,3 +1681,126 @@ func main() -> int
 - **Status**: Fixed (2026-02-03)
 - **Resolution**: Modified `create_tagged_value` to save the builder position, position at the function's entry block, emit the alloca there, then restore the builder position. This places all tagged_val allocas in the entry block where they're allocated once at function entry, not per loop iteration.
 - **Tests**: Verified via `--emit-ir`: all 248 tagged_val allocas in main are now before the first `br` instruction (entry block). Galaxian compiles and runs past the previous crash point.
+
+### BUG-082: first/most/parallel-for return wrong values instead of task results
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: Any program using `first`, `most`, or `for..in` with task dispatch. Example:
+  ```coex
+  task double(x: int) -> int
+      return x * 2
+  ~
+  func main() -> int
+      result = first i in [21]
+          double(i)
+      ~
+      print(result)   # Prints "2" instead of "42"
+      return 0
+  ~
+  ```
+- **Observed**: `first` returns small integers (1, 2) unrelated to the computed result. `most` returns partial/wrong sums. Parallel `for..in` map returns 0 or the iteration count instead of accumulated results. The returned values suggest the iteration index or list length is being returned rather than the actual task result.
+- **Expected**: `first` should return the result of the first task to complete. `most` should return a list of results from all completed tasks. Parallel `for..in` should collect mapped results.
+- **Hypothesis**: The codegen for structured concurrency collection (`first`/`most`/`for..in`) is reading the wrong field from the task closure or result slot. The task result is being stored but the collection code reads the iteration variable or an internal counter instead.
+- **Files**: `codegen/core.py` or `codegen/expressions.py` (first/most/for-collection codegen), `runtime/coex_task.c` (task result storage)
+- **Affected Tests** (22 tests, marked xfail):
+  - `test_first_most.py`: test_first_single_element, test_first_with_computation, test_first_result_is_correct_value, test_most_single_element, test_most_multiple_elements, test_most_large_collection, test_most_sum_results
+  - `test_thread_concurrency.py`: test_parallel_map_simple, test_parallel_map_order_preserved, test_parallel_map_with_computation, test_parallel_map_single_element, test_first_single_item, test_first_larger_collection, test_most_larger_collection, test_most_single_item, test_first_with_loop_tasks
+  - `test_thread_kind.py`: test_thread_parallel_for, test_thread_first
+  - `test_fire_and_forget.py`: test_for_collection_unchanged, test_first_unchanged
+  - `test_complex_first_most.py`: test_first_with_if_else, test_first_with_multiple_conditions, test_first_with_local_computation, test_most_with_if_else, test_most_with_local_vars, test_first_with_computation_in_body (these 6 in CI-ignored file)
+- **Status**: Open
+
+### BUG-083: User-defined kind handler substitution crashes at runtime
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Define a `template` kind with curly-brace or positional substitution and call it:
+  ```coex
+  template greet(name: string) -> string:
+      Hello, {name}!
+  ~
+  func main() -> int
+      result = greet("World")
+      print(result)
+      return 0
+  ~
+  ```
+- **Observed**: Compiles successfully but crashes at runtime (execution failed, no output).
+- **Expected**: Should print `Hello, World!`
+- **Hypothesis**: The handler substitution codegen produces code that segfaults, likely due to incorrect string interpolation or missing runtime support for the template kind's body expansion.
+- **Files**: `codegen/core.py` or `codegen/functions.py` (user-defined kind handler dispatch)
+- **Affected Tests** (2 tests, marked xfail):
+  - `test_user_defined_kinds.py`: test_curly_brace_substitution, test_positional_substitution
+- **Status**: Open
+
+### BUG-084: GC stats don't reflect per-task allocation counts in concurrent programs
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: GC
+- **Severity**: Low
+- **Reproduction**: Spawn 8 tasks that each allocate 100 lists, then check gc_dump_stats output for total count matching 800.
+- **Observed**: `gc_dump_stats()` reports `total_allocations: 6436` (internal overhead) rather than a user-visible count of 800. The test expects `"800"` to appear in the output, but the stats report raw internal allocation counts that include GC infrastructure allocations.
+- **Expected**: Either the stats should report user-visible allocation counts, or the tests should match the actual stat format.
+- **Hypothesis**: The tests were written expecting a per-task result aggregation pattern that doesn't exist. The GC stats count all allocations (including internal PV nodes, tagged values, etc.), not just user-level list creations.
+- **Files**: `coex_gc.py` (gc_dump_stats), test expectations
+- **Affected Tests** (2 tests, marked xfail):
+  - `test_gc_stats_atomic.py`: test_concurrent_allocations_stats_consistent, test_stress_concurrent_allocations
+- **Status**: Open
+
+### BUG-085: String.from_bytes produces wrong characters (all bytes become 0x01)
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      bytes = [72, 101, 108, 108, 111]
+      s = String.from_bytes(bytes)
+      print(s)    # Prints "\x01\x01\x01\x01\x01" instead of "Hello"
+      return 0
+  ~
+  ```
+- **Observed**: All bytes in the output string are `0x01` regardless of input values. The string length is correct (5 chars) but every character is `\x01`.
+- **Expected**: `String.from_bytes([72, 101, 108, 108, 111])` should produce `"Hello"`.
+- **Hypothesis**: The byte-to-char conversion reads a boolean (nonzero → 1) or a type tag instead of the actual byte value. Likely the list element extraction is reading the TaggedValue type field (which would be 1 for TV_TYPE_INT) instead of the value field.
+- **Files**: `codegen/strings.py` (String.from_bytes implementation)
+- **Affected Tests** (2 tests, marked xfail):
+  - `test_string_len.py`: test_string_from_bytes_ascii, test_string_bytes_ascii
+- **Status**: Open
+
+### BUG-086: cstring slice returns zero for byte values at non-zero offsets
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: Codegen
+- **Severity**: Low
+- **Reproduction**:
+  ```coex
+  func main() -> int
+      s = "world!"
+      cs = s.cstring()
+      print(cs.len())       # Correct: 6
+      print(cs.byte_at(0))  # Returns 0, expected 119 ('w')
+      print(cs.byte_at(3))  # Returns 0, expected 100 ('d')
+      print(cs.byte_at(6))  # Correct: 0 (null terminator)
+      return 0
+  ~
+  ```
+- **Observed**: `cstring.byte_at()` returns 0 for all positions except possibly the null terminator. The length is correctly reported as 6.
+- **Expected**: `byte_at(0)` should return 119 (`'w'`), `byte_at(3)` should return 100 (`'d'`).
+- **Hypothesis**: The `byte_at` implementation may be reading from the wrong base pointer (e.g., the cstring struct header instead of the character data), or the cstring slice view's data pointer offset is not applied correctly.
+- **Files**: `codegen/strings.py` (cstring byte_at or slice implementation)
+- **Affected Tests** (1 test, marked xfail):
+  - `test_cstring.py`: test_cstring_slice
+- **Status**: Open
+
+### BUG-087: Cross-heap map references lost during GC swap
+- **Discovered**: 2026-02-04, during CI failure analysis
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**: Create a map with heap-allocated values (strings), trigger gc_async() to swap heaps, then access the values.
+- **Observed**: Map values become inaccessible or corrupted after a heap swap triggered by gc_async().
+- **Expected**: Map values should survive GC heap swaps via proper cross-heap reference tracing.
+- **Hypothesis**: The cross-heap scanning in `gc_scan_cross_heap` doesn't fully trace through HAMT map node structures, missing references stored in branch nodes.
+- **Files**: `coex_gc.py` (`_implement_gc_scan_cross_heap`, `_implement_gc_mark_object`)
+- **Affected Tests** (1 test, marked xfail):
+  - `test_gc_async.py`: test_map_with_heap_values_across_gc
+- **Status**: Open
