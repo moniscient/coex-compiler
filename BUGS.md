@@ -53,18 +53,6 @@
 - **Files**: `coex_gc.py`, `implementation_prompts/phase1_nonblocking_safepoints.md`
 - **Status**: Open (enhancement)
 
-### BUG-016: gc_async() race condition requires TLAB
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: GC
-- **Severity**: Medium
-- **Reproduction**: Use `gc_async()` with concurrent allocations
-- **Observed**: Race condition causes undefined behavior
-- **Expected**: Async GC should run safely in background
-- **Hypothesis**: Allocation list access races with async GC thread without TLABs
-- **Files**: `coex_gc.py` (gc_async implementation)
-- **Status**: Open (blocked on Phase 4 TLAB implementation)
-- **Note**: Tests currently pass (xpassed) but architectural race condition remains
-
 ### BUG-023: llvmlite thread_local attribute silently ignored
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen

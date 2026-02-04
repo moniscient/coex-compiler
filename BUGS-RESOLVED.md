@@ -4,6 +4,18 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-016: gc_async() race condition requires TLAB
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**: Use `gc_async()` with concurrent allocations
+- **Observed**: Race condition causes undefined behavior
+- **Expected**: Async GC should run safely in background
+- **Root Cause**: The original hypothesis was that allocation list access raced with the async GC thread without Thread-Local Allocation Buffers (TLABs). Phase 4 of the GC implementation added TLABs with CAS-based allocation (`_implement_gc_tlab_init`, `_implement_gc_tlab_alloc`, `_implement_gc_tlab_refill`), thread-local allocation lists, and proper synchronization via mutex/condition variables for GC coordination.
+- **Fix**: TLABs now provide thread-local allocation buffers that don't require locks for the fast path. Each thread allocates from its own TLAB, and only refills require mutex synchronization. The gc_async() function properly signals the background GC thread via condition variable, and allocations are safe because they go to thread-local lists that are only processed during the sweep phase under proper synchronization.
+- **Files**: `coex_gc.py` (TLAB implementation in `_implement_gc_tlab_*` functions, thread list allocation in `_implement_gc_alloc_to_thread_list`)
+- **Status**: Fixed (2026-02-04) - TLAB implementation complete, stress tests passing
+
 ### BUG-087: Cross-heap map references lost during GC swap
 - **Discovered**: 2026-02-04, during CI failure analysis
 - **Category**: GC
@@ -956,9 +968,9 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 ### External Dependencies
 - llvmlite TLS issue: See BUG-023
 
-### Bug Count Summary (as of 2026-01-30)
-- **Open**: 11 bugs (BUG-015, BUG-016, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057, BUG-058)
-- **Resolved**: 48 bugs (including BUG-004: CAS-based thread-safe TLAB allocation)
+### Bug Count Summary (as of 2026-02-04)
+- **Open**: 10 bugs (BUG-015, BUG-023, BUG-033, BUG-035, BUG-036, BUG-042, BUG-043, BUG-044, BUG-050, BUG-057)
+- **Resolved**: 49 bugs (including BUG-004: CAS-based TLAB allocation, BUG-016: gc_async race condition)
 
 ### Lock Audit Bugs (BUG-033 to BUG-044)
 - **Resolved (by design)**: BUG-034, BUG-037, BUG-038, BUG-039, BUG-040, BUG-041 - condition variable mutexes mandated by POSIX

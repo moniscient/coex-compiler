@@ -12,9 +12,6 @@ Tests verify:
 Run with: python3 -m pytest tests/test_gc_stress_10m.py -v -s
 """
 
-import pytest
-
-
 class TestGCStressAllocations:
     """Stress tests with 1 million allocations per type."""
 
@@ -142,7 +139,6 @@ func main() -> int
 ''', "1000000\n1\n1\n1\n1\n")
 
 
-@pytest.mark.xfail(reason="BUG-016: gc_async() race condition requires TLAB")
 class TestGCAsyncStress:
     """Stress tests using gc_async() with 1M allocations."""
 
