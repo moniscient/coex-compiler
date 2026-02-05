@@ -305,8 +305,8 @@ class JsonGenerator:
 
         # Process object: create map, iterate through child elements
         builder.position_at_end(process_object)
-        # Create map with string keys and pointer values
-        map_flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR)
+        # Create map with string keys and handle values
+        map_flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
         map_val = builder.call(cg.map_new, [map_flags])
         map_ptr_alloca = builder.alloca(cg.map_struct.as_pointer(), name="map_ptr")
         builder.store(map_val, map_ptr_alloca)
@@ -335,12 +335,14 @@ class JsonGenerator:
         # Convert value
         value_json = builder.call(self.json_from_cjson, [obj_current_child])
 
-        # Convert json pointer to i64 for map storage
-        value_i64 = builder.ptrtoint(value_json, i64)
+        # Convert json pointer to handle for map storage
+        value_i8 = builder.bitcast(value_json, ir.IntType(8).as_pointer())
+        value_promoted = builder.call(cg.gc.gc_promote_to_heap, [value_i8])
+        value_handle = builder.call(cg.gc.gc_ptr_to_handle, [value_promoted])
 
         # Add to map
         curr_map = builder.load(map_ptr_alloca)
-        new_map = builder.call(cg.map_set_string, [curr_map, key_string, value_i64])
+        new_map = builder.call(cg.map_set_string, [curr_map, key_string, value_handle])
         builder.store(new_map, map_ptr_alloca)
 
         # Move to next sibling
@@ -939,9 +941,10 @@ class JsonGenerator:
         is_found = builder.icmp_unsigned("!=", result, ir.Constant(i64, 0))
         builder.cbranch(is_found, found, not_found)
 
-        # Found: convert i64 back to Json*
+        # Found: convert handle back to Json*
         builder.position_at_end(found)
-        json_result = builder.inttoptr(result, cg.json_struct.as_pointer())
+        json_i8 = builder.call(cg.gc.gc_handle_deref, [result])
+        json_result = builder.bitcast(json_i8, cg.json_struct.as_pointer())
         builder.ret(json_result)
 
         # Not found or not object: return json null
@@ -1458,9 +1461,11 @@ class JsonGenerator:
         map_i8 = builder.call(cg.gc.gc_handle_deref, [map_handle])
         map_ptr = builder.bitcast(map_i8, cg.map_struct.as_pointer())
 
-        # Convert json value to i64 for map storage (pointer as i64)
+        # Convert json value to handle for map storage
         json_val = func.args[2]
-        json_as_i64 = builder.ptrtoint(json_val, i64)
+        json_i8 = builder.bitcast(json_val, ir.IntType(8).as_pointer())
+        json_promoted = builder.call(cg.gc.gc_promote_to_heap, [json_i8])
+        json_as_i64 = builder.call(cg.gc.gc_ptr_to_handle, [json_promoted])
 
         # Call map_set_string
         new_map = builder.call(cg.map_set_string, [map_ptr, func.args[1], json_as_i64])
@@ -1954,9 +1959,10 @@ class JsonGenerator:
         kv_str = builder.call(cg.string_concat, [quote_str, key_str])
         kv_str = builder.call(cg.string_concat, [kv_str, colon_str])
 
-        # Get value and stringify it
+        # Get value handle and dereference to Json*
         val_i64 = builder.call(cg.map_get_string, [map_ptr, key_str])
-        val_json = builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+        val_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+        val_json = builder.bitcast(val_i8, cg.json_struct.as_pointer())
         val_str = builder.call(cg.json_stringify, [val_json])
         kv_str = builder.call(cg.string_concat, [kv_str, val_str])
 
@@ -2352,9 +2358,10 @@ class JsonGenerator:
         curr_str = builder.call(cg.string_concat, [curr_str, key_str])
         curr_str = builder.call(cg.string_concat, [curr_str, colon_space])
 
-        # Get value and pretty-print it
+        # Get value handle and dereference to Json*
         val_i64 = builder.call(cg.map_get_string, [map_ptr, key_str])
-        val_json = builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+        val_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+        val_json = builder.bitcast(val_i8, cg.json_struct.as_pointer())
         val_str = builder.call(cg.json_pretty_internal, [val_json, indent_size, child_depth])
         curr_str = builder.call(cg.string_concat, [curr_str, val_str])
         builder.store(curr_str, result_str_ptr)
@@ -2738,12 +2745,12 @@ class JsonGenerator:
 
         if not expr.entries:
             # Empty JSON object: create empty map, wrap in json_new_object
-            flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR  # String keys, Json values
+            flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE  # String keys, Json handle values
             empty_map = builder.call(cg.map_new, [ir.Constant(i64, flags)])
             return builder.call(cg.json_new_object, [empty_map])
 
-        # Create map with string keys and json values
-        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR
+        # Create map with string keys and json handle values
+        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE
         map_ptr = builder.call(cg.map_new, [ir.Constant(i64, flags)])
 
         # Add each entry
@@ -2757,8 +2764,10 @@ class JsonGenerator:
             # Convert value to JSON if it isn't already
             json_value = self.convert_to_json(value, value_expr)
 
-            # Cast json pointer to i64 for map storage
-            json_i64 = builder.ptrtoint(json_value, i64)
+            # Convert json pointer to handle for map storage
+            json_i8 = builder.bitcast(json_value, ir.IntType(8).as_pointer())
+            json_promoted = builder.call(cg.gc.gc_promote_to_heap, [json_i8])
+            json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [json_promoted])
 
             # Add to map using string-aware set
             map_ptr = builder.call(cg.map_set_string, [map_ptr, key_string, json_i64])
@@ -2985,8 +2994,8 @@ class JsonGenerator:
         values_list = builder.call(cg.map_values, [map_ptr])
         num_entries = builder.call(cg.list_len, [keys_list])
 
-        # Create new JSON-compatible map
-        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_PTR
+        # Create new JSON-compatible map with handle values
+        flags = cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE
         json_map = builder.call(cg.map_new, [ir.Constant(i64, flags)])
 
         # Store map pointer for loop mutation
@@ -3021,7 +3030,7 @@ class JsonGenerator:
         is_string_key = (isinstance(key_type, PrimitiveType) and key_type.name == "string") or \
                         (isinstance(key_type, NamedType) and key_type.name == "String")
         if is_string_key:
-            # Key is already a String* stored as ptrtoint
+            # Key is a String* stored as raw ptrtoint in HAMT leaf
             string_key = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
         else:
             # Int or other key - convert to string
@@ -3035,8 +3044,10 @@ class JsonGenerator:
         # Convert value to JSON based on value_type
         json_val = self._convert_map_value_to_json(val_i64, value_type)
 
-        # Store JSON value as ptrtoint in the new map
-        json_val_i64 = builder.ptrtoint(json_val, i64)
+        # Store JSON value as handle in the new map
+        json_val_i8 = builder.bitcast(json_val, ir.IntType(8).as_pointer())
+        json_val_promoted = builder.call(cg.gc.gc_promote_to_heap, [json_val_i8])
+        json_val_i64 = builder.call(cg.gc.gc_ptr_to_handle, [json_val_promoted])
         curr_map = builder.load(json_map_ptr)
         new_map = builder.call(cg.map_set_string, [curr_map, string_key, json_val_i64])
         builder.store(new_map, json_map_ptr)
@@ -3121,25 +3132,30 @@ class JsonGenerator:
                 elem_bool = builder.trunc(elem_i64, ir.IntType(1))
                 return builder.call(cg.json_new_bool, [elem_bool])
             elif elem_type.name == "string":
-                elem_str = builder.inttoptr(elem_i64, cg.string_struct.as_pointer())
+                elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+                elem_str = builder.bitcast(elem_i8, cg.string_struct.as_pointer())
                 return builder.call(cg.json_new_string, [elem_str])
             elif elem_type.name == "json":
-                # Already JSON
-                return builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+                # Already JSON - dereference handle
+                elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+                return builder.bitcast(elem_i8, cg.json_struct.as_pointer())
 
         if isinstance(elem_type, NamedType):
             if elem_type.name == "Json":
-                return builder.inttoptr(elem_i64, cg.json_struct.as_pointer())
+                elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+                return builder.bitcast(elem_i8, cg.json_struct.as_pointer())
             elif elem_type.name == "String":
-                elem_str = builder.inttoptr(elem_i64, cg.string_struct.as_pointer())
+                elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+                elem_str = builder.bitcast(elem_i8, cg.string_struct.as_pointer())
                 return builder.call(cg.json_new_string, [elem_str])
             # For other named types (user-defined), convert to JSON
-            elem_ptr = builder.inttoptr(elem_i64, ir.IntType(8).as_pointer())
-            return self.convert_udt_to_json(elem_ptr, elem_type.name)
+            elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+            return self.convert_udt_to_json(elem_i8, elem_type.name)
 
         if isinstance(elem_type, ListType):
-            # Nested list - recursively convert
-            elem_list = builder.inttoptr(elem_i64, cg.list_struct.as_pointer())
+            # Nested list - recursively convert (dereference handle)
+            elem_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+            elem_list = builder.bitcast(elem_i8, cg.list_struct.as_pointer())
             return self.convert_list_to_json_array(elem_list, None)
 
         # Default fallback: treat as integer
@@ -3181,14 +3197,16 @@ class JsonGenerator:
             func_name = expr.name
 
         # Create annotation object: {"@coex:func": "func_name"}
-        flags = ir.Constant(i64, 0x01)  # String keys
+        flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
         map_ptr = builder.call(cg.map_new, [flags])
 
         # Add @coex:func key with the function name string
         key_str = cg._get_string_ptr("@coex:func")
         name_str = cg._get_string_ptr(func_name)
         name_json = builder.call(cg.json_new_string, [name_str])
-        name_json_i64 = builder.ptrtoint(name_json, i64)
+        name_json_i8 = builder.bitcast(name_json, ir.IntType(8).as_pointer())
+        name_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [name_json_i8])
+        name_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [name_json_promoted])
         map_ptr = builder.call(cg.map_set_string, [map_ptr, key_str, name_json_i64])
 
         # Wrap map in JSON object
@@ -3292,12 +3310,14 @@ class JsonGenerator:
         json_array = builder.call(cg.json_new_array, [final_json_list])
 
         # Create annotation object: {"@coex:set": json_array}
-        flags = ir.Constant(i64, 0x01)  # String keys
+        flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
         map_ptr = builder.call(cg.map_new, [flags])
 
         # Add @coex:set key with the array value
         key_str = cg._get_string_ptr("@coex:set")
-        json_array_i64 = builder.ptrtoint(json_array, i64)
+        json_array_i8 = builder.bitcast(json_array, ir.IntType(8).as_pointer())
+        json_array_promoted = builder.call(cg.gc.gc_promote_to_heap, [json_array_i8])
+        json_array_i64 = builder.call(cg.gc.gc_ptr_to_handle, [json_array_promoted])
         map_ptr = builder.call(cg.map_set_string, [map_ptr, key_str, json_array_i64])
 
         # Wrap map in JSON object
@@ -3310,13 +3330,15 @@ class JsonGenerator:
         i64 = ir.IntType(64)
 
         # Create empty JSON object (starts with empty map)
-        flags = ir.Constant(i64, 0x01)  # String keys
+        flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
         map_ptr = builder.call(cg.map_new, [flags])
 
         # Add _type field
         type_str = cg._get_string_ptr(type_name)
         type_json = builder.call(cg.json_new_string, [type_str])
-        type_json_i64 = builder.ptrtoint(type_json, i64)
+        type_json_i8 = builder.bitcast(type_json, ir.IntType(8).as_pointer())
+        type_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [type_json_i8])
+        type_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [type_json_promoted])
         type_key = cg._get_string_ptr("_type")
         map_ptr = builder.call(cg.map_set_string, [map_ptr, type_key, type_json_i64])
 
@@ -3330,8 +3352,10 @@ class JsonGenerator:
             # Convert field value to JSON
             field_json = self.convert_field_to_json(field_val, field_type)
 
-            # Add to map
-            field_json_i64 = builder.ptrtoint(field_json, i64)
+            # Add to map (store as handle)
+            field_json_i8 = builder.bitcast(field_json, ir.IntType(8).as_pointer())
+            field_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [field_json_i8])
+            field_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [field_json_promoted])
             field_key = cg._get_string_ptr(field_name)
             map_ptr = builder.call(cg.map_set_string, [map_ptr, field_key, field_json_i64])
 
@@ -3369,20 +3393,24 @@ class JsonGenerator:
             builder.position_at_end(variant_block)
 
             # Create JSON object for this variant
-            flags = ir.Constant(i64, 0x01)  # String keys
+            flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
             map_ptr = builder.call(cg.map_new, [flags])
 
             # Add _type field
             type_str = cg._get_string_ptr(enum_name)
             type_json = builder.call(cg.json_new_string, [type_str])
-            type_json_i64 = builder.ptrtoint(type_json, i64)
+            type_json_i8 = builder.bitcast(type_json, ir.IntType(8).as_pointer())
+            type_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [type_json_i8])
+            type_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [type_json_promoted])
             type_key = cg._get_string_ptr("_type")
             map_ptr = builder.call(cg.map_set_string, [map_ptr, type_key, type_json_i64])
 
             # Add _variant field
             variant_str = cg._get_string_ptr(variant_name)
             variant_json = builder.call(cg.json_new_string, [variant_str])
-            variant_json_i64 = builder.ptrtoint(variant_json, i64)
+            variant_json_i8 = builder.bitcast(variant_json, ir.IntType(8).as_pointer())
+            variant_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [variant_json_i8])
+            variant_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [variant_json_promoted])
             variant_key = cg._get_string_ptr("_variant")
             map_ptr = builder.call(cg.map_set_string, [map_ptr, variant_key, variant_json_i64])
 
@@ -3394,8 +3422,10 @@ class JsonGenerator:
                 # Convert field value to JSON
                 field_json = self.convert_field_to_json(field_val, field_type)
 
-                # Add to map
-                field_json_i64 = builder.ptrtoint(field_json, i64)
+                # Add to map (store as handle)
+                field_json_i8 = builder.bitcast(field_json, ir.IntType(8).as_pointer())
+                field_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [field_json_i8])
+                field_json_i64 = builder.call(cg.gc.gc_ptr_to_handle, [field_json_promoted])
                 field_key = cg._get_string_ptr(field_name)
                 map_ptr = builder.call(cg.map_set_string, [map_ptr, field_key, field_json_i64])
 
@@ -3748,8 +3778,9 @@ class JsonGenerator:
             field_key = cg._get_string_ptr(field_name)
             field_json_i64 = builder.call(cg.map_get_string, [map_ptr, field_key])
 
-            # Convert from JSON
-            field_json = builder.inttoptr(field_json_i64, cg.json_struct.as_pointer())
+            # Convert handle back to Json*
+            field_json_i8 = builder.call(cg.gc.gc_handle_deref, [field_json_i64])
+            field_json = builder.bitcast(field_json_i8, cg.json_struct.as_pointer())
             field_val = self.extract_json_value(field_json, field_type)
 
             # Store in struct

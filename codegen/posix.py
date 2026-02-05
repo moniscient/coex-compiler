@@ -204,17 +204,21 @@ class PosixGenerator:
         fd_field = builder.gep(posix_ptr_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(fd, fd_field)
 
-        # Return Result.ok(posix)
-        posix_as_i64 = builder.ptrtoint(posix_ptr_val, i64)
-        ok_result = builder.call(cg.result_ok, [posix_as_i64])
+        # Return Result.ok(posix) - store as GC handle, not raw pointer
+        posix_i8 = builder.bitcast(posix_ptr_val, ir.IntType(8).as_pointer())
+        posix_promoted = builder.call(cg.gc.gc_promote_to_heap, [posix_i8])
+        posix_handle = builder.call(cg.gc.gc_ptr_to_handle, [posix_promoted])
+        ok_result = builder.call(cg.result_ok, [posix_handle])
         builder.ret(ok_result)
 
         # Open failed - return Err(message)
         builder.position_at_end(open_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to open file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_read_all(self, posix_ptr: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
@@ -276,16 +280,20 @@ class PosixGenerator:
 
         # Create string from buffer (bytes_read = byte_len, assume ASCII for char_count)
         result_string = builder.call(cg.string_new, [buffer, bytes_read, bytes_read])
-        string_as_i64 = builder.ptrtoint(result_string, i64)
-        ok_result = builder.call(cg.result_ok, [string_as_i64])
+        str_i8 = builder.bitcast(result_string, ir.IntType(8).as_pointer())
+        str_promoted = builder.call(cg.gc.gc_promote_to_heap, [str_i8])
+        str_handle = builder.call(cg.gc.gc_ptr_to_handle, [str_promoted])
+        ok_result = builder.call(cg.result_ok, [str_handle])
         builder.ret(ok_result)
 
         # Read failed
         builder.position_at_end(read_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_writeln(self, posix_ptr: ir.Type, i64: ir.Type):
@@ -343,8 +351,10 @@ class PosixGenerator:
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_close(self, posix_ptr: ir.Type, i32: ir.Type):
@@ -391,8 +401,10 @@ class PosixGenerator:
         builder.position_at_end(close_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to close file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_read(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
@@ -464,9 +476,11 @@ class PosixGenerator:
         # Free the temporary buffer
         builder.call(cg.free, [buf])
 
-        # Return Ok(byte_list)
-        list_as_i64 = builder.ptrtoint(byte_list, i64)
-        ok_result = builder.call(cg.result_ok, [list_as_i64])
+        # Return Ok(byte_list) - store as GC handle
+        list_i8 = builder.bitcast(byte_list, ir.IntType(8).as_pointer())
+        list_promoted = builder.call(cg.gc.gc_promote_to_heap, [list_i8])
+        list_handle = builder.call(cg.gc.gc_ptr_to_handle, [list_promoted])
+        ok_result = builder.call(cg.result_ok, [list_handle])
         builder.ret(ok_result)
 
         # Read failed
@@ -474,8 +488,10 @@ class PosixGenerator:
         builder.call(cg.free, [buf])
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read from file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, i64)
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_write(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
@@ -536,8 +552,10 @@ class PosixGenerator:
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_seek(self, posix_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
@@ -594,8 +612,10 @@ class PosixGenerator:
         builder.position_at_end(seek_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to seek in file")
         err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_as_i64 = builder.ptrtoint(err_string, ir.IntType(64))
-        err_result = builder.call(cg.result_err, [err_as_i64])
+        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
+        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
+        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_time(self, i64: ir.Type, i8_ptr: ir.Type):
