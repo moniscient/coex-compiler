@@ -70,6 +70,9 @@ class TaskTransformer:
         self._spawn_async_fn = None
         self._join_task_fn = None
 
+        # GC frame tracking for step functions
+        self._step_gc_start_slot = None
+
         # Task nursery tracking (for fire-and-forget bare calls)
         self._nursery_task_handles_alloca: Optional[ir.Value] = None
         self._nursery_task_count_alloca: Optional[ir.Value] = None
@@ -915,10 +918,49 @@ class TaskTransformer:
         resolved_val = step_fn.args[1]
         out_ptr = step_fn.args[2]
 
+        # Save and initialize GC state for step function context
+        old_gc_frame = getattr(cg, 'gc_frame', None)
+        old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
+
+        # Collect heap-typed frame fields for GC root tracking
+        heap_fields = []  # [(field_name, field_idx)]
+        seen = set()
+        i32 = ir.IntType(32)
+        for param in func.params:
+            if param.type_annotation and cg._is_heap_type(param.type_annotation):
+                if param.name in frame_info.field_indices:
+                    heap_fields.append((param.name, frame_info.field_indices[param.name]))
+                    seen.add(param.name)
+        for local_name, local_type in analysis.hoisted_locals.items():
+            if local_name not in seen and local_type and cg._is_heap_type(local_type):
+                if local_name in frame_info.field_indices:
+                    heap_fields.append((local_name, frame_info.field_indices[local_name]))
+                    seen.add(local_name)
+        for local_name, local_type in analysis.all_locals.items():
+            if local_name not in seen and local_type and cg._is_heap_type(local_type):
+                if local_name in frame_info.field_indices:
+                    heap_fields.append((local_name, frame_info.field_indices[local_name]))
+                    seen.add(local_name)
+
+        # Push GC frame and register roots BEFORE the switch (must be in entry block)
+        if heap_fields and cg.gc is not None:
+            cg.gc_frame = cg.gc.push_frame(builder, len(heap_fields))
+            cg.gc_root_indices = {name: i for i, (name, _) in enumerate(heap_fields)}
+            self._step_gc_start_slot = cg.gc_frame
+            # Register current handle values as initial roots
+            for i, (name, fidx) in enumerate(heap_fields):
+                fptr = builder.gep(frame_ptr, [ir.Constant(i32, 0), ir.Constant(i32, fidx)], inbounds=True)
+                val = builder.load(fptr)
+                cg.gc.set_root(builder, cg.gc_frame, i, val)
+        else:
+            cg.gc_frame = None
+            cg.gc_root_indices = {}
+            self._step_gc_start_slot = None
+
         # Load current state
         state_ptr = builder.gep(frame_ptr, [
-            ir.Constant(ir.IntType(32), 0),
-            ir.Constant(ir.IntType(32), frame_info.field_indices['__state'])
+            ir.Constant(i32, 0),
+            ir.Constant(i32, frame_info.field_indices['__state'])
         ], inbounds=True, name="state_ptr")
         current_state = builder.load(state_ptr, name="state")
 
@@ -934,31 +976,30 @@ class TaskTransformer:
         for i, block in enumerate(state_blocks):
             switch.add_case(ir.Constant(ir.IntType(64), i), block)
 
-        # Save and initialize GC state for step function context
-        old_gc_frame = getattr(cg, 'gc_frame', None)
-        old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
-        cg.gc_frame = None
-        cg.gc_root_indices = {}
-
         # Generate code for each state
         self._generate_state_blocks(
             builder, step_fn, frame_ptr, frame_info, func,
             analysis, state_blocks, task_result_type, out_ptr, resolved_val
         )
 
-        # Restore GC state
-        cg.gc_frame = old_gc_frame
-        cg.gc_root_indices = old_gc_root_indices
-
         # Default block: write DONE(0) - should never reach here
         builder.position_at_end(default_block)
         self._store_task_result_done(builder, out_ptr, ir.Constant(ir.IntType(64), 0))
         builder.ret_void()
 
+        # Restore GC state
+        cg.gc_frame = old_gc_frame
+        cg.gc_root_indices = old_gc_root_indices
+        self._step_gc_start_slot = None
+
         return step_fn
 
     def _store_task_result_done(self, builder: ir.IRBuilder, out_ptr: ir.Value, value: ir.Value):
         """Store TASK_RESULT_DONE to output parameter."""
+        # Pop GC frame if in step function context (before writing result)
+        if self._step_gc_start_slot is not None and self.cg.gc is not None:
+            self.cg.gc.pop_frame(builder, self._step_gc_start_slot)
+
         # Store kind = 0
         kind_ptr = builder.gep(out_ptr, [
             ir.Constant(ir.IntType(32), 0),
@@ -990,6 +1031,11 @@ class TaskTransformer:
     def _store_task_result_spawn(self, builder: ir.IRBuilder, out_ptr: ir.Value,
                                    frame_ptr: ir.Value, step_fn_ptr: ir.Value):
         """Store TASK_RESULT_SPAWN to output parameter."""
+        # NOTE: Do NOT pop GC frame on SPAWN - roots must stay registered in the
+        # current thread's shadow stack so that GC triggered by the child task
+        # can find and preserve the parent's heap objects. The leaked shadow stack
+        # slots are bounded (num_heap_fields per suspension) and acceptable.
+
         # Store kind = 1
         kind_ptr = builder.gep(out_ptr, [
             ir.Constant(ir.IntType(32), 0),
@@ -2195,6 +2241,8 @@ class TaskTransformer:
         frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         child_frame_mem = builder.call(malloc_fn, [frame_size], name="child_frame_mem")
+        # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
+        builder.call(self.cg.memset, [child_frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
         child_frame_ptr = builder.bitcast(
             child_frame_mem,
             child_frame_info.llvm_frame_type.as_pointer(),
@@ -2522,6 +2570,8 @@ class TaskTransformer:
         frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
+        # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
+        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
 
         # Initialize state to 0
@@ -2688,6 +2738,8 @@ class TaskTransformer:
         frame_size = ir.Constant(ir.IntType(64), num_fields * 8)
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
+        # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
+        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
 
         # Initialize state to 0

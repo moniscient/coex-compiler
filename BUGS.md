@@ -303,4 +303,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-099**
+**Next valid BUG ID: BUG-101**

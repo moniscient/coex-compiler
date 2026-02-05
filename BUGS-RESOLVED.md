@@ -4,6 +4,37 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-099: GC during scheduler task execution crashes — task frame not traced
+- **Discovered**: 2026-02-04, during full test suite run
+- **Category**: GC/Runtime
+- **Severity**: High
+- **Reproduction**: `python3 -m pytest tests/test_task_state_machine.py::TestTaskFrameGC::test_gc_during_task_execution -v --tb=short`
+- **Observed**: Execution fails (segfault or corruption) when `gc()` is called inside a scheduler-based `task` that has a live list across a suspension point (`y := inner_task()`)
+- **Expected**: GC should trace task frame slots and preserve live objects (list `x` with 5 elements) across suspension and collection
+- **Root Cause**: `task_transform.py` set `cg.gc_frame = None` when generating state machine step functions, disabling ALL GC root registration. Heap-typed locals stored in the task frame were invisible to the garbage collector.
+- **Fix**: Added GC shadow stack push/pop to step function entry/exit:
+  1. At step function entry: push a GC frame and register all heap-typed frame fields as roots
+  2. On DONE: pop the GC frame
+  3. On SPAWN: intentionally leave the GC frame un-popped so roots remain registered while the child task runs (prevents collection of parent's heap objects)
+  4. Zero-initialize all task frames via `memset` after `malloc` so uninitialized pointer fields are null (safe for `gc_ptr_to_handle`)
+- **Files**: `task_transform.py`
+- **Status**: Fixed (2026-02-04)
+
+### BUG-100: Task frame data not preserved across multiple GC cycles
+- **Discovered**: 2026-02-04, during full test suite run
+- **Category**: GC/Runtime
+- **Severity**: High
+- **Reproduction**: `python3 -m pytest tests/test_task_state_machine.py::TestTaskFrameGC::test_frame_survives_gc -v --tb=short`
+- **Observed**: Execution fails when a scheduler-based `task` calls `gc()` multiple times while holding a large list (`big_list` with 10 elements) across a suspension point
+- **Expected**: Frame data (list handle) should survive multiple GC cycles while the task is suspended
+- **Root Cause**: Same as BUG-099 — suspended task frames were not registered as GC roots
+- **Fix**: Same fix as BUG-099
+- **Files**: `task_transform.py`
+- **Status**: Fixed (2026-02-04)
+- **Note**: Same underlying fix as BUG-099
+
+---
+
 ### BUG-094: Universal C FFI for malloc'd string to Coex heap string conversion
 - **Discovered**: 2026-02-04, during FFI review
 - **Category**: Runtime/Stdlib
