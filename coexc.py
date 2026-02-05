@@ -261,6 +261,11 @@ def compile_coex(source_path: str, output_path: str = None,
             print(f"Warning: Task runtime library not found at {task_runtime}")
             print("Build it with: cd runtime && make")
 
+        # Add string runtime library (BUG-094: C FFI string conversion functions)
+        string_runtime = os.path.join(runtime_dir, "libcoex_string.a")
+        if os.path.exists(string_runtime):
+            link_cmd.append(string_runtime)
+
         # Add scheduler runtime library if tasks or channels are used
         # (channels depend on scheduler for task wakeup)
         if codegen.uses_scheduler() or codegen.uses_channels():

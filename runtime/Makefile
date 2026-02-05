@@ -24,6 +24,10 @@ SCHEDULER_OBJ = coex_scheduler.o
 CHANNEL_LIB = libcoex_channel.a
 CHANNEL_OBJ = coex_channel.o
 
+# String Runtime (C string conversion utilities)
+STRING_LIB = libcoex_string.a
+STRING_OBJ = coex_string.o
+
 # Metal GPU Dispatch - native on macOS, stub on other platforms
 METAL_LIB = libcoex_metal.a
 ifeq ($(UNAME_S),Darwin)
@@ -81,7 +85,7 @@ else
 endif
 
 # All libraries (UI is optional, only built if deps available)
-LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB) $(METAL_LIB) $(BLAS_LIB)
+LIBS = $(FFI_LIB) $(TASK_LIB) $(SCHEDULER_LIB) $(CHANNEL_LIB) $(STRING_LIB) $(METAL_LIB) $(BLAS_LIB)
 
 all: $(LIBS)
 
@@ -111,6 +115,13 @@ $(CHANNEL_LIB): $(CHANNEL_OBJ)
 	$(AR) rcs $@ $^
 
 coex_channel.o: coex_channel.c coex_channel.h coex_scheduler.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# String Library
+$(STRING_LIB): $(STRING_OBJ)
+	$(AR) rcs $@ $^
+
+coex_string.o: coex_string.c coex_string.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Metal Library - native implementation on macOS

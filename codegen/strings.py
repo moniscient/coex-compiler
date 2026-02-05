@@ -215,6 +215,28 @@ class StringGenerator:
         string_cstring_ty = ir.FunctionType(list_ptr, [string_ptr])
         cg.string_cstring = ir.Function(cg.module, string_cstring_ty, name="coex_string_cstring")
 
+        # C Runtime FFI functions for string conversion (BUG-094)
+        # These are implemented in runtime/coex_string.c and linked from libcoex_string.a
+        i32 = ir.IntType(32)
+
+        # coex_string_from_cstring_take(c_str: i8*) -> String*
+        # Takes ownership of malloc'd C string, frees it after copying
+        string_from_cstring_take_ty = ir.FunctionType(string_ptr, [i8_ptr])
+        cg.string_from_cstring_take = ir.Function(cg.module, string_from_cstring_take_ty,
+                                                   name="coex_string_from_cstring_take")
+
+        # coex_string_from_cstring_copy(c_str: i8*) -> String*
+        # Copies C string without freeing (caller retains ownership)
+        string_from_cstring_copy_ty = ir.FunctionType(string_ptr, [i8_ptr])
+        cg.string_from_cstring_copy = ir.Function(cg.module, string_from_cstring_copy_ty,
+                                                   name="coex_string_from_cstring_copy")
+
+        # coex_string_from_raw_bytes(data: i8*, byte_len: i64) -> String*
+        # Creates string from raw byte buffer with known length (for C interop)
+        string_from_raw_bytes_ty = ir.FunctionType(string_ptr, [i8_ptr, i64])
+        cg.string_from_raw_bytes = ir.Function(cg.module, string_from_raw_bytes_ty,
+                                                name="coex_string_from_raw_bytes")
+
         # Implement all string functions
         self._implement_string_data()
         self._implement_string_new()

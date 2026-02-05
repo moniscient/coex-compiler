@@ -4,6 +4,27 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-094: Universal C FFI for malloc'd string to Coex heap string conversion
+- **Discovered**: 2026-02-04, during FFI review
+- **Category**: Runtime/Stdlib
+- **Severity**: Medium
+- **Reproduction**: Any C FFI call that returns a malloc'd string (cJSON, file I/O, etc.)
+- **Observed**: Multiple FFI libraries had ad-hoc implementations for converting C strings to Coex strings, leading to inconsistency and potential memory leaks
+- **Root Cause**: No universal C function existed for converting malloc'd C strings to GC-managed Coex strings. The LLVM IR function `string_from_literal` worked but wasn't callable from C code.
+- **Fix**: Created universal C runtime functions in `runtime/coex_string.c`:
+  1. `coex_string_from_cstring_take(char* c_str)` - Takes ownership of malloc'd C string, copies to GC heap, frees original
+  2. `coex_string_from_cstring_copy(const char* c_str)` - Copies C string without freeing (caller retains ownership)
+  3. `coex_string_from_raw_bytes(const char* data, size_t len)` - Creates string from byte buffer with known length
+  - Added function declarations in `codegen/strings.py` for LLVM IR access
+  - Updated `codegen/core.py` `_convert_from_c_type()` to use `string_from_cstring_take` for extern function returns (replacing manual copy + free)
+  - Functions use `coex_gc_alloc_arena_or_gc()` for thread-safe allocation via TLAB
+- **Files**:
+  - New: `runtime/coex_string.c`, `runtime/coex_string.h`
+  - Updated: `runtime/Makefile`, `codegen/strings.py`, `codegen/core.py`
+- **Status**: Fixed (2026-02-04)
+
+---
+
 ### BUG-075: Deep nested list type inference fails after reassignment
 - **Discovered**: 2026-01-29, during value semantics stress testing
 - **Category**: Codegen
