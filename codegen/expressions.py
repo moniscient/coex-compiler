@@ -1574,6 +1574,18 @@ class ExpressionGenerator:
                 result = cg.builder.call(cg.gc.gc_validate_handle_storage, [])
                 return result
 
+            if name == "gc_compact":
+                cg.builder.call(cg.gc.gc_compact, [])
+                # Reload all heap variable pointers after compaction.
+                # gc_compact moves objects to a new buffer and updates handles,
+                # but the raw pointers in stack allocas are stale.
+                if hasattr(cg, 'gc_root_indices') and hasattr(cg, 'gc_frame') and cg.gc_frame is not None:
+                    cg.gc.reload_roots_after_compact(
+                        cg.builder, cg.gc_frame,
+                        cg.gc_root_indices, cg.locals
+                    )
+                return ir.Constant(ir.IntType(64), 0)
+
             if name == "print":
                 if expr.args:
                     value = self.generate_expression(expr.args[0])
