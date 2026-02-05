@@ -19,6 +19,7 @@ Methods:
 - posix.urandom(count) -> [byte]
 """
 
+import sys
 from llvmlite import ir
 from ast_nodes import PrimitiveType
 
@@ -175,8 +176,10 @@ class PosixGenerator:
         is_read = builder.icmp_unsigned("==", first_char, ir.Constant(ir.IntType(8), ord('r')))
         read_flags = ir.Constant(i32, 0)  # O_RDONLY
         # O_WRONLY | O_CREAT | O_TRUNC: macOS = 1537, Linux = 577
-        # Use macOS values since we're on Darwin
-        write_flags = ir.Constant(i32, 1537)  # O_WRONLY(1) | O_CREAT(512) | O_TRUNC(1024)
+        if sys.platform == "darwin":
+            write_flags = ir.Constant(i32, 1537)  # O_WRONLY(1) | O_CREAT(512) | O_TRUNC(1024)
+        else:
+            write_flags = ir.Constant(i32, 577)  # O_WRONLY(1) | O_CREAT(64) | O_TRUNC(512)
         flags = builder.select(is_read, read_flags, write_flags)
 
         # Call open(path, flags, 0644)

@@ -168,15 +168,18 @@ void coex_task_signal_complete(TaskClosure* closure) {
     atomic_store(&closure->completed, true);
     pthread_cond_broadcast(&closure->cond);
 
-    /* Also signal shared waiter if present (for wait_any) */
+    /* Signal shared waiter if present (for wait_any).
+     * Must be done while holding closure->mutex to prevent a race where
+     * the main thread clears shared_waiter and destroys the waiter's mutex
+     * between our read and our lock of waiter->mutex.
+     * Lock order: closure->mutex -> waiter->mutex (consistent everywhere). */
     SharedWaiter* waiter = closure->shared_waiter;
-    pthread_mutex_unlock(&closure->mutex);
-
     if (waiter != NULL) {
         pthread_mutex_lock(&waiter->mutex);
         pthread_cond_signal(&waiter->cond);
         pthread_mutex_unlock(&waiter->mutex);
     }
+    pthread_mutex_unlock(&closure->mutex);
 }
 
 void coex_task_wait_complete(TaskClosure* closure) {

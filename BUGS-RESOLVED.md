@@ -1577,3 +1577,31 @@ func main() -> int
   2. Changed `open()` declaration from `FunctionType(i32, [i8_ptr, i32, i32])` to `FunctionType(i32, [i8_ptr, i32], var_arg=True)` so LLVM generates correct variadic call code
 - **Files**: `codegen/posix.py:49, 176-177`
 - **Status**: Fixed (2026-02-04)
+
+---
+
+### BUG-097: posix.open() uses macOS-only O_CREAT|O_TRUNC flag values, fails on Linux
+- **Discovered**: 2026-02-04, during CI failure investigation
+- **Category**: Codegen/Stdlib
+- **Severity**: High
+- **Reproduction**: Run `test_posix_write` on Linux — file creation fails because flags 1537 don't mean O_WRONLY|O_CREAT|O_TRUNC on Linux
+- **Observed**: `posix.open("file.txt", "w")` fails on Linux because the hardcoded flag value 1537 is macOS-specific
+- **Expected**: Should use platform-appropriate flag values (macOS: 1537, Linux: 577)
+- **Hypothesis**: BUG-096 fix hardcoded macOS values without platform detection
+- **Fix**: Added `import sys` and `sys.platform == "darwin"` check in `codegen/posix.py` to select correct flag values per platform
+- **Files**: `codegen/posix.py:23, 178-181`
+- **Status**: Fixed (2026-02-04)
+
+---
+
+### BUG-098: Race condition in coex_task_signal_complete causes hang on Linux
+- **Discovered**: 2026-02-04, during CI failure investigation
+- **Category**: Runtime
+- **Severity**: Critical
+- **Reproduction**: Run `test_first_larger_collection` on Linux — hangs due to race between task thread signaling waiter and main thread clearing waiter
+- **Observed**: Task thread reads `shared_waiter` under `closure->mutex`, then releases mutex before locking `waiter->mutex`. Main thread can destroy `waiter->mutex` in between, causing undefined behavior / hang.
+- **Expected**: Waiter signaling should be atomic with respect to waiter lifecycle
+- **Hypothesis**: The unlock-then-relock gap between `closure->mutex` and `waiter->mutex` creates a TOCTOU race
+- **Fix**: Moved waiter signaling inside the `closure->mutex` hold. Lock order (closure->mutex -> waiter->mutex) is consistent with main thread, preventing deadlock.
+- **Files**: `runtime/coex_task.c:166-182`
+- **Status**: Fixed (2026-02-04)
