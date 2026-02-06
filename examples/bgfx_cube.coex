@@ -1,0 +1,106 @@
+# bgfx Spinning Cube
+#
+# Renders a colored cube rotating in 3D space via bgfx (Metal on macOS).
+# Demonstrates: vertex buffers, index buffers, shaders, transforms, 3D projection.
+#
+# Compile:
+#   python3 coexc.py examples/bgfx_cube.coex -o bgfx_cube
+# Run:
+#   ./bgfx_cube
+
+import ui
+import bgfx
+
+func main() -> int
+    # Initialize windowing
+    config = {title: "bgfx Spinning Cube", width: 800, height: 600}
+    ui.initialize(config)
+
+    # Initialize bgfx rendering
+    result = bgfx.initialize(800, 600)
+    if result == 0
+        print("Failed to initialize bgfx")
+        ui.close()
+        return 1
+    ~
+
+    # Enable debug text + stats overlay (8=text, 4=stats)
+    bgfx.set_debug(12)
+
+    # Configure view 0
+    bgfx.set_view_rect(0, 0, 0, 800, 600)
+    bgfx.set_view_clear(0, 3, 0x303030ff, 1.0, 0)
+
+    # Create vertex buffer - cube with 8 vertices (position xyz + color rgba)
+    # All data stored as floats; colors use 0.0-1.0 range
+    vb_json = "{\"layout\":{\"attribs\":["
+    vb_json = vb_json + "{\"name\":\"Position\",\"type\":\"Float\",\"num\":3},"
+    vb_json = vb_json + "{\"name\":\"Color0\",\"type\":\"Float\",\"num\":4}"
+    vb_json = vb_json + "]},"
+    vb_json = vb_json + "\"data\":["
+    vb_json = vb_json + "-1.0,-1.0,1.0, 1.0,0.0,0.0,1.0,"
+    vb_json = vb_json + "1.0,-1.0,1.0, 0.0,1.0,0.0,1.0,"
+    vb_json = vb_json + "1.0,1.0,1.0, 0.0,0.0,1.0,1.0,"
+    vb_json = vb_json + "-1.0,1.0,1.0, 1.0,1.0,0.0,1.0,"
+    vb_json = vb_json + "-1.0,-1.0,-1.0, 1.0,0.0,1.0,1.0,"
+    vb_json = vb_json + "1.0,-1.0,-1.0, 0.0,1.0,1.0,1.0,"
+    vb_json = vb_json + "1.0,1.0,-1.0, 1.0,1.0,1.0,1.0,"
+    vb_json = vb_json + "-1.0,1.0,-1.0, 0.5,0.5,0.5,1.0"
+    vb_json = vb_json + "]}"
+    vb_handle = bgfx.create_vertex_buffer(vb_json)
+
+    # Create index buffer - 12 triangles (36 indices) for 6 faces
+    ib_json = "{\"data\":["
+    ib_json = ib_json + "0,1,2, 0,2,3,"
+    ib_json = ib_json + "5,4,7, 5,7,6,"
+    ib_json = ib_json + "4,0,3, 4,3,7,"
+    ib_json = ib_json + "1,5,6, 1,6,2,"
+    ib_json = ib_json + "3,2,6, 3,6,7,"
+    ib_json = ib_json + "4,5,1, 4,1,0"
+    ib_json = ib_json + "],\"is_32bit\":false}"
+    ib_handle = bgfx.create_index_buffer(ib_json)
+
+    # Load shaders and create program
+    vs = bgfx.load_shader("examples/shaders/vs_cube.bin")
+    fs = bgfx.load_shader("examples/shaders/fs_cube.bin")
+    program = bgfx.create_program(vs, fs)
+
+    # Render state: write RGB+A + depth test less + cull CW + MSAA
+    # STATE_DEFAULT = 0x010000700000001f = 72057598332895263
+    state_default = 72057598332895263
+
+    # Main render loop
+    while not ui.should_close()
+        time = ui.get_time()
+
+        # Camera: eye at (0,2,-6) looking at origin
+        view_mtx = bgfx.mtx_look_at("[0.0,2.0,-6.0]", "[0.0,0.0,0.0]", "[0.0,1.0,0.0]")
+        proj_mtx = bgfx.mtx_proj(60.0, 1.333, 0.1, 100.0)
+        bgfx.set_view_transform(0, view_mtx, proj_mtx)
+        bgfx.touch(0)
+
+        # Debug text overlay
+        bgfx.dbg_text_clear()
+        bgfx.dbg_text(0, 1, 15, "bgfx + Coex: Spinning Cube")
+
+        # Rotation from time
+        rot_mtx = bgfx.mtx_rotate_xyz(time * 0.5, time * 0.7, time * 0.3)
+        bgfx.set_transform(rot_mtx)
+
+        # Bind state, buffers, and submit
+        bgfx.set_state(state_default, 0)
+        bgfx.set_vertex_buffer(0, vb_handle, 0, 8)
+        bgfx.set_index_buffer(ib_handle, 0, 36)
+        bgfx.submit(0, program, 0, 255)
+
+        bgfx.frame()
+    ~
+
+    # Clean up
+    bgfx.destroy_vertex_buffer(vb_handle)
+    bgfx.destroy_index_buffer(ib_handle)
+    bgfx.destroy_program(program)
+    bgfx.shutdown()
+    ui.close()
+    return 0
+~

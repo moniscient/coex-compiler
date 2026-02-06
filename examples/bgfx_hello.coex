@@ -1,0 +1,52 @@
+# bgfx Hello World
+#
+# Minimal bgfx integration test.
+# Shows a window with debug stats and text overlay.
+#
+# Requires: deps/build_deps.sh (for bgfx), runtime/make bgfx
+# Compile:  python3 coexc.py examples/bgfx_hello.coex -o bgfx_hello
+# Run:      ./bgfx_hello
+
+import ui
+import bgfx
+
+func main() -> int
+    # Initialize windowing via UI shell
+    config = {title: "bgfx Hello", width: 800, height: 600}
+    ui.initialize(config)
+
+    # Initialize bgfx rendering
+    result = bgfx.initialize(800, 600)
+    if result == 0
+        print("Failed to initialize bgfx")
+        ui.close()
+        return 1
+    ~
+
+    # Enable debug stats overlay (4 = stats)
+    bgfx.set_debug(4)
+
+    # Configure view 0: clear color + depth (flags=3), dark gray bg
+    bgfx.set_view_rect(0, 0, 0, 800, 600)
+    bgfx.set_view_clear(0, 3, 0x303030ff, 1.0, 0)
+
+    # Main render loop
+    while not ui.should_close()
+        # Touch view 0 to ensure it renders
+        bgfx.touch(0)
+
+        # Debug text overlay
+        bgfx.dbg_text_clear()
+        bgfx.dbg_text(0, 1, 15, "bgfx + Coex")
+        bgfx.dbg_text(0, 2, 6, "Hello from the bgfx 3D rendering library!")
+        bgfx.dbg_text(0, 4, 7, "Press ESC or close window to exit.")
+
+        # Advance frame
+        bgfx.frame()
+    ~
+
+    # Clean up
+    bgfx.shutdown()
+    ui.close()
+    return 0
+~

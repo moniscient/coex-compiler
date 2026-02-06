@@ -14,6 +14,10 @@
 
 #ifdef COEX_UI_HAS_GLFW
 #include <GLFW/glfw3.h>
+#ifdef __linux__
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#endif
 #endif
 
 /* Global state */
@@ -446,6 +450,23 @@ void* coex_ui_shell_get_render_context(void) {
 #ifdef COEX_UI_HAS_GLFW
     /* Return the GLFW window pointer - can be used to get OpenGL context */
     return _ui_state.window;
+#else
+    return NULL;
+#endif
+}
+
+void* coex_ui_shell_get_native_window_handle(void) {
+#if defined(COEX_UI_HAS_GLFW) && defined(__linux__)
+    if (_ui_state.window) {
+        return (void*)(uintptr_t)glfwGetX11Window(_ui_state.window);
+    }
+#endif
+    return NULL;
+}
+
+void* coex_ui_shell_get_native_display_handle(void) {
+#if defined(COEX_UI_HAS_GLFW) && defined(__linux__)
+    return (void*)glfwGetX11Display();
 #else
     return NULL;
 #endif
