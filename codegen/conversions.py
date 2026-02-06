@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Tuple, Optional
 
 from ast_nodes import (
     Type, ListType, ArrayType, SetType, MapType, PrimitiveType, NamedType, TupleType,
-    Expr, Identifier, CallExpr, MemberExpr
+    ResultType, Expr, Identifier, CallExpr, MemberExpr
 )
 
 if TYPE_CHECKING:
@@ -610,6 +610,8 @@ class ConversionGenerator:
             if coex_type.name == "json":
                 return True
         if isinstance(coex_type, (ListType, SetType, MapType, ArrayType)):
+            return True
+        if isinstance(coex_type, ResultType):
             return True
         if isinstance(coex_type, NamedType):
             # String is heap-allocated

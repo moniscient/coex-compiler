@@ -1636,3 +1636,23 @@ func main() -> int
 - **Fix**: Moved waiter signaling inside the `closure->mutex` hold. Lock order (closure->mutex -> waiter->mutex) is consistent with main thread, preventing deadlock.
 - **Files**: `runtime/coex_task.c:166-182`
 - **Status**: Fixed (2026-02-04)
+
+### BUG-092: Audit all heap pointer storage for handle invariant violations
+- **Discovered**: 2026-02-04, during Channel fix for BUG-006
+- **Category**: Codegen/GC
+- **Severity**: High
+- **Reproduction**: Any code path storing heap pointers in Result types, JSON maps, or using Result.ok/err with reference types, followed by GC before retrieval
+- **Observed**: Multiple code paths used `ptrtoint` (raw pointer as i64) instead of `gc_ptr_to_handle` (GC handle as i64) when storing heap objects. Also discovered ResultType was missing from `is_heap_type()`, preventing Result variables from being GC-rooted.
+- **Expected**: All stored references to GC-managed objects must be handles (i64 indices), never raw pointers
+- **Root Cause**: Systematic use of `ptrtoint` for pointer-to-i64 conversion where handle storage was required. Additionally, `codegen/conversions.py:is_heap_type()` did not include `ResultType`, causing Result variables to never be registered as GC shadow stack roots.
+- **Fix (2026-02-05)**:
+  1. **posix.py** (Group 1): Changed 10 `ptrtoint` storage sites to `gc_promote_to_heap + gc_ptr_to_handle` for Result ok/err values (posix struct, strings, byte lists)
+  2. **core.py + expressions.py** (Group 2): Changed `Result.unwrap()` retrieval from `inttoptr` to `gc_handle_deref + bitcast` for reference types
+  3. **json_type.py** (Group 3): Changed JSON map creation to use `MAP_FLAG_VALUE_IS_HANDLE`, fixed 5+ storage sites (promote+handle), fixed 3 map retrieval sites (`gc_handle_deref`), fixed list element retrieval sites for reference types, fixed annotation/struct/enum serialization functions
+  4. **expressions.py**: Added `Result.ok/err` static constructor interception to convert reference type arguments via `gc_promote_to_heap + gc_ptr_to_handle` instead of raw `ptrtoint`
+  5. **conversions.py**: Added `ResultType` to `is_heap_type()` check so Result variables are tracked as GC roots in the shadow stack
+  - **Important distinction**: HAMT keys stored via `hamt_collect_keys` are raw `ptrtoint` values (not handles) — `inttoptr` is correct for key retrieval. Only map VALUES in JSON maps are handles.
+  - **Remaining work**: Task closure result storage (thread.py) deferred to BUG-099 due to architectural complexity requiring coordinated changes across multiple retrieval sites.
+- **Files**: `codegen/posix.py`, `codegen/core.py`, `codegen/expressions.py`, `codegen/json_type.py`, `codegen/conversions.py`
+- **Tests**: `tests/test_bug092_handle_storage.py` (11 new tests covering Result, JSON, and task handle storage with GC pressure)
+- **Status**: Fixed (2026-02-05) — Partial fix: posix Result, JSON maps, Result.ok/err constructors. Task closure storage deferred to BUG-099.

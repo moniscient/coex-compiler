@@ -3210,9 +3210,13 @@ class CodeGenerator:
                             coex_type = self.var_coex_types[var_name]
                             if isinstance(coex_type, ResultType):
                                 ok_llvm_type = self._get_llvm_type(coex_type.ok_type)
-                                # If ok_type is a pointer, convert i64 result back to pointer
+                                # If ok_type is a pointer, convert i64 handle back to pointer
                                 if isinstance(ok_llvm_type, ir.PointerType):
-                                    return self.builder.inttoptr(result, ok_llvm_type)
+                                    if self._is_reference_type(coex_type.ok_type):
+                                        ptr_i8 = self.builder.call(self.gc.gc_handle_deref, [result])
+                                        return self.builder.bitcast(ptr_i8, ok_llvm_type)
+                                    else:
+                                        return self.builder.inttoptr(result, ok_llvm_type)
                     return result
 
                 return result

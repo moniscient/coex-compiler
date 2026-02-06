@@ -2262,12 +2262,24 @@ class ExpressionGenerator:
                 mangled = f"{type_name}_{expr.method}"
                 if mangled in cg.functions:
                     func = cg.functions[mangled]
+                    is_result_constructor = (type_name == "Result" and expr.method in ("ok", "err"))
                     args = []
                     for i, arg in enumerate(expr.args):
                         arg_val = self.generate_expression(arg)
                         if i < len(func.args):
                             expected = func.args[i].type
-                            arg_val = cg._cast_value(arg_val, expected)
+                            # For Result.ok/err with reference type arguments,
+                            # convert pointer to GC handle instead of raw ptrtoint
+                            if (is_result_constructor and
+                                isinstance(arg_val.type, ir.PointerType) and
+                                isinstance(expected, ir.IntType) and
+                                cg.gc is not None):
+                                i8_ptr = ir.IntType(8).as_pointer()
+                                val_i8 = cg.builder.bitcast(arg_val, i8_ptr)
+                                val_promoted = cg.builder.call(cg.gc.gc_promote_to_heap, [val_i8])
+                                arg_val = cg.builder.call(cg.gc.gc_ptr_to_handle, [val_promoted])
+                            else:
+                                arg_val = cg._cast_value(arg_val, expected)
                         args.append(arg_val)
                     return cg.builder.call(func, args)
 
@@ -2642,8 +2654,13 @@ class ExpressionGenerator:
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, ResultType):
                                 ok_llvm_type = cg._get_llvm_type(coex_type.ok_type)
+                                # If ok_type is a pointer, convert i64 handle back to pointer
                                 if isinstance(ok_llvm_type, ir.PointerType):
-                                    return cg.builder.inttoptr(result, ok_llvm_type)
+                                    if cg._is_reference_type(coex_type.ok_type):
+                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
+                                        return cg.builder.bitcast(ptr_i8, ok_llvm_type)
+                                    else:
+                                        return cg.builder.inttoptr(result, ok_llvm_type)
                     return result
 
                 return result

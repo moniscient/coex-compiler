@@ -135,84 +135,16 @@
 
 ---
 
-### BUG-092: Audit all heap pointer storage for handle invariant violations
-- **Discovered**: 2026-02-04, during Channel fix for BUG-006
+### BUG-099: Task closure result storage uses raw pointers instead of handles
+- **Discovered**: 2026-02-05, during BUG-092 audit
 - **Category**: Codegen/GC
 - **Severity**: High
-- **Reproduction**: Any code path storing heap pointers that survives a GC cycle
-- **Observed**: Channel was storing raw pointers via `ptrtoint` instead of handles. Similar violations likely exist elsewhere.
-- **Expected**: All stored references to GC-managed objects must be handles (i64 indices), never raw pointers
-- **Hypothesis**: Multiple code paths use `ptrtoint` to store heap pointers where `gc_ptr_to_handle` should be used
-
-**Audit Scope** - Search for these patterns in `codegen/`:
-
-1. **`ptrtoint` on heap struct pointers** - Check all uses of `builder.ptrtoint(value, i64)` where `value.type.pointee.name` is one of:
-   - `struct.List`, `struct.Map`, `struct.Set`, `struct.Array`, `struct.String`, `struct.Json`
-   - Any user-defined type struct
-
-2. **Storage locations requiring handles**:
-   - Collection elements (List, Array elements that are reference types)
-   - Map keys and values that are reference types
-   - Set elements that are reference types
-   - Channel send/receive (FIXED in this session)
-   - Struct fields containing reference types
-   - TaggedValue storage for heap types
-   - Any value persisted in heap-allocated structures
-
-3. **Known problem areas from BUG-081** (partially fixed):
-   - `codegen/json_type.py` - lines 339, 870, 891, 1463, 2705, 2999, 3108, 3127, 3142, 3186, 3193, 3206, 3568
-   - `codegen/posix.py` - Result<T,E> returns (lines 202, 210, 273, 281, 340, 388, 462, 471, 533, 591)
-   - `codegen/loops.py` - parallel task results (lines 2187, 2493, 2790, 2807)
-   - `codegen/core.py` - field initialization (lines 2864, 2917)
-
-4. **Correct pattern**:
-   ```python
-   # WRONG: Store raw pointer
-   value_i64 = builder.ptrtoint(heap_ptr, i64)
-
-   # CORRECT: Store handle
-   value_i8 = builder.bitcast(heap_ptr, i8_ptr)
-   value_handle = builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
-   ```
-
-5. **Retrieval pattern**:
-   ```python
-   # For handle storage:
-   raw_ptr = builder.call(cg.gc.gc_handle_deref, [handle])
-   typed_ptr = builder.bitcast(raw_ptr, target_struct.as_pointer())
-
-   # NOT inttoptr (that's for raw pointer storage)
-   ```
-
-**Files to audit**:
-- `codegen/expressions.py` - collection access, struct field access
-- `codegen/statements.py` - assignments, variable storage
-- `codegen/loops.py` - parallel result collection
-- `codegen/json_type.py` - JSON value storage
-- `codegen/hamt.py` - Map/Set key/value storage
-- `codegen/strings.py` - string operations returning strings
-- `codegen/posix.py` - Result type returns
-- `codegen/channel.py` - FIXED this session
-- `codegen/core.py` - struct field initialization
-
-- **Files**: All files in `codegen/` directory
+- **Reproduction**: Parallel for/first-assign/most-assign returning reference types (strings, lists, etc.) with GC pressure between task completion and result consumption
+- **Observed**: `codegen/thread.py` lines 519-522 use `ptrtoint` to store task results in closure. Retrieval in `codegen/loops.py` (lines 2191, 2497, 2812) uses `ptrtoint` roundtrip to recover i64 value stored in TaggedValue. For reference type results, these are raw pointers, not handles.
+- **Expected**: Task results containing reference types should use `gc_promote_to_heap + gc_ptr_to_handle` for storage, with matching `gc_handle_deref` at retrieval sites.
+- **Hypothesis**: Requires coordinated changes at storage (thread.py) and all retrieval sites (loops.py), plus ensuring TaggedValue consumers treat values as handles for reference types.
+- **Files**: `codegen/thread.py`, `codegen/loops.py`
 - **Status**: Open
-- **Note**: This is a systematic audit bug. Each violation found should be fixed and noted here until all are resolved.
-
-**Investigation Notes (2026-02-04)**:
-1. **False positives in strings.py**: String data buffer storage (`owner_handle` field) intentionally uses raw pointers via `ptrtoint`. These are NOT violations because:
-   - String data can be arena-allocated (FLAG_ARENA, no handle, bulk-freed)
-   - Arena allocations don't support `gc_ptr_to_handle` - they have no forward field
-   - The string struct tracks the data buffer; data is read back via `inttoptr`
-
-2. **Result type complexity**: Result stores reference types via `_cast_value(ptr, i64)` which uses `ptrtoint`. Fixing this requires:
-   - Change `_cast_value` to use `gc_ptr_to_handle` when target is i64 and source is a reference type pointer
-   - Update `Result.unwrap` and similar to use `gc_handle_deref` instead of `inttoptr`
-   - Both changes must happen together or the code will crash
-
-3. **Audit criteria refinement**: Only flag `ptrtoint` on GC-allocated objects (not arena-allocated data buffers). Key distinction:
-   - GC-allocated: TYPE_STRING, TYPE_LIST, TYPE_MAP, TYPE_ARRAY, user types → need handles
-   - Arena-allocated data: TYPE_STRING_DATA, TYPE_LIST_TAIL, etc. → raw pointers OK
 
 ---
 
@@ -303,4 +235,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-101**
+**Next valid BUG ID: BUG-100**
