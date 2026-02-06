@@ -235,4 +235,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-100**
+**Next valid BUG ID: BUG-103**

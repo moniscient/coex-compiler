@@ -1656,3 +1656,51 @@ func main() -> int
 - **Files**: `codegen/posix.py`, `codegen/core.py`, `codegen/expressions.py`, `codegen/json_type.py`, `codegen/conversions.py`
 - **Tests**: `tests/test_bug092_handle_storage.py` (11 new tests covering Result, JSON, and task handle storage with GC pressure)
 - **Status**: Fixed (2026-02-05) — Partial fix: posix Result, JSON maps, Result.ok/err constructors. Task closure storage deferred to BUG-099.
+
+### BUG-099: gc_compact stale raw pointers after compaction
+- **Discovered**: 2026-02-05, during gc_compact implementation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: `x = [10, 20, 30]; gc_compact(); gc(); print(x.get(0))` → segfault
+- **Observed**: Segfault in gc_ptr_to_handle during GC mark phase after compaction
+- **Expected**: Objects should be accessible after compaction + GC
+- **Hypothesis**: Compaction copies objects via memcpy, but internal raw pointer fields (List root/tail, String owner, Map/Set HAMT root) still point to OLD object locations. When GC mark traces through these stale pointers, it accesses freed memory. Also, compiled code caches raw pointers in stack allocas that become stale after compaction.
+- **Files**: coex_gc.py, codegen/expressions.py
+- **Fix**: Three-part fix: (1) Added pointer fixup pass in gc_compact_impl that updates internal raw pointer fields for List, String, Map, Set, Array types using gc_ptr_to_handle → gc_handle_deref pipeline. (2) Added gc_segment_get_root function and reload_roots_after_compact helper that re-dereferences handles for all live heap variables after gc_compact() call. (3) Moved gc_compact_deferred_cleanup from before mark phase to after sweep phase in gc_collect, so old memory stays valid during mark traversal.
+- **Status**: Fixed (2026-02-05)
+
+### BUG-100: gc_compact prev buffer munmapped by sweep before second compaction
+- **Discovered**: 2026-02-05, during gc_compact multiple-rounds testing
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: `x = [1,2,3]; gc_compact(); x = x.append(4); gc_compact()` → segfault in gc_compact_impl
+- **Observed**: Segfault at the live_count poison store in gc_compact_impl on second call
+- **Expected**: Multiple compaction rounds should work correctly
+- **Hypothesis**: The first compaction's compact buffer is saved as gc_compact_prev_buffer. During the gc_collect() call inside the second gc_compact(), the sweep phase processes objects in buffer A. If all objects have been moved elsewhere, buffer A's live_count reaches 0, and sweep munmaps it via gc_dead_tlab_list. Then gc_compact_impl tries to poison the now-freed buffer.
+- **Files**: coex_gc.py
+- **Fix**: Moved the live_count poisoning from gc_compact_impl to gc_compact wrapper, so it happens BEFORE the gc_collect() call. The sentinel value (0x7FFFFFFFFFFFFFFF) prevents live_count from ever reaching 0 during sweep.
+- **Status**: Fixed (2026-02-05)
+
+### BUG-101: gc_compact fixup pass doesn't strip HAMT tag bits from Map/Set root pointers
+- **Discovered**: 2026-02-05, during gc_compact stress testing
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: `c = {1: 100}; gc_compact(); print(c.get(1))` → prints 0 instead of 100
+- **Observed**: Map.get() returns 0 after compaction. HAMT root pointer becomes NULL.
+- **Expected**: Map should return correct values after compaction
+- **Hypothesis**: HAMT uses pointer tagging (bit 0 = 1 for leaf, 0 for node). The fixup pass calls `gc_ptr_to_handle(tagged_ptr)` which subtracts HEADER_SIZE from the tagged pointer, reading the wrong memory location for the forward field. This returns handle=0, so the fixup is skipped, leaving a stale pointer.
+- **Files**: coex_gc.py (fixup_ptr_field in gc_compact_impl)
+- **Fix**: Added `tag_mask` parameter to `fixup_ptr_field`. For Map and Set root fields, strips tag bits (AND with ~mask) before `gc_ptr_to_handle`, then restores tag bits (OR) on the new pointer. Uses `tag_mask=1` for HAMT tagged pointers.
+- **Status**: Fixed (2026-02-05)
+
+### BUG-102: gc_compact fixup pass doesn't handle PV_NODE children pointers
+- **Discovered**: 2026-02-05, during gc_compact stress testing
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Build list with 100+ elements (requiring PV tree depth > 1), compact periodically, access first element → wrong value
+- **Observed**: `x.get(0)` returns 95 instead of 1 after multiple compactions on a 101-element list
+- **Expected**: List elements should be correctly accessible after compaction
+- **Hypothesis**: PV_NODE type (TYPE_PV_NODE=10) stores 32 raw i8* children pointers. After compaction moves child PV_NODEs, the parent's children array still has stale pointers. The fixup pass only handled List/String/Map/Set/Array but not PV_NODE.
+- **Files**: coex_gc.py (fixup switch in gc_compact_impl)
+- **Fix**: Added TYPE_PV_NODE case to the fixup switch. Added `fixup_raw_ptr_field` helper for i8* pointer fields. Iterates all 32 PV_NODE children and fixes each non-null pointer via gc_ptr_to_handle → gc_handle_deref.
+- **Status**: Fixed (2026-02-05)

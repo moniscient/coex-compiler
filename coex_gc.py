@@ -242,6 +242,11 @@ class GarbageCollector:
         self.gc_handle_pool_alloc = None   # Fast path: allocate from thread-local pool
         self.gc_handle_pool_refill = None  # Slow path: refill pool under mutex
 
+        # Heap compaction functions
+        self.gc_compact_impl = None        # Internal compaction algorithm
+        self.gc_compact = None             # User-facing builtin
+        self.gc_compact_deferred_cleanup = None  # Deferred memory cleanup
+
         # Dual-heap async GC functions
         self.gc_async = None
         self.gc_capture_snapshot = None
@@ -376,6 +381,7 @@ class GarbageCollector:
         self._implement_gc_segment_push()
         self._implement_gc_segment_pop()
         self._implement_gc_segment_set_root()
+        self._implement_gc_segment_get_root()
         self._implement_gc_segment_scan_roots()
         # Phase 4: TLAB allocation
         self._implement_gc_tlab_init()
@@ -424,6 +430,10 @@ class GarbageCollector:
         # Per-thread handle pool functions (lock-free allocation)
         self._implement_gc_handle_pool_alloc()
         self._implement_gc_handle_pool_refill()
+        # Heap compaction
+        self._implement_gc_compact_deferred_cleanup()
+        self._implement_gc_compact_impl()
+        self._implement_gc_compact()
 
     def _create_types(self):
         """Create GC-related LLVM types"""
@@ -1005,6 +1015,43 @@ class GarbageCollector:
         self.gc_mark_worklist_capacity.initializer = ir.Constant(self.i64, 0)
         self.gc_mark_worklist_capacity.linkage = 'internal'
 
+        # ============================================================
+        # Heap Compaction Globals
+        # ============================================================
+
+        # Compacting flag: 1 while compaction is in progress
+        # Prevents concurrent GC and handle table growth
+        self.gc_compacting = ir.GlobalVariable(
+            self.module, self.i64, name="gc_compacting")
+        self.gc_compacting.initializer = ir.Constant(self.i64, 0)
+        self.gc_compacting.linkage = 'internal'
+
+        # Linked list of old malloc'd pointers to free after compaction
+        # Each node is {i8* old_ptr, i8* next}
+        self.gc_compact_deferred_free_list = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_compact_deferred_free_list")
+        self.gc_compact_deferred_free_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_compact_deferred_free_list.linkage = 'internal'
+
+        # Linked list of dead TLABs to munmap after compaction
+        # Each node is {i8* tlab_ptr, i64 tlab_size, i8* next}
+        self.gc_compact_dead_tlab_list = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_compact_dead_tlab_list")
+        self.gc_compact_dead_tlab_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_compact_dead_tlab_list.linkage = 'internal'
+
+        # Previous compaction buffer (to be freed at next cleanup)
+        self.gc_compact_prev_buffer = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_compact_prev_buffer")
+        self.gc_compact_prev_buffer.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_compact_prev_buffer.linkage = 'internal'
+
+        # Size of previous compaction buffer (for munmap)
+        self.gc_compact_prev_buffer_size = ir.GlobalVariable(
+            self.module, self.i64, name="gc_compact_prev_buffer_size")
+        self.gc_compact_prev_buffer_size.initializer = ir.Constant(self.i64, 0)
+        self.gc_compact_prev_buffer_size.linkage = 'internal'
+
     def _declare_functions(self):
         """Declare GC runtime functions"""
         # gc_init() -> void
@@ -1203,6 +1250,11 @@ class GarbageCollector:
         gc_segment_set_root_ty = ir.FunctionType(self.void, [self.i64, self.i64])
         self.gc_segment_set_root = ir.Function(self.module, gc_segment_set_root_ty, name="coex_gc_segment_set_root")
 
+        # gc_segment_get_root(slot: i64) -> i64
+        # Read handle from absolute slot index (may span segments)
+        gc_segment_get_root_ty = ir.FunctionType(self.i64, [self.i64])
+        self.gc_segment_get_root = ir.Function(self.module, gc_segment_get_root_ty, name="coex_gc_segment_get_root")
+
         # gc_segment_scan_roots() -> void
         # Scan all segments for roots (used by gc_scan_roots)
         gc_segment_scan_roots_ty = ir.FunctionType(self.void, [])
@@ -1274,6 +1326,25 @@ class GarbageCollector:
         # If arena-allocated, copies the object to GC heap and returns new pointer.
         gc_promote_to_heap_ty = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
         self.gc_promote_to_heap = ir.Function(self.module, gc_promote_to_heap_ty, name="coex_gc_promote_to_heap")
+
+        # ============================================================
+        # Heap Compaction Function Declarations
+        # ============================================================
+
+        # gc_compact_impl() -> void
+        # Internal: runs the compaction algorithm (size estimation, copy, handle update)
+        gc_compact_impl_ty = ir.FunctionType(self.void, [])
+        self.gc_compact_impl = ir.Function(self.module, gc_compact_impl_ty, name="coex_gc_compact_impl")
+
+        # gc_compact() -> void
+        # User-facing builtin: runs gc_collect() then gc_compact_impl()
+        gc_compact_ty = ir.FunctionType(self.void, [])
+        self.gc_compact = ir.Function(self.module, gc_compact_ty, name="coex_gc_compact")
+
+        # gc_compact_deferred_cleanup() -> void
+        # Frees old memory from previous compaction (called at start of gc_collect)
+        gc_compact_cleanup_ty = ir.FunctionType(self.void, [])
+        self.gc_compact_deferred_cleanup = ir.Function(self.module, gc_compact_cleanup_ty, name="coex_gc_compact_deferred_cleanup")
 
         # ============================================================
         # Pthread function declarations (external)
@@ -3987,6 +4058,12 @@ class GarbageCollector:
         # This makes handles retired in cycle N-1 available for reuse in cycle N
         builder.call(self.gc_promote_retired_handles, [])
 
+        # NOTE: gc_compact_deferred_cleanup is called AFTER sweep, not here.
+        # Old memory must remain valid during mark phase because gc_mark_object
+        # traverses internal raw pointers (e.g., List root/tail, String owner)
+        # that may still point to old locations. gc_ptr_to_handle reads the
+        # forward field from old memory, which requires it to be mapped.
+
         # Set gc_phase = 2 (MARKING)
         builder.store(ir.Constant(self.i64, 2), self.gc_phase)
 
@@ -4012,6 +4089,13 @@ class GarbageCollector:
 
         # Phase 9: Sweep phase - free unmarked objects
         builder.call(self.gc_sweep, [])
+
+        # Free deferred memory from previous compaction (if any).
+        # Must be AFTER sweep: during mark phase, gc_ptr_to_handle reads the
+        # forward field from old object locations (stale raw pointers in List
+        # root/tail, String owner, etc.). Old memory must stay mapped until
+        # marking and sweep are complete.
+        builder.call(self.gc_compact_deferred_cleanup, [])
 
         # Reset watermark_active for all threads
         # Lock registry mutex to prevent threads from unregistering during iteration
@@ -4347,6 +4431,14 @@ class GarbageCollector:
         # Now check if GC should be triggered (original behavior)
         builder.position_at_end(enabled_check)
 
+        # Skip GC trigger if compaction is in progress
+        compacting_val = builder.load(self.gc_compacting)
+        is_compacting_now = builder.icmp_unsigned('!=', compacting_val, ir.Constant(self.i64, 0))
+        not_compacting = func.append_basic_block("not_compacting")
+        builder.cbranch(is_compacting_now, done, not_compacting)
+
+        builder.position_at_end(not_compacting)
+
         # Check if GC is enabled
         gc_enabled = builder.load(self.gc_enabled)
         threshold_check = func.append_basic_block("threshold_check")
@@ -4531,6 +4623,46 @@ class GarbageCollector:
         # Compute absolute slot index and store handle via gc_segment_set_root
         absolute_slot = builder.add(start_slot, index_val)
         builder.call(self.gc_segment_set_root, [absolute_slot, handle])
+
+    def reload_roots_after_compact(self, builder: ir.IRBuilder, gc_frame: ir.Value,
+                                     gc_root_indices: dict, locals_dict: dict):
+        """Reload heap variable pointers after gc_compact moves objects.
+
+        After gc_compact(), objects have been copied to a new buffer and handles
+        updated, but the raw pointers stored in stack allocas are stale.
+        This method reads the handle from the shadow stack, dereferences it to
+        get the current pointer, and updates each variable's stack alloca.
+
+        Args:
+            builder: LLVM IR builder
+            gc_frame: Start slot of the current GC frame (i64)
+            gc_root_indices: Dict mapping var_name -> shadow stack slot index
+            locals_dict: Dict mapping var_name -> LLVM alloca instruction
+        """
+        for var_name, slot_index in gc_root_indices.items():
+            if var_name not in locals_dict:
+                continue
+            alloca = locals_dict[var_name]
+            # Get the element type of the alloca
+            if not isinstance(alloca.type, ir.PointerType):
+                continue
+            elem_type = alloca.type.pointee
+            # Only reload pointer types (heap objects)
+            if not isinstance(elem_type, ir.PointerType):
+                continue
+
+            # Read handle from shadow stack
+            absolute_slot = builder.add(gc_frame, ir.Constant(self.i64, slot_index))
+            handle = builder.call(self.gc_segment_get_root, [absolute_slot])
+
+            # Only deref and update if handle is non-null
+            is_nonnull = builder.icmp_unsigned("!=", handle, ir.Constant(self.i64, 0))
+            with builder.if_then(is_nonnull):
+                # Deref handle to get current pointer
+                new_ptr = builder.call(self.gc_handle_deref, [handle])
+                # Bitcast to the expected pointer type
+                typed_ptr = builder.bitcast(new_ptr, elem_type)
+                builder.store(typed_ptr, alloca)
 
     def alloc_with_deref(self, builder: ir.IRBuilder, size: ir.Value, type_id: ir.Value) -> ir.Value:
         """Allocate memory and return the pointer (backward compatibility helper).
@@ -5526,6 +5658,94 @@ class GarbageCollector:
         builder.store(handle, slot_ptr)
 
         builder.ret_void()
+
+    def _implement_gc_segment_get_root(self):
+        """Read handle from absolute slot index.
+
+        Mirror of gc_segment_set_root but returns the handle instead of setting it.
+        Used to reload heap variable pointers after gc_compact() moves objects.
+        """
+        func = self.gc_segment_get_root
+        func.args[0].name = "slot"
+
+        entry = func.append_basic_block("entry")
+        loop_check = func.append_basic_block("loop_check")
+        loop_body = func.append_basic_block("loop_body")
+        found = func.append_basic_block("found")
+
+        builder = ir.IRBuilder(entry)
+        slot = func.args[0]
+
+        # Get ThreadEntry via pthread TLS
+        tls_key = builder.load(self.tls_thread_entry_key)
+        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
+        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
+
+        # Get segment_base from ThreadEntry field 12
+        seg_base_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 12)  # segment_base field
+        ], inbounds=True)
+        segment_base_i8 = builder.load(seg_base_ptr)
+        base_segment = builder.bitcast(segment_base_i8, self.stack_segment_type.as_pointer())
+
+        # Calculate which segment and which slot within it
+        slots_per_segment = ir.Constant(self.i64, self.SEGMENT_SLOTS)
+        slot_in_segment = builder.urem(slot, slots_per_segment)
+        segment_index = builder.udiv(slot, slots_per_segment)
+
+        # Walk to the correct segment
+        curr_segment_alloca = builder.alloca(self.stack_segment_type.as_pointer(), name="curr")
+        remaining_alloca = builder.alloca(self.i64, name="remaining")
+
+        builder.store(base_segment, curr_segment_alloca)
+        builder.store(segment_index, remaining_alloca)
+        builder.branch(loop_check)
+
+        # Loop check: if remaining == 0, we found the right segment
+        builder.position_at_end(loop_check)
+        remaining = builder.load(remaining_alloca)
+        is_zero = builder.icmp_unsigned("==", remaining, ir.Constant(self.i64, 0))
+        builder.cbranch(is_zero, found, loop_body)
+
+        # Loop body: advance to next segment and decrement remaining
+        builder.position_at_end(loop_body)
+        curr_segment_in_loop = builder.load(curr_segment_alloca)
+
+        # Get next segment pointer: curr_segment->next (field 1)
+        next_ptr = builder.gep(curr_segment_in_loop, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 1)  # next field
+        ], inbounds=True)
+        next_seg_i8ptr = builder.load(next_ptr)
+        next_segment = builder.bitcast(next_seg_i8ptr, self.stack_segment_type.as_pointer())
+
+        # Update curr_segment to next
+        builder.store(next_segment, curr_segment_alloca)
+
+        # Decrement remaining
+        remaining_in_loop = builder.load(remaining_alloca)
+        new_remaining = builder.sub(remaining_in_loop, ir.Constant(self.i64, 1))
+        builder.store(new_remaining, remaining_alloca)
+
+        builder.branch(loop_check)
+
+        # Found the correct segment - read the handle
+        builder.position_at_end(found)
+        curr_segment = builder.load(curr_segment_alloca)
+
+        # Get slots array: curr_segment->slots[0] (field 3)
+        slots_ptr = builder.gep(curr_segment, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 3),  # slots array
+            ir.Constant(self.i32, 0)   # first element
+        ], inbounds=True)
+
+        # Read handle from slot_in_segment
+        slot_ptr = builder.gep(slots_ptr, [slot_in_segment], inbounds=True)
+        handle = builder.load(slot_ptr)
+
+        builder.ret(handle)
 
     def _implement_gc_segment_scan_roots(self):
         """Scan all segments for roots.
@@ -8784,10 +9004,30 @@ class GarbageCollector:
         This is called when gc_next_handle exceeds gc_handle_table_size
         and the free list is empty. Doubles the table capacity and copies
         existing entries to the new table.
+
+        Spins waiting for compaction to complete before proceeding, to
+        prevent racing with the compactor's handle table access.
         """
         func = self.gc_handle_table_grow
         entry = func.append_basic_block("entry")
+        wait_compact = func.append_basic_block("wait_compact")
+        wait_yield = func.append_basic_block("wait_yield")
+        do_grow = func.append_basic_block("do_grow")
         builder = ir.IRBuilder(entry)
+
+        # Spin-wait if compaction is in progress
+        builder.branch(wait_compact)
+
+        builder.position_at_end(wait_compact)
+        compacting = builder.load(self.gc_compacting)
+        is_compacting = builder.icmp_unsigned('!=', compacting, ir.Constant(self.i64, 0))
+        builder.cbranch(is_compacting, wait_yield, do_grow)
+
+        builder.position_at_end(wait_yield)
+        builder.call(self.sched_yield, [])
+        builder.branch(wait_compact)
+
+        builder.position_at_end(do_grow)
 
         # Load current table state
         old_table = builder.load(self.gc_handle_table)
@@ -9434,4 +9674,1028 @@ class GarbageCollector:
         builder.branch(done)
 
         builder.position_at_end(done)
+        builder.ret_void()
+
+    # ========================================================================
+    # Heap Compaction Implementation
+    # ========================================================================
+
+    def _implement_gc_compact_deferred_cleanup(self):
+        """Free old memory from previous compaction.
+
+        Called at the start of gc_collect() after watermarks, when all mutators
+        are at safepoints and have discarded any raw pointers from before
+        compaction. Two lists are processed:
+
+        1. gc_compact_deferred_free_list: linked list of {i8* old_ptr, i8* next}
+           nodes where old_ptr is a malloc'd object header to free.
+        2. gc_compact_dead_tlab_list: linked list of {i8* tlab_ptr, i64 tlab_size, i8* next}
+           nodes where tlab_ptr is a dead TLAB to munmap.
+        """
+        func = self.gc_compact_deferred_cleanup
+
+        entry = func.append_basic_block("entry")
+        free_loop = func.append_basic_block("free_loop")
+        free_body = func.append_basic_block("free_body")
+        tlab_loop = func.append_basic_block("tlab_loop")
+        tlab_body = func.append_basic_block("tlab_body")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Load deferred free list head
+        free_head = builder.load(self.gc_compact_deferred_free_list)
+        free_head_int = builder.ptrtoint(free_head, self.i64)
+        has_free = builder.icmp_unsigned('!=', free_head_int, ir.Constant(self.i64, 0))
+
+        # Alloca for loop variable (must be in entry block)
+        curr_free_alloca = builder.alloca(self.i8_ptr, name="curr_free")
+        curr_tlab_alloca = builder.alloca(self.i8_ptr, name="curr_tlab")
+        builder.store(free_head, curr_free_alloca)
+        builder.cbranch(has_free, free_loop, tlab_loop)
+
+        # --- Free list loop: free each old malloc'd pointer ---
+        builder.position_at_end(free_loop)
+        curr_free = builder.load(curr_free_alloca)
+        curr_free_int = builder.ptrtoint(curr_free, self.i64)
+        is_null_free = builder.icmp_unsigned('==', curr_free_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_free, tlab_loop, free_body)
+
+        builder.position_at_end(free_body)
+        # Node layout: { i8* old_ptr, i8* next }
+        # Cast to struct pointer
+        free_node_type = ir.LiteralStructType([self.i8_ptr, self.i8_ptr])
+        free_node = builder.bitcast(curr_free, free_node_type.as_pointer())
+
+        # Load old_ptr (field 0) and free it
+        old_ptr_ptr = builder.gep(free_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        old_ptr = builder.load(old_ptr_ptr)
+        builder.call(self.codegen.free, [old_ptr])
+
+        # Load next (field 1) and advance
+        next_free_ptr = builder.gep(free_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        next_free = builder.load(next_free_ptr)
+
+        # Free the node itself
+        builder.call(self.codegen.free, [curr_free])
+
+        builder.store(next_free, curr_free_alloca)
+        builder.branch(free_loop)
+
+        # --- TLAB list loop: munmap each dead TLAB ---
+        builder.position_at_end(tlab_loop)
+        tlab_head = builder.load(self.gc_compact_dead_tlab_list)
+        builder.store(tlab_head, curr_tlab_alloca)
+        tlab_head_int = builder.ptrtoint(tlab_head, self.i64)
+        has_tlab = builder.icmp_unsigned('!=', tlab_head_int, ir.Constant(self.i64, 0))
+
+        tlab_check = func.append_basic_block("tlab_check")
+        builder.cbranch(has_tlab, tlab_check, done)
+
+        builder.position_at_end(tlab_check)
+        curr_tlab = builder.load(curr_tlab_alloca)
+        curr_tlab_int = builder.ptrtoint(curr_tlab, self.i64)
+        is_null_tlab = builder.icmp_unsigned('==', curr_tlab_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_tlab, done, tlab_body)
+
+        builder.position_at_end(tlab_body)
+        # Node layout: { i8* tlab_ptr, i64 tlab_size, i8* next }
+        tlab_node_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i8_ptr])
+        tlab_node = builder.bitcast(curr_tlab, tlab_node_type.as_pointer())
+
+        # Load tlab_ptr (field 0) and tlab_size (field 1)
+        tlab_ptr_ptr = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        tlab_ptr = builder.load(tlab_ptr_ptr)
+        tlab_size_ptr = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        tlab_size = builder.load(tlab_size_ptr)
+
+        # munmap the TLAB
+        builder.call(self.munmap, [tlab_ptr, tlab_size])
+
+        # Load next (field 2) and advance
+        next_tlab_ptr = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        next_tlab = builder.load(next_tlab_ptr)
+
+        # Free the node itself
+        builder.call(self.codegen.free, [curr_tlab])
+
+        builder.store(next_tlab, curr_tlab_alloca)
+        builder.branch(tlab_check)
+
+        # --- Done: clear both lists ---
+        builder.position_at_end(done)
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_compact_deferred_free_list)
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_compact_dead_tlab_list)
+        # Note: gc_compact_prev_buffer is NOT freed here because it may still
+        # contain live objects. It is freed in gc_compact_impl AFTER objects
+        # are copied out of it.
+        builder.ret_void()
+
+    def _implement_gc_compact_impl(self):
+        """Core compaction algorithm.
+
+        Sets gc_compacting=1, walks all threads' alloc lists, copies live
+        objects into a contiguous mmap'd buffer, updates handle table entries,
+        and defers old memory for cleanup at the next GC cycle.
+
+        Phases:
+        1. Size estimation: walk alloc lists, accumulate total bytes needed
+        2. Buffer allocation: mmap a single contiguous buffer
+        3. Copy & update: memcpy objects, update handles, track old memory
+        4. Set gc_compacting=0
+
+        Concurrency safety: handle table updates are pointer-width stores
+        (naturally atomic). Old memory is deferred-freed at next GC after
+        watermarks guarantee all mutators have discarded raw pointers.
+        """
+        func = self.gc_compact_impl
+
+        entry = func.append_basic_block("entry")
+        size_thread_loop = func.append_basic_block("size_thread_loop")
+        size_process_thread = func.append_basic_block("size_process_thread")
+        size_node_loop = func.append_basic_block("size_node_loop")
+        size_process_node = func.append_basic_block("size_process_node")
+        size_skip_node = func.append_basic_block("size_skip_node")
+        size_accumulate = func.append_basic_block("size_accumulate")
+        size_next_node = func.append_basic_block("size_next_node")
+        size_next_thread = func.append_basic_block("size_next_thread")
+        check_size = func.append_basic_block("check_size")
+        alloc_buffer = func.append_basic_block("alloc_buffer")
+        alloc_failed = func.append_basic_block("alloc_failed")
+        copy_thread_loop = func.append_basic_block("copy_thread_loop")
+        copy_process_thread = func.append_basic_block("copy_process_thread")
+        copy_node_loop = func.append_basic_block("copy_node_loop")
+        copy_process_node = func.append_basic_block("copy_process_node")
+        copy_skip_node = func.append_basic_block("copy_skip_node")
+        copy_object = func.append_basic_block("copy_object")
+        copy_check_capacity = func.append_basic_block("copy_check_capacity")
+        copy_update_handle = func.append_basic_block("copy_update_handle")
+        copy_old_is_tlab = func.append_basic_block("copy_old_is_tlab")
+        copy_old_is_malloc = func.append_basic_block("copy_old_is_malloc")
+        copy_next_node = func.append_basic_block("copy_next_node")
+        copy_next_thread = func.append_basic_block("copy_next_thread")
+        # Pointer fixup phase blocks
+        fixup_start = func.append_basic_block("fixup_start")
+        fixup_thread_check = func.append_basic_block("fixup_thread_check")
+        fixup_process_thread = func.append_basic_block("fixup_process_thread")
+        fixup_node_loop = func.append_basic_block("fixup_node_loop")
+        fixup_process_node = func.append_basic_block("fixup_process_node")
+        fixup_check_type = func.append_basic_block("fixup_check_type")
+        fixup_next_node = func.append_basic_block("fixup_next_node")
+        fixup_next_thread = func.append_basic_block("fixup_next_thread")
+        update_stats = func.append_basic_block("update_stats")
+        done = func.append_basic_block("done")
+
+        builder = ir.IRBuilder(entry)
+
+        # Set gc_compacting = 1 to prevent concurrent GC and table growth
+        builder.store(ir.Constant(self.i64, 1), self.gc_compacting)
+
+        # Allocas (all in entry block - must be before any branching)
+        total_bytes_alloca = builder.alloca(self.i64, name="total_bytes")
+        movable_count_alloca = builder.alloca(self.i64, name="movable_count")
+        thread_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
+        node_alloca = builder.alloca(self.i8_ptr, name="curr_node")
+        cursor_alloca = builder.alloca(self.i8_ptr, name="cursor")
+        buffer_base_alloca = builder.alloca(self.i8_ptr, name="buffer_base")
+        buffer_limit_alloca = builder.alloca(self.i8_ptr, name="buffer_limit")
+        objects_moved_alloca = builder.alloca(self.i64, name="objects_moved")
+        bytes_moved_alloca = builder.alloca(self.i64, name="bytes_moved")
+
+        builder.store(ir.Constant(self.i64, 0), total_bytes_alloca)
+        builder.store(ir.Constant(self.i64, 0), movable_count_alloca)
+        builder.store(ir.Constant(self.i64, 0), objects_moved_alloca)
+        builder.store(ir.Constant(self.i64, 0), bytes_moved_alloca)
+
+        # NOTE: Poisoning of gc_compact_prev_buffer's live_count is done in
+        # gc_compact() BEFORE gc_collect, not here. See _implement_gc_compact.
+
+        # Lock registry mutex to iterate thread list
+        registry_mutex = builder.load(self.gc_registry_mutex)
+        builder.call(self.pthread_mutex_lock, [registry_mutex])
+
+        # ====================================================================
+        # Phase 1: Size Estimation
+        # ====================================================================
+        first_thread = builder.load(self.gc_thread_registry)
+        builder.store(first_thread, thread_alloca)
+        builder.branch(size_thread_loop)
+
+        # --- Thread loop for size estimation ---
+        builder.position_at_end(size_thread_loop)
+        curr_thread = builder.load(thread_alloca)
+        thread_int = builder.ptrtoint(curr_thread, self.i64)
+        is_null_thread = builder.icmp_unsigned('==', thread_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_thread, check_size, size_process_thread)
+
+        builder.position_at_end(size_process_thread)
+        # Load alloc_list head (field 9)
+        alloc_list_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        list_head = builder.load(alloc_list_ptr)
+        builder.store(list_head, node_alloca)
+        builder.branch(size_node_loop)
+
+        # --- Node loop for size estimation ---
+        builder.position_at_end(size_node_loop)
+        curr_node = builder.load(node_alloca)
+        node_int = builder.ptrtoint(curr_node, self.i64)
+        is_null_node = builder.icmp_unsigned('==', node_int, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_node, size_next_thread, size_process_node)
+
+        builder.position_at_end(size_process_node)
+        node_typed = builder.bitcast(curr_node, self.alloc_node_type.as_pointer())
+
+        # Get handle (field 1)
+        handle_ptr = builder.gep(node_typed, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        handle = builder.load(handle_ptr)
+
+        # Skip null handles
+        is_null_handle = builder.icmp_unsigned('==', handle, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_handle, size_skip_node, size_accumulate)
+
+        builder.position_at_end(size_skip_node)
+        # Advance to next node
+        next_ptr = builder.gep(node_typed, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val = builder.load(next_ptr)
+        builder.store(next_val, node_alloca)
+        builder.branch(size_node_loop)
+
+        builder.position_at_end(size_accumulate)
+        # Deref handle to get data pointer
+        data_ptr = builder.call(self.gc_handle_deref, [handle])
+        data_int = builder.ptrtoint(data_ptr, self.i64)
+        is_null_data = builder.icmp_unsigned('==', data_int, ir.Constant(self.i64, 0))
+
+        size_skip_null_data = func.append_basic_block("size_skip_null_data")
+        size_read_header = func.append_basic_block("size_read_header")
+        builder.cbranch(is_null_data, size_skip_null_data, size_read_header)
+
+        builder.position_at_end(size_skip_null_data)
+        next_ptr2 = builder.gep(node_typed, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val2 = builder.load(next_ptr2)
+        builder.store(next_val2, node_alloca)
+        builder.branch(size_node_loop)
+
+        builder.position_at_end(size_read_header)
+        # Get header pointer (data_ptr - HEADER_SIZE)
+        header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr = builder.inttoptr(header_int, self.header_type.as_pointer())
+
+        # Read flags to check for PINNED/ARENA
+        flags_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        flags = builder.load(flags_ptr)
+
+        # Skip pinned objects (FLAG_PINNED = 0x04)
+        pinned_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_PINNED))
+        is_pinned = builder.icmp_unsigned('!=', pinned_bit, ir.Constant(self.i64, 0))
+
+        # Skip arena objects (FLAG_ARENA = 0x20)
+        arena_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_ARENA))
+        is_arena = builder.icmp_unsigned('!=', arena_bit, ir.Constant(self.i64, 0))
+
+        skip_obj = builder.or_(is_pinned, is_arena)
+
+        size_do_accumulate = func.append_basic_block("size_do_accumulate")
+        builder.cbranch(skip_obj, size_next_node, size_do_accumulate)
+
+        builder.position_at_end(size_do_accumulate)
+        # Read user_size from header (field 0) - this is user data only, NOT total
+        size_field_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        user_size = builder.load(size_field_ptr)
+
+        # Total object size = HEADER_SIZE(32) + user_size, then align to 8
+        total_obj_size = builder.add(user_size, ir.Constant(self.i64, self.HEADER_SIZE))
+        aligned_size = builder.add(total_obj_size, ir.Constant(self.i64, 7))
+        aligned_size = builder.and_(aligned_size, ir.Constant(self.i64, -8))
+
+        # Accumulate
+        old_total = builder.load(total_bytes_alloca)
+        new_total = builder.add(old_total, aligned_size)
+        builder.store(new_total, total_bytes_alloca)
+
+        old_count = builder.load(movable_count_alloca)
+        new_count = builder.add(old_count, ir.Constant(self.i64, 1))
+        builder.store(new_count, movable_count_alloca)
+        builder.branch(size_next_node)
+
+        # Advance to next node
+        builder.position_at_end(size_next_node)
+        next_ptr3 = builder.gep(node_typed, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val3 = builder.load(next_ptr3)
+        builder.store(next_val3, node_alloca)
+        builder.branch(size_node_loop)
+
+        # Advance to next thread
+        builder.position_at_end(size_next_thread)
+        next_thread_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        next_thread_i8 = builder.load(next_thread_ptr)
+        next_thread_typed = builder.bitcast(next_thread_i8, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_typed, thread_alloca)
+        builder.branch(size_thread_loop)
+
+        # ====================================================================
+        # Phase 2: Buffer Allocation
+        # ====================================================================
+        builder.position_at_end(check_size)
+        total_bytes = builder.load(total_bytes_alloca)
+        # If no movable objects, skip compaction
+        nothing_to_compact = builder.icmp_unsigned('==', total_bytes, ir.Constant(self.i64, 0))
+
+        unlock_and_done = func.append_basic_block("unlock_and_done")
+        builder.cbranch(nothing_to_compact, unlock_and_done, alloc_buffer)
+
+        builder.position_at_end(alloc_buffer)
+        # Add TLAB header size (16 bytes) to total for the compaction buffer header
+        buffer_total = builder.add(total_bytes, ir.Constant(self.i64, self.TLAB_HEADER_SIZE))
+
+        # mmap the compaction buffer
+        import sys
+        if sys.platform == 'darwin':
+            mmap_flags = 0x1002  # MAP_PRIVATE | MAP_ANON (macOS)
+        else:
+            mmap_flags = 0x0022  # MAP_PRIVATE | MAP_ANONYMOUS (Linux)
+
+        buffer = builder.call(self.mmap, [
+            ir.Constant(self.i8_ptr, None),
+            buffer_total,
+            ir.Constant(self.i32, 3),   # PROT_READ | PROT_WRITE
+            ir.Constant(self.i32, mmap_flags),
+            ir.Constant(self.i32, -1),
+            ir.Constant(self.i64, 0),
+        ])
+
+        # Check for mmap failure (returns MAP_FAILED = -1)
+        buffer_int = builder.ptrtoint(buffer, self.i64)
+        map_failed = ir.Constant(self.i64, 0xFFFFFFFFFFFFFFFF)
+        is_failed = builder.icmp_unsigned('==', buffer_int, map_failed)
+        builder.cbranch(is_failed, alloc_failed, copy_thread_loop)
+
+        builder.position_at_end(alloc_failed)
+        # mmap failed - abort compaction, unlock, clear flag
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
+        builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
+        builder.branch(done)
+
+        # Initialize TLAB header at buffer start
+        builder.position_at_end(copy_thread_loop)
+        tlab_header = builder.bitcast(buffer, self.tlab_header_type.as_pointer())
+        # live_count = 0 (will be incremented as objects are copied)
+        live_count_ptr = builder.gep(tlab_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), live_count_ptr)
+        # next_tlab = NULL
+        next_tlab_field = builder.gep(tlab_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i8_ptr, None), next_tlab_field)
+
+        # Set cursor to after header
+        cursor_start = builder.gep(buffer, [ir.Constant(self.i64, self.TLAB_HEADER_SIZE)])
+        builder.store(cursor_start, cursor_alloca)
+        builder.store(buffer, buffer_base_alloca)
+
+        # Buffer limit
+        limit = builder.gep(buffer, [buffer_total])
+        builder.store(limit, buffer_limit_alloca)
+
+        # ====================================================================
+        # Phase 3: Copy & Update
+        # ====================================================================
+        # Re-walk all threads' alloc lists
+        first_thread2 = builder.load(self.gc_thread_registry)
+        builder.store(first_thread2, thread_alloca)
+
+        copy_thread_check = func.append_basic_block("copy_thread_check")
+        builder.branch(copy_thread_check)
+
+        # --- Thread loop for copy phase ---
+        builder.position_at_end(copy_thread_check)
+        curr_thread2 = builder.load(thread_alloca)
+        thread_int2 = builder.ptrtoint(curr_thread2, self.i64)
+        is_null_thread2 = builder.icmp_unsigned('==', thread_int2, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_thread2, fixup_start, copy_process_thread)
+
+        builder.position_at_end(copy_process_thread)
+        alloc_list_ptr2 = builder.gep(curr_thread2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        list_head2 = builder.load(alloc_list_ptr2)
+        builder.store(list_head2, node_alloca)
+        builder.branch(copy_node_loop)
+
+        # --- Node loop for copy phase ---
+        builder.position_at_end(copy_node_loop)
+        curr_node2 = builder.load(node_alloca)
+        node_int2 = builder.ptrtoint(curr_node2, self.i64)
+        is_null_node2 = builder.icmp_unsigned('==', node_int2, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_node2, copy_next_thread, copy_process_node)
+
+        builder.position_at_end(copy_process_node)
+        node_typed2 = builder.bitcast(curr_node2, self.alloc_node_type.as_pointer())
+
+        # Get handle (field 1)
+        handle_ptr2 = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        handle2 = builder.load(handle_ptr2)
+
+        # Skip null handles
+        is_null_handle2 = builder.icmp_unsigned('==', handle2, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_handle2, copy_skip_node, copy_object)
+
+        builder.position_at_end(copy_skip_node)
+        next_ptr4 = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val4 = builder.load(next_ptr4)
+        builder.store(next_val4, node_alloca)
+        builder.branch(copy_node_loop)
+
+        builder.position_at_end(copy_object)
+        # Deref handle
+        data_ptr2 = builder.call(self.gc_handle_deref, [handle2])
+        data_int2 = builder.ptrtoint(data_ptr2, self.i64)
+        is_null_data2 = builder.icmp_unsigned('==', data_int2, ir.Constant(self.i64, 0))
+
+        copy_skip_null = func.append_basic_block("copy_skip_null")
+        copy_read_obj = func.append_basic_block("copy_read_obj")
+        builder.cbranch(is_null_data2, copy_skip_null, copy_read_obj)
+
+        builder.position_at_end(copy_skip_null)
+        next_ptr5 = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val5 = builder.load(next_ptr5)
+        builder.store(next_val5, node_alloca)
+        builder.branch(copy_node_loop)
+
+        builder.position_at_end(copy_read_obj)
+        # Get header
+        header_int2 = builder.sub(data_int2, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr2 = builder.inttoptr(header_int2, self.i8_ptr)
+        header2 = builder.bitcast(header_ptr2, self.header_type.as_pointer())
+
+        # Read flags
+        flags_ptr2 = builder.gep(header2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        flags2 = builder.load(flags_ptr2)
+
+        # Skip pinned or arena objects
+        pinned_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_PINNED))
+        is_pinned2 = builder.icmp_unsigned('!=', pinned_bit2, ir.Constant(self.i64, 0))
+        arena_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_ARENA))
+        is_arena2 = builder.icmp_unsigned('!=', arena_bit2, ir.Constant(self.i64, 0))
+        skip_obj2 = builder.or_(is_pinned2, is_arena2)
+        builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
+
+        # Check if buffer has capacity for this object
+        builder.position_at_end(copy_check_capacity)
+        size_ptr2 = builder.gep(header2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        user_size2 = builder.load(size_ptr2)
+
+        # Total object size = HEADER_SIZE(32) + user_size, then align to 8
+        total_obj_size2 = builder.add(user_size2, ir.Constant(self.i64, self.HEADER_SIZE))
+        aligned_size2 = builder.add(total_obj_size2, ir.Constant(self.i64, 7))
+        aligned_size2 = builder.and_(aligned_size2, ir.Constant(self.i64, -8))
+
+        cursor = builder.load(cursor_alloca)
+        new_cursor = builder.gep(cursor, [aligned_size2])
+        new_cursor_int = builder.ptrtoint(new_cursor, self.i64)
+        limit_val = builder.load(buffer_limit_alloca)
+        limit_int = builder.ptrtoint(limit_val, self.i64)
+        fits = builder.icmp_unsigned('<=', new_cursor_int, limit_int)
+        builder.cbranch(fits, copy_update_handle, copy_next_node)
+
+        # --- Copy object and update handle ---
+        builder.position_at_end(copy_update_handle)
+
+        # memcpy from old header to cursor
+        builder.call(self.codegen.memcpy, [cursor, header_ptr2, aligned_size2])
+
+        # Set FLAG_TLAB on the new copy's flags (it's in a TLAB-like buffer now)
+        new_header = builder.bitcast(cursor, self.header_type.as_pointer())
+        new_flags_ptr = builder.gep(new_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        new_flags = builder.load(new_flags_ptr)
+        new_flags_with_tlab = builder.or_(new_flags, ir.Constant(self.i64, self.FLAG_TLAB))
+        builder.store(new_flags_with_tlab, new_flags_ptr)
+
+        # New user data pointer = cursor + HEADER_SIZE
+        new_data_ptr = builder.gep(cursor, [ir.Constant(self.i64, self.HEADER_SIZE)])
+
+        # Update handle table: gc_handle_store(handle, new_data_ptr)
+        builder.call(self.gc_handle_store, [handle2, new_data_ptr])
+
+        # Update alloc_node's tlab_base (field 3) to point to compact buffer
+        buffer_base = builder.load(buffer_base_alloca)
+        tlab_base_node_ptr = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+
+        # Save old tlab_base for deferred cleanup
+        old_tlab_base = builder.load(tlab_base_node_ptr)
+
+        # Update node's tlab_base to new buffer
+        builder.store(buffer_base, tlab_base_node_ptr)
+
+        # Increment compaction buffer's live_count atomically
+        buffer_base_reload = builder.load(buffer_base_alloca)
+        compact_tlab_header = builder.bitcast(buffer_base_reload, self.tlab_header_type.as_pointer())
+        compact_live_ptr = builder.gep(compact_tlab_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.atomic_rmw('add', compact_live_ptr, ir.Constant(self.i64, 1), 'monotonic')
+
+        # Track old memory for deferred cleanup
+        # Check if old was TLAB (FLAG_TLAB set on original)
+        tlab_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_TLAB))
+        was_tlab = builder.icmp_unsigned('!=', tlab_bit2, ir.Constant(self.i64, 0))
+        builder.cbranch(was_tlab, copy_old_is_tlab, copy_old_is_malloc)
+
+        # --- Old object was in a TLAB ---
+        builder.position_at_end(copy_old_is_tlab)
+        # Decrement old TLAB's live_count
+        old_tlab_base_int = builder.ptrtoint(old_tlab_base, self.i64)
+        old_tlab_not_null = builder.icmp_unsigned('!=', old_tlab_base_int, ir.Constant(self.i64, 0))
+
+        tlab_decrement = func.append_basic_block("tlab_decrement")
+        copy_after_old = func.append_basic_block("copy_after_old")
+        builder.cbranch(old_tlab_not_null, tlab_decrement, copy_after_old)
+
+        builder.position_at_end(tlab_decrement)
+        old_tlab_hdr = builder.bitcast(old_tlab_base, self.tlab_header_type.as_pointer())
+        old_live_ptr = builder.gep(old_tlab_hdr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        old_live_count = builder.atomic_rmw('sub', old_live_ptr, ir.Constant(self.i64, 1), 'acq_rel')
+        was_last_in_tlab = builder.icmp_unsigned('==', old_live_count, ir.Constant(self.i64, 1))
+
+        tlab_now_empty = func.append_basic_block("tlab_now_empty")
+        builder.cbranch(was_last_in_tlab, tlab_now_empty, copy_after_old)
+
+        builder.position_at_end(tlab_now_empty)
+        # Old TLAB is now empty - add to deferred dead TLAB list
+        # Allocate a node: { i8* tlab_ptr, i64 tlab_size, i8* next }
+        tlab_node_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i8_ptr])
+        tlab_node_size = ir.Constant(self.i64, 24)  # 3 * 8 bytes
+        tlab_node_raw = builder.call(self.codegen.malloc, [tlab_node_size])
+        tlab_node = builder.bitcast(tlab_node_raw, tlab_node_type.as_pointer())
+
+        # Set tlab_ptr (field 0)
+        tlab_ptr_field = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(old_tlab_base, tlab_ptr_field)
+
+        # Set tlab_size (field 1) - use TLAB_SIZE constant
+        tlab_size_field = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, self.TLAB_SIZE), tlab_size_field)
+
+        # Set next (field 2) - link to current list head
+        tlab_next_field = builder.gep(tlab_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        old_dead_tlab_head = builder.load(self.gc_compact_dead_tlab_list)
+        builder.store(old_dead_tlab_head, tlab_next_field)
+        builder.store(tlab_node_raw, self.gc_compact_dead_tlab_list)
+
+        # BUG-065 style fix: reset thread's TLAB fields if this is the
+        # thread's current TLAB, to prevent allocation from dead memory
+        thread_tlab_base_ptr_c = builder.gep(curr_thread2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
+        ], inbounds=True)
+        thread_tlab_base_c = builder.load(thread_tlab_base_ptr_c)
+        thread_tlab_base_int_c = builder.ptrtoint(thread_tlab_base_c, self.i64)
+        old_tlab_base_int_c = builder.ptrtoint(old_tlab_base, self.i64)
+        is_current_tlab_c = builder.icmp_unsigned("==", thread_tlab_base_int_c, old_tlab_base_int_c)
+
+        with builder.if_then(is_current_tlab_c):
+            # Reset tlab_base, tlab_cursor, tlab_limit to NULL
+            builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_base_ptr_c)
+            thread_tlab_cursor_ptr_c = builder.gep(curr_thread2, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
+            ], inbounds=True)
+            builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_cursor_ptr_c)
+            thread_tlab_limit_ptr_c = builder.gep(curr_thread2, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)
+            ], inbounds=True)
+            builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_limit_ptr_c)
+
+        builder.branch(copy_after_old)
+
+        # --- Old object was malloc'd ---
+        builder.position_at_end(copy_old_is_malloc)
+        # Add old header pointer to deferred free list
+        # Allocate a node: { i8* old_ptr, i8* next }
+        free_node_type = ir.LiteralStructType([self.i8_ptr, self.i8_ptr])
+        free_node_size = ir.Constant(self.i64, 16)  # 2 * 8 bytes
+        free_node_raw = builder.call(self.codegen.malloc, [free_node_size])
+        free_node = builder.bitcast(free_node_raw, free_node_type.as_pointer())
+
+        # Set old_ptr (field 0)
+        old_ptr_field = builder.gep(free_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(header_ptr2, old_ptr_field)
+
+        # Set next (field 1) - link to current list head
+        free_next_field = builder.gep(free_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        old_free_head = builder.load(self.gc_compact_deferred_free_list)
+        builder.store(old_free_head, free_next_field)
+        builder.store(free_node_raw, self.gc_compact_deferred_free_list)
+        builder.branch(copy_after_old)
+
+        # --- After handling old memory ---
+        builder.position_at_end(copy_after_old)
+        # Update counters
+        old_moved = builder.load(objects_moved_alloca)
+        builder.store(builder.add(old_moved, ir.Constant(self.i64, 1)), objects_moved_alloca)
+        old_bytes = builder.load(bytes_moved_alloca)
+        builder.store(builder.add(old_bytes, aligned_size2), bytes_moved_alloca)
+
+        # Advance cursor
+        builder.store(new_cursor, cursor_alloca)
+        builder.branch(copy_next_node)
+
+        # Advance to next node in copy phase
+        builder.position_at_end(copy_next_node)
+        next_ptr6 = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val6 = builder.load(next_ptr6)
+        builder.store(next_val6, node_alloca)
+        builder.branch(copy_node_loop)
+
+        # Advance to next thread in copy phase
+        builder.position_at_end(copy_next_thread)
+        next_thread_ptr2 = builder.gep(curr_thread2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        next_thread_i8_2 = builder.load(next_thread_ptr2)
+        next_thread_typed2 = builder.bitcast(next_thread_i8_2, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_typed2, thread_alloca)
+        builder.branch(copy_thread_check)
+
+        # ====================================================================
+        # Phase 3b: Pointer Fixup Pass
+        # ====================================================================
+        # After all objects have been copied and handles updated, internal raw
+        # pointer fields in container types (List root/tail, String owner,
+        # Map/Set HAMT root, Array data handle) still hold OLD addresses.
+        # Fix them up by: old_ptr -> gc_ptr_to_handle -> gc_handle_deref -> new_ptr
+        # Old memory is still valid (deferred cleanup hasn't run yet).
+
+        builder.position_at_end(fixup_start)
+        # Re-walk all threads' alloc lists
+        first_thread_fixup = builder.load(self.gc_thread_registry)
+        builder.store(first_thread_fixup, thread_alloca)
+        builder.branch(fixup_thread_check)
+
+        # --- Thread loop for fixup phase ---
+        builder.position_at_end(fixup_thread_check)
+        curr_thread_fixup = builder.load(thread_alloca)
+        thread_int_fixup = builder.ptrtoint(curr_thread_fixup, self.i64)
+        is_null_thread_fixup = builder.icmp_unsigned('==', thread_int_fixup, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_thread_fixup, update_stats, fixup_process_thread)
+
+        builder.position_at_end(fixup_process_thread)
+        alloc_list_ptr_fixup = builder.gep(curr_thread_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        list_head_fixup = builder.load(alloc_list_ptr_fixup)
+        builder.store(list_head_fixup, node_alloca)
+        builder.branch(fixup_node_loop)
+
+        # --- Node loop for fixup phase ---
+        builder.position_at_end(fixup_node_loop)
+        curr_node_fixup = builder.load(node_alloca)
+        node_int_fixup = builder.ptrtoint(curr_node_fixup, self.i64)
+        is_null_node_fixup = builder.icmp_unsigned('==', node_int_fixup, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_node_fixup, fixup_next_thread, fixup_process_node)
+
+        builder.position_at_end(fixup_process_node)
+        node_typed_fixup = builder.bitcast(curr_node_fixup, self.alloc_node_type.as_pointer())
+
+        # Get handle (field 1)
+        handle_ptr_fixup = builder.gep(node_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        handle_fixup = builder.load(handle_ptr_fixup)
+
+        # Skip null handles
+        is_null_handle_fixup = builder.icmp_unsigned('==', handle_fixup, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_handle_fixup, fixup_next_node, fixup_check_type)
+
+        builder.position_at_end(fixup_check_type)
+        # Deref handle to get current data pointer (in compact buffer)
+        data_ptr_fixup = builder.call(self.gc_handle_deref, [handle_fixup])
+        data_int_fixup = builder.ptrtoint(data_ptr_fixup, self.i64)
+
+        # Check if this object is in the compact buffer (only fix up moved objects)
+        buffer_base_int_fixup = builder.ptrtoint(builder.load(buffer_base_alloca), self.i64)
+        buffer_limit_int_fixup = builder.ptrtoint(builder.load(buffer_limit_alloca), self.i64)
+        in_buffer = builder.and_(
+            builder.icmp_unsigned('>=', data_int_fixup, buffer_base_int_fixup),
+            builder.icmp_unsigned('<', data_int_fixup, buffer_limit_int_fixup)
+        )
+        builder.cbranch(in_buffer, func.append_basic_block("fixup_do_type"), fixup_next_node)
+
+        # --- Do type-specific fixup ---
+        fixup_do_type = list(func.basic_blocks)[-1]  # The block we just appended
+        builder.position_at_end(fixup_do_type)
+
+        # Read type_id from header
+        header_int_fixup = builder.sub(data_int_fixup, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr_fixup = builder.inttoptr(header_int_fixup, self.i8_ptr)
+        header_fixup = builder.bitcast(header_ptr_fixup, self.header_type.as_pointer())
+        type_id_ptr_fixup = builder.gep(header_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        type_id_fixup = builder.load(type_id_ptr_fixup)
+
+        # Helper to fix up one raw-pointer-as-i64 field:
+        # Reads old ptr, converts to handle, dereferences to new ptr, stores back
+        def fixup_ptr_field(field_ptr, tag_mask=0):
+            old_val = builder.load(field_ptr)
+            # Strip tag bits before pointer operations
+            if tag_mask:
+                stripped_val = builder.and_(old_val, ir.Constant(self.i64, ~tag_mask & 0xFFFFFFFFFFFFFFFF))
+                tag_bits = builder.and_(old_val, ir.Constant(self.i64, tag_mask))
+            else:
+                stripped_val = old_val
+            old_ptr = builder.inttoptr(stripped_val, self.i8_ptr)
+            old_ptr_int = builder.ptrtoint(old_ptr, self.i64)
+            is_nonnull = builder.icmp_unsigned('>', old_ptr_int, ir.Constant(self.i64, 0x10000))
+            with builder.if_then(is_nonnull):
+                handle_from_old = builder.call(self.gc_ptr_to_handle, [old_ptr])
+                handle_valid = builder.icmp_unsigned('!=', handle_from_old, ir.Constant(self.i64, 0))
+                with builder.if_then(handle_valid):
+                    new_ptr = builder.call(self.gc_handle_deref, [handle_from_old])
+                    new_val = builder.ptrtoint(new_ptr, self.i64)
+                    # Restore tag bits
+                    if tag_mask:
+                        new_val = builder.or_(new_val, tag_bits)
+                    builder.store(new_val, field_ptr)
+
+        # Helper to fix up one raw i8* pointer field:
+        # Loads i8* ptr, converts to handle, dereferences, stores new i8* back
+        def fixup_raw_ptr_field(field_ptr):
+            """Fix up an i8* field that stores a raw pointer to a GC-managed object."""
+            old_ptr = builder.load(field_ptr)
+            old_ptr_int = builder.ptrtoint(old_ptr, self.i64)
+            is_nonnull = builder.icmp_unsigned('>', old_ptr_int, ir.Constant(self.i64, 0x10000))
+            with builder.if_then(is_nonnull):
+                handle_from_old = builder.call(self.gc_ptr_to_handle, [old_ptr])
+                handle_valid = builder.icmp_unsigned('!=', handle_from_old, ir.Constant(self.i64, 0))
+                with builder.if_then(handle_valid):
+                    new_ptr = builder.call(self.gc_handle_deref, [handle_from_old])
+                    builder.store(new_ptr, field_ptr)
+
+        # Switch on type_id for types that contain raw pointer fields
+        fixup_list = func.append_basic_block("fixup_list")
+        fixup_string = func.append_basic_block("fixup_string")
+        fixup_map = func.append_basic_block("fixup_map")
+        fixup_set = func.append_basic_block("fixup_set")
+        fixup_array = func.append_basic_block("fixup_array")
+        fixup_pv_node = func.append_basic_block("fixup_pv_node")
+
+        switch = builder.switch(type_id_fixup, fixup_next_node)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_LIST), fixup_list)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), fixup_string)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_MAP), fixup_map)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_SET), fixup_set)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), fixup_array)
+        switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), fixup_pv_node)
+
+        # --- Fix up List: root (field 0) and tail (field 3) ---
+        builder.position_at_end(fixup_list)
+        list_struct_type = ir.LiteralStructType([self.i64] * 7)  # 7 i64 fields
+        list_typed_fixup = builder.bitcast(data_ptr_fixup, list_struct_type.as_pointer())
+        # Fix root (field 0)
+        root_field_ptr = builder.gep(list_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        fixup_ptr_field(root_field_ptr)
+        # Fix tail (field 3)
+        tail_field_ptr = builder.gep(list_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        fixup_ptr_field(tail_field_ptr)
+        builder.branch(fixup_next_node)
+
+        # --- Fix up String: owner (field 0) ---
+        builder.position_at_end(fixup_string)
+        string_struct_type = ir.LiteralStructType([self.i64] * 4)  # 4 i64 fields
+        string_typed_fixup = builder.bitcast(data_ptr_fixup, string_struct_type.as_pointer())
+        owner_field_ptr = builder.gep(string_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        fixup_ptr_field(owner_field_ptr)
+        builder.branch(fixup_next_node)
+
+        # --- Fix up Map: root (field 0) --- HAMT uses tag bit 0 for leaf/node
+        builder.position_at_end(fixup_map)
+        map_struct_type = ir.LiteralStructType([self.i64] * 3)  # 3 i64 fields
+        map_typed_fixup = builder.bitcast(data_ptr_fixup, map_struct_type.as_pointer())
+        map_root_field_ptr = builder.gep(map_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        fixup_ptr_field(map_root_field_ptr, tag_mask=1)
+        builder.branch(fixup_next_node)
+
+        # --- Fix up Set: root (field 0) --- HAMT uses tag bit 0 for leaf/node
+        builder.position_at_end(fixup_set)
+        set_struct_type = ir.LiteralStructType([self.i64] * 3)  # 3 i64 fields
+        set_typed_fixup = builder.bitcast(data_ptr_fixup, set_struct_type.as_pointer())
+        set_root_field_ptr = builder.gep(set_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        fixup_ptr_field(set_root_field_ptr, tag_mask=1)
+        builder.branch(fixup_next_node)
+
+        # --- Fix up Array: handle/data ptr (field 0) ---
+        builder.position_at_end(fixup_array)
+        array_handle_ptr = builder.bitcast(data_ptr_fixup, self.i64.as_pointer())
+        fixup_ptr_field(array_handle_ptr)
+        builder.branch(fixup_next_node)
+
+        # --- Fix up PV_NODE: 32 children (each i8*) ---
+        builder.position_at_end(fixup_pv_node)
+        # PV_NODE struct is { [32 x i8*] } — array of 32 raw pointers
+        pv_node_type = ir.LiteralStructType([ir.ArrayType(self.i8_ptr, 32)])
+        pv_typed_fixup = builder.bitcast(data_ptr_fixup, pv_node_type.as_pointer())
+        # Loop over all 32 children
+        for child_idx in range(32):
+            child_ptr_ptr = builder.gep(pv_typed_fixup, [
+                ir.Constant(self.i32, 0), ir.Constant(self.i32, 0),
+                ir.Constant(self.i32, child_idx)
+            ], inbounds=True)
+            fixup_raw_ptr_field(child_ptr_ptr)
+        builder.branch(fixup_next_node)
+
+        # --- Advance to next node in fixup phase ---
+        builder.position_at_end(fixup_next_node)
+        next_ptr_fixup = builder.gep(node_typed_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        next_val_fixup = builder.load(next_ptr_fixup)
+        builder.store(next_val_fixup, node_alloca)
+        builder.branch(fixup_node_loop)
+
+        # --- Advance to next thread in fixup phase ---
+        builder.position_at_end(fixup_next_thread)
+        next_thread_ptr_fixup = builder.gep(curr_thread_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        next_thread_i8_fixup = builder.load(next_thread_ptr_fixup)
+        next_thread_typed_fixup = builder.bitcast(next_thread_i8_fixup, self.thread_entry_type.as_pointer())
+        builder.store(next_thread_typed_fixup, thread_alloca)
+        builder.branch(fixup_thread_check)
+
+        # ====================================================================
+        # Phase 4: Update Statistics
+        # ====================================================================
+        builder.position_at_end(update_stats)
+
+        # Unlock registry mutex
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
+
+        # Update gc_stats
+        # compactions_completed (index 8)
+        compact_count_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)
+        ], inbounds=True)
+        builder.atomic_rmw('add', compact_count_ptr, ir.Constant(self.i64, 1), 'monotonic')
+
+        # objects_moved_last_compact (index 9)
+        moved_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
+        ], inbounds=True)
+        final_moved = builder.load(objects_moved_alloca)
+        builder.store(final_moved, moved_ptr)
+
+        # bytes_moved_last_compact (index 10)
+        bytes_ptr = builder.gep(self.gc_stats, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 10)
+        ], inbounds=True)
+        final_bytes = builder.load(bytes_moved_alloca)
+        builder.store(final_bytes, bytes_ptr)
+
+        # Free the previous compact buffer now that all objects have been
+        # copied out of it into the new buffer.
+        prev_buf = builder.load(self.gc_compact_prev_buffer)
+        prev_buf_int = builder.ptrtoint(prev_buf, self.i64)
+        has_prev_buf = builder.icmp_unsigned('!=', prev_buf_int, ir.Constant(self.i64, 0))
+
+        free_prev_buf = func.append_basic_block("free_prev_buf")
+        after_free_prev = func.append_basic_block("after_free_prev")
+        builder.cbranch(has_prev_buf, free_prev_buf, after_free_prev)
+
+        builder.position_at_end(free_prev_buf)
+        prev_size = builder.load(self.gc_compact_prev_buffer_size)
+        builder.call(self.munmap, [prev_buf, prev_size])
+        builder.branch(after_free_prev)
+
+        builder.position_at_end(after_free_prev)
+
+        # Save the NEW compact buffer for deferred cleanup in the next compaction
+        compact_buffer = builder.load(buffer_base_alloca)
+        builder.store(compact_buffer, self.gc_compact_prev_buffer)
+        compact_size = builder.load(buffer_limit_alloca)
+        compact_size_int = builder.ptrtoint(compact_size, self.i64)
+        compact_base_int = builder.ptrtoint(compact_buffer, self.i64)
+        compact_total_size = builder.sub(compact_size_int, compact_base_int)
+        builder.store(compact_total_size, self.gc_compact_prev_buffer_size)
+
+        # Clear gc_compacting flag
+        builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
+        builder.branch(done)
+
+        # --- Unlock and done (nothing to compact) ---
+        builder.position_at_end(unlock_and_done)
+        builder.call(self.pthread_mutex_unlock, [registry_mutex])
+        builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
+        builder.branch(done)
+
+        # --- Done ---
+        builder.position_at_end(done)
+        builder.ret_void()
+
+    def _implement_gc_compact(self):
+        """User-facing gc_compact() builtin.
+
+        Runs gc_collect() first to get a clean live set (dead objects are
+        swept away), then runs gc_compact_impl() to compact survivors.
+
+        IMPORTANT: Poisons the previous compact buffer's live_count BEFORE
+        gc_collect, so the sweep phase won't munmap it (live_count can never
+        reach 0 with a sentinel value). gc_compact_impl handles the actual
+        freeing of the prev buffer after copying objects out.
+        """
+        func = self.gc_compact
+
+        entry = func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry)
+
+        # Poison the previous compact buffer's live_count BEFORE gc_collect.
+        # During gc_collect's sweep, objects in the prev compact buffer may die,
+        # which decrements live_count. If live_count reaches 0, sweep will
+        # munmap the buffer. But gc_compact_impl needs it alive to copy from.
+        # The sentinel value prevents live_count from ever reaching 0.
+        prev_compact = builder.load(self.gc_compact_prev_buffer)
+        prev_compact_int = builder.ptrtoint(prev_compact, self.i64)
+        has_prev = builder.icmp_unsigned('!=', prev_compact_int, ir.Constant(self.i64, 0))
+        poison_block = func.append_basic_block("poison_prev")
+        after_poison = func.append_basic_block("after_poison")
+        builder.cbranch(has_prev, poison_block, after_poison)
+
+        builder.position_at_end(poison_block)
+        prev_hdr = builder.bitcast(prev_compact, self.tlab_header_type.as_pointer())
+        prev_live_ptr = builder.gep(prev_hdr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0x7FFFFFFFFFFFFFFF), prev_live_ptr)
+        builder.branch(after_poison)
+
+        builder.position_at_end(after_poison)
+
+        # Run GC first to ensure clean live set
+        builder.call(self.gc_collect, [])
+        # Then compact survivors
+        builder.call(self.gc_compact_impl, [])
         builder.ret_void()
