@@ -202,6 +202,111 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
+# bgfx - Cross-platform rendering library (BSD 2-clause license)
+# Requires: bx (base library), bimg (image library), bgfx (rendering)
+# Build order: bx -> bimg -> bgfx
+# -----------------------------------------------------------------------------
+echo "=== Building bgfx (bx + bimg + bgfx) ==="
+
+# Determine make target based on platform
+case "$UNAME_S" in
+    Darwin)
+        if [ "$UNAME_M" = "arm64" ]; then
+            BGFX_TARGET="osx-arm64"
+        else
+            BGFX_TARGET="osx-x64"
+        fi
+        ;;
+    Linux)
+        BGFX_TARGET="linux64"
+        ;;
+    *)
+        echo "Error: Unsupported platform $UNAME_S for bgfx"
+        BGFX_TARGET=""
+        ;;
+esac
+
+if [ -n "$BGFX_TARGET" ] && [ ! -f "lib/libbgfx.a" ]; then
+    # Clone bx (base library - required first)
+    if [ ! -d "bx" ]; then
+        echo "Cloning bx..."
+        git clone --depth 1 https://github.com/bkaradzic/bx.git
+    fi
+
+    # Clone bimg (image library - requires bx)
+    if [ ! -d "bimg" ]; then
+        echo "Cloning bimg..."
+        git clone --depth 1 https://github.com/bkaradzic/bimg.git
+    fi
+
+    # Clone bgfx (rendering library - requires bx and bimg)
+    if [ ! -d "bgfx" ]; then
+        echo "Cloning bgfx..."
+        git clone --depth 1 https://github.com/bkaradzic/bgfx.git
+    fi
+
+    # Build using bgfx's makefile system
+    # The bgfx makefile expects bx/ bimg/ bgfx/ as siblings
+    echo "Building bgfx for target: $BGFX_TARGET..."
+    cd bgfx
+
+    # Generate projects and build
+    make "$BGFX_TARGET" -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) 2>&1 || {
+        echo ""
+        echo "=== bgfx build failed ==="
+        echo "bgfx requires GENie build tools. Trying cmake fallback..."
+
+        # Fallback: build with cmake if available
+        mkdir -p build_cmake
+        cd build_cmake
+        cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBX_DIR="$SCRIPT_DIR/bx" \
+            -DBIMG_DIR="$SCRIPT_DIR/bimg" \
+            -DBGFX_BUILD_EXAMPLES=OFF \
+            -DBGFX_BUILD_TOOLS=OFF
+        make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) 2>&1 || {
+            echo "bgfx cmake build also failed."
+            echo "You may need to install build prerequisites."
+            echo "See: https://bkaradzic.github.io/bgfx/build.html"
+            cd "$SCRIPT_DIR"
+            touch lib/.bgfx_unavailable
+        }
+        cd ..
+    }
+
+    # Find and copy output libraries
+    # bgfx build outputs vary by platform and build system
+    for lib_name in bgfx bimg bx; do
+        found_lib=$(find . "$SCRIPT_DIR/bx" "$SCRIPT_DIR/bimg" -name "lib${lib_name}Release.a" -o -name "lib${lib_name}.a" 2>/dev/null | head -1)
+        if [ -n "$found_lib" ]; then
+            cp "$found_lib" "$SCRIPT_DIR/lib/lib${lib_name}.a"
+            echo "Copied: lib${lib_name}.a"
+        else
+            echo "Warning: lib${lib_name}.a not found in build output"
+        fi
+    done
+
+    # Copy headers
+    mkdir -p "$SCRIPT_DIR/include/bgfx"
+    mkdir -p "$SCRIPT_DIR/include/bx"
+    mkdir -p "$SCRIPT_DIR/include/bimg"
+    cp -r "$SCRIPT_DIR/bgfx/include/bgfx"/* "$SCRIPT_DIR/include/bgfx/" 2>/dev/null || true
+    cp -r "$SCRIPT_DIR/bx/include/bx"/* "$SCRIPT_DIR/include/bx/" 2>/dev/null || true
+    cp -r "$SCRIPT_DIR/bimg/include/bimg"/* "$SCRIPT_DIR/include/bimg/" 2>/dev/null || true
+
+    cd "$SCRIPT_DIR"
+    echo "bgfx build complete"
+elif [ -f "lib/libbgfx.a" ]; then
+    echo "bgfx already installed"
+else
+    echo "Skipping bgfx (unsupported platform)"
+fi
+
+echo ""
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo "=== Build Summary ==="

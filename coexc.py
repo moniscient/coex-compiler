@@ -358,10 +358,26 @@ def compile_coex(source_path: str, output_path: str = None,
                         link_cmd.append(lunasvg_lib)
                     if os.path.exists(plutovg_lib):
                         link_cmd.append(plutovg_lib)
+                # Add bgfx 3D graphics library (nested inside uses_ui since bgfx requires the shell)
+                if codegen.uses_bgfx():
+                    bgfx_runtime = os.path.join(runtime_dir, "libcoex_bgfx.a")
+                    if os.path.exists(bgfx_runtime):
+                        link_cmd.append(bgfx_runtime)
+                        # Add bgfx dependencies (order matters: bgfx, bimg, bx)
+                        for lib_name in ["libbgfx.a", "libbimg.a", "libbx.a"]:
+                            dep_lib = os.path.join(deps_dir, lib_name)
+                            if os.path.exists(dep_lib):
+                                link_cmd.append(dep_lib)
+                    else:
+                        print(f"Warning: bgfx runtime library not found at {bgfx_runtime}")
+                        print("Build it with: cd deps && ./build_deps.sh && cd ../runtime && make bgfx")
                 # Add required frameworks (macOS)
                 if sys.platform == "darwin":
                     link_cmd.extend(["-framework", "Cocoa", "-framework", "Metal", "-framework", "QuartzCore"])
-                    # Link C++ standard library for cimgui and lunasvg
+                    # Add IOKit for bgfx Metal renderer GPU enumeration
+                    if codegen.uses_bgfx():
+                        link_cmd.extend(["-framework", "IOKit", "-framework", "Foundation"])
+                    # Link C++ standard library for cimgui, lunasvg, and bgfx
                     link_cmd.append("-lc++")
             else:
                 print(f"Warning: UI runtime library not found at {ui_runtime}")

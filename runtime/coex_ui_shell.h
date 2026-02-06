@@ -243,6 +243,20 @@ double coex_ui_shell_get_time(void);
  */
 void* coex_ui_shell_get_render_context(void);
 
+/**
+ * Get the native window handle for use by external renderers (e.g., bgfx).
+ *
+ * @return NSWindow* on macOS, X11 Window (cast to void*) on Linux
+ */
+void* coex_ui_shell_get_native_window_handle(void);
+
+/**
+ * Get the native display handle for use by external renderers (e.g., bgfx).
+ *
+ * @return NULL on macOS, X11 Display* on Linux
+ */
+void* coex_ui_shell_get_native_display_handle(void);
+
 /* ============================================================================
  * Metal-specific functions (macOS only)
  * ============================================================================ */

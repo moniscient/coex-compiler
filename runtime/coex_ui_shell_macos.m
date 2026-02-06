@@ -711,6 +711,14 @@ void* coex_ui_shell_get_render_context(void) {
     return (__bridge void*)_ui_state.metal_layer;
 }
 
+void* coex_ui_shell_get_native_window_handle(void) {
+    return (__bridge void*)_ui_state.window;
+}
+
+void* coex_ui_shell_get_native_display_handle(void) {
+    return NULL;  /* Not needed on macOS */
+}
+
 /* ============================================================================
  * Metal API for External Rendering (returns void* for C compatibility)
  * ============================================================================ */

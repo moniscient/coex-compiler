@@ -980,6 +980,22 @@ class CodeGenerator:
                     'coex_ui_begin_frame', 'coex_ui_end_frame'}
         return any(fn in self.extern_function_decls for fn in ui_funcs)
 
+    def uses_bgfx(self) -> bool:
+        """Check if the compiled program uses the bgfx 3D graphics library.
+
+        Returns True if any coex_bgfx_* functions are used, which requires linking
+        libcoex_bgfx.a along with bgfx/bimg/bx dependencies.
+        """
+        if not hasattr(self, 'extern_function_decls'):
+            return False
+        bgfx_funcs = {'coex_bgfx_init', 'coex_bgfx_shutdown', 'coex_bgfx_frame',
+                      'coex_bgfx_reset', 'coex_bgfx_set_view_rect',
+                      'coex_bgfx_set_view_clear', 'coex_bgfx_touch',
+                      'coex_bgfx_submit', 'coex_bgfx_create_vertex_buffer',
+                      'coex_bgfx_set_debug', 'coex_bgfx_dbg_text',
+                      'coex_bgfx_dbg_text_clear', 'coex_bgfx_free_json'}
+        return any(fn in self.extern_function_decls for fn in bgfx_funcs)
+
     # ========================================================================
     # User-Defined Kind Validation
     # ========================================================================

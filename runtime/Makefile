@@ -175,6 +175,42 @@ ui: $(UI_LIB)
 	@echo "UI library built: $(UI_LIB)"
 	@echo "Link with: $(UI_LDFLAGS) -lcoex_ui $(UI_FRAMEWORKS)"
 
+# bgfx Library - 3D graphics via bgfx
+BGFX_LIB = libcoex_bgfx.a
+BGFX_DEPS_DIR = ../deps
+
+# Check if bgfx dependencies exist
+BGFX_DEPS_AVAILABLE := $(shell test -f $(BGFX_DEPS_DIR)/lib/libbgfx.a && echo yes)
+
+ifeq ($(BGFX_DEPS_AVAILABLE),yes)
+    BGFX_CFLAGS = -I$(BGFX_DEPS_DIR)/include -DCOEX_UI_HAS_CJSON
+    BGFX_CXXFLAGS = -O2 -fPIC -Wall -std=c++20 -I$(BGFX_DEPS_DIR)/include -DCOEX_UI_HAS_CJSON -DBX_CONFIG_DEBUG=0
+    ifneq ($(wildcard $(BGFX_DEPS_DIR)/lib/libcimgui.a),)
+        BGFX_CFLAGS += -DCOEX_UI_HAS_IMGUI
+        BGFX_CXXFLAGS += -DCOEX_UI_HAS_IMGUI -I$(BGFX_DEPS_DIR)/include
+    endif
+    BGFX_OBJ = bgfx/coex_bgfx.o bgfx/bgfx_c_bridge.o bgfx/coex_bgfx_imgui.o
+else
+    BGFX_CFLAGS =
+    BGFX_CXXFLAGS =
+    BGFX_OBJ =
+endif
+
+bgfx: $(BGFX_LIB)
+	@echo "bgfx library built: $(BGFX_LIB)"
+
+$(BGFX_LIB): $(BGFX_OBJ)
+	$(AR) rcs $@ $^
+
+bgfx/coex_bgfx.o: bgfx/coex_bgfx.c bgfx/coex_bgfx.h coex_ui_shell.h
+	$(CC) $(CFLAGS) $(BGFX_CFLAGS) -I$(BGFX_DEPS_DIR)/include -c -o $@ $<
+
+bgfx/bgfx_c_bridge.o: bgfx/bgfx_c_bridge.cpp bgfx/coex_bgfx.h
+	clang++ $(BGFX_CXXFLAGS) -c -o $@ $<
+
+bgfx/coex_bgfx_imgui.o: bgfx/coex_bgfx_imgui.cpp bgfx/coex_bgfx.h
+	clang++ $(BGFX_CXXFLAGS) -c -o $@ $<
+
 # Test targets
 test_task: test_coex_task.c coex_task.c coex_task.h
 	$(CC) $(CFLAGS) -o $@ test_coex_task.c coex_task.c -lpthread
@@ -192,5 +228,6 @@ endif
 clean:
 	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) coex_metal.o coex_metal_stub.o $(BLAS_OBJ) $(LIBS) test_task test_metal
 	rm -f $(UI_OBJ) $(UI_LIB) coex_ui_metal.o
+	rm -f bgfx/coex_bgfx.o bgfx/bgfx_c_bridge.o bgfx/coex_bgfx_imgui.o $(BGFX_LIB)
 
-.PHONY: all test clean test_metal ui
+.PHONY: all test clean test_metal ui bgfx

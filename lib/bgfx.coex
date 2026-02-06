@@ -1,0 +1,453 @@
+# Coex bgfx Library Module
+#
+# Cross-platform 3D rendering via bgfx (Metal/Vulkan/OpenGL/D3D).
+# Requires `import ui` for windowing (bgfx renders into the UI shell window).
+#
+# Usage:
+#   import ui
+#   import bgfx
+#
+#   func main() -> int
+#       ui.initialize({title: "3D App", width: 800, height: 600})
+#       bgfx.initialize(800, 600)
+#       bgfx.set_debug(4)  # show stats
+#
+#       bgfx.set_view_rect(0, 0, 0, 800, 600)
+#       bgfx.set_view_clear(0, 3, 0x303030ff, 1.0, 0)
+#
+#       while not ui.should_close()
+#           bgfx.touch(0)
+#           bgfx.dbg_text_clear()
+#           bgfx.dbg_text(0, 1, 0x0f, "bgfx + Coex")
+#           bgfx.frame()
+#       ~
+#
+#       bgfx.shutdown()
+#       ui.close()
+#       return 0
+#   ~
+
+# =============================================================================
+# FFI Declarations - Lifecycle
+# =============================================================================
+
+extern coex_bgfx_init(width: int, height: int) -> int ~
+extern coex_bgfx_shutdown() -> int ~
+extern coex_bgfx_reset(width: int, height: int, flags: int) -> int ~
+extern coex_bgfx_frame() -> int ~
+
+# =============================================================================
+# FFI Declarations - Views
+# =============================================================================
+
+extern coex_bgfx_set_view_rect(view_id: int, x: int, y: int, width: int, height: int) -> int ~
+extern coex_bgfx_set_view_clear(view_id: int, flags: int, rgba: int, depth: float, stencil: int) -> int ~
+extern coex_bgfx_set_view_transform(view_id: int, view_json: string, proj_json: string) -> int ~
+extern coex_bgfx_touch(view_id: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Buffers
+# =============================================================================
+
+extern coex_bgfx_create_vertex_buffer(vertices_json: string) -> int ~
+extern coex_bgfx_create_index_buffer(indices_json: string) -> int ~
+extern coex_bgfx_alloc_transient_vertex_buffer(num_vertices: int, layout_json: string) -> int ~
+extern coex_bgfx_alloc_transient_index_buffer(num_indices: int, is_32bit: int) -> int ~
+extern coex_bgfx_destroy_vertex_buffer(handle: int) -> int ~
+extern coex_bgfx_destroy_index_buffer(handle: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Shaders & Programs
+# =============================================================================
+
+extern coex_bgfx_load_shader(path: string) -> int ~
+extern coex_bgfx_create_program(vertex_handle: int, fragment_handle: int) -> int ~
+extern coex_bgfx_create_compute_program(compute_handle: int) -> int ~
+extern coex_bgfx_destroy_program(handle: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Textures
+# =============================================================================
+
+extern coex_bgfx_create_texture_2d(width: int, height: int, has_mips: int, format: int, flags: int, data_json: string) -> int ~
+extern coex_bgfx_update_texture_2d(handle: int, layer: int, mip: int, x: int, y: int, width: int, height: int, data_json: string) -> int ~
+extern coex_bgfx_destroy_texture(handle: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Uniforms
+# =============================================================================
+
+extern coex_bgfx_create_uniform(name: string, utype: int, num: int) -> int ~
+extern coex_bgfx_set_uniform(handle: int, value_json: string, num: int) -> int ~
+extern coex_bgfx_destroy_uniform(handle: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Drawing
+# =============================================================================
+
+extern coex_bgfx_set_state(state: int, rgba: int) -> int ~
+extern coex_bgfx_set_transform(mtx_json: string) -> int ~
+extern coex_bgfx_set_vertex_buffer(stream: int, handle: int, start_vertex: int, num_vertices: int) -> int ~
+extern coex_bgfx_set_transient_vertex_buffer(stream: int, handle: int, start_vertex: int, num_vertices: int) -> int ~
+extern coex_bgfx_set_index_buffer(handle: int, first_index: int, num_indices: int) -> int ~
+extern coex_bgfx_set_transient_index_buffer(handle: int, first_index: int, num_indices: int) -> int ~
+extern coex_bgfx_set_texture(stage: int, uniform_handle: int, texture_handle: int, flags: int) -> int ~
+extern coex_bgfx_submit(view_id: int, program_handle: int, depth: int, flags: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Compute
+# =============================================================================
+
+extern coex_bgfx_set_compute_buffer(stage: int, handle: int, access: int) -> int ~
+extern coex_bgfx_dispatch(view_id: int, program_handle: int, num_x: int, num_y: int, num_z: int, flags: int) -> int ~
+
+# =============================================================================
+# FFI Declarations - Debug
+# =============================================================================
+
+extern coex_bgfx_set_debug(flags: int) -> int ~
+extern coex_bgfx_dbg_text(x: int, y: int, attr: int, text: string) -> int ~
+extern coex_bgfx_dbg_text_clear() -> int ~
+extern coex_bgfx_get_renderer_name() -> string ~
+extern coex_bgfx_get_caps_json() -> string ~
+
+# =============================================================================
+# FFI Declarations - Math
+# =============================================================================
+
+extern coex_bgfx_mtx_look_at(eye_json: string, at_json: string, up_json: string) -> string ~
+extern coex_bgfx_mtx_proj(fovy: float, aspect: float, near: float, far: float) -> string ~
+extern coex_bgfx_mtx_ortho(left: float, right: float, bottom: float, top: float, near: float, far: float) -> string ~
+extern coex_bgfx_mtx_rotate_xyz(ax: float, ay: float, az: float) -> string ~
+
+# =============================================================================
+# FFI Declarations - Memory
+# =============================================================================
+
+extern coex_bgfx_free_json(json_str: string) -> int ~
+
+# =============================================================================
+# FFI Declarations - Scene Observer
+# =============================================================================
+
+extern coex_bgfx_set_scene(scene_json: string) -> int ~
+extern coex_bgfx_begin_observer() -> int ~
+extern coex_bgfx_end_observer() -> int ~
+extern coex_bgfx_observer_frame() -> int ~
+
+# =============================================================================
+# High-Level Wrapper API
+# =============================================================================
+
+# Initialize bgfx rendering.
+# Must be called after ui.initialize().
+# Returns 1 on success, 0 on failure.
+func initialize(width: int, height: int) -> int
+    return coex_bgfx_init(width, height)
+~
+
+# Shut down bgfx and release all resources.
+func shutdown() -> int
+    coex_bgfx_shutdown()
+    return 1
+~
+
+# Reset the backbuffer (call after window resize).
+# flags: 0 for defaults, 0x80 for vsync
+func reset(width: int, height: int, flags: int) -> int
+    coex_bgfx_reset(width, height, flags)
+    return 1
+~
+
+# Advance to the next frame. Must be called once per frame.
+# Returns the current frame number.
+func frame() -> int
+    return coex_bgfx_frame()
+~
+
+# Set view rectangle (viewport).
+func set_view_rect(view_id: int, x: int, y: int, width: int, height: int) -> int
+    coex_bgfx_set_view_rect(view_id, x, y, width, height)
+    return 1
+~
+
+# Set view clear flags, color, depth, and stencil.
+# flags: 1=color, 2=depth, 4=stencil (combine with +)
+# rgba: clear color as 0xRRGGBBAA
+func set_view_clear(view_id: int, flags: int, rgba: int, depth: float, stencil: int) -> int
+    coex_bgfx_set_view_clear(view_id, flags, rgba, depth, stencil)
+    return 1
+~
+
+# Set view transform matrices.
+# view_mtx and proj_mtx are JSON arrays of 16 floats, or "" for identity.
+func set_view_transform(view_id: int, view_mtx: string, proj_mtx: string) -> int
+    coex_bgfx_set_view_transform(view_id, view_mtx, proj_mtx)
+    return 1
+~
+
+# Submit an empty primitive (ensures view is processed).
+func touch(view_id: int) -> int
+    coex_bgfx_touch(view_id)
+    return 1
+~
+
+# Create a vertex buffer from JSON string.
+# vertices_json: { "layout": {"attribs": [...]}, "data": [...] }
+func create_vertex_buffer(vertices_json: string) -> int
+    return coex_bgfx_create_vertex_buffer(vertices_json)
+~
+
+# Create an index buffer from JSON string.
+# indices_json: { "data": [...], "is_32bit": false }
+func create_index_buffer(indices_json: string) -> int
+    return coex_bgfx_create_index_buffer(indices_json)
+~
+
+# Destroy a vertex buffer.
+func destroy_vertex_buffer(handle: int) -> int
+    coex_bgfx_destroy_vertex_buffer(handle)
+    return 1
+~
+
+# Destroy an index buffer.
+func destroy_index_buffer(handle: int) -> int
+    coex_bgfx_destroy_index_buffer(handle)
+    return 1
+~
+
+# Load a compiled shader from file.
+func load_shader(path: string) -> int
+    return coex_bgfx_load_shader(path)
+~
+
+# Create a rendering program from vertex and fragment shaders.
+func create_program(vertex_handle: int, fragment_handle: int) -> int
+    return coex_bgfx_create_program(vertex_handle, fragment_handle)
+~
+
+# Destroy a program.
+func destroy_program(handle: int) -> int
+    coex_bgfx_destroy_program(handle)
+    return 1
+~
+
+# Create a 2D texture.
+func create_texture_2d(width: int, height: int, has_mips: int, format: int, flags: int, data: string) -> int
+    return coex_bgfx_create_texture_2d(width, height, has_mips, format, flags, data)
+~
+
+# Destroy a texture.
+func destroy_texture(handle: int) -> int
+    coex_bgfx_destroy_texture(handle)
+    return 1
+~
+
+# Create a uniform.
+# utype: 0=sampler, 1=vec4, 2=mat3, 3=mat4
+func create_uniform(name: string, utype: int, num: int) -> int
+    return coex_bgfx_create_uniform(name, utype, num)
+~
+
+# Set a uniform value.
+func set_uniform(handle: int, value: string, num: int) -> int
+    coex_bgfx_set_uniform(handle, value, num)
+    return 1
+~
+
+# Destroy a uniform.
+func destroy_uniform(handle: int) -> int
+    coex_bgfx_destroy_uniform(handle)
+    return 1
+~
+
+# Set render state.
+func set_state(state: int, rgba: int) -> int
+    coex_bgfx_set_state(state, rgba)
+    return 1
+~
+
+# Set model transform matrix (JSON array of 16 floats).
+func set_transform(mtx: string) -> int
+    return coex_bgfx_set_transform(mtx)
+~
+
+# Set vertex buffer for rendering.
+func set_vertex_buffer(stream: int, handle: int, start_vertex: int, num_vertices: int) -> int
+    coex_bgfx_set_vertex_buffer(stream, handle, start_vertex, num_vertices)
+    return 1
+~
+
+# Set index buffer for rendering.
+func set_index_buffer(handle: int, first_index: int, num_indices: int) -> int
+    coex_bgfx_set_index_buffer(handle, first_index, num_indices)
+    return 1
+~
+
+# Set texture for rendering.
+func set_texture(stage: int, uniform_handle: int, texture_handle: int, flags: int) -> int
+    coex_bgfx_set_texture(stage, uniform_handle, texture_handle, flags)
+    return 1
+~
+
+# Submit a draw call.
+# flags: 0xFF = discard all state (default after submit)
+func submit(view_id: int, program_handle: int, depth: int, flags: int) -> int
+    coex_bgfx_submit(view_id, program_handle, depth, flags)
+    return 1
+~
+
+# Dispatch a compute job.
+func dispatch(view_id: int, program_handle: int, num_x: int, num_y: int, num_z: int, flags: int) -> int
+    coex_bgfx_dispatch(view_id, program_handle, num_x, num_y, num_z, flags)
+    return 1
+~
+
+# Set debug flags.
+# 1=wireframe, 2=IFH, 4=stats, 8=text
+func set_debug(flags: int) -> int
+    coex_bgfx_set_debug(flags)
+    return 1
+~
+
+# Print debug text at grid position.
+func dbg_text(x: int, y: int, attr: int, text: string) -> int
+    coex_bgfx_dbg_text(x, y, attr, text)
+    return 1
+~
+
+# Clear the debug text buffer.
+func dbg_text_clear() -> int
+    coex_bgfx_dbg_text_clear()
+    return 1
+~
+
+# Get the name of the active renderer (e.g., "Metal", "Vulkan", "OpenGL").
+func get_renderer_name() -> string
+    result = coex_bgfx_get_renderer_name()
+    return result
+~
+
+# Get renderer capabilities as JSON string.
+func get_caps() -> string
+    result = coex_bgfx_get_caps_json()
+    return result
+~
+
+# Create a look-at view matrix. Returns JSON array of 16 floats.
+# eye/at/up: JSON arrays [x,y,z]
+func mtx_look_at(eye: string, at: string, up: string) -> string
+    result = coex_bgfx_mtx_look_at(eye, at, up)
+    return result
+~
+
+# Create a perspective projection matrix. Returns JSON array of 16 floats.
+func mtx_proj(fovy: float, aspect: float, near: float, far: float) -> string
+    result = coex_bgfx_mtx_proj(fovy, aspect, near, far)
+    return result
+~
+
+# Create an orthographic projection matrix. Returns JSON array of 16 floats.
+func mtx_ortho(left: float, right: float, bottom: float, top: float, near: float, far: float) -> string
+    result = coex_bgfx_mtx_ortho(left, right, bottom, top, near, far)
+    return result
+~
+
+# Create a rotation matrix from euler angles (radians). Returns JSON array of 16 floats.
+func mtx_rotate_xyz(ax: float, ay: float, az: float) -> string
+    result = coex_bgfx_mtx_rotate_xyz(ax, ay, az)
+    return result
+~
+
+# =============================================================================
+# Scene Observer API
+# =============================================================================
+
+# Publish a scene description for the observer to render.
+# Thread-safe: can be called from any Coex task.
+# The json parameter is automatically serialized to a string at the FFI boundary.
+func set_scene(scene: json) -> int
+    coex_bgfx_set_scene(scene.stringify())
+    return 1
+~
+
+# Enter observer mode. Call before the render loop.
+func begin_observer() -> int
+    return coex_bgfx_begin_observer()
+~
+
+# Exit observer mode. Call after the render loop.
+func end_observer() -> int
+    coex_bgfx_end_observer()
+    return 1
+~
+
+# Render one frame in observer mode.
+# Consumes the latest scene (if any) and presents it.
+# Returns the current frame number.
+func observer_frame() -> int
+    return coex_bgfx_observer_frame()
+~
+
+# =============================================================================
+# Constants Reference (use literal values - module constants not yet accessible)
+# =============================================================================
+#
+# View clear flags:
+#   CLEAR_COLOR = 1, CLEAR_DEPTH = 2, CLEAR_STENCIL = 4
+#
+# Debug flags:
+#   DEBUG_WIREFRAME = 1, DEBUG_IFH = 2, DEBUG_STATS = 4, DEBUG_TEXT = 8
+#
+# Render state - write masks:
+#   STATE_WRITE_R=1, STATE_WRITE_G=2, STATE_WRITE_B=4, STATE_WRITE_A=8
+#   STATE_WRITE_Z=0x4000000000, STATE_WRITE_RGB=7, STATE_WRITE_MASK=0x400000000f
+#
+# Render state - depth test:
+#   STATE_DEPTH_TEST_LESS = 16
+#
+# Render state - culling:
+#   STATE_CULL_CW=0x1000000000, STATE_CULL_CCW=0x2000000000
+#
+# Render state - MSAA:
+#   STATE_MSAA = 0x0100000000000000
+#
+# Default render state (write all + depth less + cull CW + MSAA):
+#   STATE_DEFAULT = 0x010000700000001f
+#
+# Submit discard flags:
+#   DISCARD_ALL = 255
+#
+# Uniform types:
+#   UNIFORM_SAMPLER=0, UNIFORM_VEC4=1, UNIFORM_MAT3=2, UNIFORM_MAT4=3
+#
+# Reset flags:
+#   RESET_VSYNC = 128
+
+# =============================================================================
+# Vertex Attribute Names Reference
+# =============================================================================
+#
+# Position   - 3D position (typically Float x 3)
+# Normal     - Surface normal (Float x 3)
+# Tangent    - Surface tangent (Float x 4, w = handedness)
+# Bitangent  - Surface bitangent (Float x 3)
+# Color0-3   - Vertex color (Uint8 x 4, normalized)
+# Indices    - Bone indices (Uint8 x 4)
+# Weight     - Bone weights (Float x 4)
+# TexCoord0-7 - Texture coordinates (Float x 2)
+#
+# Attribute Types:
+# Uint8  - 8-bit unsigned int
+# Int16  - 16-bit signed int
+# Half   - 16-bit float
+# Float  - 32-bit float
+# Uint10 - 10-bit unsigned int (packed)
+#
+# Example layout JSON:
+# {
+#   "attribs": [
+#     {"name": "Position", "type": "Float", "num": 3},
+#     {"name": "Color0", "type": "Uint8", "num": 4, "normalized": true}
+#   ]
+# }
