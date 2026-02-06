@@ -1,0 +1,245 @@
+# Token Ring Benchmark
+#
+# Matches the Go token ring benchmark pattern:
+# - N nodes arranged in a ring
+# - Each node has input/output channels
+# - A token is passed around the ring M times
+# - Tests channel communication overhead and context switching
+
+# A ring node task: receives token, increments, sends to next
+task ring_node(input: Channel<int>, output: Channel<int>, rounds: int) -> int
+    count = 0
+    for round in 0..rounds
+        token = input.receive()
+        output.send(token + 1)
+        count = count + 1
+    ~
+    return count
+~
+
+# Thread version of ring node
+thread ring_node_thread(input: Channel<int>, output: Channel<int>, rounds: int) -> int
+    count = 0
+    for round in 0..rounds
+        token = input.receive()
+        output.send(token + 1)
+        count = count + 1
+    ~
+    return count
+~
+
+# Helper to spawn node 0
+task spawn_node_0(ch0: Channel<int>, ch1: Channel<int>, rounds: int) -> int
+    return ring_node(ch0, ch1, rounds)
+~
+
+task spawn_node_1(ch1: Channel<int>, ch2: Channel<int>, rounds: int) -> int
+    return ring_node(ch1, ch2, rounds)
+~
+
+task spawn_node_2(ch2: Channel<int>, ch3: Channel<int>, rounds: int) -> int
+    return ring_node(ch2, ch3, rounds)
+~
+
+task spawn_node_3(ch3: Channel<int>, ch4: Channel<int>, rounds: int) -> int
+    return ring_node(ch3, ch4, rounds)
+~
+
+task spawn_node_4(ch4: Channel<int>, ch5: Channel<int>, rounds: int) -> int
+    return ring_node(ch4, ch5, rounds)
+~
+
+task spawn_node_5(ch5: Channel<int>, ch6: Channel<int>, rounds: int) -> int
+    return ring_node(ch5, ch6, rounds)
+~
+
+task spawn_node_6(ch6: Channel<int>, ch7: Channel<int>, rounds: int) -> int
+    return ring_node(ch6, ch7, rounds)
+~
+
+task spawn_node_7(ch7: Channel<int>, ch8: Channel<int>, rounds: int) -> int
+    return ring_node(ch7, ch8, rounds)
+~
+
+task spawn_node_8(ch8: Channel<int>, ch9: Channel<int>, rounds: int) -> int
+    return ring_node(ch8, ch9, rounds)
+~
+
+task spawn_node_9(ch9: Channel<int>, ch0: Channel<int>, rounds: int) -> int
+    return ring_node(ch9, ch0, rounds)
+~
+
+# Inject token into channel after small delay
+task inject_token(ch: Channel<int>) -> int
+    ch.send(0)
+    return 1
+~
+
+# Build and run a 10-node ring with tasks using most for concurrency
+func run_task_ring_10(rounds: int) -> int
+    # Create channels for ring
+    ch0: Channel<int> = Channel.new()
+    ch1: Channel<int> = Channel.new()
+    ch2: Channel<int> = Channel.new()
+    ch3: Channel<int> = Channel.new()
+    ch4: Channel<int> = Channel.new()
+    ch5: Channel<int> = Channel.new()
+    ch6: Channel<int> = Channel.new()
+    ch7: Channel<int> = Channel.new()
+    ch8: Channel<int> = Channel.new()
+    ch9: Channel<int> = Channel.new()
+
+    # Spawn all nodes concurrently using most, plus token injector
+    (results, errors) = most i in [0,1,2,3,4,5,6,7,8,9,10]
+        if i == 0
+            spawn_node_0(ch0, ch1, rounds)
+        else
+            if i == 1
+                spawn_node_1(ch1, ch2, rounds)
+            else
+                if i == 2
+                    spawn_node_2(ch2, ch3, rounds)
+                else
+                    if i == 3
+                        spawn_node_3(ch3, ch4, rounds)
+                    else
+                        if i == 4
+                            spawn_node_4(ch4, ch5, rounds)
+                        else
+                            if i == 5
+                                spawn_node_5(ch5, ch6, rounds)
+                            else
+                                if i == 6
+                                    spawn_node_6(ch6, ch7, rounds)
+                                else
+                                    if i == 7
+                                        spawn_node_7(ch7, ch8, rounds)
+                                    else
+                                        if i == 8
+                                            spawn_node_8(ch8, ch9, rounds)
+                                        else
+                                            if i == 9
+                                                spawn_node_9(ch9, ch0, rounds)
+                                            else
+                                                inject_token(ch0)
+                                            ~
+                                        ~
+                                    ~
+                                ~
+                            ~
+                        ~
+                    ~
+                ~
+            ~
+        ~
+    ~
+
+    # Sum results (each node processed 'rounds' messages, injector returned 1)
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    return total - 1
+~
+
+# Thread version - spawns threads for ring nodes
+func run_thread_ring_10(rounds: int) -> int
+    ch0: Channel<int> = Channel.new()
+    ch1: Channel<int> = Channel.new()
+    ch2: Channel<int> = Channel.new()
+    ch3: Channel<int> = Channel.new()
+    ch4: Channel<int> = Channel.new()
+    ch5: Channel<int> = Channel.new()
+    ch6: Channel<int> = Channel.new()
+    ch7: Channel<int> = Channel.new()
+    ch8: Channel<int> = Channel.new()
+    ch9: Channel<int> = Channel.new()
+
+    # Spawn thread nodes - threads run truly concurrently
+    n0 = ring_node_thread(ch0, ch1, rounds)
+    n1 = ring_node_thread(ch1, ch2, rounds)
+    n2 = ring_node_thread(ch2, ch3, rounds)
+    n3 = ring_node_thread(ch3, ch4, rounds)
+    n4 = ring_node_thread(ch4, ch5, rounds)
+    n5 = ring_node_thread(ch5, ch6, rounds)
+    n6 = ring_node_thread(ch6, ch7, rounds)
+    n7 = ring_node_thread(ch7, ch8, rounds)
+    n8 = ring_node_thread(ch8, ch9, rounds)
+    n9 = ring_node_thread(ch9, ch0, rounds)
+
+    # Inject token
+    ch0.send(0)
+
+    return n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9
+~
+
+func main() -> int
+    rounds = 1000
+
+    print("Token Ring Benchmark")
+    print("====================")
+    print("Nodes: 10")
+    print("Rounds: 1000")
+    print("Total messages: 10000")
+    print("")
+
+    expected = 10000
+
+    # Run task version
+    print("Running with TASKS (coroutines)...")
+    start_task = posix.time()
+    task_result = run_task_ring_10(rounds)
+    end_task = posix.time()
+    task_time = end_task - start_task
+
+    print("  Messages processed: ")
+    print(task_result)
+    print("  Time (seconds): ")
+    print(task_time)
+    print("")
+
+    # Run thread version
+    print("Running with THREADS (pthreads)...")
+    start_thread = posix.time()
+    thread_result = run_thread_ring_10(rounds)
+    end_thread = posix.time()
+    thread_time = end_thread - start_thread
+
+    print("  Messages processed: ")
+    print(thread_result)
+    print("  Time (seconds): ")
+    print(thread_time)
+    print("")
+
+    # Compare
+    print("Comparison:")
+    print("  Task time (s): ")
+    print(task_time)
+    print("  Thread time (s): ")
+    print(thread_time)
+    if thread_time > task_time
+        print("  Tasks are faster!")
+    else
+        if task_time > thread_time
+            print("  Threads are faster!")
+        else
+            print("  Same speed!")
+        ~
+    ~
+    print("")
+
+    # Verify
+    if task_result == expected and thread_result == expected
+        print("PASS: Both implementations correct")
+        return 0
+    else
+        print("FAIL: Results incorrect")
+        print("  Task result: ")
+        print(task_result)
+        print("  Thread result: ")
+        print(thread_result)
+        print("  Expected: ")
+        print(expected)
+        return 1
+    ~
+~

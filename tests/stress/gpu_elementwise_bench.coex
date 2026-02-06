@@ -1,0 +1,76 @@
+#@ [PERF] Loop modifies 'data_list' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# GPU Elementwise Benchmark
+# =================================
+# Tests GPU offload with simple element-wise operations
+# This pattern should trigger GPU execution via Metal
+#
+# Usage:
+#   python3 coexc.py tests/stress/gpu_elementwise_bench.coex -o /tmp/gpu_bench && /tmp/gpu_bench
+
+# Formula for GPU offload (64-bit precision)
+formula compute(x: float) -> float
+    return sqrt(x * x + 1.0) * sin(x) + cos(x * 0.5)
+~
+
+func main() -> int
+    print("===========================================")
+    print("GPU Elementwise Benchmark")
+    print("===========================================")
+    print("")
+
+    # Configuration
+    size = 1000000  # 1 million elements
+    iterations = 10
+
+    print("Size: ")
+    print(size)
+    print("Iterations: ")
+    print(iterations)
+    print("")
+
+    # Create input data as Array (required for GPU offload)
+    print("Initializing Array data...")
+    data_list: [float] = []
+    for i in 0..size
+        data_list = data_list.append(i * 0.001)
+    ~
+
+    # Convert to Array with explicit type annotation for GPU offload
+    data: Array<float> = data_list.toArray()
+    print("  Array size: ")
+    print(data.len())
+    print("")
+
+    # Test formula with comprehension (should trigger GPU offload)
+    print("Running formula comprehension (GPU target)...")
+    t1 = posix.time()
+
+    sum_f64 = 0.0
+    for iter in 0..iterations
+        # This comprehension pattern should trigger GPU offload
+        result: Array<float> = [compute(x) for x in data]
+        # Sum results
+        for i in 0..result.len()
+            sum_f64 = sum_f64 + result.get(i)
+        ~
+    ~
+
+    t2 = posix.time()
+    f64_sec = t2 - t1
+    print("  Time (sec): ")
+    print(f64_sec)
+    print("  Checksum: ")
+    print(sum_f64)
+    print("")
+
+    # Summary
+    print("===========================================")
+    print("Summary")
+    print("===========================================")
+    print("formula time (sec): ")
+    print(f64_sec)
+
+    print("")
+    print("Benchmark complete")
+    return 0
+~

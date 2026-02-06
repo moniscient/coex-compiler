@@ -1,0 +1,98 @@
+# SVG binding test - test state bindings
+
+import ui
+import svg
+
+func main() -> int
+    print("=== SVG Binding Test ===")
+
+    config: json = {
+        title: "SVG Binding Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    if svg.is_available() == 0
+        print("SVG module not available")
+        ui.close()
+        return 1
+    ~
+
+    # Load SVG
+    star = svg.load("examples/svg_assets/resizable_star.svg")
+    if star == 0
+        print("Failed to load SVG")
+        ui.close()
+        return 1
+    ~
+
+    print("SVG loaded, adding binding...")
+
+    # Add a binding
+    svg.bind(star, "star", "fill", "starColor")
+
+    print("Binding added")
+
+    state = "{\"starColor\":\"#ff0000\"}"
+    frame_count = 0
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        layout: json = {
+            type: "window",
+            title: "SVG Binding Test",
+            children: [
+                { type: "text", text: "SVG with color binding" },
+                {
+                    type: "svg_image",
+                    handle: star,
+                    width: 100,
+                    height: 100
+                },
+                {
+                    type: "button",
+                    label: "Change Color",
+                    id: "colorBtn"
+                }
+            ]
+        }
+
+        state = ui.render(layout, state)
+        frame_count = frame_count + 1
+
+        # Check for button click
+        parsed: json = json.parse(state)
+        if parsed.has("colorBtn_clicked")
+            # Toggle between red and green
+            current = parsed.get("starColor").as_string()
+            if current == "#ff0000"
+                parsed = parsed.set("starColor", "#00ff00")
+            else
+                parsed = parsed.set("starColor", "#ff0000")
+            ~
+            parsed = parsed.remove("colorBtn_clicked")
+            state = parsed.stringify()
+            print("Color changed!")
+        ~
+
+        if frame_count % 100 == 0
+            print("Frame: ")
+            print(frame_count)
+        ~
+    ~
+
+    svg.destroy(star)
+    ui.close()
+    print("Test completed")
+    return 0
+~

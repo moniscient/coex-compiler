@@ -1,0 +1,6 @@
+import testlib_a
+
+func double_value() -> int
+    x = testlib_a.get_value()
+    return x * 2
+~

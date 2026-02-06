@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="36" height="28" xmlns="http://www.w3.org/2000/svg">
+  <!-- Enemy Galboss - Yellow flagship commander -->
+  <!-- Main body -->
+  <polygon id="body" points="18,0 36,14 32,28 4,28 0,14" fill="#ffcc00"/>
+  <!-- Inner hull -->
+  <polygon points="18,4 30,14 28,24 8,24 6,14" fill="#ffee66"/>
+  <!-- Crown/crest -->
+  <polygon points="18,0 22,6 18,4 14,6" fill="#ff9900"/>
+  <!-- Eyes -->
+  <ellipse id="eyes" cx="12" cy="14" rx="4" ry="5" fill="#ff0000"/>
+  <ellipse cx="24" cy="14" rx="4" ry="5" fill="#ff0000"/>
+  <circle cx="12" cy="14" r="2" fill="#000000"/>
+  <circle cx="24" cy="14" r="2" fill="#000000"/>
+  <!-- Escort indicator lights -->
+  <circle id="light_left" cx="6" cy="22" r="2" fill="#00ff00"/>
+  <circle id="light_right" cx="30" cy="22" r="2" fill="#00ff00"/>
+  <!-- Wing extensions -->
+  <polygon points="0,14 -2,10 4,12" fill="#cc9900"/>
+  <polygon points="36,14 38,10 32,12" fill="#cc9900"/>
+</svg>

@@ -1,0 +1,73 @@
+# Minimal SVG test - just load and render one SVG
+
+import ui
+import svg
+
+func main() -> int
+    print("=== Minimal SVG Test ===")
+
+    config: json = {
+        title: "SVG Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    if svg.is_available() == 0
+        print("SVG module not available")
+        ui.close()
+        return 1
+    ~
+
+    # Load one SVG
+    star = svg.load("examples/svg_assets/resizable_star.svg")
+    if star == 0
+        print("Failed to load SVG")
+        ui.close()
+        return 1
+    ~
+
+    print("SVG loaded successfully")
+
+    state = "{}"
+    frame_count = 0
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        layout: json = {
+            type: "window",
+            title: "SVG Test",
+            children: [
+                { type: "text", text: "SVG Render Test" },
+                {
+                    type: "svg_image",
+                    handle: star,
+                    width: 100,
+                    height: 100
+                }
+            ]
+        }
+
+        state = ui.render(layout, state)
+        frame_count = frame_count + 1
+
+        if frame_count % 100 == 0
+            print("Frame: ")
+            print(frame_count)
+        ~
+    ~
+
+    svg.destroy(star)
+    ui.close()
+    print("Test completed")
+    return 0
+~

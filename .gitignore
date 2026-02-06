@@ -32,6 +32,13 @@ htmlcov/
 *.out
 *.exe
 
+# Dependencies (build from source or use submodules)
+deps/cJSON/
+deps/cimgui/
+deps/lunasvg/
+deps/lib/
+deps/include/
+
 # Runtime libraries (must be built for each platform)
 runtime/*.a
 runtime/*.o
@@ -39,8 +46,22 @@ runtime/*.o
 # Compiled example binaries (Mach-O executables without extension)
 examples/factorial
 examples/stress_array_1m
+examples/galaxian
 /hello
 /stress_array_1m
+/galaxian
+/json_append_objects
+/json_append_simple
+/json_append_test
+/slider_test
+/svg_binding_test
+/svg_button_test
+/svg_comprehensive_demo
+/svg_demo_test
+/svg_minimal_test
+/ui_demo
+/ui_interactive
+/ui_simple_test
 
 # Compiled stress test binaries
 tests/stress/channel_bench
@@ -49,6 +70,17 @@ tests/stress/large-v1
 tests/stress/simple_bench
 tests/stress/test_*
 tests/stress/token_ring
+
+# Compiled runtime test binaries
+runtime/test_ui_*
+runtime/test_coex_*
+
+# ImGui config (generated)
+imgui.ini
+runtime/imgui.ini
+
+# Log files
+*.log
 
 # LLVM IR dumps (debugging artifacts)
 *.ll

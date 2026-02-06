@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="28" height="24" xmlns="http://www.w3.org/2000/svg">
+  <!-- Enemy Hornet - Red elite wasp-like alien -->
+  <!-- Body -->
+  <ellipse id="body" cx="14" cy="14" rx="12" ry="8" fill="#cc0000"/>
+  <!-- Stripes -->
+  <rect x="8" y="10" width="12" height="2" fill="#ffcc00"/>
+  <rect x="8" y="14" width="12" height="2" fill="#ffcc00"/>
+  <!-- Wings -->
+  <ellipse id="wings" cx="4" cy="10" rx="4" ry="6" fill="#ff6666" fill-opacity="0.7"/>
+  <ellipse cx="24" cy="10" rx="4" ry="6" fill="#ff6666" fill-opacity="0.7"/>
+  <!-- Stinger -->
+  <polygon points="14,22 12,24 16,24" fill="#ff6600"/>
+  <!-- Eyes -->
+  <circle id="eyes" cx="10" cy="10" r="3" fill="#ffff00"/>
+  <circle cx="18" cy="10" r="3" fill="#ffff00"/>
+  <circle cx="10" cy="10" r="1.5" fill="#000000"/>
+  <circle cx="18" cy="10" r="1.5" fill="#000000"/>
+  <!-- Antennae -->
+  <line x1="10" y1="6" x2="8" y2="0" stroke="#cc0000" stroke-width="1.5"/>
+  <line x1="18" y1="6" x2="20" y2="0" stroke="#cc0000" stroke-width="1.5"/>
+</svg>

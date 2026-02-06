@@ -1,0 +1,101 @@
+# SVG Interactive Demo
+#
+# Demonstrates SVG rendering with the UI system.
+# The SVG is displayed as a widget inside the UI window.
+
+import ui
+import svg
+
+func main() -> int
+    # Initialize UI
+    config: json = {
+        title: "SVG Demo",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+    ui.initialize(config)
+
+    # Check if SVG module is available
+    if svg.is_available() == 0
+        print("SVG module not available")
+        ui.close()
+        return 1
+    ~
+
+    # Load SVG from file
+    template = svg.load("examples/demo_button.svg")
+    if template == 0
+        print("Failed to load SVG file")
+        ui.close()
+        return 1
+    ~
+
+    print("SVG loaded successfully")
+    print("Width: ")
+    print(svg.width(template))
+    print("Height: ")
+    print(svg.height(template))
+
+    # Bind button fill color to state
+    svg.bind(template, "button", "fill", "buttonColor")
+
+    # Initial state with button color
+    state = "{\"buttonColor\":\"#4a90d9\"}"
+
+    # Create layout with SVG image widget
+    layout: json = {
+        type: "window",
+        title: "SVG Demo",
+        children: [
+            {
+                type: "text",
+                text: "SVG Rendering Demo"
+            },
+            {
+                type: "spacing"
+            },
+            {
+                type: "svg_image",
+                id: "svg_button",
+                handle: template,
+                width: 200,
+                height: 100
+            },
+            {
+                type: "spacing"
+            },
+            {
+                type: "text",
+                text: "SVG with state-bound color"
+            },
+            {
+                type: "separator"
+            },
+            {
+                type: "slider_float",
+                label: "Hue",
+                id: "hue",
+                min: 0.0,
+                max: 360.0
+            }
+        ]
+    }
+
+    # Main loop
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        # Render frame (returns updated state as string)
+        state = ui.render(layout, state)
+    ~
+
+    # Cleanup
+    svg.destroy(template)
+    ui.close()
+
+    print("Demo completed")
+    return 0
+~

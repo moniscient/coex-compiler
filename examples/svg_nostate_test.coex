@@ -1,0 +1,74 @@
+# SVG without state passing - test if SVG rendering corrupts memory
+
+import ui
+import svg
+
+func main() -> int
+    print("=== SVG No-State Test ===")
+
+    config: json = {
+        title: "Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    star = svg.load("examples/svg_assets/resizable_star.svg")
+    if star == 0
+        print("Failed to load SVG")
+        ui.close()
+        return 1
+    ~
+
+    print("Ready - click button")
+
+    count = 0
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        # Don't pass state with starColor - keep it simple
+        layout: json = {
+            type: "window",
+            title: "Test",
+            children: [
+                {
+                    type: "button",
+                    label: "Click",
+                    id: "btn"
+                },
+                {
+                    type: "svg_image",
+                    handle: star,
+                    width: 80,
+                    height: 80
+                }
+            ]
+        }
+
+        # Use empty state
+        result_state = ui.render(layout, "{}")
+
+        # Check for click in a minimal way
+        # Just look for the substring in the result
+        if result_state.len() > 20
+            count = count + 1
+            if count == 1
+                print("Got state back, length: ")
+                print(result_state.len())
+            ~
+        ~
+    ~
+
+    svg.destroy(star)
+    ui.close()
+    return 0
+~

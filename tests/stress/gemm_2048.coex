@@ -1,0 +1,155 @@
+#@ [PERF] Loop modifies 'result' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# GEMM Benchmark (Configurable Dimension)
+# =======================================
+# General Matrix Multiply: C = A * B
+# Default: 2048 x 2048 matrices
+#
+# This benchmark computes standard dense matrix multiplication using
+# a triple-nested loop. The matrices are stored in row-major order
+# as flat lists.
+#
+# Performance metrics for 2048x2048:
+#   - 2048^3 = 8,589,934,592 multiply-add operations
+#   - ~17.2 billion FLOPs (2 ops per multiply-add)
+#   - Expected runtime: ~55-70 seconds on modern hardware
+#   - Expected throughput: ~250-350 MFLOPS (naive implementation)
+#
+# Scaling (approximate):
+#   64x64:    ~1ms      (~0.5M FLOPs)
+#   256x256:  ~100ms    (~34M FLOPs)
+#   512x512:  ~900ms    (~268M FLOPs)
+#   1024x1024: ~7s      (~2.1B FLOPs)
+#   2048x2048: ~55-70s  (~17B FLOPs)
+#
+# Usage:
+#   python3 coexc.py tests/stress/gemm_2048.coex -o /tmp/gemm_2048 && /tmp/gemm_2048
+
+# Compute single element C[row, col] = sum(A[row, k] * B[k, col]) for k in 0..dim
+# Uses func instead of formula because we need mutable accumulator
+func dot_product(a: [float], b: [float], row: int, col: int, dim: int) -> float
+    sum: float = 0.0
+    a_base: int = row * dim
+    for k in 0..dim
+        sum = sum + a.get(a_base + k) * b.get(k * dim + col)
+    ~
+    return sum
+~
+
+# Initialize matrix with small values to avoid overflow
+func init_matrix(dim: int, seed: float) -> [float]
+    result: [float] = []
+    scale: float = 1.0 / dim  # Scale values to keep products reasonable
+    for i in 0..dim
+        for j in 0..dim
+            val: float = (seed + (i + j) * 0.001) * scale
+            result = result.append(val)
+        ~
+    ~
+    return result
+~
+
+func main() -> int
+    print("============================================")
+    print("GEMM Benchmark")
+    print("============================================")
+    print("")
+
+    # Configuration: Change this to adjust matrix size
+    # Recommended sizes:
+    #   64   - Quick test (~0.5M FLOPs)
+    #   128  - Small benchmark (~4M FLOPs)
+    #   256  - Medium benchmark (~33M FLOPs)
+    #   512  - Large benchmark (~268M FLOPs)
+    #   1024 - Very large (~2B FLOPs)
+    #   2048 - Full benchmark (~17B FLOPs) - will take a long time!
+    dim: int = 2048
+    total_elements: int = dim * dim
+    total_ops: int = dim * dim * dim * 2  # multiply + add per inner loop iteration
+
+    print("Matrix dimension: ")
+    print(dim)
+    print("Elements per matrix: ")
+    print(total_elements)
+    print("Total FLOPs: ")
+    print(total_ops)
+    print("")
+
+    # Initialize matrices
+    print("Initializing matrices A and B...")
+    t_init_start: int = posix.time_ns()
+
+    a: [float] = init_matrix(dim, 1.0)
+    b: [float] = init_matrix(dim, 2.0)
+
+    t_init_end: int = posix.time_ns()
+    init_ms: int = (t_init_end - t_init_start) / 1000000
+    print("  Initialization time (ms): ")
+    print(init_ms)
+    print("  Matrix A size: ")
+    print(a.len())
+    print("  Matrix B size: ")
+    print(b.len())
+    print("")
+
+    # Perform GEMM: C = A * B
+    print("Computing C = A * B...")
+    print("  (This will take a while for 2048x2048)")
+    print("")
+
+    t_start: int = posix.time_ns()
+
+    # Compute matrix multiplication
+    # For timing feedback, we print progress every 256 rows
+    checksum: float = 0.0
+    rows_done: int = 0
+
+    for row in 0..dim
+        for col in 0..dim
+            val: float = dot_product(a, b, row, col, dim)
+            checksum = checksum + val
+        ~
+        rows_done = rows_done + 1
+
+        # Progress indicator every 256 rows
+        if rows_done % 256 == 0
+            print("  Rows completed: ")
+            print(rows_done)
+        ~
+    ~
+
+    t_end: int = posix.time_ns()
+
+    # Calculate timing
+    elapsed_ns: int = t_end - t_start
+    elapsed_ms: int = elapsed_ns / 1000000
+    elapsed_sec: int = elapsed_ms / 1000
+
+    print("")
+    print("============================================")
+    print("Results")
+    print("============================================")
+    print("Elapsed time (ms): ")
+    print(elapsed_ms)
+    print("Elapsed time (sec): ")
+    print(elapsed_sec)
+    print("Checksum: ")
+    print(checksum)
+
+    # Calculate GFLOPS if we have valid timing
+    if elapsed_ms > 0
+        # GFLOPS = total_ops / (elapsed_ns) = total_ops / (elapsed_ms * 1e6)
+        # For integer math: MFLOPS = total_ops / elapsed_ms / 1000
+        mflops: int = total_ops / elapsed_ms / 1000
+        print("Performance (MFLOPS): ")
+        print(mflops)
+
+        # GFLOPS with more precision
+        gflops_x100: int = total_ops / elapsed_ms / 10  # GFLOPS * 100
+        print("Performance (GFLOPS x100): ")
+        print(gflops_x100)
+    ~
+
+    print("")
+    print("Benchmark complete")
+    return 0
+~

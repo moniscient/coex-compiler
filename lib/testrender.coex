@@ -1,0 +1,15 @@
+# Test module that calls ui.render
+import ui
+
+func render_panel(value: int) -> int
+    str_val = String.from(value)
+    panel: json = {
+        type: "window",
+        title: "TestRender",
+        children: [
+            { type: "text", text: "Value: " + str_val }
+        ]
+    }
+    ui.render(panel, "{}")
+    return 1
+~

@@ -1520,10 +1520,8 @@ class ExpressionGenerator:
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
-                # Run GC synchronously
-                # NOTE: Until Phase 4 (TLAB allocation), GC must be synchronous
-                # to avoid race conditions on the allocation list.
-                cg.builder.call(cg.gc.gc_collect, [])
+                # Trigger GC via the background thread (non-blocking)
+                cg.builder.call(cg.gc.gc_async, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "gc_async":
@@ -1575,15 +1573,11 @@ class ExpressionGenerator:
                 return result
 
             if name == "gc_compact":
+                # Trigger compaction via the background GC thread (non-blocking).
+                # gc_compact only sets flags and signals; actual compaction
+                # happens in the GC thread. No reload needed since compaction
+                # hasn't happened yet when this returns.
                 cg.builder.call(cg.gc.gc_compact, [])
-                # Reload all heap variable pointers after compaction.
-                # gc_compact moves objects to a new buffer and updates handles,
-                # but the raw pointers in stack allocas are stale.
-                if hasattr(cg, 'gc_root_indices') and hasattr(cg, 'gc_frame') and cg.gc_frame is not None:
-                    cg.gc.reload_roots_after_compact(
-                        cg.builder, cg.gc_frame,
-                        cg.gc_root_indices, cg.locals
-                    )
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "print":

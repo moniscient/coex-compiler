@@ -231,6 +231,7 @@ func main() -> int
 
         # GC every frame to manage memory
         # gc()  # DISABLED: Investigating GC segfault bug
+        gc_compact()
 
         # ---------------------------------------------------------------------
         # Input Handling

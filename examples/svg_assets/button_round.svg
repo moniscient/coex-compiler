@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="80" height="80" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer ring -->
+  <circle id="ring" cx="40" cy="40" r="38" fill="none" stroke="#4a90d9" stroke-width="3"/>
+  <!-- Inner circle (clickable area) -->
+  <circle id="button" cx="40" cy="40" r="32" fill="#4a90d9"/>
+  <!-- Highlight -->
+  <circle cx="40" cy="35" r="20" fill="#ffffff" fill-opacity="0.2"/>
+  <!-- Icon (play triangle) -->
+  <polygon id="icon" points="35,25 35,55 55,40" fill="#ffffff"/>
+</svg>

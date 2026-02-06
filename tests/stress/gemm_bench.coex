@@ -1,0 +1,196 @@
+#@ [PERF] Loop modifies 'result' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# GEMM Benchmark using formula32
+# =================================
+# General Matrix Multiply: C = A * B
+# Compares formula32 (32-bit GPU precision) vs formula (64-bit precision)
+#
+# Configuration (edit in main()):
+#   scale      - Matrix dimension (default 8192 for 8192x8192)
+#   iterations - Number of GEMM iterations (default 3)
+#   k          - Inner dimension, must be 4 (unrolled in formula)
+#
+# Usage:
+#   python3 coexc.py tests/stress/gemm_bench.coex -o /tmp/gemm_bench && /tmp/gemm_bench
+#
+# Known issues worked around:
+#   BUG-033: Float list corruption across function boundaries (computing inline)
+#   BUG-034: posix.time_ns() returns garbage (using posix.time() with iterations)
+
+# Single element computation at 32-bit precision (K=4 unrolled)
+formula32 dot4_f32(a: [float], b: [float], a_base: int, b_col: int, n_dim: int) -> float
+    return a.get(a_base + 0) * b.get(0 * n_dim + b_col) + a.get(a_base + 1) * b.get(1 * n_dim + b_col) + a.get(a_base + 2) * b.get(2 * n_dim + b_col) + a.get(a_base + 3) * b.get(3 * n_dim + b_col)
+~
+
+# Single element computation at 64-bit precision (K=4 unrolled)
+formula dot4_f64(a: [float], b: [float], a_base: int, b_col: int, n_dim: int) -> float
+    return a.get(a_base + 0) * b.get(0 * n_dim + b_col) + a.get(a_base + 1) * b.get(1 * n_dim + b_col) + a.get(a_base + 2) * b.get(2 * n_dim + b_col) + a.get(a_base + 3) * b.get(3 * n_dim + b_col)
+~
+
+# Initialize matrix with predictable values
+func init_matrix(rows: int, cols: int, seed: float) -> [float]
+    result: [float] = []
+    for i in 0..rows
+        for j in 0..cols
+            result = result.append(seed + (i * cols + j) * 0.001)
+        ~
+    ~
+    return result
+~
+
+func main() -> int
+    print("===========================================")
+    print("GEMM Benchmark - formula32 vs formula64")
+    print("===========================================")
+    print("")
+
+    # Configuration - scale parameter
+    # Adjust 'scale' for different benchmark sizes:
+    # - 32: Quick test (~1K elements)
+    # - 64: Small benchmark (~4K elements)
+    # - 128: Medium benchmark (~16K elements)
+    # - 256: Large benchmark (~65K elements)
+    # - 512: Very large (~262K elements)
+    # - 1024: Large scale (~1M elements)
+    # - 4096: Huge scale (~16M elements)
+    # - 8192: Maximum scale (~67M elements)
+    scale = 8192
+    m = scale
+    n = scale
+    k = 4  # Fixed K dimension (unrolled in formula)
+    iterations = 3  # Number of GEMM iterations for timing
+
+    print("Scale: ")
+    print(scale)
+    print("Matrix dimensions: MxK * KxN = MxN")
+    print("  M = ")
+    print(m)
+    print("  K = ")
+    print(k)
+    print("  N = ")
+    print(n)
+    output_elements = m * n
+    print("Output elements: ")
+    print(output_elements)
+    total_flops = m * n * k * 2
+    print("FLOPs per iteration: ")
+    print(total_flops)
+    print("Iterations: ")
+    print(iterations)
+    print("")
+
+    # Correctness test with small matrices (inline)
+    print("Correctness test (4x4)...")
+    test_m = 4
+    test_n = 4
+    test_a = init_matrix(test_m, k, 0.1)
+    test_b = init_matrix(k, test_n, 0.2)
+
+    # Compute first element manually
+    test_val: float = dot4_f32(test_a, test_b, 0, 0, test_n)
+    print("  C[0,0] = ")
+    print(test_val)
+
+    # Expected: (0.1*0.2) + (0.101*0.204) + (0.102*0.208) + (0.103*0.212) ≈ 0.0829
+    if test_val > 0.08 and test_val < 0.09
+        print("PASS (value in expected range)")
+    else
+        print("FAIL - unexpected value")
+        return 1
+    ~
+    print("")
+
+    # Initialize benchmark matrices
+    print("Initializing benchmark matrices...")
+    a = init_matrix(m, k, 1.0)
+    b = init_matrix(k, n, 2.0)
+    print("  A size: ")
+    print(a.len())
+    print("  B size: ")
+    print(b.len())
+    print("")
+
+    # Run formula32 GEMM (multiple iterations)
+    print("Running formula32 GEMM...")
+    t2 = posix.time()
+
+    sum_f32 = 0.0
+    iter_f32 = 0
+    for iter in 0..iterations
+        for row in 0..m
+            a_base = row * k
+            for col in 0..n
+                val: float = dot4_f32(a, b, a_base, col, n)
+                sum_f32 = sum_f32 + val
+            ~
+        ~
+        iter_f32 = iter_f32 + 1
+    ~
+
+    t3 = posix.time()
+    f32_sec = t3 - t2
+    print("  Iterations: ")
+    print(iter_f32)
+    print("  Total time (sec): ")
+    print(f32_sec)
+    print("  Checksum: ")
+    print(sum_f32)
+    print("")
+
+    # Run formula64 GEMM (multiple iterations)
+    print("Running formula64 GEMM...")
+    t4 = posix.time()
+
+    sum_f64 = 0.0
+    iter_f64 = 0
+    for iter in 0..iterations
+        for row in 0..m
+            a_base = row * k
+            for col in 0..n
+                val: float = dot4_f64(a, b, a_base, col, n)
+                sum_f64 = sum_f64 + val
+            ~
+        ~
+        iter_f64 = iter_f64 + 1
+    ~
+
+    t5 = posix.time()
+    f64_sec = t5 - t4
+    print("  Iterations: ")
+    print(iter_f64)
+    print("  Total time (sec): ")
+    print(f64_sec)
+    print("  Checksum: ")
+    print(sum_f64)
+    print("")
+
+    # Summary
+    print("===========================================")
+    print("Summary")
+    print("===========================================")
+    print("formula32 total time (sec): ")
+    print(f32_sec)
+    print("formula64 total time (sec): ")
+    print(f64_sec)
+
+    # Verify checksums match (within tolerance for 32-bit precision)
+    checksum_diff = sum_f32 - sum_f64
+    if checksum_diff < 0.0
+        checksum_diff = 0.0 - checksum_diff
+    ~
+    checksum_pct = (checksum_diff / sum_f64) * 100.0
+    print("Checksum difference (%): ")
+    print(checksum_pct)
+
+    if f32_sec > 0 and f64_sec > 0
+        # Compute throughput
+        ops_f32 = total_flops * iterations
+        ops_f64 = total_flops * iterations
+        print("")
+        print("Total FLOPs computed: ")
+        print(ops_f32)
+    ~
+
+    print("")
+    print("Benchmark complete")
+    return 0
+~

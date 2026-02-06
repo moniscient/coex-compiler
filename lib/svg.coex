@@ -1,0 +1,200 @@
+# Coex SVG Module
+#
+# SVG rendering with state bindings for reactive UI.
+# SVG documents can have elements bound to state keys, enabling
+# reactive updates when state changes.
+#
+# Usage:
+#   import svg
+#   import ui
+#
+#   func main() -> int
+#       ui.initialize({ title: "SVG Demo", width: 800, height: 600 })
+#
+#       # Load SVG template (returns handle integer)
+#       template = svg.load("icon.svg")
+#
+#       # Bind element attributes to state keys
+#       svg.bind(template, "statusCircle", "fill", "statusColor")
+#       svg.bind(template, "alertIcon", "opacity", "alertVisible")
+#
+#       # Register event handlers (event types: 1=CLICK, 2=HOVER, etc.)
+#       svg.on_event(template, "playButton", 1, "playClicked")
+#
+#       state: json = { statusColor: "#00ff00" }
+#
+#       loop
+#           state = svg.render_frame(template, state, 400, 300)
+#           if state.get("playClicked")
+#               state = state.set("statusColor", "#00ff00")
+#               state = state.remove("playClicked")
+#           ~
+#           if ui.should_close()
+#               break
+#           ~
+#       ~
+#
+#       svg.destroy(template)
+#       ui.close()
+#       return 0
+#   ~
+#
+# Event Types (use with on_event):
+#   1 = CLICK      - Element was clicked
+#   2 = HOVER      - Mouse is over element
+#   3 = MOUSEDOWN  - Mouse button pressed on element
+#   4 = MOUSEUP    - Mouse button released on element
+#   5 = MOUSEENTER - Mouse entered element
+#   6 = MOUSELEAVE - Mouse left element
+
+# =============================================================================
+# FFI Declarations
+# =============================================================================
+
+extern coex_svg_init(device: int) -> int ~
+extern coex_svg_shutdown() -> int ~
+extern coex_svg_is_available() -> int ~
+extern coex_svg_load(path: string) -> int ~
+extern coex_svg_load_from_data(data: string, length: int) -> int ~
+extern coex_svg_destroy(handle: int) -> int ~
+extern coex_svg_width(handle: int) -> float ~
+extern coex_svg_height(handle: int) -> float ~
+extern coex_svg_bind(handle: int, element_id: string, attribute: string, state_key: string) -> int ~
+extern coex_svg_bind_element(handle: int, element_id: string, bindings_json: string) -> int ~
+extern coex_svg_unbind(handle: int, element_id: string) -> int ~
+extern coex_svg_on(handle: int, element_id: string, event_type: int, state_key: string) -> int ~
+extern coex_svg_off(handle: int, element_id: string, event_type: int) -> int ~
+extern coex_svg_render_frame(handle: int, state_json: string, screen_x: float, screen_y: float, width: int, height: int) -> string ~
+extern coex_svg_image_descriptor(handle: int, width: int, height: int) -> string ~
+extern coex_svg_free_json(json_str: string) -> int ~
+extern coex_svg_render_to_texture(handle: int, width: int, height: int) -> int ~
+extern coex_svg_apply_state(handle: int, state_json: string) -> int ~
+
+# =============================================================================
+# Module Initialization
+# =============================================================================
+
+# Initialize the SVG module.
+# Should be called after UI is initialized.
+# Returns 1 on success, 0 on failure.
+func initialize() -> int
+    return coex_svg_init(0)
+~
+
+# Shutdown the SVG module.
+func shutdown() -> int
+    return coex_svg_shutdown()
+~
+
+# Check if LunaSVG is available.
+# Returns 1 if available, 0 if not.
+func is_available() -> int
+    return coex_svg_is_available()
+~
+
+# =============================================================================
+# Loading SVG Documents
+# =============================================================================
+
+# Load an SVG file and create a template.
+# Returns: template handle (positive integer), or 0 if loading failed
+func load(path: string) -> int
+    return coex_svg_load(path)
+~
+
+# Load an SVG from string data.
+# Returns: template handle, or 0 if parsing failed
+func load_from_string(data: string) -> int
+    return coex_svg_load_from_data(data, data.len())
+~
+
+# Destroy an SVG template and free resources.
+func destroy(template: int) -> int
+    return coex_svg_destroy(template)
+~
+
+# =============================================================================
+# Template Properties
+# =============================================================================
+
+# Get the intrinsic width of the SVG.
+func width(template: int) -> float
+    return coex_svg_width(template)
+~
+
+# Get the intrinsic height of the SVG.
+func height(template: int) -> float
+    return coex_svg_height(template)
+~
+
+# =============================================================================
+# State Bindings
+# =============================================================================
+
+# Bind an element attribute to a state key.
+# Returns 1 on success, 0 if element not found
+func bind(template: int, element_id: string, attribute: string, state_key: string) -> int
+    return coex_svg_bind(template, element_id, attribute, state_key)
+~
+
+# Bind multiple attributes on an element using a JSON spec.
+# Returns number of bindings created
+func bind_element(template: int, element_id: string, bindings: json) -> int
+    return coex_svg_bind_element(template, element_id, bindings.stringify())
+~
+
+# Remove all bindings for an element.
+# Returns number of bindings removed
+func unbind(template: int, element_id: string) -> int
+    return coex_svg_unbind(template, element_id)
+~
+
+# =============================================================================
+# Event Registration
+# =============================================================================
+
+# Register an event handler for an element.
+# Event types: 1=CLICK, 2=HOVER, 3=MOUSEDOWN, 4=MOUSEUP, 5=MOUSEENTER, 6=MOUSELEAVE
+# Returns 1 on success, 0 if element not found
+func on_event(template: int, element_id: string, event: int, state_key: string) -> int
+    return coex_svg_on(template, element_id, event, state_key)
+~
+
+# Remove an event handler.
+# Returns 1 if removed, 0 if not found
+func off_event(template: int, element_id: string, event: int) -> int
+    return coex_svg_off(template, element_id, event)
+~
+
+# =============================================================================
+# Rendering
+# =============================================================================
+
+# Render the SVG and process events for one frame.
+# Returns: Updated state with event flags
+func render_frame(template: int, state: json, width: int, height: int) -> json
+    result_str = coex_svg_render_frame(template, state.stringify(), 0.0, 0.0, width, height)
+    return json.parse(result_str)
+~
+
+# Get a widget descriptor for the SVG image.
+func image_descriptor(template: int, width: int, height: int) -> json
+    result_str = coex_svg_image_descriptor(template, width, height)
+    return json.parse(result_str)
+~
+
+# =============================================================================
+# Advanced API
+# =============================================================================
+
+# Render the SVG to an internal texture without displaying.
+# Returns 1 on success, 0 on failure
+func render_to_texture(template: int, width: int, height: int) -> int
+    return coex_svg_render_to_texture(template, width, height)
+~
+
+# Apply state bindings to the SVG without rendering.
+# Returns number of bindings applied
+func apply_state(template: int, state: json) -> int
+    return coex_svg_apply_state(template, state.stringify())
+~

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24" height="24" xmlns="http://www.w3.org/2000/svg">
+  <!-- Enemy Drone - Blue/green basic alien -->
+  <!-- Body -->
+  <ellipse id="body" cx="12" cy="14" rx="10" ry="8" fill="#00aa44"/>
+  <!-- Wings -->
+  <polygon id="wings" points="2,12 0,6 6,10" fill="#008833"/>
+  <polygon points="22,12 24,6 18,10" fill="#008833"/>
+  <!-- Eyes -->
+  <circle id="eyes" cx="8" cy="12" r="3" fill="#00ffff"/>
+  <circle cx="16" cy="12" r="3" fill="#00ffff"/>
+  <circle cx="8" cy="12" r="1.5" fill="#000000"/>
+  <circle cx="16" cy="12" r="1.5" fill="#000000"/>
+  <!-- Antennae -->
+  <line x1="6" y1="6" x2="4" y2="0" stroke="#00aa44" stroke-width="2"/>
+  <line x1="18" y1="6" x2="20" y2="0" stroke="#00aa44" stroke-width="2"/>
+  <circle cx="4" cy="0" r="2" fill="#00ffff"/>
+  <circle cx="20" cy="0" r="2" fill="#00ffff"/>
+</svg>

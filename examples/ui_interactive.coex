@@ -1,0 +1,34 @@
+# Simple Interactive UI Demo
+# Run with: ./ui_interactive
+import ui
+
+func main() -> int
+    print("Starting Interactive UI...")
+    print("A window should appear. Close it to exit.")
+
+    # Initialize
+    config = "{\"title\": \"Coex UI\", \"width\": 400, \"height\": 300}"
+    result = ui.initialize(config)
+    if result != 1
+        print("Init failed")
+        return 1
+    ~
+
+    # Simple layout
+    layout = "{\"type\": \"window\", \"title\": \"Hello Coex!\", \"children\": [{\"type\": \"text\", \"text\": \"Welcome to Coex UI\"}, {\"type\": \"separator\"}, {\"type\": \"button\", \"label\": \"Click Me\", \"id\": \"btn1\"}, {\"type\": \"slider_int\", \"id\": \"val\", \"label\": \"Value\", \"min\": 0, \"max\": 100}]}"
+    state = "{\"val\": 50}"
+
+    # Render loop - limited frames for safety
+    count = 0
+    while count < 3000
+        if ui.should_close()
+            print("Window closed")
+            break
+        ~
+        state = ui.render(layout, state)
+        count = count + 1
+    ~
+
+    print("Done!")
+    return 0
+~

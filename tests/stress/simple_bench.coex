@@ -1,0 +1,89 @@
+# Simple Concurrent Benchmark
+# Tests basic task vs thread overhead with simple work
+
+task do_work(iterations: int) -> int
+    total = 0
+    for i in 0..iterations
+        total = total + 1
+    ~
+    return total
+~
+
+thread do_work_thread(iterations: int) -> int
+    total = 0
+    for i in 0..iterations
+        total = total + 1
+    ~
+    return total
+~
+
+# Spawn 10 tasks concurrently
+func run_tasks(iterations: int) -> int
+    (results, errors) = most i in [0,1,2,3,4,5,6,7,8,9]
+        do_work(iterations)
+    ~
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    return total
+~
+
+# Spawn 10 threads
+func run_threads(iterations: int) -> int
+    # These run sequentially due to thread call semantics
+    n0 = do_work_thread(iterations)
+    n1 = do_work_thread(iterations)
+    n2 = do_work_thread(iterations)
+    n3 = do_work_thread(iterations)
+    n4 = do_work_thread(iterations)
+    n5 = do_work_thread(iterations)
+    n6 = do_work_thread(iterations)
+    n7 = do_work_thread(iterations)
+    n8 = do_work_thread(iterations)
+    n9 = do_work_thread(iterations)
+    return n0+n1+n2+n3+n4+n5+n6+n7+n8+n9
+~
+
+func main() -> int
+    iterations = 100000000
+
+    print("Simple Concurrent Benchmark")
+    print("===========================")
+    print("Workers: 10")
+    print("Iterations each: 100000000")
+    print("Total ops: 1 billion")
+    print("")
+
+    expected = 1000000000
+
+    print("Running TASKS...")
+    start_task = posix.time()
+    task_result = run_tasks(iterations)
+    end_task = posix.time()
+    task_time = end_task - start_task
+    print("  Result: ")
+    print(task_result)
+    print("  Time: ")
+    print(task_time)
+    print("")
+
+    print("Running THREADS...")
+    start_thread = posix.time()
+    thread_result = run_threads(iterations)
+    end_thread = posix.time()
+    thread_time = end_thread - start_thread
+    print("  Result: ")
+    print(thread_result)
+    print("  Time: ")
+    print(thread_time)
+    print("")
+
+    if task_result == expected and thread_result == expected
+        print("PASS")
+        return 0
+    else
+        print("FAIL")
+        return 1
+    ~
+~

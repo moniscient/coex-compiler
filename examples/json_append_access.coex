@@ -1,0 +1,24 @@
+# Test JSON append and access without stringify
+func main() -> int
+    print("Testing JSON append and access...")
+
+    arr: json := []
+    print("Created empty array")
+
+    arr = arr.append({ name: "Alice" })
+    print("Appended Alice")
+
+    arr = arr.append({ name: "Bob" })
+    print("Appended Bob")
+
+    print("Array length: ")
+    print(arr.len())
+
+    # Try to access element
+    print("Getting element 0...")
+    elem: json = arr.get(0)
+    print("Got element 0")
+
+    print("Done!")
+    return 0
+~

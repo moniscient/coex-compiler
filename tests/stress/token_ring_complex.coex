@@ -1,0 +1,95 @@
+# Parallel Dispatch Benchmark with Complex Bodies
+#
+# NOTE: This is NOT a token ring benchmark like Go's. This tests parallel
+# fan-out computation with conditional dispatch, not channel communication.
+#
+# Go token ring: N goroutines in a ring, passing a token M times via channels
+# This benchmark: N independent workers doing parallel compute with conditional dispatch
+
+# Thread versions (OS threads via pthreads)
+thread thread_even(id: int) -> int
+    iterations = 1000000000
+    total = 0
+    for i in 0..iterations
+        total = total + 1
+    ~
+    return total
+~
+
+thread thread_odd(id: int) -> int
+    iterations = 1000000000
+    total = 0
+    for i in 0..iterations
+        total = total + 2
+    ~
+    return total
+~
+
+# Task versions (lightweight coroutines)
+task task_even(id: int) -> int
+    iterations = 1000000000
+    total = 0
+    for i in 0..iterations
+        total = total + 1
+    ~
+    return total
+~
+
+task task_odd(id: int) -> int
+    iterations = 1000000000
+    total = 0
+    for i in 0..iterations
+        total = total + 2
+    ~
+    return total
+~
+
+func run_with_threads() -> int
+    (results, errors) = most i in [0,1,2,3,4,5,6,7,8,9]
+        if i % 2 == 0
+            thread_even(i)
+        else
+            thread_odd(i)
+        ~
+    ~
+
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    return total
+~
+
+func run_with_tasks() -> int
+    (results, errors) = most i in [0,1,2,3,4,5,6,7,8,9]
+        if i % 2 == 0
+            task_even(i)
+        else
+            task_odd(i)
+        ~
+    ~
+
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    return total
+~
+
+func main() -> int
+    print("Threads (1B iterations x 10 workers):")
+    t1 = posix.time()
+    result1 = run_with_threads()
+    t2 = posix.time()
+    print(result1)
+    print(t2 - t1)
+
+    print("Tasks (1B iterations x 10 workers):")
+    t3 = posix.time()
+    result2 = run_with_tasks()
+    t4 = posix.time()
+    print(result2)
+    print(t4 - t3)
+
+    return 0
+~

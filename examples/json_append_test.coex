@@ -1,0 +1,50 @@
+#@ [PERF] Loop modifies 'children' with append on each iteration, creating intermediate lists. Consider using Array for in-place mutation.
+# Test dynamic JSON array building
+import ui
+
+func main() -> int
+    print("Testing JSON append...")
+
+    config: json = {
+        title: "Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to init UI")
+        return 1
+    ~
+
+    state = "{}"
+    frame = 0
+
+    while frame < 10
+        if ui.should_close()
+            break
+        ~
+
+        # Build children dynamically
+        children: json := []
+
+        children = children.append({ type: "text", text: "Hello" })
+        children = children.append({ type: "text", text: "World" })
+
+        layout: json = {
+            type: "window",
+            title: "Test",
+            children: children
+        }
+
+        state = ui.render(layout, state)
+        frame = frame + 1
+        print("Frame: ")
+        print(frame)
+    ~
+
+    ui.close()
+    print("Done!")
+    return 0
+~

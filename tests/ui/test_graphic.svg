@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect id="background" width="200" height="200" fill="#f0f0f0"/>
+
+  <!-- Status indicator circle -->
+  <circle id="statusCircle" cx="100" cy="50" r="30" fill="#00ff00" stroke="#333" stroke-width="2"/>
+
+  <!-- Control buttons -->
+  <g id="playButton">
+    <rect x="30" y="100" width="60" height="40" rx="5" fill="#4CAF50"/>
+    <polygon points="50,110 50,130 70,120" fill="white"/>
+  </g>
+
+  <g id="stopButton">
+    <rect x="110" y="100" width="60" height="40" rx="5" fill="#f44336"/>
+    <rect x="125" y="110" width="30" height="20" fill="white"/>
+  </g>
+
+  <!-- Value display text -->
+  <text id="valueText" x="100" y="175" text-anchor="middle" font-size="24" fill="#333">0</text>
+</svg>

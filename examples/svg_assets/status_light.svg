@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="60" height="60" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer ring (metallic look) -->
+  <circle cx="30" cy="30" r="28" fill="#7f8c8d"/>
+  <circle cx="30" cy="30" r="25" fill="#95a5a6"/>
+  <!-- Inner bezel -->
+  <circle cx="30" cy="30" r="22" fill="#2c3e50"/>
+  <!-- Light bulb -->
+  <circle id="light" cx="30" cy="30" r="18" fill="#27ae60"/>
+  <!-- Reflection -->
+  <ellipse cx="25" cy="25" rx="8" ry="6" fill="#ffffff" fill-opacity="0.4"/>
+</svg>

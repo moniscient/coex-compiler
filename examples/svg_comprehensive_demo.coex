@@ -1,0 +1,429 @@
+#@ [MOVE] Variable 'box_offset_y' is not used after this assignment. Consider: box_drag_y := box_offset_y (move instead of copy)
+#@ [MOVE] Variable 'box_offset_x' is not used after this assignment. Consider: box_drag_x := box_offset_x (move instead of copy)
+# SVG Comprehensive Demo
+#
+# Demonstrates:
+# - Multiple SVG objects with click detection
+# - State bindings for visual feedback on click
+# - A draggable SVG object
+# - An SVG object resizable via slider
+#
+# Run with: python3 coexc.py examples/svg_comprehensive_demo.coex -o svg_comprehensive_demo
+#           ./svg_comprehensive_demo
+
+import ui
+import svg
+
+func main() -> int
+    print("=== SVG Comprehensive Demo ===")
+    print("Features:")
+    print("  - Click buttons to see state changes")
+    print("  - Toggle switch changes color on click")
+    print("  - Status light cycles through colors")
+    print("  - Use slider to resize the star")
+    print("  - Drag the orange box (click and drag)")
+    print("")
+
+    # Initialize UI with larger window
+    config: json = {
+        title: "SVG Comprehensive Demo",
+        width: 900,
+        height: 700,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    # Check if SVG module is available
+    if svg.is_available() == 0
+        print("SVG module not available - LunaSVG required")
+        ui.close()
+        return 1
+    ~
+
+    print("Loading SVG assets...")
+
+    # Load all SVG templates
+    btn_play = svg.load("examples/svg_assets/button_round.svg")
+    if btn_play == 0
+        print("Failed to load button_round.svg")
+        ui.close()
+        return 1
+    ~
+
+    box_drag = svg.load("examples/svg_assets/draggable_box.svg")
+    if box_drag == 0
+        print("Failed to load draggable_box.svg")
+        ui.close()
+        return 1
+    ~
+
+    star_resize = svg.load("examples/svg_assets/resizable_star.svg")
+    if star_resize == 0
+        print("Failed to load resizable_star.svg")
+        ui.close()
+        return 1
+    ~
+
+    toggle = svg.load("examples/svg_assets/toggle_switch.svg")
+    if toggle == 0
+        print("Failed to load toggle_switch.svg")
+        ui.close()
+        return 1
+    ~
+
+    status = svg.load("examples/svg_assets/status_light.svg")
+    if status == 0
+        print("Failed to load status_light.svg")
+        ui.close()
+        return 1
+    ~
+
+    print("All SVG assets loaded successfully!")
+    print("")
+    print("Play button: ")
+    print(svg.width(btn_play))
+    print(" x ")
+    print(svg.height(btn_play))
+
+    # Set up bindings for state-reactive colors
+    # Play button changes color when clicked
+    svg.bind(btn_play, "button", "fill", "playBtnColor")
+    svg.bind(btn_play, "ring", "stroke", "playBtnRing")
+
+    # Draggable box changes border color when dragging
+    svg.bind(box_drag, "border", "stroke", "boxBorderColor")
+    svg.bind(box_drag, "box", "fill", "boxFillColor")
+
+    # Star color binding
+    svg.bind(star_resize, "star", "fill", "starColor")
+
+    # Toggle switch track and knob position
+    svg.bind(toggle, "track", "fill", "toggleTrackColor")
+    svg.bind(toggle, "knob", "cx", "toggleKnobX")
+
+    # Status light color
+    svg.bind(status, "light", "fill", "statusLightColor")
+
+    # Register click events
+    svg.on_event(btn_play, "button", 1, "playClicked")
+    svg.on_event(box_drag, "box", 1, "boxClicked")
+    svg.on_event(toggle, "track", 1, "toggleClicked")
+    svg.on_event(status, "light", 1, "statusClicked")
+
+    # Initial state
+    state = "{\"playBtnColor\":\"#4a90d9\",\"playBtnRing\":\"#4a90d9\",\"boxBorderColor\":\"#d35400\",\"boxFillColor\":\"#e67e22\",\"starColor\":\"#f1c40f\",\"toggleTrackColor\":\"#95a5a6\",\"toggleKnobX\":\"20\",\"statusLightColor\":\"#27ae60\",\"starSize\":100,\"toggleOn\":false,\"statusIndex\":0,\"clickCount\":0,\"boxDragX\":0,\"boxDragY\":0,\"isDragging\":false}"
+
+    # Status light colors to cycle through
+    status_colors = ["#27ae60", "#e74c3c", "#f39c12", "#3498db", "#9b59b6"]
+
+    # Local tracking variables
+    play_active = 0
+    toggle_on = 0
+    status_idx = 0
+    click_count = 0
+    star_size = 100
+    # Accumulated drag position
+    box_offset_x = 0
+    box_offset_y = 0
+    # Current drag delta (added to offset while dragging)
+    drag_delta_x = 0
+    drag_delta_y = 0
+    # Total position = offset + delta (recalculated each frame)
+    box_drag_x = 0
+    box_drag_y = 0
+    is_dragging = 0
+
+    print("Starting main loop...")
+    print("Close the window to exit.")
+
+    # Main loop
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        # Build dynamic layout based on current state
+        # Note: star_size is controlled by the slider
+        layout: json = {
+            type: "window",
+            title: "SVG Comprehensive Demo",
+            children: [
+                # Header
+                {
+                    type: "text",
+                    text: "SVG Interactive Elements Demo",
+                    color: [0.4, 0.8, 1.0, 1.0]
+                },
+                { type: "separator" },
+
+                # Row 1: Play button and Toggle switch
+                {
+                    type: "row",
+                    children: [
+                        {
+                            type: "column",
+                            children: [
+                                { type: "text", text: "Play Button (click me)" },
+                                {
+                                    type: "svg_image",
+                                    id: "play_btn",
+                                    handle: btn_play,
+                                    width: 80,
+                                    height: 80
+                                },
+                                { type: "text", bind: "playStatus" }
+                            ]
+                        },
+                        { type: "spacing" },
+                        {
+                            type: "column",
+                            children: [
+                                { type: "text", text: "Toggle Switch (click to toggle)" },
+                                {
+                                    type: "svg_image",
+                                    id: "toggle_sw",
+                                    handle: toggle,
+                                    width: 80,
+                                    height: 40
+                                },
+                                { type: "text", bind: "toggleStatus" }
+                            ]
+                        },
+                        { type: "spacing" },
+                        {
+                            type: "column",
+                            children: [
+                                { type: "text", text: "Status Light (click to cycle)" },
+                                {
+                                    type: "svg_image",
+                                    id: "status_lt",
+                                    handle: status,
+                                    width: 60,
+                                    height: 60
+                                },
+                                { type: "text", bind: "statusStatus" }
+                            ]
+                        }
+                    ]
+                },
+
+                { type: "separator" },
+
+                # Row 2: Resizable Star with slider
+                {
+                    type: "text",
+                    text: "Resizable Star - Use slider to change size"
+                },
+                {
+                    type: "row",
+                    children: [
+                        {
+                            type: "svg_image",
+                            id: "star_img",
+                            handle: star_resize,
+                            width: star_size,
+                            height: star_size
+                        },
+                        { type: "spacing" },
+                        {
+                            type: "column",
+                            children: [
+                                { type: "text", text: "Star Size:" },
+                                {
+                                    type: "slider_int",
+                                    label: "##starsize",
+                                    id: "starSize",
+                                    min: 50,
+                                    max: 200
+                                },
+                                { type: "text", bind: "sizeStatus" }
+                            ]
+                        }
+                    ]
+                },
+
+                { type: "separator" },
+
+                # Row 3: Draggable box
+                {
+                    type: "text",
+                    text: "Draggable Box - Click and drag to move"
+                },
+                {
+                    type: "svg_image",
+                    id: "drag_box",
+                    handle: box_drag,
+                    width: 100,
+                    height: 100,
+                    offsetX: box_drag_x,
+                    offsetY: box_drag_y
+                },
+                { type: "text", bind: "dragStatus" },
+
+                { type: "separator" },
+
+                # Stats
+                {
+                    type: "row",
+                    children: [
+                        { type: "text", text: "Total clicks: " },
+                        { type: "text", bind: "clickCount" }
+                    ]
+                }
+            ]
+        }
+
+        # Update state with current values before render
+        parsed: json = json.parse(state)
+
+        # Set status text based on current state
+        if play_active == 1
+            parsed = parsed.set("playStatus", "PLAYING")
+        else
+            parsed = parsed.set("playStatus", "Stopped")
+        ~
+
+        if toggle_on == 1
+            parsed = parsed.set("toggleStatus", "ON")
+        else
+            parsed = parsed.set("toggleStatus", "OFF")
+        ~
+
+        parsed = parsed.set("statusStatus", "Color " + String.from(status_idx))
+        parsed = parsed.set("sizeStatus", "Size: " + String.from(star_size) + "px")
+        parsed = parsed.set("dragStatus", "Position offset: (" + String.from(box_drag_x) + ", " + String.from(box_drag_y) + ")")
+        parsed = parsed.set("clickCount", click_count)
+        parsed = parsed.set("starSize", star_size)
+
+        state = parsed.stringify()
+
+        # Render frame
+        state = ui.render(layout, state)
+
+        # Parse returned state to check for events and updates
+        parsed = json.parse(state)
+
+        # Check for slider update
+        if parsed.has("starSize")
+            new_size = parsed.get("starSize").as_int()
+            if new_size >= 50 and new_size <= 200
+                star_size := new_size
+            ~
+        ~
+
+        # Handle play button click
+        if parsed.has("playClicked")
+            click_count = click_count + 1
+            if play_active == 1
+                play_active = 0
+                parsed = parsed.set("playBtnColor", "#4a90d9")
+                parsed = parsed.set("playBtnRing", "#4a90d9")
+            else
+                play_active = 1
+                parsed = parsed.set("playBtnColor", "#27ae60")
+                parsed = parsed.set("playBtnRing", "#2ecc71")
+            ~
+            parsed = parsed.remove("playClicked")
+            state = parsed.stringify()
+        ~
+
+        # Handle toggle click
+        if parsed.has("toggleClicked")
+            click_count = click_count + 1
+            if toggle_on == 1
+                toggle_on = 0
+                parsed = parsed.set("toggleTrackColor", "#95a5a6")
+                parsed = parsed.set("toggleKnobX", "20")
+            else
+                toggle_on = 1
+                parsed = parsed.set("toggleTrackColor", "#27ae60")
+                parsed = parsed.set("toggleKnobX", "60")
+            ~
+            parsed = parsed.remove("toggleClicked")
+            state = parsed.stringify()
+        ~
+
+        # Handle status light click (cycle colors)
+        if parsed.has("statusClicked")
+            click_count = click_count + 1
+            status_idx = (status_idx + 1) % 5
+            new_color = status_colors.get(status_idx)
+            parsed = parsed.set("statusLightColor", new_color)
+            parsed = parsed.remove("statusClicked")
+            state = parsed.stringify()
+        ~
+
+        # Handle box drag using actual drag delta
+        if parsed.has("boxClicked_dragging")
+            # Currently dragging - show active state
+            if is_dragging == 0
+                # Just started dragging
+                is_dragging = 1
+                print("START drag, offset was: ")
+                print(box_offset_x)
+                parsed = parsed.set("boxBorderColor", "#f39c12")
+                parsed = parsed.set("boxFillColor", "#f1c40f")
+            ~
+
+            # Get current drag delta
+            if parsed.has("boxClicked_drag_dx")
+                drag_delta_x = parsed.get("boxClicked_drag_dx").as_int()
+            ~
+            if parsed.has("boxClicked_drag_dy")
+                drag_delta_y = parsed.get("boxClicked_drag_dy").as_int()
+            ~
+
+            # Position = accumulated offset + current drag delta
+            box_drag_x = box_offset_x + drag_delta_x
+            box_drag_y = box_offset_y + drag_delta_y
+        else
+            # Not dragging - check if we need to commit
+            if is_dragging == 1
+                # Drag just ended - commit the delta to the offset
+                print("END drag, delta was: ")
+                print(drag_delta_x)
+                box_offset_x = box_offset_x + drag_delta_x
+                box_offset_y = box_offset_y + drag_delta_y
+                print(" new offset: ")
+                print(box_offset_x)
+                drag_delta_x = 0
+                drag_delta_y = 0
+                is_dragging = 0
+                parsed = parsed.set("boxBorderColor", "#d35400")
+                parsed = parsed.set("boxFillColor", "#e67e22")
+            ~
+            # Always keep position at current offset when not dragging
+            box_drag_x = box_offset_x
+            box_drag_y = box_offset_y
+        ~
+
+        # Handle click event (fires when drag completes)
+        if parsed.has("boxClicked")
+            click_count = click_count + 1
+            parsed = parsed.remove("boxClicked")
+        ~
+
+        # Update state string for next frame
+        state = parsed.stringify()
+    ~
+
+    # Cleanup
+    print("")
+    print("Cleaning up...")
+    svg.destroy(btn_play)
+    svg.destroy(box_drag)
+    svg.destroy(star_resize)
+    svg.destroy(toggle)
+    svg.destroy(status)
+    ui.close()
+
+    print("Demo completed!")
+    print("Total clicks: ")
+    print(click_count)
+    return 0
+~

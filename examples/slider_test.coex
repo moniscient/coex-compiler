@@ -1,0 +1,67 @@
+# Minimal slider test
+
+import ui
+
+func main() -> int
+    print("=== Slider Test ===")
+
+    config: json = {
+        title: "Slider Test",
+        width: 400,
+        height: 200,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    state = "{\"mySlider\":50}"
+    frame_count = 0
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        layout: json = {
+            type: "window",
+            title: "Slider Test",
+            children: [
+                { type: "text", text: "Move the slider:" },
+                {
+                    type: "slider_int",
+                    label: "Value",
+                    id: "mySlider",
+                    min: 0,
+                    max: 100
+                },
+                { type: "text", bind: "status" }
+            ]
+        }
+
+        # Update status with current slider value before render
+        parsed: json = json.parse(state)
+        slider_val = parsed.get("mySlider").as_int()
+        parsed = parsed.set("status", "Slider value: " + String.from(slider_val))
+        state = parsed.stringify()
+
+        state = ui.render(layout, state)
+
+        # Print value every 60 frames
+        frame_count = frame_count + 1
+        if frame_count % 60 == 0
+            parsed = json.parse(state)
+            val = parsed.get("mySlider").as_int()
+            print("Frame ")
+            print(frame_count)
+            print(" - Slider: ")
+            print(val)
+        ~
+    ~
+
+    ui.close()
+    return 0
+~

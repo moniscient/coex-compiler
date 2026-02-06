@@ -1,0 +1,24 @@
+# Test module with float in JSON (like heapwatch progress bar)
+import ui
+
+func render_panel(value: int) -> int
+    str_val = String.from(value)
+
+    # Calculate a float like heapwatch does
+    pct = 0.0
+    if value > 0
+        pct = value / 100.0
+    ~
+
+    panel: json = {
+        type: "window",
+        title: "TestRender",
+        children: [
+            { type: "text", text: "Value: " + str_val },
+            { type: "separator" },
+            { type: "progress", fraction: pct }
+        ]
+    }
+    ui.render(panel, "{}")
+    return 1
+~

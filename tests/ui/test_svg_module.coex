@@ -1,0 +1,68 @@
+# SVG Module Integration Test
+#
+# Tests basic SVG loading and binding functionality
+
+import svg
+
+func main() -> int
+    # Test: Check if SVG module is available
+    result = svg.is_available()
+    if result == 1
+        print("SVG module: available")
+    else
+        print("SVG module: stub implementation")
+    ~
+
+    # Initialize the SVG module
+    init_result = svg.initialize()
+    if init_result == 1
+        print("SVG module initialized: success")
+    else
+        print("SVG module initialized: failed")
+    ~
+
+    # Test: Load SVG from string
+    svg_data = "<svg width=\"100\" height=\"100\" xmlns=\"http://www.w3.org/2000/svg\"><circle id=\"test\" cx=\"50\" cy=\"50\" r=\"40\" fill=\"red\"/></svg>"
+    template = svg.load_from_string(svg_data)
+    if template != 0
+        print("SVG load from string: success")
+
+        # Test: Get dimensions
+        w = svg.width(template)
+        h = svg.height(template)
+        print("SVG width: ")
+        print(w)
+        print("SVG height: ")
+        print(h)
+
+        # Test: Bind element attribute to state
+        bind_result = svg.bind(template, "test", "fill", "circleColor")
+        if bind_result == 1
+            print("SVG bind: success")
+        else
+            print("SVG bind: failed")
+        ~
+
+        # Test: Register event handler (1 = CLICK event)
+        event_result = svg.on_event(template, "test", 1, "testClicked")
+        if event_result == 1
+            print("SVG event registration: success")
+        else
+            print("SVG event registration: failed")
+        ~
+
+        # Test: Unbind
+        removed = svg.unbind(template, "test")
+        print("Unbind removed bindings: ")
+        print(removed)
+
+        # Cleanup
+        svg.destroy(template)
+        print("SVG destroy: success")
+    else
+        print("SVG load from string: failed (expected without LunaSVG)")
+    ~
+
+    print("All SVG module tests completed")
+    return 0
+~

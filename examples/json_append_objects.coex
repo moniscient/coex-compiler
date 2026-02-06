@@ -1,0 +1,23 @@
+# Test JSON append with objects
+func main() -> int
+    print("Testing JSON append with objects...")
+
+    # Build array dynamically
+    arr: json := []
+    print("Created empty array")
+
+    arr = arr.append({ name: "Alice" })
+    print("Appended Alice")
+
+    arr = arr.append({ name: "Bob" })
+    print("Appended Bob")
+
+    print("Array length: ")
+    print(arr.len())
+
+    print("Stringified: ")
+    print(arr.stringify())
+
+    print("Done!")
+    return 0
+~

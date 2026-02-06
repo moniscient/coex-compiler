@@ -1,0 +1,131 @@
+# Channel Throughput Benchmark
+#
+# Tests channel send/receive overhead with producer-consumer pattern.
+# Measures how many messages can be passed through a channel.
+
+# Task producer - sends N messages
+task task_producer(ch: Channel<int>, count: int) -> int
+    for i in 0..count
+        ch.send(i)
+    ~
+    return count
+~
+
+# Task consumer - receives N messages and sums them
+task task_consumer(ch: Channel<int>, count: int) -> int
+    total = 0
+    for i in 0..count
+        val = ch.receive()
+        total = total + val
+    ~
+    return total
+~
+
+# Thread producer
+thread thread_producer(ch: Channel<int>, count: int) -> int
+    for i in 0..count
+        ch.send(i)
+    ~
+    return count
+~
+
+# Thread consumer
+thread thread_consumer(ch: Channel<int>, count: int) -> int
+    total = 0
+    for i in 0..count
+        val = ch.receive()
+        total = total + val
+    ~
+    return total
+~
+
+# Run producer-consumer with tasks
+func run_task_bench(msg_count: int) -> int
+    ch: Channel<int> = Channel.new()
+
+    # Use first to run producer and consumer concurrently
+    # First will complete when one finishes (consumer gets all messages)
+    (results, errors) = most i in [0, 1]
+        if i == 0
+            task_producer(ch, msg_count)
+        else
+            task_consumer(ch, msg_count)
+        ~
+    ~
+
+    total = 0
+    for r in results
+        total = total + r
+    ~
+    return total
+~
+
+# Run producer-consumer with threads
+func run_thread_bench(msg_count: int) -> int
+    ch: Channel<int> = Channel.new()
+
+    # Spawn producer and consumer threads
+    prod_result = thread_producer(ch, msg_count)
+    cons_result = thread_consumer(ch, msg_count)
+
+    return prod_result + cons_result
+~
+
+func main() -> int
+    msg_count = 100000
+
+    print("Channel Throughput Benchmark")
+    print("============================")
+    print("Messages: 100000")
+    print("")
+
+    # Expected: producer sends count, consumer sums 0..count-1
+    # Sum of 0..99999 = 99999 * 100000 / 2 = 4999950000
+    expected_sum = 4999950000
+    expected_total = msg_count + expected_sum
+
+    print("Running with TASKS...")
+    start_task = posix.time()
+    task_result = run_task_bench(msg_count)
+    end_task = posix.time()
+    task_time = end_task - start_task
+
+    print("  Result: ")
+    print(task_result)
+    print("  Time (seconds): ")
+    print(task_time)
+    print("")
+
+    print("Running with THREADS...")
+    start_thread = posix.time()
+    thread_result = run_thread_bench(msg_count)
+    end_thread = posix.time()
+    thread_time = end_thread - start_thread
+
+    print("  Result: ")
+    print(thread_result)
+    print("  Time (seconds): ")
+    print(thread_time)
+    print("")
+
+    print("Comparison:")
+    print("  Task time (s): ")
+    print(task_time)
+    print("  Thread time (s): ")
+    print(thread_time)
+    print("")
+
+    if task_result == expected_total and thread_result == expected_total
+        print("PASS: Both correct")
+        return 0
+    else
+        print("Results:")
+        print("  Task: ")
+        print(task_result)
+        print("  Thread: ")
+        print(thread_result)
+        print("  Expected: ")
+        print(expected_total)
+        return 1
+    ~
+~

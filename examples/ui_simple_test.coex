@@ -1,0 +1,76 @@
+# Simple UI test to check if controls work
+
+import ui
+
+func main() -> int
+    print("=== Simple UI Test ===")
+
+    config: json = {
+        title: "Simple UI Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    state = "{\"sliderVal\":50,\"clickCount\":0}"
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        layout: json = {
+            type: "window",
+            title: "Test Window",
+            children: [
+                { type: "text", text: "Click the button or move the slider" },
+                {
+                    type: "button",
+                    label: "Click Me",
+                    id: "testBtn"
+                },
+                { type: "text", bind: "clickStatus" },
+                {
+                    type: "slider_int",
+                    label: "Test Slider",
+                    id: "sliderVal",
+                    min: 0,
+                    max: 100
+                },
+                { type: "text", bind: "sliderStatus" }
+            ]
+        }
+
+        # Update status text before render
+        parsed: json = json.parse(state)
+        click_count = parsed.get("clickCount").as_int()
+        slider_val = parsed.get("sliderVal").as_int()
+        parsed = parsed.set("clickStatus", "Clicks: " + String.from(click_count))
+        parsed = parsed.set("sliderStatus", "Slider: " + String.from(slider_val))
+        state = parsed.stringify()
+
+        # Render
+        state = ui.render(layout, state)
+
+        # Check for button click
+        parsed = json.parse(state)
+        if parsed.has("testBtn_clicked")
+            click_count = parsed.get("clickCount").as_int() + 1
+            parsed = parsed.set("clickCount", click_count)
+            parsed = parsed.remove("testBtn_clicked")
+            state = parsed.stringify()
+            print("Button clicked! Count: ")
+            print(click_count)
+        ~
+    ~
+
+    ui.close()
+    print("Test completed")
+    return 0
+~

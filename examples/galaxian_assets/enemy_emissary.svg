@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="28" height="24" xmlns="http://www.w3.org/2000/svg">
+  <!-- Enemy Emissary - Purple mid-tier alien -->
+  <!-- Body -->
+  <polygon id="body" points="14,0 28,16 24,24 4,24 0,16" fill="#9933cc"/>
+  <!-- Inner detail -->
+  <polygon points="14,4 22,14 20,20 8,20 6,14" fill="#cc66ff"/>
+  <!-- Eyes -->
+  <ellipse id="eyes" cx="10" cy="12" rx="3" ry="4" fill="#ff00ff"/>
+  <ellipse cx="18" cy="12" rx="3" ry="4" fill="#ff00ff"/>
+  <circle cx="10" cy="12" r="1.5" fill="#000000"/>
+  <circle cx="18" cy="12" r="1.5" fill="#000000"/>
+  <!-- Side spikes -->
+  <polygon points="0,16 -4,12 2,14" fill="#660099"/>
+  <polygon points="28,16 32,12 26,14" fill="#660099"/>
+</svg>

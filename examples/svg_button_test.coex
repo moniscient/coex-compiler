@@ -1,0 +1,91 @@
+# SVG + button test - no bindings
+
+import ui
+import svg
+
+func main() -> int
+    print("=== SVG + Button Test ===")
+
+    config: json = {
+        title: "SVG + Button Test",
+        width: 400,
+        height: 300,
+        theme: "dark"
+    }
+
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    if svg.is_available() == 0
+        print("SVG module not available")
+        ui.close()
+        return 1
+    ~
+
+    star = svg.load("examples/svg_assets/resizable_star.svg")
+    if star == 0
+        print("Failed to load SVG")
+        ui.close()
+        return 1
+    ~
+
+    print("SVG loaded")
+
+    state = "{\"count\":0}"
+    frame_count = 0
+
+    while true
+        if ui.should_close()
+            break
+        ~
+
+        layout: json = {
+            type: "window",
+            title: "Test",
+            children: [
+                { type: "text", text: "Click button to count" },
+                {
+                    type: "button",
+                    label: "Click Me",
+                    id: "btn"
+                },
+                { type: "text", bind: "status" },
+                {
+                    type: "svg_image",
+                    handle: star,
+                    width: 80,
+                    height: 80
+                }
+            ]
+        }
+
+        # Update status before render
+        parsed: json = json.parse(state)
+        count = parsed.get("count").as_int()
+        parsed = parsed.set("status", "Count: " + String.from(count))
+        state = parsed.stringify()
+
+        state = ui.render(layout, state)
+
+        # Check for click
+        parsed = json.parse(state)
+        if parsed.has("btn_clicked")
+            count = parsed.get("count").as_int() + 1
+            parsed = parsed.set("count", count)
+            parsed = parsed.remove("btn_clicked")
+            state = parsed.stringify()
+            print("Click! Count = ")
+            print(count)
+        ~
+
+        frame_count = frame_count + 1
+    ~
+
+    svg.destroy(star)
+    ui.close()
+    print("Done")
+    return 0
+~

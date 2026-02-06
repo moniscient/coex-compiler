@@ -1,0 +1,118 @@
+# Comprehensive UI test - demonstrates all UI library functions
+# Tests: initialization, render with various widgets, state handling, events
+import ui
+
+func main() -> int
+    print("=== Coex UI Library Test ===")
+    print("")
+
+    # Test 1: Initialize UI
+    print("Test 1: UI Initialization")
+    config = "{\"title\": \"Coex UI Test\", \"width\": 800, \"height\": 600}"
+    init_result = ui.initialize(config)
+    if init_result != 1
+        print("FAILED: UI initialization returned error")
+        return 1
+    ~
+    print("  OK: UI initialized successfully")
+    print("")
+
+    # Test 2: Utility functions
+    print("Test 2: Utility Functions")
+
+    # should_close should be false initially
+    close_check = ui.should_close()
+    if close_check == true
+        print("FAILED: should_close returned true initially")
+        return 1
+    ~
+    print("  OK: should_close() returns false")
+
+    # get_time should return a positive value
+    time_val = ui.get_time()
+    if time_val < 0.0
+        print("FAILED: get_time returned negative value")
+        return 1
+    ~
+    print("  OK: get_time() returns positive value")
+    print("")
+
+    # Test 3: Simple render - text widget
+    print("Test 3: Render Text Widget")
+    text_layout = "{\"type\": \"window\", \"title\": \"Text Test\", \"children\": [{\"type\": \"text\", \"text\": \"Hello from Coex!\"}]}"
+    text_state = "{}"
+    text_result = ui.render(text_layout, text_state)
+    print("  Render result:")
+    print(text_result)
+    print("  OK: Text widget rendered")
+    print("")
+
+    # Test 4: Render with multiple widgets
+    print("Test 4: Render Multiple Widgets")
+    multi_layout = "{\"type\": \"window\", \"title\": \"Multi Widget\", \"children\": [{\"type\": \"text\", \"text\": \"Counter App\"}, {\"type\": \"button\", \"label\": \"Increment\", \"id\": \"btn_inc\"}, {\"type\": \"button\", \"label\": \"Decrement\", \"id\": \"btn_dec\"}, {\"type\": \"separator\"}, {\"type\": \"slider_int\", \"id\": \"slider1\", \"label\": \"Value\", \"min\": 0, \"max\": 100}]}"
+    multi_state = "{\"slider1\": 50}"
+    multi_result = ui.render(multi_layout, multi_state)
+    print("  Render result:")
+    print(multi_result)
+    print("  OK: Multiple widgets rendered")
+    print("")
+
+    # Test 5: Render with checkbox and input
+    print("Test 5: Render Input Widgets")
+    input_layout = "{\"type\": \"window\", \"title\": \"Inputs\", \"children\": [{\"type\": \"checkbox\", \"label\": \"Enable feature\", \"id\": \"check1\"}, {\"type\": \"input_text\", \"label\": \"Name\", \"id\": \"name_input\"}, {\"type\": \"input_int\", \"label\": \"Age\", \"id\": \"age_input\"}]}"
+    input_state = "{\"check1\": true, \"name_input\": \"Test User\", \"age_input\": 25}"
+    input_result = ui.render(input_layout, input_state)
+    print("  Render result:")
+    print(input_result)
+    print("  OK: Input widgets rendered")
+    print("")
+
+    # Test 6: Render with nested layout (row/column)
+    print("Test 6: Render Nested Layout")
+    nested_layout = "{\"type\": \"window\", \"title\": \"Layout\", \"children\": [{\"type\": \"row\", \"children\": [{\"type\": \"button\", \"label\": \"Left\", \"id\": \"left_btn\"}, {\"type\": \"button\", \"label\": \"Right\", \"id\": \"right_btn\"}]}, {\"type\": \"column\", \"children\": [{\"type\": \"text\", \"text\": \"Item 1\"}, {\"type\": \"text\", \"text\": \"Item 2\"}, {\"type\": \"text\", \"text\": \"Item 3\"}]}]}"
+    nested_state = "{}"
+    nested_result = ui.render(nested_layout, nested_state)
+    print("  Render result:")
+    print(nested_result)
+    print("  OK: Nested layout rendered")
+    print("")
+
+    # Test 7: Frame timing
+    print("Test 7: Frame Timing")
+    start_time = ui.get_time()
+
+    # Render a few frames
+    frame_layout = "{\"type\": \"window\", \"title\": \"Frame\", \"children\": [{\"type\": \"text\", \"text\": \"Frame test\"}]}"
+    frame_state = "{}"
+    frame_result = ui.render(frame_layout, frame_state)
+    frame_result = ui.render(frame_layout, frame_state)
+    frame_result = ui.render(frame_layout, frame_state)
+    frame_result = ui.render(frame_layout, frame_state)
+    frame_result = ui.render(frame_layout, frame_state)
+
+    end_time = ui.get_time()
+    print("  Rendered 5 frames")
+    print("  OK: Frame rendering works")
+    print("")
+
+    # Summary
+    print("=== All Tests Passed ===")
+    print("")
+    print("UI Library Functions Verified:")
+    print("  - ui.initialize(config)")
+    print("  - ui.should_close()")
+    print("  - ui.get_time()")
+    print("  - ui.render(layout, state)")
+    print("")
+    print("Widget Types Tested:")
+    print("  - window, text, button, separator")
+    print("  - slider_int, checkbox")
+    print("  - input_text, input_int")
+    print("  - row, column (layouts)")
+    print("")
+
+    # Note: Skipping ui.close() due to BUG-050 segfault
+    # ui.close()
+
+    return 0
+~

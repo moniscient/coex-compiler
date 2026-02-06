@@ -269,6 +269,7 @@ class GarbageCollector:
         self.gc_snapshot = None
         self.gc_thread_handle = None
         self.gc_trigger_requested = None
+        self.gc_compact_requested = None
         self.gc_thread_running = None
 
         # Pthread functions
@@ -737,6 +738,12 @@ class GarbageCollector:
         self.gc_trigger_requested = ir.GlobalVariable(self.module, self.i64, name="gc_trigger_requested")
         self.gc_trigger_requested.initializer = ir.Constant(self.i64, 0)
         self.gc_trigger_requested.linkage = 'internal'
+
+        # GC compact requested flag - set by mutators to request compaction
+        # GC thread checks this after collection to decide whether to compact
+        self.gc_compact_requested = ir.GlobalVariable(self.module, self.i64, name="gc_compact_requested")
+        self.gc_compact_requested.initializer = ir.Constant(self.i64, 0)
+        self.gc_compact_requested.linkage = 'internal'
 
         # GC thread running flag - set to 0 to stop the GC thread
         self.gc_thread_running = ir.GlobalVariable(self.module, self.i64, name="gc_thread_running")
@@ -5063,6 +5070,12 @@ class GarbageCollector:
         check_trigger = func.append_basic_block("check_trigger")
         wait_for_trigger = func.append_basic_block("wait_for_trigger")
         do_collection = func.append_basic_block("do_collection")
+        check_compact = func.append_basic_block("check_compact")
+        poison_prev = func.append_basic_block("poison_prev")
+        after_poison = func.append_basic_block("after_poison")
+        maybe_compact = func.append_basic_block("maybe_compact")
+        do_compact = func.append_basic_block("do_compact")
+        after_compact = func.append_basic_block("after_compact")
         signal_done = func.append_basic_block("signal_done")
         exit_thread = func.append_basic_block("exit_thread")
 
@@ -5100,6 +5113,9 @@ class GarbageCollector:
         # Do collection
         builder.position_at_end(do_collection)
 
+        # Load gc_compact_requested into a local BEFORE clearing trigger
+        compact_requested = builder.load(self.gc_compact_requested)
+
         # Clear trigger flag before collection (prevents re-trigger during collection)
         builder.store(ir.Constant(self.i64, 0), self.gc_trigger_requested)
 
@@ -5107,10 +5123,54 @@ class GarbageCollector:
         mutex_ptr3 = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
 
+        # Check if compact was requested — if so, poison prev buffer before collect
+        builder.branch(check_compact)
+
+        builder.position_at_end(check_compact)
+        wants_compact = builder.icmp_unsigned("!=", compact_requested, ir.Constant(self.i64, 0))
+        builder.cbranch(wants_compact, poison_prev, after_poison)
+
+        # Poison the previous compact buffer's live_count BEFORE gc_collect.
+        # During gc_collect's sweep, objects in the prev compact buffer may die,
+        # which decrements live_count. If live_count reaches 0, sweep will
+        # munmap the buffer. But gc_compact_impl needs it alive to copy from.
+        # The sentinel value prevents live_count from ever reaching 0.
+        builder.position_at_end(poison_prev)
+        prev_compact = builder.load(self.gc_compact_prev_buffer)
+        prev_compact_int = builder.ptrtoint(prev_compact, self.i64)
+        has_prev = builder.icmp_unsigned('!=', prev_compact_int, ir.Constant(self.i64, 0))
+        poison_do = func.append_basic_block("poison_do")
+        builder.cbranch(has_prev, poison_do, after_poison)
+
+        builder.position_at_end(poison_do)
+        prev_hdr = builder.bitcast(prev_compact, self.tlab_header_type.as_pointer())
+        prev_live_ptr = builder.gep(prev_hdr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0x7FFFFFFFFFFFFFFF), prev_live_ptr)
+        builder.branch(after_poison)
+
+        # After optional poisoning, run gc_collect
+        builder.position_at_end(after_poison)
+
         # Run the collection - gc_collect handles all marking and sweeping
         # It also handles gc_phase transitions and watermark resets
         builder.call(self.gc_collect, [])
 
+        # After collection, check if we need to compact
+        builder.branch(maybe_compact)
+
+        builder.position_at_end(maybe_compact)
+        wants_compact2 = builder.icmp_unsigned("!=", compact_requested, ir.Constant(self.i64, 0))
+        builder.cbranch(wants_compact2, do_compact, after_compact)
+
+        # Run compaction and clear the flag
+        builder.position_at_end(do_compact)
+        builder.call(self.gc_compact_impl, [])
+        builder.store(ir.Constant(self.i64, 0), self.gc_compact_requested)
+        builder.branch(after_compact)
+
+        builder.position_at_end(after_compact)
         builder.branch(signal_done)
 
         # Signal completion to any waiting threads
@@ -10659,43 +10719,29 @@ class GarbageCollector:
     def _implement_gc_compact(self):
         """User-facing gc_compact() builtin.
 
-        Runs gc_collect() first to get a clean live set (dead objects are
-        swept away), then runs gc_compact_impl() to compact survivors.
+        Sets gc_compact_requested and gc_trigger_requested flags, then signals
+        the GC thread to wake up. The GC thread will handle poisoning the prev
+        buffer, running gc_collect(), and running gc_compact_impl().
 
-        IMPORTANT: Poisons the previous compact buffer's live_count BEFORE
-        gc_collect, so the sweep phase won't munmap it (live_count can never
-        reach 0 with a sentinel value). gc_compact_impl handles the actual
-        freeing of the prev buffer after copying objects out.
+        Same pattern as gc_async — never runs collection or compaction in the
+        calling thread.
         """
         func = self.gc_compact
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # Poison the previous compact buffer's live_count BEFORE gc_collect.
-        # During gc_collect's sweep, objects in the prev compact buffer may die,
-        # which decrements live_count. If live_count reaches 0, sweep will
-        # munmap the buffer. But gc_compact_impl needs it alive to copy from.
-        # The sentinel value prevents live_count from ever reaching 0.
-        prev_compact = builder.load(self.gc_compact_prev_buffer)
-        prev_compact_int = builder.ptrtoint(prev_compact, self.i64)
-        has_prev = builder.icmp_unsigned('!=', prev_compact_int, ir.Constant(self.i64, 0))
-        poison_block = func.append_basic_block("poison_prev")
-        after_poison = func.append_basic_block("after_poison")
-        builder.cbranch(has_prev, poison_block, after_poison)
+        # Set compact requested flag so GC thread knows to compact after collection
+        builder.store(ir.Constant(self.i64, 1), self.gc_compact_requested)
 
-        builder.position_at_end(poison_block)
-        prev_hdr = builder.bitcast(prev_compact, self.tlab_header_type.as_pointer())
-        prev_live_ptr = builder.gep(prev_hdr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0x7FFFFFFFFFFFFFFF), prev_live_ptr)
-        builder.branch(after_poison)
+        # Set trigger flag to request collection (compact requires collect first)
+        builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
 
-        builder.position_at_end(after_poison)
+        # Signal the GC thread to wake up
+        mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [mutex_ptr])
+        cond_start = builder.load(self.gc_cond_start)
+        builder.call(self.pthread_cond_signal, [cond_start])
+        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
 
-        # Run GC first to ensure clean live set
-        builder.call(self.gc_collect, [])
-        # Then compact survivors
-        builder.call(self.gc_compact_impl, [])
         builder.ret_void()

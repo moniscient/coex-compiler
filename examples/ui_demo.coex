@@ -1,0 +1,51 @@
+#@ [MOVE] Variable 'new_state' is not used after this assignment. Consider: state := new_state (move instead of copy)
+# Interactive UI Demo
+# Run this and interact with the window!
+import ui
+
+func main() -> int
+    print("Starting UI Demo...")
+    print("Close the window to exit.")
+
+    # Initialize UI
+    config = "{\"title\": \"Coex UI Demo\", \"width\": 500, \"height\": 400}"
+    result = ui.initialize(config)
+    if result != 1
+        print("Failed to initialize UI")
+        return 1
+    ~
+
+    # Layout with interactive widgets
+    layout = "{\"type\": \"window\", \"title\": \"Coex UI Demo\", \"children\": [{\"type\": \"text\", \"text\": \"Welcome to Coex UI!\"}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Counter:\"}, {\"type\": \"row\", \"children\": [{\"type\": \"button\", \"label\": \"- Decrease\", \"id\": \"dec_btn\"}, {\"type\": \"button\", \"label\": \"+ Increase\", \"id\": \"inc_btn\"}]}, {\"type\": \"separator\"}, {\"type\": \"slider_int\", \"id\": \"slider1\", \"label\": \"Slider Value\", \"min\": 0, \"max\": 100}, {\"type\": \"checkbox\", \"label\": \"Enable Feature\", \"id\": \"check1\"}, {\"type\": \"input_text\", \"label\": \"Your Name\", \"id\": \"name_input\"}, {\"type\": \"separator\"}, {\"type\": \"text\", \"text\": \"Try clicking buttons and moving the slider!\"}]}"
+
+    # Initial state
+    state = "{\"slider1\": 50, \"check1\": false, \"name_input\": \"User\"}"
+
+    # Main loop - render frames until window closes
+    frame_count = 0
+    max_frames = 500
+
+    while frame_count < max_frames
+        # Check if we should close
+        if ui.should_close()
+            print("Window closed by user")
+            break
+        ~
+
+        # Render frame
+        new_state = ui.render(layout, state)
+        state = new_state
+
+        frame_count = frame_count + 1
+    ~
+
+    if frame_count >= max_frames
+        print("Demo complete - 500 frames rendered")
+    ~
+
+    print("Final state:")
+    print(state)
+    print("Demo finished!")
+
+    return 0
+~
