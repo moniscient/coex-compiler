@@ -42,17 +42,6 @@
 
 -->
 
-### BUG-015: Non-blocking safepoints require shadow stack changes
-- **Discovered**: 2025-01-17, during codebase scan
-- **Category**: GC
-- **Severity**: Medium
-- **Reproduction**: Run concurrent GC with multiple threads doing work
-- **Observed**: Threads serialize at safepoints, blocking each other
-- **Expected**: Safepoints should be non-blocking for better concurrency
-- **Hypothesis**: Current shadow stack design requires stop-the-world synchronization
-- **Files**: `coex_gc.py`, `implementation_prompts/phase1_nonblocking_safepoints.md`
-- **Status**: Open (enhancement)
-
 ### BUG-023: llvmlite thread_local attribute silently ignored
 - **Discovered**: 2025-01-17, during codebase scan
 - **Category**: Codegen
@@ -106,28 +95,6 @@
 - **Expected**: TBD - review if lock-free channel is feasible
 - **Hypothesis**: Required for blocking receive; could use lock-free for send
 - **Files**: `runtime/coex_channel.h:63-64`, `runtime/coex_channel.c:172-174, 184-216, 222-265, 272-274`
-- **Status**: Open (under review)
-
-### BUG-043: GC main mutex for handle allocation
-- **Discovered**: 2026-01-18, during lock audit
-- **Category**: GC
-- **Severity**: Medium (review for necessity)
-- **Reproduction**: Handle allocation slow path, async GC coordination
-- **Observed**: Uses `gc_mutex` at `coex_gc.py:568`
-- **Expected**: TBD - review scope of mutex protection
-- **Hypothesis**: Protects handle table growth, free list refill, GC coordination
-- **Files**: `coex_gc.py:568, 1426-1428, 1956-1985, 2258-2262, 3925-3967, 4085-4212, 7792-7855`
-- **Status**: Open (under review)
-
-### BUG-044: GC registry mutex for thread tracking
-- **Discovered**: 2026-01-18, during lock audit
-- **Category**: GC
-- **Severity**: Low (review for necessity)
-- **Reproduction**: Thread registration/unregistration during GC
-- **Observed**: Uses `gc_registry_mutex` at `coex_gc.py:696-699`
-- **Expected**: TBD - protects thread registry during iteration
-- **Hypothesis**: Required for safe iteration while threads register/unregister
-- **Files**: `coex_gc.py:696-699, 1514-1519, 1747-1765, 1817-1888, 3032-3198, 3326-3372, 5578-5930, 6376-6480`
 - **Status**: Open (under review)
 
 
@@ -235,4 +202,18 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-103**
+### BUG-103: gc_compact() crashes with memory corruption in game loop
+- **Discovered**: 2026-02-05, during compiling and running galaxian.coex
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Compile and run `examples/galaxian.coex` with `gc_compact()` enabled (line 234). Crashes on first frame.
+- **Observed**: Abort trap on thread #2. Two crash signatures: (1) `coex_gc_mark_object` EXC_BAD_ACCESS at invalid address during mark phase, (2) `malloc: pointer being freed was not allocated` during compaction. The GC background thread corrupts object pointers when `gc_compact_impl` copies live objects to a new buffer.
+- **Expected**: `gc_compact()` should safely compact the heap without corrupting pointers or freeing invalid memory.
+- **Hypothesis**: The compactor's pointer fixup is not correctly updating all references. Possible causes: (a) handle table entries not updated after objects move, (b) stale pointers in shadow stack frames, (c) race condition between compaction on thread #2 and allocation on thread #1, (d) objects allocated by the C runtime (cJSON, ImGui) being treated as GC-managed objects during sweep.
+- **Files**: `coex_gc.py` (functions: `_implement_gc_compact_impl`, `_implement_gc_compact`, `_implement_gc_compact_deferred_cleanup`)
+- **Status**: Open
+- **Workaround**: Comment out `gc_compact()` in game loop. Note: `gc()` also has known crash issues (commented out in galaxian.coex).
+
+---
+
+**Next valid BUG ID: BUG-104**

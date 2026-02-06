@@ -679,6 +679,12 @@ class GarbageCollector:
         self.gc_handle_retired_list.initializer = ir.Constant(self.i64, 0)
         self.gc_handle_retired_list.linkage = 'internal'
 
+        # Flag to prevent concurrent handle table growth (CAS-based)
+        # 0 = not growing, 1 = a thread is growing the table
+        self.gc_table_growing = ir.GlobalVariable(self.module, self.i64, name="gc_table_growing")
+        self.gc_table_growing.initializer = ir.Constant(self.i64, 0)
+        self.gc_table_growing.linkage = 'internal'
+
         # ============================================================
         # Dual-heap async GC globals
         # ============================================================
@@ -842,10 +848,19 @@ class GarbageCollector:
         self.gc_thread_count.linkage = 'internal'
 
         # Mutex for registry modifications (pointer to allocated mutex)
+        # NOTE: Only used by diagnostic builtins (gc_dump_heap, gc_validate_handle_storage)
+        # Mutator paths and GC thread use lock-free CAS operations instead.
         self.gc_registry_mutex = ir.GlobalVariable(
             self.module, self.i8_ptr, name="gc_registry_mutex")
         self.gc_registry_mutex.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_registry_mutex.linkage = 'internal'
+
+        # Dead thread list for deferred cleanup (CAS-based LIFO)
+        # Threads mark themselves dead and CAS-append here; GC thread cleans up
+        self.gc_dead_threads = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_dead_threads")
+        self.gc_dead_threads.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_dead_threads.linkage = 'internal'
 
         # GC phase: 0=idle, 1=watermark, 2=marking, 3=sweeping
         self.gc_phase = ir.GlobalVariable(
@@ -2260,25 +2275,33 @@ class GarbageCollector:
         builder.store(first_segment, self.tls_segment_current)
         builder.store(ir.Constant(self.i64, 0), self.tls_slot_index)
 
-        # Lock registry mutex
-        mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex])
+        # CAS-based prepend to registry (lock-free)
+        # new_entry->next = load(gc_thread_registry)
+        # CAS(gc_thread_registry, old_head, new_entry) - retry on failure
+        cas_loop = func.append_basic_block("cas_registry_loop")
+        cas_done_reg = func.append_basic_block("cas_registry_done")
 
-        # Prepend to registry: new_entry->next = gc_thread_registry
         old_head = builder.load(self.gc_thread_registry)
         old_head_i8 = builder.bitcast(old_head, self.i8_ptr)
         builder.store(old_head_i8, next_ptr)
+        builder.branch(cas_loop)
 
-        # gc_thread_registry = new_entry
-        builder.store(new_entry, self.gc_thread_registry)
+        builder.position_at_end(cas_loop)
+        # Read current head for CAS
+        expected_head = builder.load(self.gc_thread_registry)
+        expected_i8 = builder.bitcast(expected_head, self.i8_ptr)
+        # Update our next pointer to current head
+        builder.store(expected_i8, next_ptr)
+        # Try CAS: gc_thread_registry = new_entry (if still == expected_head)
+        cas_result = builder.cmpxchg(
+            self.gc_thread_registry, expected_head, new_entry,
+            'acq_rel', 'acquire')
+        cas_success = builder.extract_value(cas_result, 1)
+        builder.cbranch(cas_success, cas_done_reg, cas_loop)
 
-        # Increment thread count
-        count = builder.load(self.gc_thread_count)
-        new_count = builder.add(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.gc_thread_count)
-
-        # Unlock registry mutex
-        builder.call(self.pthread_mutex_unlock, [mutex])
+        builder.position_at_end(cas_done_reg)
+        # Atomically increment thread count
+        builder.atomic_rmw('add', self.gc_thread_count, ir.Constant(self.i64, 1), 'acq_rel')
 
         # Store in pthread TLS (see BUG-023 for llvmlite TLS issue)
         tls_key = builder.load(self.tls_thread_entry_key)
@@ -2295,21 +2318,17 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_unregister_thread(self):
-        """Unregister the calling thread from the GC.
+        """Unregister the calling thread from the GC (lock-free).
 
-        Removes the ThreadEntry from the registry and frees it.
-        Must be called before thread exit, after all handles are dropped.
+        Uses deferred deletion: marks the ThreadEntry as dead (watermark_active = 0xDEAD),
+        CAS-appends it to gc_dead_threads for the GC thread to clean up.
+        Frees thread-local resources (segments, handles) without holding any mutex.
         """
         func = self.gc_unregister_thread
 
         entry = func.append_basic_block("entry")
         not_registered = func.append_basic_block("not_registered")
         do_unregister = func.append_basic_block("do_unregister")
-        found_at_head = func.append_basic_block("found_at_head")
-        search_loop = func.append_basic_block("search_loop")
-        search_check = func.append_basic_block("search_check")
-        found_in_list = func.append_basic_block("found_in_list")
-        search_next = func.append_basic_block("search_next")
         cleanup = func.append_basic_block("cleanup")
 
         builder = ir.IRBuilder(entry)
@@ -2327,81 +2346,46 @@ class GarbageCollector:
         builder.position_at_end(not_registered)
         builder.ret_void()
 
-        # Do unregistration
+        # Do unregistration - mark dead and defer removal
         builder.position_at_end(do_unregister)
 
-        # Lock registry mutex
-        mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex])
+        # Mark as dead: watermark_active = 0xDEAD (sentinel value)
+        wm_active_ptr = builder.gep(my_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0xDEAD), wm_active_ptr)
 
-        # Check if at head of list
-        head = builder.load(self.gc_thread_registry)
-        head_int = builder.ptrtoint(head, self.i64)
-        is_head = builder.icmp_unsigned('==', head_int, my_entry_int)
-        builder.cbranch(is_head, found_at_head, search_loop)
+        # Atomically decrement thread count
+        builder.atomic_rmw('sub', self.gc_thread_count, ir.Constant(self.i64, 1), 'acq_rel')
 
-        # Found at head - remove
-        builder.position_at_end(found_at_head)
+        # CAS-append to gc_dead_threads list (using the entry's next field)
+        # We reuse field 11 (next) for the dead list linkage
+        dead_cas_loop = func.append_basic_block("dead_cas_loop")
+        dead_cas_done = func.append_basic_block("dead_cas_done")
+
         my_next_ptr = builder.gep(my_entry, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
         ], inbounds=True)
-        next_entry_i8 = builder.load(my_next_ptr)
-        next_entry = builder.bitcast(next_entry_i8, self.thread_entry_type.as_pointer())
-        builder.store(next_entry, self.gc_thread_registry)
+        my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
+
+        builder.branch(dead_cas_loop)
+
+        builder.position_at_end(dead_cas_loop)
+        old_dead_head = builder.load(self.gc_dead_threads)
+        # Set our next to current dead list head
+        builder.store(old_dead_head, my_next_ptr)
+        # CAS: gc_dead_threads = my_entry (if still == old_dead_head)
+        dead_cas = builder.cmpxchg(
+            self.gc_dead_threads, old_dead_head, my_entry_i8,
+            'acq_rel', 'acquire')
+        dead_cas_ok = builder.extract_value(dead_cas, 1)
+        builder.cbranch(dead_cas_ok, dead_cas_done, dead_cas_loop)
+
+        builder.position_at_end(dead_cas_done)
         builder.branch(cleanup)
 
-        # Search for entry in list - use alloca for prev tracking
-        builder.position_at_end(search_loop)
-        prev_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="prev")
-        builder.store(head, prev_alloca)
-        builder.branch(search_check)
-
-        # Check current position
-        builder.position_at_end(search_check)
-        prev_val = builder.load(prev_alloca)
-        prev_next_ptr = builder.gep(prev_val, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
-        ], inbounds=True)
-        curr_i8 = builder.load(prev_next_ptr)
-        curr = builder.bitcast(curr_i8, self.thread_entry_type.as_pointer())
-
-        # Check if curr is null (not found - shouldn't happen)
-        curr_int = builder.ptrtoint(curr, self.i64)
-        curr_is_null = builder.icmp_unsigned('==', curr_int, ir.Constant(self.i64, 0))
-        is_mine = builder.icmp_unsigned('==', curr_int, my_entry_int)
-
-        # If curr is null, go to cleanup (shouldn't happen)
-        with builder.if_then(curr_is_null):
-            builder.branch(cleanup)
-
-        # Check if we found our entry
-        builder.cbranch(is_mine, found_in_list, search_next)
-
-        # Found in list - unlink
-        builder.position_at_end(found_in_list)
-        my_next_ptr2 = builder.gep(my_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
-        ], inbounds=True)
-        my_next = builder.load(my_next_ptr2)
-        # prev->next = my->next
-        builder.store(my_next, prev_next_ptr)
-        builder.branch(cleanup)
-
-        # Continue search
-        builder.position_at_end(search_next)
-        builder.store(curr, prev_alloca)
-        builder.branch(search_check)
-
-        # Cleanup
+        # Cleanup - free thread-local resources
         builder.position_at_end(cleanup)
-
-        # Decrement thread count
-        count = builder.load(self.gc_thread_count)
-        new_count = builder.sub(count, ir.Constant(self.i64, 1))
-        builder.store(new_count, self.gc_thread_count)
-
-        # Unlock mutex
-        builder.call(self.pthread_mutex_unlock, [mutex])
 
         # ============================================================
         # Free segment chain (Phase 5)
@@ -2450,7 +2434,7 @@ class GarbageCollector:
         builder.position_at_end(seg_done)
 
         # ============================================================
-        # Return unused handles from pool to free list (Phase 7)
+        # Return unused handles from pool to free list (CAS-based, lock-free)
         # ============================================================
         # If pool_next < pool_end, there are unused handles we should return
         return_handles = func.append_basic_block("return_handles")
@@ -2469,43 +2453,51 @@ class GarbageCollector:
         has_unused = builder.icmp_unsigned("<", pool_next_val, pool_end_val)
         builder.cbranch(has_unused, return_handles, return_done)
 
-        # Lock gc_mutex to safely modify free list
+        # Return handles using CAS pushes to free list (no mutex)
         builder.position_at_end(return_handles)
-        gc_mutex = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [gc_mutex])
-
-        # Allocate loop variable
         ret_idx_alloca = builder.alloca(self.i64, name="ret_idx")
         builder.store(pool_next_val, ret_idx_alloca)
         builder.branch(return_loop)
 
-        # Return each unused handle to free list
+        # Return each unused handle to free list via CAS
         builder.position_at_end(return_loop)
         ret_idx = builder.load(ret_idx_alloca)
         done_returning = builder.icmp_unsigned(">=", ret_idx, pool_end_val)
 
         return_one = func.append_basic_block("return_one")
-        unlock_and_done = func.append_basic_block("unlock_and_done")
+        builder.cbranch(done_returning, return_done, return_one)
 
-        builder.cbranch(done_returning, unlock_and_done, return_one)
-
-        # Return one handle to free list
+        # CAS-push one handle to free list
         builder.position_at_end(return_one)
-        builder.call(self.gc_handle_free, [ret_idx])
-        next_idx = builder.add(ret_idx, ir.Constant(self.i64, 1))
+        cas_push_loop = func.append_basic_block("cas_push_loop")
+        cas_push_done = func.append_basic_block("cas_push_done")
+        builder.branch(cas_push_loop)
+
+        builder.position_at_end(cas_push_loop)
+        old_free_head = builder.load(self.gc_handle_free_list)
+        table_ret = builder.load(self.gc_handle_table)
+        ret_idx_val = builder.load(ret_idx_alloca)
+        slot_ptr_ret = builder.gep(table_ret, [ret_idx_val])
+        old_head_as_ptr = builder.inttoptr(old_free_head, self.i8_ptr)
+        builder.store(old_head_as_ptr, slot_ptr_ret)
+        # CAS: gc_handle_free_list = ret_idx (if still == old_free_head)
+        free_cas = builder.cmpxchg(
+            self.gc_handle_free_list, old_free_head, ret_idx_val,
+            'acq_rel', 'acquire')
+        free_cas_ok = builder.extract_value(free_cas, 1)
+        builder.cbranch(free_cas_ok, cas_push_done, cas_push_loop)
+
+        builder.position_at_end(cas_push_done)
+        next_idx = builder.add(ret_idx_val, ir.Constant(self.i64, 1))
         builder.store(next_idx, ret_idx_alloca)
         builder.branch(return_loop)
 
-        # Done returning - unlock mutex
-        builder.position_at_end(unlock_and_done)
-        builder.call(self.pthread_mutex_unlock, [gc_mutex])
-        builder.branch(return_done)
-
         builder.position_at_end(return_done)
 
-        # Free ThreadEntry
-        my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
-        builder.call(self.codegen.free, [my_entry_i8])
+        # NOTE: ThreadEntry memory is NOT freed here. It stays in the dead list
+        # and will be cleaned up by the GC thread in gc_collect's dead-entry pass.
+        # This is safe because the entry is marked dead (0xDEAD) and won't be
+        # scanned for roots.
 
         # Clear pthread TLS
         tls_key2 = builder.load(self.tls_thread_entry_key)
@@ -2784,14 +2776,10 @@ class GarbageCollector:
         builder.branch(have_block_tlab)
 
         # ============================================================
-        # Fallback to mutex-protected malloc (slow path)
+        # Fallback to malloc (slow path - malloc is thread-safe on POSIX)
         # ============================================================
         builder.position_at_end(fallback_malloc)
-        # Lock mutex for malloc fallback
-        mutex_ptr = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
         malloc_block = builder.call(self.codegen.malloc, [aligned_size])
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
         builder.store(malloc_block, block_alloca)
         builder.store(ir.Constant(self.i64, 0), is_tlab_alloca)  # Not TLAB allocation
         builder.branch(have_block_malloc)
@@ -3797,9 +3785,10 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # Lock registry for iteration (brief hold)
-        mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex])
+        # No registry mutex needed - GC thread is sole remover of dead entries.
+        # CAS-based insertion only modifies head pointer. Interior next pointers
+        # are only modified by GC thread. New entries at head are either seen
+        # (scanned) or not (birth-marking protects their allocations).
 
         # Allocate storage for current thread pointer
         curr_thread_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
@@ -3827,6 +3816,21 @@ class GarbageCollector:
 
         # Process this thread - scan its segmented shadow stack
         builder.position_at_end(process_thread)
+
+        # Skip dead entries (watermark_active == 0xDEAD)
+        skip_dead = func.append_basic_block("skip_dead_scan")
+        scan_live = func.append_basic_block("scan_live")
+        wm_active_check_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_active_val = builder.load(wm_active_check_ptr)
+        is_dead = builder.icmp_unsigned('==', wm_active_val, ir.Constant(self.i64, 0xDEAD))
+        builder.cbranch(is_dead, skip_dead, scan_live)
+
+        builder.position_at_end(skip_dead)
+        builder.branch(next_thread)
+
+        builder.position_at_end(scan_live)
 
         # Get segment_base (offset 96) - first segment pointer
         seg_base_ptr = builder.gep(curr_thread, [
@@ -3964,7 +3968,6 @@ class GarbageCollector:
 
         # Done
         builder.position_at_end(done)
-        builder.call(self.pthread_mutex_unlock, [mutex])
         builder.ret_void()
 
     def _implement_gc_sweep(self):
@@ -4104,10 +4107,8 @@ class GarbageCollector:
         # marking and sweep are complete.
         builder.call(self.gc_compact_deferred_cleanup, [])
 
-        # Reset watermark_active for all threads
-        # Lock registry mutex to prevent threads from unregistering during iteration
-        reset_mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [reset_mutex])
+        # Reset watermark_active for all threads (no mutex needed - GC thread only)
+        # Skip dead entries (watermark_active == 0xDEAD)
 
         # Allocate storage for loop variable
         reset_curr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="reset_curr")
@@ -4122,10 +4123,22 @@ class GarbageCollector:
         builder.cbranch(reset_null, cleanup, reset_thread)
 
         builder.position_at_end(reset_thread)
-        # Reset watermark_active = 0
+
+        # Skip dead entries
         reset_wm_ptr = builder.gep(reset_curr, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
+        reset_wm_val = builder.load(reset_wm_ptr)
+        reset_is_dead = builder.icmp_unsigned('==', reset_wm_val, ir.Constant(self.i64, 0xDEAD))
+        reset_skip_dead = func.append_basic_block("reset_skip_dead")
+        reset_do_reset = func.append_basic_block("reset_do_reset")
+        builder.cbranch(reset_is_dead, reset_skip_dead, reset_do_reset)
+
+        builder.position_at_end(reset_skip_dead)
+        builder.branch(reset_next)
+
+        builder.position_at_end(reset_do_reset)
+        # Reset watermark_active = 0
         builder.store(ir.Constant(self.i64, 0), reset_wm_ptr)
 
         # Also reset watermark_depth = 0
@@ -4150,8 +4163,129 @@ class GarbageCollector:
         # Cleanup - runs after successful GC
         builder.position_at_end(cleanup)
 
-        # Unlock registry mutex after watermark reset loop
-        builder.call(self.pthread_mutex_unlock, [reset_mutex])
+        # ============================================================
+        # Dead thread cleanup: remove dead entries from registry
+        # GC thread is sole remover, so no mutex needed.
+        # ============================================================
+        # CAS-steal the dead threads list
+        dead_steal_loop = func.append_basic_block("dead_steal_loop")
+        dead_steal_done = func.append_basic_block("dead_steal_done")
+        dead_cleanup_loop = func.append_basic_block("dead_cleanup_loop")
+        dead_cleanup_check = func.append_basic_block("dead_cleanup_check")
+        dead_remove_entry = func.append_basic_block("dead_remove_entry")
+        dead_next_dead = func.append_basic_block("dead_next_dead")
+        dead_cleanup_done = func.append_basic_block("dead_cleanup_done")
+
+        dead_stolen_alloca = builder.alloca(self.i8_ptr, name="dead_stolen")
+        dead_curr_alloca = builder.alloca(self.i8_ptr, name="dead_curr")
+
+        builder.branch(dead_steal_loop)
+
+        # CAS-steal dead threads list
+        builder.position_at_end(dead_steal_loop)
+        dead_head = builder.load(self.gc_dead_threads)
+        dead_cas_steal = builder.cmpxchg(
+            self.gc_dead_threads, dead_head, ir.Constant(self.i8_ptr, None),
+            'acq_rel', 'acquire')
+        dead_steal_ok = builder.extract_value(dead_cas_steal, 1)
+        builder.store(dead_head, dead_stolen_alloca)
+        builder.cbranch(dead_steal_ok, dead_steal_done, dead_steal_loop)
+
+        builder.position_at_end(dead_steal_done)
+        stolen_dead = builder.load(dead_stolen_alloca)
+        builder.store(stolen_dead, dead_curr_alloca)
+        builder.branch(dead_cleanup_loop)
+
+        # Walk stolen dead list and remove each from main registry, then free
+        builder.position_at_end(dead_cleanup_loop)
+        dead_curr_i8 = builder.load(dead_curr_alloca)
+        dead_curr_int = builder.ptrtoint(dead_curr_i8, self.i64)
+        dead_is_null = builder.icmp_unsigned('==', dead_curr_int, ir.Constant(self.i64, 0))
+        builder.cbranch(dead_is_null, dead_cleanup_done, dead_cleanup_check)
+
+        builder.position_at_end(dead_cleanup_check)
+        dead_entry = builder.bitcast(dead_curr_i8, self.thread_entry_type.as_pointer())
+        # Save next pointer before we modify the entry
+        dead_next_ptr = builder.gep(dead_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        dead_next_i8 = builder.load(dead_next_ptr)
+        builder.branch(dead_remove_entry)
+
+        # Remove dead entry from main registry (GC thread is sole remover)
+        # Walk gc_thread_registry to find and unlink
+        builder.position_at_end(dead_remove_entry)
+        dead_entry_int = builder.ptrtoint(dead_entry, self.i64)
+
+        # Check if at head
+        reg_head = builder.load(self.gc_thread_registry)
+        reg_head_int = builder.ptrtoint(reg_head, self.i64)
+        dead_is_head = builder.icmp_unsigned('==', reg_head_int, dead_entry_int)
+
+        dead_at_head = func.append_basic_block("dead_at_head")
+        dead_search = func.append_basic_block("dead_search")
+        dead_search_check = func.append_basic_block("dead_search_check")
+        dead_found = func.append_basic_block("dead_found")
+        dead_search_next = func.append_basic_block("dead_search_next")
+        dead_free_entry = func.append_basic_block("dead_free_entry")
+        builder.cbranch(dead_is_head, dead_at_head, dead_search)
+
+        # Remove from head
+        builder.position_at_end(dead_at_head)
+        dead_my_next_ptr = builder.gep(dead_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        dead_my_next_i8 = builder.load(dead_my_next_ptr)
+        dead_my_next = builder.bitcast(dead_my_next_i8, self.thread_entry_type.as_pointer())
+        builder.store(dead_my_next, self.gc_thread_registry)
+        builder.branch(dead_free_entry)
+
+        # Search interior of list
+        builder.position_at_end(dead_search)
+        dead_prev_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="dead_prev")
+        builder.store(reg_head, dead_prev_alloca)
+        builder.branch(dead_search_check)
+
+        builder.position_at_end(dead_search_check)
+        dead_prev = builder.load(dead_prev_alloca)
+        dead_prev_next_ptr = builder.gep(dead_prev, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        dead_prev_next_i8 = builder.load(dead_prev_next_ptr)
+        dead_prev_next = builder.bitcast(dead_prev_next_i8, self.thread_entry_type.as_pointer())
+        dead_prev_next_int = builder.ptrtoint(dead_prev_next, self.i64)
+        # Check if null (not found - entry may have already been removed)
+        dead_prev_null = builder.icmp_unsigned('==', dead_prev_next_int, ir.Constant(self.i64, 0))
+        dead_prev_match = builder.icmp_unsigned('==', dead_prev_next_int, dead_entry_int)
+
+        with builder.if_then(dead_prev_null):
+            builder.branch(dead_free_entry)
+        builder.cbranch(dead_prev_match, dead_found, dead_search_next)
+
+        builder.position_at_end(dead_found)
+        # Unlink: prev->next = dead_entry->next
+        dead_unlink_next_ptr = builder.gep(dead_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        ], inbounds=True)
+        dead_unlink_next = builder.load(dead_unlink_next_ptr)
+        builder.store(dead_unlink_next, dead_prev_next_ptr)
+        builder.branch(dead_free_entry)
+
+        builder.position_at_end(dead_search_next)
+        builder.store(dead_prev_next, dead_prev_alloca)
+        builder.branch(dead_search_check)
+
+        # Free the dead ThreadEntry
+        builder.position_at_end(dead_free_entry)
+        dead_entry_as_i8 = builder.bitcast(dead_entry, self.i8_ptr)
+        builder.call(self.codegen.free, [dead_entry_as_i8])
+        builder.branch(dead_next_dead)
+
+        builder.position_at_end(dead_next_dead)
+        builder.store(dead_next_i8, dead_curr_alloca)
+        builder.branch(dead_cleanup_loop)
+
+        builder.position_at_end(dead_cleanup_done)
 
         # Set gc_phase = 0 (IDLE)
         builder.store(ir.Constant(self.i64, 0), self.gc_phase)
@@ -4335,18 +4469,25 @@ class GarbageCollector:
         builder.ret_void()
 
     def _implement_gc_safepoint(self):
-        """Implement safe-point check for automatic GC triggering.
+        """Implement non-blocking safe-point check for automatic GC triggering.
 
         This function is safe to call at function entry because:
         1. All previous operations have completed
         2. Caller's heap variables are properly rooted
         3. No intermediate allocations exist yet
 
-        Also handles watermark protocol acknowledgment:
+        Non-blocking watermark protocol acknowledgment:
         - If gc_phase != 0 (IDLE), checks if we need to acknowledge
         - Sets watermark_depth to current stack depth on first encounter
+        - After acknowledging, continues immediately (no spin-wait)
+
+        Safety: GC scans slots [0, watermark). Mutator writes to [slot_index, ...)
+        where slot_index >= watermark. Disjoint ranges. Birth-marking ensures
+        new allocations survive the current cycle.
 
         Checks if allocation count >= threshold and triggers GC if so.
+        The triggering mutator signals the GC thread and continues without
+        waiting for collection to complete.
         """
         func = self.gc_safepoint
 
@@ -4410,26 +4551,11 @@ class GarbageCollector:
         # watermark_active = 1
         builder.store(ir.Constant(self.i64, 1), wm_active_ptr)
 
-        # Wait for GC to complete (gc_phase returns to 0)
-        # This prevents the thread from modifying its shadow stack while GC scans it.
-        # The calling thread that triggered GC doesn't reach this code because it
-        # checked gc_phase = 0 before triggering.
-        wait_loop = func.append_basic_block("wait_gc_complete")
-        wait_yield = func.append_basic_block("wait_yield")
-        gc_done = func.append_basic_block("gc_done")
-        builder.branch(wait_loop)
-
-        builder.position_at_end(wait_loop)
-        phase_val = builder.load(self.gc_phase)
-        gc_still_active = builder.icmp_unsigned('!=', phase_val, ir.Constant(self.i64, 0))
-        builder.cbranch(gc_still_active, wait_yield, gc_done)
-
-        # Yield and retry
-        builder.position_at_end(wait_yield)
-        builder.call(self.sched_yield, [])
-        builder.branch(wait_loop)
-
-        builder.position_at_end(gc_done)
+        # Non-blocking safepoint: mutator acknowledges watermark and continues immediately.
+        # Safety: GC scans slots [0, watermark). Mutator writes to [slot_index, ...)
+        # where slot_index >= watermark. Disjoint ranges. Popped frames leave valid
+        # handles in mapped segment memory (floating garbage, not dangling refs).
+        # Birth-marking ensures new allocations survive the current cycle.
         builder.branch(after_ack)
 
         builder.position_at_end(after_ack)
@@ -4470,34 +4596,27 @@ class GarbageCollector:
         builder.cbranch(should_gc, do_gc, done)
 
         # Delegate GC to the dedicated GC thread (BUG-088 fix)
-        # Instead of calling gc_collect() directly on the mutator thread,
-        # signal the GC thread and wait for it to complete.
+        # Non-blocking: signal the GC thread and continue immediately.
+        # The mutator never waits for collection to complete (BUG-015 fix).
+        # Birth-marking ensures new allocations survive the current cycle.
         builder.position_at_end(do_gc)
 
-        # Lock mutex to atomically set gc_complete=0 and signal
-        gc_mutex_ptr = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [gc_mutex_ptr])
-
-        # Set gc_complete = 0 so gc_wait_for_completion will actually wait
-        # (prevents race where GC thread hasn't started yet and gc_complete
-        # is still 1 from a previous cycle)
-        gc_complete_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), gc_complete_ptr)
-
         # Set trigger flag to request collection
+        # Note: gc_complete is NOT cleared here. The safepoint never waits for
+        # completion (Phase A: non-blocking safepoints). gc_complete is only
+        # relevant for the explicit gc() builtin's gc_wait_for_completion.
+        # gc_capture_snapshot (called by gc_collect) sets gc_complete = 0.
         builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
 
-        # Signal the GC thread's condition variable to wake it up
+        # Signal the GC thread to wake up.
+        # Lock/unlock mutex around cond_signal to ensure the signal is not lost
+        # on macOS's pthread implementation. No data is protected by this mutex
+        # on the mutator path — it's purely for condvar signaling correctness.
+        gc_mutex_ptr = builder.load(self.gc_mutex)
+        builder.call(self.pthread_mutex_lock, [gc_mutex_ptr])
         gc_cond_start = builder.load(self.gc_cond_start)
         builder.call(self.pthread_cond_signal, [gc_cond_start])
-
-        # Unlock mutex
         builder.call(self.pthread_mutex_unlock, [gc_mutex_ptr])
-
-        # Wait for GC thread to complete collection before resuming
-        builder.call(self.gc_wait_for_completion, [])
 
         builder.branch(done)
 
@@ -5214,7 +5333,9 @@ class GarbageCollector:
         # Set trigger flag to request collection
         builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
 
-        # Signal the GC thread to wake up
+        # Signal the GC thread to wake up.
+        # Lock/unlock mutex around cond_signal to ensure the signal is not lost.
+        # No data is protected — purely condvar signaling correctness.
         mutex_ptr = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_lock, [mutex_ptr])
         cond_start = builder.load(self.gc_cond_start)
@@ -5316,11 +5437,8 @@ class GarbageCollector:
         hit_limit = builder.icmp_unsigned(">=", curr_iter, max_iterations)
         builder.cbranch(hit_limit, timeout, thread_loop)
 
-        # Thread loop start
+        # Thread loop start - no mutex needed, GC thread is sole remover
         builder.position_at_end(thread_loop)
-        # Lock registry mutex for safe iteration
-        wm_mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [wm_mutex])
         first_thread = builder.load(self.gc_thread_registry)
         builder.store(first_thread, curr_thread_alloca)
         builder.branch(check_thread)
@@ -5344,6 +5462,7 @@ class GarbageCollector:
         builder.cbranch(is_self, advance, check_watermark)
 
         # Check watermark_active for this thread
+        # Dead threads (0xDEAD) are treated as "acknowledged" - skip them
         builder.position_at_end(check_watermark)
         wm_active_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
@@ -5351,7 +5470,7 @@ class GarbageCollector:
         wm_active = builder.load(wm_active_ptr)
         not_acked = builder.icmp_unsigned("==", wm_active, ir.Constant(self.i64, 0))
 
-        # If not acknowledged, yield and retry
+        # If not acknowledged (and not dead), yield and retry
         builder.cbranch(not_acked, yield_and_retry, advance)
 
         # Advance to next thread (field 9 is the 'next' pointer, stored as i8*)
@@ -5367,14 +5486,10 @@ class GarbageCollector:
 
         # All threads acknowledged
         builder.position_at_end(all_done)
-        # Unlock registry mutex before returning
-        builder.call(self.pthread_mutex_unlock, [wm_mutex])
         builder.ret_void()
 
         # Yield and retry
         builder.position_at_end(yield_and_retry)
-        # Unlock registry mutex before yielding
-        builder.call(self.pthread_mutex_unlock, [wm_mutex])
         builder.call(self.sched_yield, [])
         new_iter = builder.add(curr_iter, ir.Constant(self.i64, 1))
         builder.store(new_iter, iter_alloca)
@@ -6818,8 +6933,9 @@ class GarbageCollector:
 
         This allows allocations to continue without blocking during sweep.
 
-        THREAD SAFETY: Only holds gc_registry_mutex to prevent thread
-        unregistration during iteration. Allocation lists are accessed atomically.
+        THREAD SAFETY: No mutex needed. GC thread is sole remover from registry.
+        CAS-based insertion only modifies head pointer. Dead entries are skipped.
+        Allocation lists are accessed atomically.
         """
         func = self.gc_sweep_thread_lists
 
@@ -6838,11 +6954,8 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # Lock registry mutex to prevent threads from unregistering during sweep
-        registry_mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [registry_mutex])
-
-        # NO gc_mutex needed - we use atomic operations for list access
+        # No registry mutex needed - GC thread is sole remover, CAS insertion is safe.
+        # Dead entries (watermark_active == 0xDEAD) are skipped.
 
         # Allocate locals for iteration
         thread_ptr_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
@@ -6886,6 +6999,21 @@ class GarbageCollector:
 
         # Process this thread's allocation list
         builder.position_at_end(process_thread)
+
+        # Skip dead entries (watermark_active == 0xDEAD)
+        sweep_skip_dead = func.append_basic_block("sweep_skip_dead")
+        sweep_live_thread = func.append_basic_block("sweep_live_thread")
+        wm_active_sweep_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_active_sweep = builder.load(wm_active_sweep_ptr)
+        is_dead_sweep = builder.icmp_unsigned('==', wm_active_sweep, ir.Constant(self.i64, 0xDEAD))
+        builder.cbranch(is_dead_sweep, sweep_skip_dead, sweep_live_thread)
+
+        builder.position_at_end(sweep_skip_dead)
+        builder.branch(next_thread)
+
+        builder.position_at_end(sweep_live_thread)
 
         # DEBUG: Increment thread counter
         builder.atomic_rmw('add', self.gc_debug_sweep_threads, ir.Constant(self.i64, 1), 'monotonic')
@@ -7299,8 +7427,6 @@ class GarbageCollector:
 
         builder.position_at_end(free_tlab_done)
 
-        # Unlock registry mutex
-        builder.call(self.pthread_mutex_unlock, [registry_mutex])
         builder.ret_void()
 
     def _implement_gc_grow_heaps(self):
@@ -9065,27 +9191,22 @@ class GarbageCollector:
         and the free list is empty. Doubles the table capacity and copies
         existing entries to the new table.
 
-        Spins waiting for compaction to complete before proceeding, to
-        prevent racing with the compactor's handle table access.
+        Non-blocking: if compaction is in progress, returns without growing.
+        The caller's retry loop will try again.
         """
         func = self.gc_handle_table_grow
         entry = func.append_basic_block("entry")
-        wait_compact = func.append_basic_block("wait_compact")
-        wait_yield = func.append_basic_block("wait_yield")
+        skip_if_compacting = func.append_basic_block("skip_if_compacting")
         do_grow = func.append_basic_block("do_grow")
         builder = ir.IRBuilder(entry)
 
-        # Spin-wait if compaction is in progress
-        builder.branch(wait_compact)
-
-        builder.position_at_end(wait_compact)
+        # Check once: if compacting, return without growing. Caller retries.
         compacting = builder.load(self.gc_compacting)
         is_compacting = builder.icmp_unsigned('!=', compacting, ir.Constant(self.i64, 0))
-        builder.cbranch(is_compacting, wait_yield, do_grow)
+        builder.cbranch(is_compacting, skip_if_compacting, do_grow)
 
-        builder.position_at_end(wait_yield)
-        builder.call(self.sched_yield, [])
-        builder.branch(wait_compact)
+        builder.position_at_end(skip_if_compacting)
+        builder.ret_void()
 
         builder.position_at_end(do_grow)
 
@@ -9186,30 +9307,53 @@ class GarbageCollector:
         builder.ret(handle)
 
     def _implement_gc_handle_free(self):
-        """Return a handle to the free list (called during sweep).
+        """Return a handle to the free list (CAS-based push).
 
         The freed slot stores the previous free list head, forming a LIFO list.
+        Uses CAS to safely push even while mutator threads CAS-pop.
         """
         func = self.gc_handle_free
         func.args[0].name = "handle"
 
         entry = func.append_basic_block("entry")
+        cas_loop = func.append_basic_block("cas_loop")
+        cas_retry = func.append_basic_block("cas_retry")
+        cas_done = func.append_basic_block("cas_done")
+
         builder = ir.IRBuilder(entry)
 
         handle = func.args[0]
-
-        # Get current free list head
-        old_head = builder.load(self.gc_handle_free_list)
-
-        # Store old head in the slot being freed (as a pointer-sized value)
         table = builder.load(self.gc_handle_table)
         slot_ptr = builder.gep(table, [handle])
-        old_head_as_ptr = builder.inttoptr(old_head, self.i8_ptr)
-        builder.store(old_head_as_ptr, slot_ptr)
 
-        # Update free list head
-        builder.store(handle, self.gc_handle_free_list)
+        # Alloca for expected value in CAS loop
+        expected_alloca = builder.alloca(self.i64, name="expected_head")
+        old_head = builder.load(self.gc_handle_free_list)
+        builder.store(old_head, expected_alloca)
+        builder.branch(cas_loop)
 
+        # CAS loop: store old_head in slot, then try to CAS free_list head
+        builder.position_at_end(cas_loop)
+        cur_head = builder.load(expected_alloca)
+
+        # Store current head as "next" pointer in the freed slot
+        cur_head_as_ptr = builder.inttoptr(cur_head, self.i8_ptr)
+        builder.store(cur_head_as_ptr, slot_ptr)
+
+        # CAS: gc_handle_free_list cur_head -> handle
+        cas_result = builder.cmpxchg(
+            self.gc_handle_free_list, cur_head, handle,
+            'acq_rel', 'acquire')
+        cas_success = builder.extract_value(cas_result, 1)
+        builder.cbranch(cas_success, cas_done, cas_retry)
+
+        # On CAS failure, extract actual value and retry
+        builder.position_at_end(cas_retry)
+        cas_old = builder.extract_value(cas_result, 0)
+        builder.store(cas_old, expected_alloca)
+        builder.branch(cas_loop)
+
+        builder.position_at_end(cas_done)
         builder.ret_void()
 
     def _implement_gc_handle_deref(self):
@@ -9390,21 +9534,42 @@ class GarbageCollector:
         builder.store(next_handle, current)
         builder.branch(check_next)
 
-        # Link retired list tail to free list head, update free list head
+        # Link retired list tail to free list head, update free list head (CAS-based)
         builder.position_at_end(link_lists)
         # current now points to the tail of retired list
         tail = builder.load(current)
-        free_head = builder.load(self.gc_handle_free_list)
-
-        # Link tail to free list head
         table2 = builder.load(self.gc_handle_table)
         tail_slot_ptr = builder.gep(table2, [tail])
-        free_head_as_ptr = builder.inttoptr(free_head, self.i8_ptr)
-        builder.store(free_head_as_ptr, tail_slot_ptr)
 
-        # Set free list head to retired list head
-        builder.store(retired_head, self.gc_handle_free_list)
+        # CAS loop: link tail→free_head, then CAS free_list_head = retired_head
+        expected_free = builder.alloca(self.i64, name="expected_free")
+        free_head_init = builder.load(self.gc_handle_free_list)
+        builder.store(free_head_init, expected_free)
 
+        cas_promote_loop = func.append_basic_block("cas_promote_loop")
+        cas_promote_retry = func.append_basic_block("cas_promote_retry")
+        cas_promote_done = func.append_basic_block("cas_promote_done")
+
+        builder.branch(cas_promote_loop)
+
+        builder.position_at_end(cas_promote_loop)
+        cur_free = builder.load(expected_free)
+        # Link tail of retired list to current free list head
+        cur_free_as_ptr = builder.inttoptr(cur_free, self.i8_ptr)
+        builder.store(cur_free_as_ptr, tail_slot_ptr)
+        # CAS: gc_handle_free_list cur_free -> retired_head
+        cas_result = builder.cmpxchg(
+            self.gc_handle_free_list, cur_free, retired_head,
+            'acq_rel', 'acquire')
+        cas_ok = builder.extract_value(cas_result, 1)
+        builder.cbranch(cas_ok, cas_promote_done, cas_promote_retry)
+
+        builder.position_at_end(cas_promote_retry)
+        cas_actual = builder.extract_value(cas_result, 0)
+        builder.store(cas_actual, expected_free)
+        builder.branch(cas_promote_loop)
+
+        builder.position_at_end(cas_promote_done)
         # Clear retired list
         builder.store(ir.Constant(self.i64, 0), self.gc_handle_retired_list)
 
@@ -9488,35 +9653,36 @@ class GarbageCollector:
         builder.ret(ir.Constant(self.i64, 0))
 
     def _implement_gc_handle_pool_refill(self):
-        """Slow-path handle pool refill.
+        """Lock-free slow-path handle pool refill.
 
         Called when gc_handle_pool_alloc returns 0 (pool empty).
-        Acquires mutex and allocates HANDLE_POOL_SIZE (512) handles in batch.
+        Uses CAS-based free list pop and atomic bump allocation - NO mutex.
 
-        IMPORTANT: Try free list first before bump allocation! (BUG-062 fix)
-        The free list contains handles retired by previous GC cycles.
-        Bump allocation should only be used when free list is exhausted.
-
-        This is the only place that touches the global handle table for
-        allocation - all other allocations go through the thread-local pool.
+        Strategy:
+        1. Try CAS-based pop from free list (one handle at a time, pool of 1)
+        2. If free list empty, atomic bump allocate a batch of HANDLE_POOL_SIZE
+        3. If bump exceeds table, CAS to claim grower role and grow table
 
         ThreadEntry fields updated:
             - handle_pool_start (field 18): set to first handle in new batch
             - handle_pool_next (field 19): set to first handle in new batch
-            - handle_pool_end (field 20): set to first handle + HANDLE_POOL_SIZE
+            - handle_pool_end (field 20): set to first handle + batch size
         """
         func = self.gc_handle_pool_refill
 
         entry = func.append_basic_block("entry")
         have_entry = func.append_basic_block("have_entry")
         try_free_list = func.append_basic_block("try_free_list")
-        drain_free_list = func.append_basic_block("drain_free_list")
-        check_pool_full = func.append_basic_block("check_pool_full")
-        pool_ready = func.append_basic_block("pool_ready")
+        cas_pop_free = func.append_basic_block("cas_pop_free")
+        cas_pop_success = func.append_basic_block("cas_pop_success")
+        cas_pop_retry = func.append_basic_block("cas_pop_retry")
         use_bump = func.append_basic_block("use_bump")
+        bump_check_size = func.append_basic_block("bump_check_size")
         need_grow = func.append_basic_block("need_grow")
-        do_bump = func.append_basic_block("do_bump")
-        finish = func.append_basic_block("finish")
+        try_claim_grower = func.append_basic_block("try_claim_grower")
+        do_grow = func.append_basic_block("do_grow")
+        wait_grower = func.append_basic_block("wait_grower")
+        finish_bump = func.append_basic_block("finish_bump")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
@@ -9533,203 +9699,140 @@ class GarbageCollector:
 
         builder.position_at_end(have_entry)
 
-        # Lock mutex for handle allocation
-        mutex_ptr = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-
-        # Allocate stack space for collecting handles from free list
         pool_size = ir.Constant(self.i64, self.HANDLE_POOL_SIZE)
-        pool_handles = builder.alloca(ir.ArrayType(self.i64, self.HANDLE_POOL_SIZE), name="pool_handles")
-        pool_count = builder.alloca(self.i64, name="pool_count")
-        builder.store(ir.Constant(self.i64, 0), pool_count)
+
+        # Alloca for CAS expected value (must be in entry-reachable block)
+        expected_alloca = builder.alloca(self.i64, name="expected_free")
 
         builder.branch(try_free_list)
 
         # ============================================================
-        # BUG-062 FIX: Try free list first before bump allocation
+        # Try CAS-based pop from free list (lock-free)
+        # Pop one handle, set pool to size 1. Simple and correct.
         # ============================================================
         builder.position_at_end(try_free_list)
         free_head = builder.load(self.gc_handle_free_list)
-        free_head_int = builder.ptrtoint(free_head, self.i64) if free_head.type == self.i8_ptr else free_head
-        # Actually gc_handle_free_list is i64, not i8*
-        free_head_val = builder.load(self.gc_handle_free_list)
-        has_free = builder.icmp_unsigned('!=', free_head_val, ir.Constant(self.i64, 0))
-        builder.cbranch(has_free, drain_free_list, use_bump)
+        has_free = builder.icmp_unsigned('!=', free_head, ir.Constant(self.i64, 0))
+        builder.store(free_head, expected_alloca)
+        builder.cbranch(has_free, cas_pop_free, use_bump)
 
-        # Drain handles from free list into local array
-        builder.position_at_end(drain_free_list)
-        current_count = builder.load(pool_count)
-        is_pool_full = builder.icmp_unsigned('>=', current_count, pool_size)
-        builder.cbranch(is_pool_full, pool_ready, check_pool_full)
-
-        builder.position_at_end(check_pool_full)
-        # Get current free list head
-        curr_free = builder.load(self.gc_handle_free_list)
-        has_more_free = builder.icmp_unsigned('!=', curr_free, ir.Constant(self.i64, 0))
-
-        # If free list empty, check if we got any handles
-        check_got_any = func.append_basic_block("check_got_any")
-        get_one_handle = func.append_basic_block("get_one_handle")
-        builder.cbranch(has_more_free, get_one_handle, check_got_any)
-
-        builder.position_at_end(get_one_handle)
-        # Pop one handle from free list
+        # CAS pop: read next from table[head], try to swap head
+        builder.position_at_end(cas_pop_free)
+        expected_head = builder.load(expected_alloca)
         table = builder.load(self.gc_handle_table)
-        slot_ptr = builder.gep(table, [curr_free])
+        slot_ptr = builder.gep(table, [expected_head])
         next_free_ptr = builder.load(slot_ptr)
         next_free = builder.ptrtoint(next_free_ptr, self.i64)
-        # Update free list head
-        builder.store(next_free, self.gc_handle_free_list)
+
+        # CAS: gc_handle_free_list expected_head -> next_free
+        cas_result = builder.cmpxchg(
+            self.gc_handle_free_list, expected_head, next_free,
+            'acq_rel', 'acquire')
+        cas_success = builder.extract_value(cas_result, 1)
+        builder.cbranch(cas_success, cas_pop_success, cas_pop_retry)
+
+        # CAS failed - reload and retry
+        builder.position_at_end(cas_pop_retry)
+        cas_old = builder.extract_value(cas_result, 0)
+        # Check if free list became empty
+        retry_has_free = builder.icmp_unsigned('!=', cas_old, ir.Constant(self.i64, 0))
+        builder.store(cas_old, expected_alloca)
+        builder.cbranch(retry_has_free, cas_pop_free, use_bump)
+
+        # CAS succeeded - we popped expected_head from free list
+        builder.position_at_end(cas_pop_success)
+        popped_handle = builder.load(expected_alloca)
         # Clear the slot (will be set by gc_handle_store later)
-        builder.store(ir.Constant(self.i8_ptr, None), slot_ptr)
-        # Store handle in local array
-        cnt = builder.load(pool_count)
-        handle_slot = builder.gep(pool_handles, [ir.Constant(self.i64, 0), cnt])
-        builder.store(curr_free, handle_slot)
-        # Increment count
-        new_cnt = builder.add(cnt, ir.Constant(self.i64, 1))
-        builder.store(new_cnt, pool_count)
-        builder.branch(drain_free_list)
+        table_s = builder.load(self.gc_handle_table)
+        slot_s = builder.gep(table_s, [popped_handle])
+        builder.store(ir.Constant(self.i8_ptr, None), slot_s)
 
-        builder.position_at_end(check_got_any)
-        got_count = builder.load(pool_count)
-        got_any = builder.icmp_unsigned('>', got_count, ir.Constant(self.i64, 0))
-        builder.cbranch(got_any, pool_ready, use_bump)
-
-        # Pool is ready from free list - set up thread's pool
-        builder.position_at_end(pool_ready)
-        # Get first handle from our collected array
-        first_handle_ptr = builder.gep(pool_handles, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-        first_handle = builder.load(first_handle_ptr)
-        final_count = builder.load(pool_count)
-        # For free list handles, we can't use contiguous range
-        # Instead, we return them one by one to the global free list and take first one
-        # Actually, simpler approach: just take the first handle and set pool to single-element
-        # The pool mechanism expects contiguous handles, so we'll just refill with 1 handle at a time
-        # from free list, which is less efficient but correct.
-        #
-        # Better approach: store handles in reverse order back to free list except first one,
-        # and give thread just the first handle as a pool of 1.
-        #
-        # Actually, the simplest correct fix: if we got handles from free list,
-        # push all but the first back to free list, and give thread a pool of size 1.
-        # On next refill, we'll get another handle from free list.
-
-        # Push all except first handle back to free list
-        push_back_loop = func.append_basic_block("push_back_loop")
-        push_back_body = func.append_basic_block("push_back_body")
-        push_back_done = func.append_basic_block("push_back_done")
-
-        push_idx = builder.alloca(self.i64, name="push_idx")
-        builder.store(ir.Constant(self.i64, 1), push_idx)  # Start at index 1
-        builder.branch(push_back_loop)
-
-        builder.position_at_end(push_back_loop)
-        pidx = builder.load(push_idx)
-        fcnt = builder.load(pool_count)
-        done_pushing = builder.icmp_unsigned('>=', pidx, fcnt)
-        builder.cbranch(done_pushing, push_back_done, push_back_body)
-
-        builder.position_at_end(push_back_body)
-        # Get handle at index pidx
-        h_ptr = builder.gep(pool_handles, [ir.Constant(self.i64, 0), pidx])
-        h_val = builder.load(h_ptr)
-        # Push to free list
-        old_free_head = builder.load(self.gc_handle_free_list)
-        table2 = builder.load(self.gc_handle_table)
-        slot_ptr2 = builder.gep(table2, [h_val])
-        old_head_as_ptr = builder.inttoptr(old_free_head, self.i8_ptr)
-        builder.store(old_head_as_ptr, slot_ptr2)
-        builder.store(h_val, self.gc_handle_free_list)
-        # Increment index
-        new_pidx = builder.add(pidx, ir.Constant(self.i64, 1))
-        builder.store(new_pidx, push_idx)
-        builder.branch(push_back_loop)
-
-        builder.position_at_end(push_back_done)
-        # Now set up pool with just the first handle (pool of size 1)
-        # This is inefficient but correct - we'll refill often from free list
+        # Set up pool with just this one handle (pool of size 1)
         pool_start_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 18)
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 18)
         ], inbounds=True)
-        builder.store(first_handle, pool_start_ptr)
+        builder.store(popped_handle, pool_start_ptr)
 
         pool_next_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 19)
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 19)
         ], inbounds=True)
-        builder.store(first_handle, pool_next_ptr)
+        builder.store(popped_handle, pool_next_ptr)
 
         pool_end_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 20)
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 20)
         ], inbounds=True)
-        end_h = builder.add(first_handle, ir.Constant(self.i64, 1))
+        end_h = builder.add(popped_handle, ir.Constant(self.i64, 1))
         builder.store(end_h, pool_end_ptr)
-
-        # Unlock and return
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
         builder.branch(done)
 
         # ============================================================
-        # Bump allocate a contiguous batch of HANDLE_POOL_SIZE handles
+        # Atomic bump allocate a contiguous batch of HANDLE_POOL_SIZE
         # (Only used when free list is empty)
         # ============================================================
         builder.position_at_end(use_bump)
-        next_handle_val = builder.load(self.gc_next_handle)
+        # Atomically claim HANDLE_POOL_SIZE handles
+        start_handle = builder.atomic_rmw(
+            'add', self.gc_next_handle, pool_size, 'acq_rel')
+        end_handle = builder.add(start_handle, pool_size)
+        builder.branch(bump_check_size)
+
+        # Check if claimed range exceeds table size
+        builder.position_at_end(bump_check_size)
         table_size = builder.load(self.gc_handle_table_size)
+        exceeds_table = builder.icmp_unsigned('>', end_handle, table_size)
+        builder.cbranch(exceeds_table, need_grow, finish_bump)
 
-        # Calculate end of batch
-        batch_end = builder.add(next_handle_val, pool_size)
-
-        # Check if we need to grow the table
-        need_grow_cond = builder.icmp_unsigned(">", batch_end, table_size)
-        builder.cbranch(need_grow_cond, need_grow, do_bump)
-
-        # Grow table and retry
+        # Need to grow table - undo bump and coordinate growth
         builder.position_at_end(need_grow)
+        # Undo the bump (give back the handles we claimed)
+        builder.atomic_rmw('sub', self.gc_next_handle, pool_size, 'acq_rel')
+        builder.branch(try_claim_grower)
+
+        # Try to become the grower via CAS on gc_table_growing
+        builder.position_at_end(try_claim_grower)
+        grow_cas = builder.cmpxchg(
+            self.gc_table_growing, ir.Constant(self.i64, 0),
+            ir.Constant(self.i64, 1), 'acq_rel', 'acquire')
+        grow_claimed = builder.extract_value(grow_cas, 1)
+        builder.cbranch(grow_claimed, do_grow, wait_grower)
+
+        # We are the grower - grow table and clear flag
+        builder.position_at_end(do_grow)
         builder.call(self.gc_handle_table_grow, [])
+        builder.store(ir.Constant(self.i64, 0), self.gc_table_growing)
+        # Retry bump allocation
         builder.branch(use_bump)
 
-        # Do bump allocation
-        builder.position_at_end(do_bump)
-        start_handle = builder.load(self.gc_next_handle)
-        end_handle = builder.add(start_handle, pool_size)
-
-        # Update gc_next_handle
-        builder.store(end_handle, self.gc_next_handle)
-
-        builder.branch(finish)
+        # Another thread is growing - yield and retry
+        builder.position_at_end(wait_grower)
+        builder.call(self.sched_yield, [])
+        # Check if growth is done
+        still_growing = builder.load(self.gc_table_growing)
+        is_still_growing = builder.icmp_unsigned('!=', still_growing, ir.Constant(self.i64, 0))
+        builder.cbranch(is_still_growing, wait_grower, use_bump)
 
         # ============================================================
-        # Update ThreadEntry with new pool
+        # Update ThreadEntry with new pool from bump allocation
         # ============================================================
-        builder.position_at_end(finish)
+        builder.position_at_end(finish_bump)
 
         # Update handle_pool_start (field 18)
-        pool_start_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 18)
+        pool_start_ptr2 = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 18)
         ], inbounds=True)
-        builder.store(start_handle, pool_start_ptr)
+        builder.store(start_handle, pool_start_ptr2)
 
         # Update handle_pool_next (field 19)
-        pool_next_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 19)
+        pool_next_ptr2 = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 19)
         ], inbounds=True)
-        builder.store(start_handle, pool_next_ptr)
+        builder.store(start_handle, pool_next_ptr2)
 
         # Update handle_pool_end (field 20)
-        pool_end_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0),
-            ir.Constant(self.i32, 20)
+        pool_end_ptr2 = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 20)
         ], inbounds=True)
-        builder.store(end_handle, pool_end_ptr)
-
-        # Unlock mutex
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        builder.store(end_handle, pool_end_ptr2)
 
         builder.branch(done)
 
@@ -9940,9 +10043,7 @@ class GarbageCollector:
         # NOTE: Poisoning of gc_compact_prev_buffer's live_count is done in
         # gc_compact() BEFORE gc_collect, not here. See _implement_gc_compact.
 
-        # Lock registry mutex to iterate thread list
-        registry_mutex = builder.load(self.gc_registry_mutex)
-        builder.call(self.pthread_mutex_lock, [registry_mutex])
+        # No registry mutex needed - GC thread is sole remover, CAS insertion is safe.
 
         # ====================================================================
         # Phase 1: Size Estimation
@@ -9959,6 +10060,21 @@ class GarbageCollector:
         builder.cbranch(is_null_thread, check_size, size_process_thread)
 
         builder.position_at_end(size_process_thread)
+
+        # Skip dead entries (watermark_active == 0xDEAD)
+        size_skip_dead = func.append_basic_block("size_skip_dead")
+        size_live_thread = func.append_basic_block("size_live_thread")
+        wm_size_ptr = builder.gep(curr_thread, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_size_val = builder.load(wm_size_ptr)
+        is_dead_size = builder.icmp_unsigned('==', wm_size_val, ir.Constant(self.i64, 0xDEAD))
+        builder.cbranch(is_dead_size, size_skip_dead, size_live_thread)
+
+        builder.position_at_end(size_skip_dead)
+        builder.branch(size_next_thread)
+
+        builder.position_at_end(size_live_thread)
         # Load alloc_list head (field 9)
         alloc_list_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
@@ -10117,8 +10233,7 @@ class GarbageCollector:
         builder.cbranch(is_failed, alloc_failed, copy_thread_loop)
 
         builder.position_at_end(alloc_failed)
-        # mmap failed - abort compaction, unlock, clear flag
-        builder.call(self.pthread_mutex_unlock, [registry_mutex])
+        # mmap failed - abort compaction, clear flag
         builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
         builder.branch(done)
 
@@ -10163,6 +10278,21 @@ class GarbageCollector:
         builder.cbranch(is_null_thread2, fixup_start, copy_process_thread)
 
         builder.position_at_end(copy_process_thread)
+
+        # Skip dead entries
+        copy_skip_dead = func.append_basic_block("copy_skip_dead")
+        copy_live_thread = func.append_basic_block("copy_live_thread")
+        wm_copy_ptr = builder.gep(curr_thread2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_copy_val = builder.load(wm_copy_ptr)
+        is_dead_copy = builder.icmp_unsigned('==', wm_copy_val, ir.Constant(self.i64, 0xDEAD))
+        builder.cbranch(is_dead_copy, copy_skip_dead, copy_live_thread)
+
+        builder.position_at_end(copy_skip_dead)
+        builder.branch(copy_next_thread)
+
+        builder.position_at_end(copy_live_thread)
         alloc_list_ptr2 = builder.gep(curr_thread2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
         ], inbounds=True)
@@ -10454,6 +10584,21 @@ class GarbageCollector:
         builder.cbranch(is_null_thread_fixup, update_stats, fixup_process_thread)
 
         builder.position_at_end(fixup_process_thread)
+
+        # Skip dead entries
+        fixup_skip_dead = func.append_basic_block("fixup_skip_dead")
+        fixup_live_thread = func.append_basic_block("fixup_live_thread")
+        wm_fixup_ptr = builder.gep(curr_thread_fixup, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_fixup_val = builder.load(wm_fixup_ptr)
+        is_dead_fixup = builder.icmp_unsigned('==', wm_fixup_val, ir.Constant(self.i64, 0xDEAD))
+        builder.cbranch(is_dead_fixup, fixup_skip_dead, fixup_live_thread)
+
+        builder.position_at_end(fixup_skip_dead)
+        builder.branch(fixup_next_thread)
+
+        builder.position_at_end(fixup_live_thread)
         alloc_list_ptr_fixup = builder.gep(curr_thread_fixup, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
         ], inbounds=True)
@@ -10652,9 +10797,6 @@ class GarbageCollector:
         # ====================================================================
         builder.position_at_end(update_stats)
 
-        # Unlock registry mutex
-        builder.call(self.pthread_mutex_unlock, [registry_mutex])
-
         # Update gc_stats
         # compactions_completed (index 8)
         compact_count_ptr = builder.gep(self.gc_stats, [
@@ -10706,9 +10848,8 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
         builder.branch(done)
 
-        # --- Unlock and done (nothing to compact) ---
+        # --- Nothing to compact ---
         builder.position_at_end(unlock_and_done)
-        builder.call(self.pthread_mutex_unlock, [registry_mutex])
         builder.store(ir.Constant(self.i64, 0), self.gc_compacting)
         builder.branch(done)
 
@@ -10737,7 +10878,9 @@ class GarbageCollector:
         # Set trigger flag to request collection (compact requires collect first)
         builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
 
-        # Signal the GC thread to wake up
+        # Signal the GC thread to wake up.
+        # Lock/unlock mutex around cond_signal to ensure the signal is not lost.
+        # No data is protected — purely condvar signaling correctness.
         mutex_ptr = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_lock, [mutex_ptr])
         cond_start = builder.load(self.gc_cond_start)

@@ -1704,3 +1704,43 @@ func main() -> int
 - **Files**: coex_gc.py (fixup switch in gc_compact_impl)
 - **Fix**: Added TYPE_PV_NODE case to the fixup switch. Added `fixup_raw_ptr_field` helper for i8* pointer fields. Iterates all 32 PV_NODE children and fixes each non-null pointer via gc_ptr_to_handle → gc_handle_deref.
 - **Status**: Fixed (2026-02-05)
+
+### BUG-015: Non-blocking safepoints require shadow stack changes
+- **Discovered**: 2025-01-17, during codebase scan
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**: Run concurrent GC with multiple threads doing work
+- **Observed**: Threads serialize at safepoints, blocking each other
+- **Expected**: Safepoints should be non-blocking for better concurrency
+- **Fix**: Removed spin-wait loop in `_implement_gc_safepoint` that blocked mutator threads waiting for GC to complete. Mutators now acknowledge watermark and continue immediately. The triggering mutator also no longer waits for completion — it signals the GC thread and continues. Safety: GC scans slots [0, watermark), mutator writes to [slot_index, ...) where slot_index >= watermark. Disjoint ranges. Birth-marking ensures new allocations survive the current cycle.
+- **Files**: `coex_gc.py` (`_implement_gc_safepoint`)
+- **Status**: Fixed (2026-02-05)
+
+### BUG-043: GC main mutex for handle allocation
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**: Handle allocation slow path, async GC coordination
+- **Observed**: Uses `gc_mutex` for handle pool refill, malloc fallback, and GC signaling
+- **Fix**: Multi-phase lock-free replacement:
+  1. Handle pool refill: replaced mutex-guarded free list pop with CAS-based free list pop and atomic bump allocation (`atomic_rmw('add')` for batch of 512 handles). Table growth coordinated via CAS flag (`gc_table_growing`).
+  2. Malloc fallback: removed mutex wrapper (malloc is thread-safe on all POSIX platforms).
+  3. GC signaling: removed `gc_mutex` lock/unlock from `gc_safepoint` do_gc block, `gc_async`, and `gc_compact`. Use bare `pthread_cond_signal` without mutex (POSIX allows this; the GC thread's flag-check loop handles missed signals).
+  4. `gc_mutex` retained only for: `gc_thread_main` idle-wait, `gc_wait_for_completion` (explicit `gc()` builtin), `gc_capture_snapshot`, and diagnostic builtins.
+- **Files**: `coex_gc.py` (`_implement_gc_handle_pool_refill`, `_implement_gc_alloc`, `_implement_gc_safepoint`, `_implement_gc_async`, `_implement_gc_compact`)
+- **Status**: Fixed (2026-02-05)
+
+### BUG-044: GC registry mutex for thread tracking
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: GC
+- **Severity**: Low
+- **Reproduction**: Thread registration/unregistration during GC
+- **Observed**: Uses `gc_registry_mutex` for thread registry access from both mutators and GC thread
+- **Fix**: Lock-free thread registry with deferred deletion:
+  1. `gc_register_thread`: CAS-based prepend to linked list with `atomic_rmw('add')` for thread count.
+  2. `gc_unregister_thread`: deferred deletion — marks entry dead (watermark_active = 0xDEAD), CAS-appends to `gc_dead_threads` list, CAS-based handle return to free list. ThreadEntry memory freed by GC thread.
+  3. Removed `gc_registry_mutex` from all GC thread operations: `gc_scan_roots`, `gc_sweep_thread_lists`, `gc_collect` watermark reset, `gc_wait_for_watermarks`, `gc_compact_impl`. All add dead-entry skip checks.
+  4. GC thread dead-entry cleanup pass at end of `gc_collect`: CAS-steals dead list, walks main registry to unlink dead entries, frees ThreadEntry memory.
+  5. `gc_registry_mutex` retained only for diagnostic builtins (`gc_dump_heap`, `gc_validate_handle_storage`).
+- **Files**: `coex_gc.py` (`_implement_gc_register_thread`, `_implement_gc_unregister_thread`, `_implement_gc_scan_roots`, `_implement_gc_sweep_thread_lists`, `_implement_gc_collect`, `_implement_gc_wait_for_watermarks`, `_implement_gc_compact_impl`)
+- **Status**: Fixed (2026-02-05)

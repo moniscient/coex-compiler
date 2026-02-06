@@ -155,6 +155,38 @@ These `_REF` suffixed type IDs tell the GC "each element is an i64 handle that n
 
 **Debug validation**: Use `gc_validate_handle_storage()` to detect invariant violations at runtime. It checks if stored values look like handles (small integers) vs pointers (large addresses).
 
+### Lock-Free GC Invariant
+
+**CRITICAL INVARIANT**: Mutator (compute) threads must NEVER be blocked by garbage collection activity. This means:
+
+- **NO `pthread_mutex_lock`** on `gc_mutex` or `gc_registry_mutex` from any mutator code path (allocation, safepoints, thread registration/unregistration)
+- **NO spin-waits** on `gc_phase`, `gc_compacting`, or any GC state variable from mutator threads
+- **NO `pthread_cond_wait`** on GC condition variables from automatic safepoints
+
+The sole exception is the explicit `gc()` builtin, which calls `gc_wait_for_completion()` because the user explicitly requested synchronous collection.
+
+**Allowed synchronization for mutators:**
+- `cmpxchg` (CAS) loops with bounded retries for: free list pop, thread registry insert, handle return
+- `atomic_rmw` for: handle bump allocation, allocation count, statistics counters
+- `sched_yield()` only during handle table growth (extremely rare, O(log N) total)
+
+**GC thread only:**
+- `gc_mutex` + `gc_cond_start` for idle-wait (blocks only the GC thread)
+- Direct linked list manipulation for dead thread cleanup (GC thread is sole remover)
+
+**Why this works:**
+- Immutable heap objects: no write barriers, no object mutation during scan
+- Birth-marking: new allocations survive current cycle regardless of scan timing
+- Segments never freed during execution: stale shadow stack reads are safe
+- MI-6 deferred reclamation: retired handles valid for 2 full cycles
+- Handle indirection: compaction updates handle table atomically, dereferences see old or new pointer (both valid)
+
+**When adding new GC features, verify:**
+1. No mutex acquisition on any mutator path
+2. No spin-wait or busy-wait on any GC phase/flag from mutators
+3. New data structures use CAS or atomic_rmw, not mutexes
+4. Any shared list uses CAS insertion and GC-thread-only removal
+
 ### GC Diagnostic Builtins
 
 These functions are available in Coex code for debugging:
