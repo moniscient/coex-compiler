@@ -222,15 +222,12 @@ func main() -> int
 
         frame_count = frame_count + 1
 
-        # Debug: print frame count and GC stats periodically
-        if frame_count % 1000 == 0
-            print("Frame: ")
-            print(frame_count)
-            gc_dump_stats()
-        ~
+        # Debug: print frame count and GC stats every frame for crash debugging
+        print("Frame: ")
+        print(frame_count)
+        gc_dump_stats()
 
-        # GC every frame to manage memory
-        # gc()  # DISABLED: Investigating GC segfault bug
+        # Automatic threshold-triggered GC via safepoints (no explicit gc() needed)
         # gc_compact()  # DISABLED: Causes crash - see BUG-103
 
         # ---------------------------------------------------------------------

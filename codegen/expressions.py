@@ -24,7 +24,7 @@ from ast_nodes import (
     SelfExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
-    AtomicType, ListType, ArrayType, SetType, FunctionDecl, KindFunctionDecl
+    AtomicType, PrimitiveType, ListType, ArrayType, MapType, SetType, FunctionDecl, KindFunctionDecl
 )
 
 if TYPE_CHECKING:
@@ -1520,8 +1520,9 @@ class ExpressionGenerator:
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
-                # Trigger GC via the background thread (non-blocking)
+                # Trigger GC and wait for completion (synchronous)
                 cg.builder.call(cg.gc.gc_async, [])
+                cg.builder.call(cg.gc.gc_wait_for_completion, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "gc_async":
@@ -2685,6 +2686,24 @@ class ExpressionGenerator:
                     # Check if element is a reference type - if so, store handle instead of pointer
                     elem_coex_type = cg._infer_type_from_expr(expr.args[0])
                     is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
+
+                    # Safety net: if type inference missed it but LLVM type is a pointer,
+                    # it's a reference type (e.g. String.from() returns String*)
+                    if not is_ref_type and isinstance(elem_type, ir.PointerType):
+                        is_ref_type = True
+                        # Try to infer coex type from LLVM pointer type
+                        if elem_coex_type is None or not cg._is_reference_type(elem_coex_type):
+                            if hasattr(elem_type.pointee, 'name'):
+                                if elem_type.pointee.name == "struct.String":
+                                    elem_coex_type = PrimitiveType("string")
+                                elif elem_type.pointee.name == "struct.List":
+                                    elem_coex_type = ListType(PrimitiveType("int"))
+                                elif elem_type.pointee.name == "struct.Map":
+                                    elem_coex_type = MapType(PrimitiveType("int"), PrimitiveType("int"))
+                                elif elem_type.pointee.name == "struct.Set":
+                                    elem_coex_type = SetType(PrimitiveType("int"))
+                                elif elem_type.pointee.name == "struct.Array":
+                                    elem_coex_type = ArrayType(PrimitiveType("int"))
 
                     # Check if TaggedValue mode is enabled
                     use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)

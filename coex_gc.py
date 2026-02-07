@@ -23,9 +23,9 @@ if TYPE_CHECKING:
 class GarbageCollector:
     """Generates LLVM IR for garbage collection runtime with shadow stack"""
 
-    # Constants (Phase 1: Updated to 32-byte header)
-    HEADER_SIZE = 32         # 4 x i64: size, type_id, flags, forward
-    MIN_BLOCK_SIZE = 40      # Minimum block: header(32) + alignment padding
+    # Constants (Phase 1: Updated to 40-byte header with generation field)
+    HEADER_SIZE = 40         # 5 x i64: size, type_id, flags, forward, generation
+    MIN_BLOCK_SIZE = 48      # Minimum block: header(40) + alignment padding
     MAX_TYPES = 256          # Maximum number of registered types
     GC_THRESHOLD = 100000    # Trigger GC after this many allocations
     INITIAL_HEAP_SIZE = 1024 * 1024 * 1024  # 1GB initial heap
@@ -34,12 +34,17 @@ class GarbageCollector:
     INITIAL_HANDLE_TABLE_SIZE = 1048576  # 1M handles (8MB for pointers)
 
     # Flag bits in header (stored in i64 flags field)
-    FLAG_MARK_BIT = 0x01     # Bit 0: mark bit for GC
     FLAG_FORWARDED = 0x02    # Bit 1: object has been forwarded (compaction)
     FLAG_PINNED = 0x04       # Bit 2: pinned (not movable) - future use
     FLAG_FINALIZER = 0x08    # Bit 3: has finalizer - future use
     FLAG_TLAB = 0x10         # Bit 4: allocated from TLAB (don't free individually)
-    FLAG_ARENA = 0x20        # Bit 5: arena-allocated (no handle, bulk-freed)
+
+    # Generation marking: header field 4 stores a generation counter.
+    # Objects are stamped with gc_current_mark_value at allocation.
+    # GC increments gc_current_mark_value before marking; sweep retires
+    # objects whose generation != current. Arena objects use UINT64_MAX
+    # as a sentinel (never matches any generation).
+    GC_ARENA_GENERATION = 0xFFFFFFFFFFFFFFFF  # -1 as u64: sentinel for arena objects
 
     # Trace levels for debugging infrastructure (Phase 0)
     GC_TRACE_NONE = 0        # No tracing output
@@ -438,14 +443,15 @@ class GarbageCollector:
 
     def _create_types(self):
         """Create GC-related LLVM types"""
-        # Object header (Phase 1): { i64 size, i64 type_id, i64 flags, i64 forward }
-        # 32 bytes total, all i64 for cross-platform consistency
+        # Object header: { i64 size, i64 type_id, i64 flags, i64 forward, i64 generation }
+        # 40 bytes total, all i64 for cross-platform consistency
         # Placed immediately before user data
         self.header_type = ir.LiteralStructType([
             self.i64,  # 0: block size (including header)
             self.i64,  # 8: type_id (was i32, now i64)
-            self.i64,  # 16: flags (mark, forward, pinned, finalizer bits)
+            self.i64,  # 16: flags (FORWARDED, PINNED, FINALIZER, TLAB)
             self.i64,  # 24: forward pointer (for compaction, 0 if not forwarded)
+            self.i64,  # 32: generation (GC cycle counter; UINT64_MAX = arena)
         ])
 
         # Allocation node: { i8* next, i64 handle, i64 size }
@@ -570,7 +576,7 @@ class GarbageCollector:
         self.thread_entry_type = ir.LiteralStructType([
             self.i64,     # 0:  thread_id - platform thread identifier
             self.i8_ptr,  # 8:  shadow_stack_head - pointer to thread's frame top location
-            self.i64,     # 16: watermark_depth - stack depth when watermark set (0 = none)
+            self.i64,     # 16: watermark_slot - slot_index when watermark set (0 = none)
             self.i64,     # 24: watermark_active - 1 if acknowledged current GC cycle
             self.i64,     # 32: stack_depth - current shadow stack depth
             self.i64,     # 40: last_gc_cycle - last GC cycle acknowledged
@@ -799,15 +805,17 @@ class GarbageCollector:
         self.gc_stats.linkage = 'internal'
 
         # ============================================================
-        # Phase 4: Mark Bit Inversion
+        # Generation Marking
         # ============================================================
-        # Instead of clearing mark bits during sweep, we invert the meaning.
-        # gc_current_mark_value alternates between 1 and 0 each cycle.
-        # An object is "marked" if its mark bit equals gc_current_mark_value.
-        # This eliminates the need to clear marks during sweep.
+        # Each object header has a generation field (field 4). An object
+        # is "marked" if its generation equals gc_current_mark_value.
+        # The GC increments gc_current_mark_value before marking reachable
+        # objects. New allocations are stamped with the current generation,
+        # so they naturally survive the current cycle without any special
+        # birth-marking mechanism.
 
-        # Current mark value - objects with this mark bit value are live
-        # Starts at 1 (matching birth-marking), flips after each GC cycle
+        # Current generation counter - objects with this generation value are live
+        # Starts at 1, increments by 1 each GC cycle
         self.gc_current_mark_value = ir.GlobalVariable(self.module, self.i64, name="gc_current_mark_value")
         self.gc_current_mark_value.initializer = ir.Constant(self.i64, 1)
         self.gc_current_mark_value.linkage = 'internal'
@@ -1344,7 +1352,7 @@ class GarbageCollector:
 
         # gc_promote_to_heap(ptr: i8*) -> i8*
         # Promotes an arena-allocated object to the GC heap.
-        # If the object is already on the heap (FLAG_ARENA not set), returns ptr unchanged.
+        # If the object is already on the heap (generation != UINT64_MAX), returns ptr unchanged.
         # If arena-allocated, copies the object to GC heap and returns new pointer.
         gc_promote_to_heap_ty = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
         self.gc_promote_to_heap = ir.Function(self.module, gc_promote_to_heap_ty, name="coex_gc_promote_to_heap")
@@ -2164,7 +2172,7 @@ class GarbageCollector:
         ], inbounds=True)
         builder.store(ir.Constant(self.i8_ptr, None), head_ptr)
 
-        # Field 2: watermark_depth = 0
+        # Field 2: watermark_slot = 0
         wm_depth_ptr = builder.gep(new_entry, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
@@ -2817,19 +2825,25 @@ class GarbageCollector:
         type_id_64 = builder.zext(type_id, self.i64)
         builder.store(type_id_64, type_id_ptr)
 
-        # Flags field (offset 16) - BIRTH-MARKING + TLAB flag
-        # Objects are born marked with current mark value
-        # If from TLAB, also set FLAG_TLAB bit
+        # Flags field (offset 16) - just TLAB flag (no mark bit; generation is separate)
         flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        current_mark = builder.load(self.gc_current_mark_value)
         # Shift is_tlab (0 or 1) to bit position 4 for FLAG_TLAB
         tlab_flag = builder.shl(is_tlab, ir.Constant(self.i64, 4))
-        flags_value = builder.or_(current_mark, tlab_flag)
-        builder.store(flags_value, flags_ptr)
+        builder.store(tlab_flag, flags_ptr)
 
         # Forward pointer field (offset 24) - will store handle
         forward_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), forward_ptr)
+
+        # Generation field (offset 32) - stamp with current generation
+        # MUST use atomic load to prevent LLVM from hoisting/caching this value.
+        # gc_current_mark_value is incremented by the GC thread; without atomic,
+        # LLVM at O3 can determine (via internal linkage) that no store exists
+        # in the mutator's execution path and treat it as loop-invariant,
+        # causing all objects in a loop to get a stale generation value.
+        gen_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        current_gen = builder.load_atomic(self.gc_current_mark_value, ordering='seq_cst', align=8)
+        builder.store(current_gen, gen_ptr)
 
         builder.branch(alloc_handle)
 
@@ -3273,14 +3287,16 @@ class GarbageCollector:
         # Null pointer check (defensive - shouldn't happen for valid handles)
         is_null_ptr = builder.icmp_unsigned("==", ptr, ir.Constant(self.i8_ptr, None))
 
-        # Also check if pointer looks valid (not a small integer like free list index)
-        # Valid heap pointers are typically > 0x10000 (64KB)
+        # Also check if pointer looks valid (not a small integer like free list index).
+        # Retired handle table slots contain next-free-handle indices (integers < 1M)
+        # cast to i8*. These must not be dereferenced. On macOS/arm64, valid heap
+        # pointers from mmap start well above 1MB. Using 4MB threshold for safety.
         check_ptr_valid = func.append_basic_block("check_ptr_valid")
         builder.cbranch(is_null_ptr, done, check_ptr_valid)
 
         builder.position_at_end(check_ptr_valid)
         ptr_val = builder.ptrtoint(ptr, self.i64)
-        min_valid_addr = ir.Constant(self.i64, 0x10000)  # 64KB
+        min_valid_addr = ir.Constant(self.i64, 0x400000)  # 4MB
         ptr_looks_valid = builder.icmp_unsigned(">=", ptr_val, min_valid_addr)
         builder.cbranch(ptr_looks_valid, get_header, done)
 
@@ -3291,22 +3307,23 @@ class GarbageCollector:
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
 
-        # Check if already marked (Phase 4: compare mark bit to gc_current_mark_value)
-        flags_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        flags = builder.load(flags_ptr)
-        mark_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
+        # Check if already traced: generation > current means already processed
+        # in this cycle. We use gen > current (not gen == current) because
+        # born-marked objects (gen == current) need child tracing — they may
+        # reference old objects (gen < current) that must be marked to survive.
+        # Marking stores current+1 to distinguish "traced" from "born-marked".
+        gen_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        obj_gen = builder.load(gen_ptr)
         current_mark = builder.load(self.gc_current_mark_value)
-        already_marked = builder.icmp_unsigned("==", mark_bit, current_mark)
+        already_marked = builder.icmp_unsigned(">", obj_gen, current_mark)
         builder.cbranch(already_marked, done, do_mark)
 
         builder.position_at_end(do_mark)
-        # Set mark bit to current mark value (Phase 4: mark inversion)
-        # Clear bit 0 and set it to gc_current_mark_value
-        flags_val = builder.load(flags_ptr)
-        cleared_flags = builder.and_(flags_val, ir.Constant(self.i64, ~self.FLAG_MARK_BIT & 0xFFFFFFFFFFFFFFFF))
+        # Set generation to current+1 to mark as "traced" (distinct from born-marked gen==current)
+        gen_ptr2 = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
         current_mark2 = builder.load(self.gc_current_mark_value)
-        new_flags = builder.or_(cleared_flags, current_mark2)
-        builder.store(new_flags, flags_ptr)
+        traced_gen = builder.add(current_mark2, ir.Constant(self.i64, 1))
+        builder.store(traced_gen, gen_ptr2)
 
         # Get type_id and check for types that need recursive marking (Phase 1: type_id is now i64)
         type_id_ptr = builder.gep(header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
@@ -3766,7 +3783,9 @@ class GarbageCollector:
 
         Phase 5: Uses segment-based shadow stack scanning.
         For each thread, walks segments from segment_base via `next` pointers,
-        scanning slots up to slot_index (the watermark).
+        scanning slots up to slot_index. gc_segment_pop enforces
+        slot_index >= watermark_slot during active GC, so scanning up to
+        slot_index always covers all watermark-time roots plus any new ones.
         """
         func = self.gc_scan_roots
 
@@ -3788,7 +3807,7 @@ class GarbageCollector:
         # No registry mutex needed - GC thread is sole remover of dead entries.
         # CAS-based insertion only modifies head pointer. Interior next pointers
         # are only modified by GC thread. New entries at head are either seen
-        # (scanned) or not (birth-marking protects their allocations).
+        # (scanned) or not (generation stamping protects their allocations).
 
         # Allocate storage for current thread pointer
         curr_thread_alloca = builder.alloca(self.thread_entry_type.as_pointer(), name="curr_thread")
@@ -3987,8 +4006,10 @@ class GarbageCollector:
         # Delegate to thread-aware sweep that handles per-thread allocation lists
         builder.call(self.gc_sweep_thread_lists, [])
 
-        # Reset allocation counter
-        builder.store(ir.Constant(self.i64, 0), self.gc_alloc_count)
+        # NOTE: gc_alloc_count is reset solely by the safepoint's atomic_rmw('xchg')
+        # at trigger time. Do NOT reset it here — a non-atomic store would race with
+        # mutator threads' atomic_rmw('add') increments, wiping allocations counted
+        # during sweep and delaying the next GC trigger.
 
         # Note: Sweep statistics are not currently tracked in the thread-list
         # sweep. For accurate stats, gc_sweep_thread_lists would need to be
@@ -4006,7 +4027,7 @@ class GarbageCollector:
         3. Increment gc_cycle_id
         4. (Single-threaded: threads acknowledge at next safepoint)
         5. Promote retired handles from previous cycle to free list (MI-6)
-        6. Set gc_phase = 2 (MARKING), flip mark value
+        6. Set gc_phase = 2 (MARKING), increment generation counter
         7. Mark phase: scan roots from all registered threads
         8. Set gc_phase = 3 (SWEEPING)
         9. Sweep phase: free unmarked objects (retire handles)
@@ -4050,8 +4071,23 @@ class GarbageCollector:
 
         builder.position_at_end(do_collection)
 
-        # Set gc_phase = 1 (WATERMARK) to signal threads to acknowledge
-        builder.store(ir.Constant(self.i64, 1), self.gc_phase)
+        # Increment gc_current_mark_value (generation counter) with seq_cst ordering.
+        # The generation is read by mutators in gc_alloc for birth-stamping.
+        # Without proper ordering, LLVM may cache the old value (internal
+        # linkage allows interprocedural analysis), and ARM64 may delay
+        # propagation of the new value. seq_cst ensures:
+        # 1. The increment is immediately visible to all threads (no caching/hoisting)
+        # 2. Mutators' acquire loads see the new value after this completes
+        old_mark = builder.atomic_rmw('add', self.gc_current_mark_value,
+                                       ir.Constant(self.i64, 1), 'seq_cst')
+
+        # Set gc_phase = 1 (WATERMARK) with release ordering.
+        # This is the synchronization point: mutators' acquire load of gc_phase
+        # establishes happens-before, making the generation increment visible.
+        # The generation increment above uses seq_cst for immediate visibility, while
+        # gc_phase release/acquire provides the formal happens-before guarantee.
+        builder.store_atomic(ir.Constant(self.i64, 1), self.gc_phase,
+                             ordering='release', align=8)
 
         # Increment gc_cycle_id
         cycle = builder.load(self.gc_cycle_id)
@@ -4074,15 +4110,9 @@ class GarbageCollector:
         # that may still point to old locations. gc_ptr_to_handle reads the
         # forward field from old memory, which requires it to be mapped.
 
-        # Set gc_phase = 2 (MARKING)
-        builder.store(ir.Constant(self.i64, 2), self.gc_phase)
-
-        # Phase 9: Flip gc_current_mark_value BEFORE mark phase
-        # This ensures newly allocated objects (born with OLD mark value) will be
-        # properly traversed, since they won't appear "already marked" with new value
-        old_mark = builder.load(self.gc_current_mark_value)
-        new_mark = builder.xor(old_mark, ir.Constant(self.i64, 1))
-        builder.store(new_mark, self.gc_current_mark_value)
+        # Set gc_phase = 2 (MARKING) — release ordering for mutator visibility
+        builder.store_atomic(ir.Constant(self.i64, 2), self.gc_phase,
+                             ordering='release', align=8)
 
         # Phase 5: Reset mark worklist for new cycle
         builder.call(self.gc_mark_worklist_reset, [])
@@ -4094,8 +4124,9 @@ class GarbageCollector:
         # Phase 5: Drain the mark worklist (iterative marking)
         builder.call(self.gc_mark_drain, [])
 
-        # Set gc_phase = 3 (SWEEPING)
-        builder.store(ir.Constant(self.i64, 3), self.gc_phase)
+        # Set gc_phase = 3 (SWEEPING) — release ordering for mutator visibility
+        builder.store_atomic(ir.Constant(self.i64, 3), self.gc_phase,
+                             ordering='release', align=8)
 
         # Phase 9: Sweep phase - free unmarked objects
         builder.call(self.gc_sweep, [])
@@ -4141,7 +4172,7 @@ class GarbageCollector:
         # Reset watermark_active = 0
         builder.store(ir.Constant(self.i64, 0), reset_wm_ptr)
 
-        # Also reset watermark_depth = 0
+        # Also reset watermark_slot = 0
         reset_depth_ptr = builder.gep(reset_curr, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
@@ -4287,8 +4318,9 @@ class GarbageCollector:
 
         builder.position_at_end(dead_cleanup_done)
 
-        # Set gc_phase = 0 (IDLE)
-        builder.store(ir.Constant(self.i64, 0), self.gc_phase)
+        # Set gc_phase = 0 (IDLE) — release ordering for mutator visibility
+        builder.store_atomic(ir.Constant(self.i64, 0), self.gc_phase,
+                             ordering='release', align=8)
 
         # Phase 9: Update statistics
         # Increment collections_completed atomically (BUG-018 fix)
@@ -4478,11 +4510,11 @@ class GarbageCollector:
 
         Non-blocking watermark protocol acknowledgment:
         - If gc_phase != 0 (IDLE), checks if we need to acknowledge
-        - Sets watermark_depth to current stack depth on first encounter
+        - Sets watermark_slot to current slot_index on first encounter
         - After acknowledging, continues immediately (no spin-wait)
 
         Safety: GC scans slots [0, watermark). Mutator writes to [slot_index, ...)
-        where slot_index >= watermark. Disjoint ranges. Birth-marking ensures
+        where slot_index >= watermark. Disjoint ranges. Generation stamping ensures
         new allocations survive the current cycle.
 
         Checks if allocation count >= threshold and triggers GC if so.
@@ -4502,8 +4534,12 @@ class GarbageCollector:
 
         builder = ir.IRBuilder(entry)
 
-        # First, check gc_phase for watermark protocol
-        phase = builder.load(self.gc_phase)
+        # First, check gc_phase for watermark protocol.
+        # MUST use acquire ordering: when gc_phase != 0 is observed, the
+        # acquire establishes happens-before with the GC thread's release
+        # store of gc_phase, making the generation increment visible to this thread.
+        # This ensures generation stamping in gc_alloc uses the correct (new) value.
+        phase = builder.load_atomic(self.gc_phase, ordering='acquire', align=8)
         is_idle = builder.icmp_unsigned('==', phase, ir.Constant(self.i64, 0))
         builder.cbranch(is_idle, enabled_check, check_phase)
 
@@ -4530,16 +4566,16 @@ class GarbageCollector:
         # Acknowledge watermark
         builder.position_at_end(do_ack)
 
-        # watermark_depth = stack_depth
-        depth_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        # watermark_slot = slot_index (capture current slot position as watermark)
+        slot_idx_ptr_wm = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 14)  # slot_index
         ], inbounds=True)
-        stack_depth = builder.load(depth_ptr)
+        slot_watermark = builder.load(slot_idx_ptr_wm)
 
         wm_depth_ptr = builder.gep(thread_entry, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
-        builder.store(stack_depth, wm_depth_ptr)
+        builder.store(slot_watermark, wm_depth_ptr)
 
         # last_gc_cycle = gc_cycle_id
         cycle_id = builder.load(self.gc_cycle_id)
@@ -4555,7 +4591,7 @@ class GarbageCollector:
         # Safety: GC scans slots [0, watermark). Mutator writes to [slot_index, ...)
         # where slot_index >= watermark. Disjoint ranges. Popped frames leave valid
         # handles in mapped segment memory (floating garbage, not dangling refs).
-        # Birth-marking ensures new allocations survive the current cycle.
+        # Generation stamping ensures new allocations survive the current cycle.
         builder.branch(after_ack)
 
         builder.position_at_end(after_ack)
@@ -4598,7 +4634,7 @@ class GarbageCollector:
         # Delegate GC to the dedicated GC thread (BUG-088 fix)
         # Non-blocking: signal the GC thread and continue immediately.
         # The mutator never waits for collection to complete (BUG-015 fix).
-        # Birth-marking ensures new allocations survive the current cycle.
+        # Generation stamping ensures new allocations survive the current cycle.
         builder.position_at_end(do_gc)
 
         # Set trigger flag to request collection
@@ -4819,8 +4855,8 @@ class GarbageCollector:
         if so. Otherwise falls back to GC allocation.
 
         Arena-allocated objects:
-        - Have the same header layout as GC objects (32 bytes)
-        - Have FLAG_ARENA set in flags (no handle, bulk-freed)
+        - Have the same header layout as GC objects (40 bytes)
+        - Have generation == UINT64_MAX as sentinel (no handle, bulk-freed)
         - Are NOT added to the allocation list
         - Are NOT tracked by GC
         - Are bulk-freed when arena scope ends
@@ -5330,6 +5366,12 @@ class GarbageCollector:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
+        # Clear gc_complete so gc_wait_for_completion will actually wait
+        complete_ptr = builder.gep(self.gc_state, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, 0), complete_ptr)
+
         # Set trigger flag to request collection
         builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
 
@@ -5709,9 +5751,11 @@ class GarbageCollector:
         builder.ret(start_slot)
 
     def _implement_gc_segment_pop(self):
-        """Restore slot index to start_slot value.
+        """Restore slot index to start_slot value, with watermark enforcement.
 
-        May go back to previous segment if needed.
+        If GC is active and start_slot < watermark_slot, spin-waits until
+        GC completes before lowering slot_index. This prevents the GC from
+        scanning a stale (lowered) slot_index and missing roots.
 
         IMPORTANT: Uses ThreadEntry fields (via pthread TLS) instead of LLVM
         thread_local globals, which don't work in llvmlite.
@@ -5720,6 +5764,11 @@ class GarbageCollector:
         func.args[0].name = "start_slot"
 
         entry = func.append_basic_block("entry")
+        check_phase = func.append_basic_block("check_phase")
+        check_watermark = func.append_basic_block("check_watermark")
+        spin_wait = func.append_basic_block("spin_wait")
+        recheck_phase = func.append_basic_block("recheck_phase")
+        do_store = func.append_basic_block("do_store")
 
         builder = ir.IRBuilder(entry)
         start_slot = func.args[0]
@@ -5729,14 +5778,65 @@ class GarbageCollector:
         thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
         thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
 
-        # Update ThreadEntry.slot_index (field 14) directly
-        # The segment chain remains intact for potential reuse
         slot_idx_ptr = builder.gep(thread_entry, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 14)  # slot_index field
         ], inbounds=True)
-        builder.store(start_slot, slot_idx_ptr)
 
+        # Fast path: if gc_phase == 0 (IDLE), no watermark enforcement needed
+        # Acquire ordering pairs with GC thread's release stores of gc_phase
+        phase = builder.load_atomic(self.gc_phase, ordering='acquire', align=8)
+        is_idle = builder.icmp_unsigned('==', phase, ir.Constant(self.i64, 0))
+        builder.cbranch(is_idle, do_store, check_phase)
+
+        # GC is active - check if we need to enforce watermark
+        builder.position_at_end(check_phase)
+        # Load watermark_active (field 3)
+        wm_active_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        wm_active = builder.load(wm_active_ptr)
+        has_watermark = builder.icmp_unsigned('!=', wm_active, ir.Constant(self.i64, 0))
+
+        # If watermark not yet active, acknowledge it now before allowing the pop.
+        # Without this, the pop lowers slot_index, and a later safepoint captures
+        # the lowered value as the watermark — allowing the GC to miss roots.
+        ack_watermark = func.append_basic_block("ack_watermark")
+        builder.cbranch(has_watermark, check_watermark, ack_watermark)
+
+        builder.position_at_end(ack_watermark)
+        # Capture current slot_index as the watermark before the pop
+        current_slot = builder.load(slot_idx_ptr)
+        wm_slot_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)  # watermark_slot
+        ], inbounds=True)
+        builder.store(current_slot, wm_slot_ptr)
+        builder.store(ir.Constant(self.i64, 1), wm_active_ptr)
+        builder.branch(check_watermark)
+
+        # Watermark is set - check if start_slot would drop below it
+        builder.position_at_end(check_watermark)
+        wm_depth_ptr = builder.gep(thread_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)  # watermark_slot
+        ], inbounds=True)
+        watermark_slot = builder.load(wm_depth_ptr)
+        is_safe = builder.icmp_unsigned('>=', start_slot, watermark_slot)
+        builder.cbranch(is_safe, do_store, spin_wait)
+
+        # Spin-wait: start_slot < watermark_slot, must wait for GC to finish
+        builder.position_at_end(spin_wait)
+        builder.call(self.sched_yield, [])
+        builder.branch(recheck_phase)
+
+        # Re-check gc_phase after yield
+        builder.position_at_end(recheck_phase)
+        phase2 = builder.load_atomic(self.gc_phase, ordering='acquire', align=8)
+        is_idle2 = builder.icmp_unsigned('==', phase2, ir.Constant(self.i64, 0))
+        builder.cbranch(is_idle2, do_store, spin_wait)
+
+        # Store start_slot to slot_index
+        builder.position_at_end(do_store)
+        builder.store(start_slot, slot_idx_ptr)
         builder.ret_void()
 
     def _implement_gc_segment_set_root(self):
@@ -6664,20 +6764,23 @@ class GarbageCollector:
         type_id_64 = builder.zext(type_id, self.i64)
         builder.store(type_id_64, type_ptr)
 
-        # Store flags with FLAG_ARENA and current mark bit
+        # Store flags with just FLAG_TLAB (generation field handles arena identity)
         flags_ptr = builder.gep(header_ptr, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
         ], inbounds=True)
-        current_mark = builder.load(self.gc_current_mark_value)
-        arena_flag = ir.Constant(self.i64, self.FLAG_ARENA | self.FLAG_TLAB)
-        flags_value = builder.or_(current_mark, arena_flag)
-        builder.store(flags_value, flags_ptr)
+        builder.store(ir.Constant(self.i64, self.FLAG_TLAB), flags_ptr)
 
         # Store forward = 0 (no handle for arena objects)
         forward_ptr = builder.gep(header_ptr, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
         builder.store(ir.Constant(self.i64, 0), forward_ptr)
+
+        # Store generation = UINT64_MAX (-1) as arena sentinel
+        gen_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, self.GC_ARENA_GENERATION), gen_ptr)
 
         # Get user pointer (after header)
         user_ptr_arena = builder.gep(arena_block, [header_size])
@@ -6716,7 +6819,7 @@ class GarbageCollector:
         Algorithm:
         1. Check if ptr is NULL -> return NULL
         2. Read the header (ptr - HEADER_SIZE)
-        3. Check FLAG_ARENA in flags
+        3. Check generation == UINT64_MAX (arena sentinel)
         4. If not arena-allocated, return ptr unchanged (already on heap)
         5. If arena-allocated:
            - Read size and type_id from header
@@ -6756,16 +6859,12 @@ class GarbageCollector:
         header_raw = builder.gep(ptr, [neg_header])
         header_ptr = builder.bitcast(header_raw, self.header_type.as_pointer())
 
-        # Read flags (field 2)
-        flags_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        # Check if arena-allocated via generation == UINT64_MAX
+        gen_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
         ], inbounds=True)
-        flags = builder.load(flags_ptr)
-
-        # Check FLAG_ARENA
-        arena_flag = ir.Constant(self.i64, self.FLAG_ARENA)
-        is_arena = builder.and_(flags, arena_flag)
-        is_arena_set = builder.icmp_unsigned("!=", is_arena, ir.Constant(self.i64, 0))
+        gen_val = builder.load(gen_ptr)
+        is_arena_set = builder.icmp_unsigned("==", gen_val, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
 
         builder.cbranch(is_arena_set, do_promote, done)
 
@@ -7099,7 +7198,7 @@ class GarbageCollector:
         is_null_handle = builder.icmp_unsigned("==", obj_handle, ir.Constant(self.i64, 0))
         builder.cbranch(is_null_handle, next_node, check_mark)
 
-        # Check mark bit
+        # Check generation
         builder.position_at_end(check_mark)
 
         # Dereference handle to get data pointer
@@ -7118,19 +7217,24 @@ class GarbageCollector:
         ], inbounds=True)
         obj_size = builder.load(size_ptr)
 
-        # Get flags field
+        # Get flags field (still needed for TLAB check later)
         flags_ptr = builder.gep(header, [
             ir.Constant(self.i32, 0),
             ir.Constant(self.i32, 2)  # flags field
         ], inbounds=True)
         flags = builder.load(flags_ptr)
 
-        # Extract mark bit
-        mark_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
+        # Check generation field against current generation
+        gen_ptr = builder.gep(header, [
+            ir.Constant(self.i32, 0),
+            ir.Constant(self.i32, 4)  # generation field
+        ], inbounds=True)
+        obj_gen = builder.load(gen_ptr)
         current_mark = builder.load(self.gc_current_mark_value)
 
-        # If mark_bit == current_mark, object is live
-        is_marked = builder.icmp_unsigned("==", mark_bit, current_mark)
+        # If generation >= current, object is live (born-marked gen==current
+        # or explicitly traced gen==current+1 both survive)
+        is_marked = builder.icmp_unsigned(">=", obj_gen, current_mark)
         builder.cbranch(is_marked, marked_node, unmarked_node)
 
         # Object is marked - add to survivors list
@@ -7418,10 +7522,31 @@ class GarbageCollector:
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
         next_dead = builder.load(next_dead_ptr)
-        # Free this TLAB
+
+        # Re-check live_count before munmap: a mutator may have allocated a new
+        # object into this TLAB between the sweep's decrement-to-zero and now
+        # (the CAS bump in gc_tlab_alloc happens before gc_alloc increments
+        # live_count, creating a race window). If live_count > 0, skip munmap.
+        recheck_live_ptr = builder.gep(dead_header, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)  # live_count field
+        ], inbounds=True)
+        recheck_live = builder.load(recheck_live_ptr)
+        recheck_live.ordering = 'acquire'
+        tlab_still_dead = builder.icmp_unsigned("==", recheck_live, ir.Constant(self.i64, 0))
+
+        do_munmap = func.append_basic_block("do_munmap")
+        skip_munmap = func.append_basic_block("skip_munmap")
+        builder.cbranch(tlab_still_dead, do_munmap, skip_munmap)
+
+        # TLAB is confirmed dead — safe to munmap
+        builder.position_at_end(do_munmap)
         tlab_size_const = ir.Constant(self.i64, self.TLAB_SIZE)
         builder.call(self.munmap, [curr_dead, tlab_size_const])
-        # Move to next
+        builder.store(next_dead, dead_tlab_alloca)
+        builder.branch(free_tlab_loop)
+
+        # TLAB was reused — skip munmap, just move to next
+        builder.position_at_end(skip_munmap)
         builder.store(next_dead, dead_tlab_alloca)
         builder.branch(free_tlab_loop)
 
@@ -7950,7 +8075,7 @@ class GarbageCollector:
         builder.call(printf, [header_ptr])
 
         # Object format string
-        obj_fmt = "[GC:HEAP] obj=%p type=%d size=%lld marked=%d\n"
+        obj_fmt = "[GC:HEAP] obj=%p type=%d size=%lld gen=%lld\n"
         obj_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(obj_fmt) + 1), name=".gc_heap_obj")
         obj_global.global_constant = True
         obj_global.linkage = 'private'
@@ -8039,13 +8164,11 @@ class GarbageCollector:
         size = builder.load(size_ptr)
         type_id_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
         type_id = builder.load(type_id_ptr)
-        flags_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        flags = builder.load(flags_ptr)
+        # Extract generation from field 4
+        gen_ptr = builder.gep(header_ptr_local, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
+        gen_val = builder.load(gen_ptr)
 
-        # Extract mark bit
-        marked = builder.and_(flags, ir.Constant(self.i64, self.FLAG_MARK_BIT))
-
-        builder.call(printf, [obj_ptr, data_ptr, type_id, size, marked])
+        builder.call(printf, [obj_ptr, data_ptr, type_id, size, gen_val])
 
         # Increment counter
         count_val = builder.load(count_alloca)
@@ -10145,9 +10268,12 @@ class GarbageCollector:
         pinned_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_PINNED))
         is_pinned = builder.icmp_unsigned('!=', pinned_bit, ir.Constant(self.i64, 0))
 
-        # Skip arena objects (FLAG_ARENA = 0x20)
-        arena_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_ARENA))
-        is_arena = builder.icmp_unsigned('!=', arena_bit, ir.Constant(self.i64, 0))
+        # Skip arena objects (generation == UINT64_MAX)
+        gen_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        gen_val = builder.load(gen_ptr)
+        is_arena = builder.icmp_unsigned('==', gen_val, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
 
         skip_obj = builder.or_(is_pinned, is_arena)
 
@@ -10161,7 +10287,7 @@ class GarbageCollector:
         ], inbounds=True)
         user_size = builder.load(size_field_ptr)
 
-        # Total object size = HEADER_SIZE(32) + user_size, then align to 8
+        # Total object size = HEADER_SIZE(40) + user_size, then align to 8
         total_obj_size = builder.add(user_size, ir.Constant(self.i64, self.HEADER_SIZE))
         aligned_size = builder.add(total_obj_size, ir.Constant(self.i64, 7))
         aligned_size = builder.and_(aligned_size, ir.Constant(self.i64, -8))
@@ -10361,8 +10487,11 @@ class GarbageCollector:
         # Skip pinned or arena objects
         pinned_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_PINNED))
         is_pinned2 = builder.icmp_unsigned('!=', pinned_bit2, ir.Constant(self.i64, 0))
-        arena_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_ARENA))
-        is_arena2 = builder.icmp_unsigned('!=', arena_bit2, ir.Constant(self.i64, 0))
+        gen_ptr2 = builder.gep(header2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
+        ], inbounds=True)
+        gen_val2 = builder.load(gen_ptr2)
+        is_arena2 = builder.icmp_unsigned('==', gen_val2, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
         skip_obj2 = builder.or_(is_pinned2, is_arena2)
         builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
 
@@ -10373,7 +10502,7 @@ class GarbageCollector:
         ], inbounds=True)
         user_size2 = builder.load(size_ptr2)
 
-        # Total object size = HEADER_SIZE(32) + user_size, then align to 8
+        # Total object size = HEADER_SIZE(40) + user_size, then align to 8
         total_obj_size2 = builder.add(user_size2, ir.Constant(self.i64, self.HEADER_SIZE))
         aligned_size2 = builder.add(total_obj_size2, ir.Constant(self.i64, 7))
         aligned_size2 = builder.and_(aligned_size2, ir.Constant(self.i64, -8))

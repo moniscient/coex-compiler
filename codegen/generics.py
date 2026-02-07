@@ -362,6 +362,12 @@ class GenericsHandler:
             if isinstance(obj_type, MapType):
                 return obj_type.value_type
         elif isinstance(expr, MethodCallExpr):
+            # Check for static method calls: Type.method()
+            if isinstance(expr.object, Identifier):
+                type_name = expr.object.name
+                if type_name == "String":
+                    # String.from(), String.from_bytes(), String.from_hex() all return string
+                    return PrimitiveType("string")
             # Check the receiver type and method name
             obj_type = self.infer_type_from_expr(expr.object)
             if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
@@ -384,6 +390,21 @@ class GenericsHandler:
                     return ListType(PrimitiveType("string"))
                 elif expr.method == "values":
                     return ListType(PrimitiveType("json"))
+            # List/Array methods
+            if isinstance(obj_type, ListType):
+                if expr.method == "append":
+                    return obj_type  # Returns same list type
+                elif expr.method == "get":
+                    return obj_type.element_type
+                elif expr.method == "len":
+                    return PrimitiveType("int")
+            if isinstance(obj_type, ArrayType):
+                if expr.method == "append":
+                    return obj_type
+                elif expr.method == "get":
+                    return obj_type.element_type
+                elif expr.method == "len":
+                    return PrimitiveType("int")
 
         # Default
         return PrimitiveType("int")

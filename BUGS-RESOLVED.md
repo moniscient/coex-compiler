@@ -1744,3 +1744,48 @@ func main() -> int
   5. `gc_registry_mutex` retained only for diagnostic builtins (`gc_dump_heap`, `gc_validate_handle_storage`).
 - **Files**: `coex_gc.py` (`_implement_gc_register_thread`, `_implement_gc_unregister_thread`, `_implement_gc_scan_roots`, `_implement_gc_sweep_thread_lists`, `_implement_gc_collect`, `_implement_gc_wait_for_watermarks`, `_implement_gc_compact_impl`)
 - **Status**: Fixed (2026-02-05)
+
+### BUG-104: gc_alloc_count double-reset delays second GC trigger
+- **Discovered**: 2026-02-06, during Galaxian GC watermark investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Heavy allocation loop without explicit gc() calls. GC triggers once at 100K threshold, then gc_sweep's non-atomic store(0) wipes concurrent allocations, delaying next trigger.
+- **Observed**: Only 1 GC cycle triggers despite ~600K+ allocations; crash occurs before second trigger
+- **Expected**: GC should trigger approximately every 100K allocations
+- **Fix**: Removed redundant store(0) in gc_sweep; safepoint xchg is sole reset mechanism.
+- **Files**: `coex_gc.py` (gc_sweep)
+- **Status**: Fixed (2026-02-06)
+
+### BUG-105: TLAB live_count race causes premature munmap
+- **Discovered**: 2026-02-06, during Galaxian GC watermark investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Heavy concurrent allocation. gc_tlab_alloc CAS bumps cursor before gc_alloc increments live_count, creating a window where sweep decrements to 0 and adds TLAB to dead list.
+- **Observed**: SIGSEGV when accessing objects in munmap'd TLAB
+- **Expected**: TLABs with live allocations should not be freed
+- **Fix**: Added atomic live_count re-check with acquire ordering before munmap; skip munmap if live_count > 0.
+- **Files**: `coex_gc.py` (TLAB free loop in gc_sweep_thread_lists)
+- **Status**: Fixed (2026-02-06)
+
+### BUG-106: gc_segment_pop watermark enforcement gap
+- **Discovered**: 2026-02-06, during Galaxian GC watermark investigation
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Deep recursion with allocation pressure. When gc_phase != 0 but watermark_active == 0 (thread hasn't hit safepoint yet), gc_segment_pop allows unrestricted slot_index lowering.
+- **Observed**: GC scans slots containing stale retired handles, causing crash
+- **Expected**: gc_segment_pop should acknowledge watermark when GC is active
+- **Fix**: Added watermark acknowledgment in gc_segment_pop when gc_phase != 0 and watermark_active == 0: captures current slot_index as watermark, sets watermark_active = 1, then falls through to watermark check.
+- **Files**: `coex_gc.py` (gc_segment_pop)
+- **Status**: Fixed (2026-02-06)
+
+### BUG-107: gc_mark_object validity threshold too low for retired handle detection
+- **Discovered**: 2026-02-06, during stress test crash investigation
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Stress test with 600K+ allocations and deep recursion. Retired handle table entries contain free-list link integers (handle indices up to ~200K) that pass the 0x10000 (64KB) validity check.
+- **Observed**: gc_mark_object dereferences retired handle, gets free-list index as pointer (~0x2f8e1), crashes with EXC_BAD_ACCESS
+- **Expected**: Retired handle entries (small integers) should be detected as invalid pointers
+- **Fix**: Raised validity threshold from 0x10000 (64KB) to 0x400000 (4MB). On macOS/arm64, valid heap pointers are well above this.
+- **Files**: `coex_gc.py` (gc_mark_object)
+- **Status**: Fixed (2026-02-06)
+- **Note**: Root cause may be stale handles in shadow stack slots surviving across function calls. The threshold fix is a safety net.

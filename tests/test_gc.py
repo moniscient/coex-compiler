@@ -714,3 +714,364 @@ func main() -> int
     return 0
 ~
 ''', "200\n8\n300\n")
+
+    def test_gc_json_stringify_in_loop(self, expect_output):
+        """Test gc() with json stringify in a loop (BUG-103 regression)"""
+        expect_output('''
+func main() -> int
+    frame = 0
+    while frame < 20
+        frame = frame + 1
+        gc()
+        x: json = { type: "test", value: frame }
+        s: string = x.stringify()
+        if frame == 20
+            print(s)
+        ~
+    ~
+    return 0
+~
+''', '{"value":20,"type":"test"}\n')
+
+    def test_gc_json_stringify_after_gc(self, expect_output):
+        """Test gc() after json stringify doesn't corrupt next iteration"""
+        expect_output('''
+func main() -> int
+    frame = 0
+    while frame < 20
+        frame = frame + 1
+        x: json = { type: "test", value: frame }
+        s: string = x.stringify()
+        gc()
+        if frame == 20
+            print(s)
+        ~
+    ~
+    return 0
+~
+''', '{"value":20,"type":"test"}\n')
+
+    def test_gc_nested_json_in_loop(self, expect_output):
+        """Test gc() with nested json objects in a loop"""
+        expect_output('''
+func main() -> int
+    frame = 0
+    while frame < 30
+        frame = frame + 1
+        gc()
+        layout: json = {
+            type: "window",
+            children: [
+                { type: "text", text: "SCORE: " + String.from(frame) },
+                { type: "text", text: "Frame: " + String.from(frame) }
+            ]
+        }
+        s: string = layout.stringify()
+    ~
+    print("ok")
+    return 0
+~
+''', "ok\n")
+
+
+class TestGCWatermarkEnforcement:
+    """Tests for watermark enforcement in gc_segment_pop.
+
+    Verifies that gc_segment_pop prevents slot_index from dropping below
+    the watermark during active GC, ensuring roots are not missed.
+    """
+
+    def test_deep_call_stack_with_gc(self, expect_output):
+        """Test gc() with deep call stack exercises the watermark blocking path.
+
+        Deep recursion creates many shadow stack frames. gc() in the middle
+        forces watermark capture at depth, then unwinding must respect it.
+        """
+        expect_output('''
+func recurse(depth: int, data: List<int>) -> int
+    if depth <= 0
+        gc()
+        return data.get(0) + data.get(1)
+    ~
+    extra: List<int> = [depth, depth + 1, depth + 2]
+    result = recurse(depth - 1, data)
+    return result + extra.get(0)
+~
+
+func main() -> int
+    data: List<int> = [100, 200, 300]
+    result = recurse(50, data)
+    print(result)
+    return 0
+~
+''', "1575\n")
+
+    def test_gc_across_nested_function_returns(self, expect_output):
+        """Test that data survives gc() when multiple functions are on the stack."""
+        expect_output('''
+func inner(x: List<int>) -> int
+    gc()
+    return x.get(0)
+~
+
+func middle(x: List<int>) -> int
+    y: List<int> = [10, 20, 30]
+    result = inner(x)
+    return result + y.get(2)
+~
+
+func outer(x: List<int>) -> int
+    z: Map<int, int> = {1: 100, 2: 200}
+    result = middle(x)
+    return result + z.get(1)
+~
+
+func main() -> int
+    data: List<int> = [42, 43, 44]
+    print(outer(data))
+    return 0
+~
+''', "172\n")
+
+    def test_threshold_gc_with_deep_nesting(self, expect_output):
+        """Test automatic threshold-triggered GC with heavy allocation in nested functions.
+
+        Allocates enough garbage to trigger automatic GC (threshold ~100000)
+        while keeping live data across deep call stacks.
+        """
+        expect_output('''
+func make_garbage(n: int) -> int
+    for i in 0..n
+        temp: List<int> = [i, i + 1]
+    ~
+    return n
+~
+
+func level3(data: List<int>) -> int
+    make_garbage(40000)
+    return data.get(0) + data.get(1)
+~
+
+func level2(data: List<int>) -> int
+    extra: List<int> = [7, 8, 9]
+    result = level3(data)
+    make_garbage(40000)
+    return result + extra.get(1)
+~
+
+func level1(data: List<int>) -> int
+    m: Map<int, int> = {1: 10, 2: 20}
+    result = level2(data)
+    make_garbage(40000)
+    return result + m.get(2)
+~
+
+func main() -> int
+    live: List<int> = [100, 200, 300]
+    result = level1(live)
+    print(result)
+    return 0
+~
+''', "328\n")
+
+    def test_gc_stress_rapid_alloc_nested_calls(self, expect_output):
+        """Stress test: rapid automatic GC with heavy allocation in nested functions.
+
+        Many iterations of nested calls that each allocate enough to trigger GC,
+        ensuring watermark enforcement is correct across many cycles.
+        """
+        expect_output('''
+func allocate_and_return(n: int) -> List<int>
+    for i in 0..n
+        temp: List<int> = [i]
+    ~
+    return [n]
+~
+
+func nested_work(depth: int, acc: int) -> int
+    if depth <= 0
+        result: List<int> = allocate_and_return(5000)
+        return acc + result.get(0)
+    ~
+    result: List<int> = allocate_and_return(5000)
+    return nested_work(depth - 1, acc + result.get(0))
+~
+
+func main() -> int
+    total = 0
+    for i in 0..20
+        total = total + nested_work(5, 0)
+    ~
+    print(total)
+    return 0
+~
+''', "600000\n")
+
+    def test_gc_auto_trigger_multiple_cycles(self, expect_output):
+        """Test that automatic GC triggers correctly multiple times without explicit gc() calls.
+
+        Allocates enough objects to trigger GC threshold multiple times.
+        Each iteration creates ~5000 temporary lists, and with 100K threshold
+        and 30 iterations, this should trigger 1-2 GC cycles automatically.
+        Verifies that live data survives all cycles.
+        """
+        expect_output('''
+func churn(n: int) -> int
+    total = 0
+    for i in 0..n
+        temp: List<int> = [i, i+1, i+2]
+        total = total + temp.get(0)
+    ~
+    return total
+~
+
+func main() -> int
+    live: List<int> = [10, 20, 30]
+    result = 0
+    for round in 0..30
+        result = result + churn(5000)
+    ~
+    print(live.get(0))
+    print(live.get(1))
+    print(live.get(2))
+    print(result)
+    return 0
+~
+''', "10\n20\n30\n374925000\n")
+
+    def test_gc_no_explicit_gc_heavy_alloc(self, expect_output):
+        """Test heavy allocation without any explicit gc() calls.
+
+        Specifically targets the double-reset bug: if gc_alloc_count is
+        reset twice (once by safepoint xchg, once by sweep store), the
+        second GC trigger is delayed and crashes may occur before it fires.
+        """
+        expect_output('''
+func make_garbage(n: int) -> int
+    for i in 0..n
+        s = "garbage_" + String.from(i)
+    ~
+    return n
+~
+
+func main() -> int
+    total = 0
+    for i in 0..50
+        total = total + make_garbage(3000)
+    ~
+    print(total)
+    return 0
+~
+''', "150000\n")
+
+    def test_gc_tlab_reuse_after_sweep(self, expect_output):
+        """Test that TLABs with live objects are not prematurely freed.
+
+        Creates a pattern where some objects survive GC while others in
+        the same TLAB die. The live_count check before munmap must prevent
+        premature TLAB reclamation.
+        """
+        expect_output('''
+func allocate_mixed(keeper: List<int>, n: int, tag: int) -> List<int>
+    for i in 0..n
+        temp: List<int> = [i * 2]
+    ~
+    return keeper.append(tag)
+~
+
+func main() -> int
+    data: List<int> = [0]
+    for round in 0..40
+        data = allocate_mixed(data, 4000, round)
+    ~
+    print(data.len())
+    print(data.get(0))
+    print(data.get(40))
+    return 0
+~
+''', "41\n0\n39\n")
+
+    def test_gc_watermark_with_deep_recursion(self, expect_output):
+        """Test watermark enforcement during deep recursion with allocation.
+
+        When gc_phase != 0 and a thread hasn't hit safepoint yet, segment_pop
+        must acknowledge the watermark. This test exercises deep call stacks
+        with allocation pressure to trigger GC during active recursion.
+        """
+        expect_output('''
+func recursive_alloc(depth: int, acc: int) -> int
+    if depth <= 0
+        return acc
+    ~
+    temp: List<int> = [depth, depth+1, depth+2]
+    for i in 0..500
+        garbage: List<int> = [i]
+    ~
+    return recursive_alloc(depth - 1, acc + temp.get(0))
+~
+
+func main() -> int
+    total = 0
+    for round in 0..10
+        total = total + recursive_alloc(20, 0)
+    ~
+    print(total)
+    return 0
+~
+''', "2100\n")
+
+    def test_gc_list_of_strings_auto_gc(self, expect_output):
+        """Test that strings in lists survive automatic GC.
+
+        Born-marked objects (gen==current) must have children traced during marking,
+        otherwise old strings (gen<current) stored in new list nodes get swept.
+        This specifically tests the concurrent race where the mutator creates
+        a new list containing references to old strings while GC is running.
+        """
+        expect_output('''
+func main() -> int
+    frame = 0
+    keeper: List<string> = ["alive"]
+    while frame < 200
+        frame = frame + 1
+        i = 0
+        while i < 200
+            s = "garbage_" + String.from(i)
+            i = i + 1
+        ~
+        keeper = keeper.append("frame_" + String.from(frame))
+    ~
+    print(keeper.get(0))
+    print(keeper.len())
+    return 0
+~
+''', "alive\n201\n")
+
+    def test_gc_list_of_strings_heavy(self, expect_output):
+        """Stress test: lists of strings with heavy allocation triggering multiple GC cycles."""
+        expect_output('''
+func main() -> int
+    frame = 0
+    while frame < 100
+        frame = frame + 1
+        items: List<string> = []
+        i = 0
+        while i < 60
+            items = items.append("item_" + String.from(i) + "_frame_" + String.from(frame))
+            i = i + 1
+        ~
+        total_len = 0
+        j = 0
+        while j < items.len()
+            s = items.get(j)
+            total_len = total_len + s.len()
+            j = j + 1
+        ~
+        if frame % 50 == 0
+            print("Frame " + String.from(frame) + " ok")
+        ~
+    ~
+    print("ok")
+    return 0
+~
+''', "Frame 50 ok\nFrame 100 ok\nok\n")
