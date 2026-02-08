@@ -2900,27 +2900,27 @@ class CodeGenerator:
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
 
-        # Calculate size - estimate 8 bytes per field (works for most types)
-        size = len(field_info) * 8 if field_info else 8
-        size_val = ir.Constant(ir.IntType(64), size)
-
-        # Allocate via GC with registered type ID
-        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
-        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
-        ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
-        
-        # Initialize fields
-        # First, handle named arguments
+        # Evaluate ALL field expressions BEFORE allocating the struct.
+        # Any expression evaluation could trigger GC/compaction, which would
+        # invalidate a raw pointer to the struct if we allocated it first.
         field_values = {}
         for name, value_expr in named_args.items():
             field_values[name] = self._generate_expression(value_expr)
-        
-        # Then positional arguments (match order of fields)
+
         for i, arg in enumerate(args):
             if i < len(field_info):
                 field_name = field_info[i][0]
                 if field_name not in field_values:
                     field_values[field_name] = self._generate_expression(arg)
+
+        # Calculate size - estimate 8 bytes per field (works for most types)
+        size = len(field_info) * 8 if field_info else 8
+        size_val = ir.Constant(ir.IntType(64), size)
+
+        # Allocate via GC with registered type ID (AFTER all expressions evaluated)
+        type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
+        raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
+        ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
         
         # Store each field
         i64 = ir.IntType(64)

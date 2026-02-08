@@ -660,7 +660,9 @@ class StringGenerator:
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
+        # Save handle for re-derivation after second allocation.
+        # Arena objects have forward=0 (no handle); GC objects have forward=handle.
+        string_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer
         # BUG-019: Allocate size+1 for C interop null terminator
@@ -689,20 +691,28 @@ class StringGenerator:
         null_ptr = builder.gep(dest_data, [total_size])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
+        # Re-derive string_ptr: arena objects (handle==0) don't move, use raw_ptr.
+        # GC objects may have been moved by compaction, re-derive via handle.
+        is_arena_obj = builder.icmp_unsigned('==', string_handle, ir.Constant(i64, 0))
+        deref_ptr = builder.call(cg.gc.gc_handle_deref, [string_handle])
+        # gc_handle_deref(0) returns NULL; select picks raw_ptr for arena case
+        string_raw2 = builder.select(is_arena_obj, raw_ptr, deref_ptr)
+        string_ptr2 = builder.bitcast(string_raw2, cg.string_struct.as_pointer())
+
         owner_handle = builder.ptrtoint(dest_data, i64)
-        owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        owner_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
 
-        offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        offset_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), offset_ptr)
 
-        len_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
+        len_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(total_len, len_ptr)
 
-        size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
+        size_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(total_size, size_ptr)
 
-        builder.ret(string_ptr)
+        builder.ret(string_ptr2)
 
     def _implement_string_join_list(self):
         """Efficiently join a list of strings with a separator."""
@@ -800,13 +810,21 @@ class StringGenerator:
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        result_str = builder.bitcast(raw_ptr, string_ptr_ty)
+        # Save handle for re-derivation after second allocation.
+        # Arena objects have forward=0 (no handle); GC objects have forward=handle.
+        result_str_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer
         # BUG-019: Allocate size+1 for C interop null terminator
         string_data_type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         alloc_size = builder.add(total_size, ir.Constant(i64, 1))
         dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
+
+        # Re-derive: arena objects (handle==0) don't move, use raw_ptr.
+        is_arena_str = builder.icmp_unsigned('==', result_str_handle, ir.Constant(i64, 0))
+        deref_str = builder.call(cg.gc.gc_handle_deref, [result_str_handle])
+        result_str_raw2 = builder.select(is_arena_str, raw_ptr, deref_str)
+        result_str = builder.bitcast(result_str_raw2, string_ptr_ty)
 
         owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.ptrtoint(dest_data, i64)

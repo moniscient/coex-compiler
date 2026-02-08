@@ -4128,15 +4128,14 @@ class GarbageCollector:
         builder.store_atomic(ir.Constant(self.i64, 3), self.gc_phase,
                              ordering='release', align=8)
 
+        # Free deferred memory from previous compaction (if any).
+        # Must be BEFORE sweep: sweep may discover the same TLABs as dead,
+        # causing double-free if compact cleanup runs after. Marking is now
+        # complete so old memory is no longer needed for gc_ptr_to_handle.
+        builder.call(self.gc_compact_deferred_cleanup, [])
+
         # Phase 9: Sweep phase - free unmarked objects
         builder.call(self.gc_sweep, [])
-
-        # Free deferred memory from previous compaction (if any).
-        # Must be AFTER sweep: during mark phase, gc_ptr_to_handle reads the
-        # forward field from old object locations (stale raw pointers in List
-        # root/tail, String owner, etc.). Old memory must stay mapped until
-        # marking and sweep are complete.
-        builder.call(self.gc_compact_deferred_cleanup, [])
 
         # Reset watermark_active for all threads (no mutex needed - GC thread only)
         # Skip dead entries (watermark_active == 0xDEAD)
@@ -7324,10 +7323,9 @@ class GarbageCollector:
                     builder.store(old_dead_head, next_tlab_field)
                     builder.store(node_tlab_base, self.gc_dead_tlab_list)
 
-                    # BUG-065 FIX: Reset thread's TLAB fields if this is the thread's current TLAB
-                    # When a TLAB is added to the dead list, it will be munmap'd at end of sweep.
-                    # If we don't reset the thread's TLAB fields, the next allocation will try to
-                    # use stale pointers that point to freed memory, causing a crash.
+                    # Reset thread's TLAB fields if this is the thread's current TLAB.
+                    # This is safe during synchronous gc() (mutator is blocked).
+                    # For async gc, deferred munmap (below) provides safety even without reset.
                     thread_tlab_base_ptr = builder.gep(curr_thread, [
                         ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
                     ], inbounds=True)
@@ -7337,14 +7335,13 @@ class GarbageCollector:
                     is_current_tlab = builder.icmp_unsigned("==", thread_tlab_base_int, node_tlab_base_int)
 
                     with builder.if_then(is_current_tlab):
-                        # Reset tlab_base, tlab_cursor, tlab_limit to NULL
                         builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_base_ptr)
                         thread_tlab_cursor_ptr = builder.gep(curr_thread, [
-                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)  # tlab_cursor field
+                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
                         ], inbounds=True)
                         builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_cursor_ptr)
                         thread_tlab_limit_ptr = builder.gep(curr_thread, [
-                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)  # tlab_limit field
+                            ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)
                         ], inbounds=True)
                         builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_limit_ptr)
 
@@ -7497,7 +7494,11 @@ class GarbageCollector:
         final_reclaimed = builder.load(reclaimed_bytes_alloca)
         builder.store(final_reclaimed, reclaimed_stat_ptr)
 
-        # Free all dead TLABs (deferred from sweep to avoid use-after-free)
+        # Defer dead TLAB munmap to the NEXT gc_collect cycle.
+        # Since we don't reset mutator TLAB fields (lock-free invariant),
+        # the mutator may still be allocating from a dead TLAB. Moving dead
+        # TLABs to gc_compact_dead_tlab_list ensures they survive until
+        # gc_compact_deferred_cleanup runs at the start of the next cycle.
         free_tlab_loop = func.append_basic_block("free_tlab_loop")
         free_tlab_body = func.append_basic_block("free_tlab_body")
         free_tlab_done = func.append_basic_block("free_tlab_done")
@@ -7516,17 +7517,15 @@ class GarbageCollector:
         builder.cbranch(is_null_dead, free_tlab_done, free_tlab_body)
 
         builder.position_at_end(free_tlab_body)
-        # Get next TLAB before freeing (from header->next_tlab)
+        # Get next TLAB before processing (from header->next_tlab)
         dead_header = builder.bitcast(curr_dead, self.tlab_header_type.as_pointer())
         next_dead_ptr = builder.gep(dead_header, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
         ], inbounds=True)
         next_dead = builder.load(next_dead_ptr)
 
-        # Re-check live_count before munmap: a mutator may have allocated a new
-        # object into this TLAB between the sweep's decrement-to-zero and now
-        # (the CAS bump in gc_tlab_alloc happens before gc_alloc increments
-        # live_count, creating a race window). If live_count > 0, skip munmap.
+        # Re-check live_count: if the mutator allocated into this TLAB
+        # between decrement-to-zero and now, skip it entirely.
         recheck_live_ptr = builder.gep(dead_header, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)  # live_count field
         ], inbounds=True)
@@ -7534,19 +7533,40 @@ class GarbageCollector:
         recheck_live.ordering = 'acquire'
         tlab_still_dead = builder.icmp_unsigned("==", recheck_live, ir.Constant(self.i64, 0))
 
-        do_munmap = func.append_basic_block("do_munmap")
-        skip_munmap = func.append_basic_block("skip_munmap")
-        builder.cbranch(tlab_still_dead, do_munmap, skip_munmap)
+        defer_tlab = func.append_basic_block("defer_tlab")
+        skip_tlab = func.append_basic_block("skip_tlab")
+        builder.cbranch(tlab_still_dead, defer_tlab, skip_tlab)
 
-        # TLAB is confirmed dead — safe to munmap
-        builder.position_at_end(do_munmap)
+        # TLAB confirmed dead — add to gc_compact_dead_tlab_list for next-cycle cleanup
+        builder.position_at_end(defer_tlab)
+        # Allocate a node: { i8* tlab_ptr, i64 tlab_size, i8* next }
+        tlab_defer_node_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i8_ptr])
+        tlab_defer_node_size = ir.Constant(self.i64, 24)  # 8 + 8 + 8 bytes
+        tlab_defer_raw = builder.call(self.codegen.malloc, [tlab_defer_node_size])
+        tlab_defer_node = builder.bitcast(tlab_defer_raw, tlab_defer_node_type.as_pointer())
+        # Set tlab_ptr (field 0)
+        tlab_defer_ptr_field = builder.gep(tlab_defer_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(curr_dead, tlab_defer_ptr_field)
+        # Set tlab_size (field 1)
+        tlab_defer_size_field = builder.gep(tlab_defer_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
         tlab_size_const = ir.Constant(self.i64, self.TLAB_SIZE)
-        builder.call(self.munmap, [curr_dead, tlab_size_const])
+        builder.store(tlab_size_const, tlab_defer_size_field)
+        # Set next (field 2) — link to current list head
+        tlab_defer_next_field = builder.gep(tlab_defer_node, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        old_compact_dead_head = builder.load(self.gc_compact_dead_tlab_list)
+        builder.store(old_compact_dead_head, tlab_defer_next_field)
+        builder.store(tlab_defer_raw, self.gc_compact_dead_tlab_list)
         builder.store(next_dead, dead_tlab_alloca)
         builder.branch(free_tlab_loop)
 
-        # TLAB was reused — skip munmap, just move to next
-        builder.position_at_end(skip_munmap)
+        # TLAB was reused — skip, just move to next
+        builder.position_at_end(skip_tlab)
         builder.store(next_dead, dead_tlab_alloca)
         builder.branch(free_tlab_loop)
 
@@ -10484,7 +10504,10 @@ class GarbageCollector:
         ], inbounds=True)
         flags2 = builder.load(flags_ptr2)
 
-        # Skip pinned or arena objects
+        # Skip pinned, arena, or newborn objects
+        # Newborn objects (generation == gc_current_mark_value) may still be
+        # under initialization by the mutator — moving them would corrupt
+        # partially-written fields.
         pinned_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_PINNED))
         is_pinned2 = builder.icmp_unsigned('!=', pinned_bit2, ir.Constant(self.i64, 0))
         gen_ptr2 = builder.gep(header2, [
@@ -10492,7 +10515,9 @@ class GarbageCollector:
         ], inbounds=True)
         gen_val2 = builder.load(gen_ptr2)
         is_arena2 = builder.icmp_unsigned('==', gen_val2, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
-        skip_obj2 = builder.or_(is_pinned2, is_arena2)
+        current_gen2 = builder.load_atomic(self.gc_current_mark_value, ordering='acquire', align=8)
+        is_newborn2 = builder.icmp_unsigned('==', gen_val2, current_gen2)
+        skip_obj2 = builder.or_(is_pinned2, builder.or_(is_arena2, is_newborn2))
         builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
 
         # Check if buffer has capacity for this object
@@ -10611,8 +10636,8 @@ class GarbageCollector:
         builder.store(old_dead_tlab_head, tlab_next_field)
         builder.store(tlab_node_raw, self.gc_compact_dead_tlab_list)
 
-        # BUG-065 style fix: reset thread's TLAB fields if this is the
-        # thread's current TLAB, to prevent allocation from dead memory
+        # Reset thread's TLAB fields if this is the thread's current TLAB.
+        # Safe during synchronous gc()/gc_compact(); deferred munmap provides safety for async.
         thread_tlab_base_ptr_c = builder.gep(curr_thread2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
         ], inbounds=True)
@@ -10622,7 +10647,6 @@ class GarbageCollector:
         is_current_tlab_c = builder.icmp_unsigned("==", thread_tlab_base_int_c, old_tlab_base_int_c)
 
         with builder.if_then(is_current_tlab_c):
-            # Reset tlab_base, tlab_cursor, tlab_limit to NULL
             builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_base_ptr_c)
             thread_tlab_cursor_ptr_c = builder.gep(curr_thread2, [
                 ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
