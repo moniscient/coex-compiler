@@ -157,13 +157,21 @@ These `_REF` suffixed type IDs tell the GC "each element is an i64 handle that n
 
 ### Lock-Free GC Invariant
 
-**CRITICAL INVARIANT**: Mutator (compute) threads must NEVER be blocked by garbage collection activity. This means:
+**CRITICAL INVARIANT — DO NOT VIOLATE FOR ANY REASON**: Mutator (compute) threads must NEVER be blocked by garbage collection activity. There are NO exceptions to this rule. If a bug appears to require blocking a mutator on GC, the root cause is elsewhere — find the real bug instead of adding synchronization.
 
-- **NO `pthread_mutex_lock`** on `gc_mutex` or `gc_registry_mutex` from any mutator code path (allocation, safepoints, thread registration/unregistration)
-- **NO spin-waits** on `gc_phase`, `gc_compacting`, or any GC state variable from mutator threads
-- **NO `pthread_cond_wait`** on GC condition variables from automatic safepoints
+**Prohibited on any mutator code path (no exceptions):**
+- **NO `pthread_mutex_lock`** on `gc_mutex` or `gc_registry_mutex` (allocation, safepoints, thread registration/unregistration)
+- **NO spin-waits** on `gc_phase`, `gc_compacting`, or any GC state variable
+- **NO `pthread_cond_wait`** on GC condition variables
+- **NO `gc_wait_for_completion()`** from any mutator code path
 
-The sole exception is the explicit `gc()` builtin, which calls `gc_wait_for_completion()` because the user explicitly requested synchronous collection.
+**GC builtin calling conventions (IMMUTABLE — do not change):**
+- **`gc()`**: Asynchronous. Calls `gc_async()` — sets trigger flag, signals GC thread, returns immediately. If a cycle is already running, the request is coalesced into the next cycle. Never blocks.
+- **`gc_compact()`**: Identical to `gc()`. Compaction is always the second phase of every GC cycle, not a separate operation. This builtin exists for API compatibility. Never blocks.
+- **`gc_async()`**: The underlying implementation for both `gc()` and `gc_compact()`. Sets `gc_trigger_requested`, signals GC thread, returns immediately.
+
+**GC cycle architecture:**
+- Every GC cycle consists of two phases executed sequentially on the GC thread: `gc_collect()` (mark + sweep) followed by `gc_compact_impl()` (copy + update handles). Compaction is not optional or separately triggered.
 
 **Allowed synchronization for mutators:**
 - `cmpxchg` (CAS) loops with bounded retries for: free list pop, thread registry insert, handle return
@@ -186,6 +194,7 @@ The sole exception is the explicit `gc()` builtin, which calls `gc_wait_for_comp
 2. No spin-wait or busy-wait on any GC phase/flag from mutators
 3. New data structures use CAS or atomic_rmw, not mutexes
 4. Any shared list uses CAS insertion and GC-thread-only removal
+5. No blocking calls (`gc_wait_for_completion`, `pthread_cond_wait`, etc.) on any mutator path — if you think you need one, the bug is elsewhere
 
 ### GC Diagnostic Builtins
 
@@ -193,7 +202,7 @@ These functions are available in Coex code for debugging:
 
 | Function | Description |
 |----------|-------------|
-| `gc()` | Force a garbage collection cycle |
+| `gc()` | Request a garbage collection cycle (async) |
 | `gc_dump_stats()` | Print allocation/collection statistics |
 | `gc_dump_heap()` | Print all objects on the heap |
 | `gc_dump_roots()` | Print shadow stack root handles |

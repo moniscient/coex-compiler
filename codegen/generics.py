@@ -18,7 +18,7 @@ from ast_nodes import (
     TupleType, FunctionType, MapType, SetType, ArrayType,
     IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, Identifier,
     ListExpr, MapExpr, SetExpr, JsonObjectExpr, CallExpr, MemberExpr, IndexExpr,
-    MethodCallExpr
+    MethodCallExpr, BinaryExpr, BinaryOp, UnaryExpr, UnaryOp, TernaryExpr
 )
 
 if TYPE_CHECKING:
@@ -361,6 +361,33 @@ class GenericsHandler:
             # For maps, return value type
             if isinstance(obj_type, MapType):
                 return obj_type.value_type
+        elif isinstance(expr, BinaryExpr):
+            if expr.op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT,
+                           BinaryOp.LE, BinaryOp.GE, BinaryOp.AND, BinaryOp.OR):
+                return PrimitiveType("bool")
+            if expr.op == BinaryOp.RANGE:
+                return PrimitiveType("int")
+            # For ADD, check if either operand is a string (string concatenation)
+            left_type = self.infer_type_from_expr(expr.left)
+            if expr.op == BinaryOp.ADD:
+                if isinstance(left_type, PrimitiveType) and left_type.name == "string":
+                    return PrimitiveType("string")
+                right_type = self.infer_type_from_expr(expr.right)
+                if isinstance(right_type, PrimitiveType) and right_type.name == "string":
+                    return PrimitiveType("string")
+            # For arithmetic ops, propagate float if either operand is float
+            if isinstance(left_type, PrimitiveType) and left_type.name == "float":
+                return PrimitiveType("float")
+            right_type = self.infer_type_from_expr(expr.right)
+            if isinstance(right_type, PrimitiveType) and right_type.name == "float":
+                return PrimitiveType("float")
+            return left_type
+        elif isinstance(expr, UnaryExpr):
+            if expr.op == UnaryOp.NOT:
+                return PrimitiveType("bool")
+            return self.infer_type_from_expr(expr.operand)
+        elif isinstance(expr, TernaryExpr):
+            return self.infer_type_from_expr(expr.then_expr)
         elif isinstance(expr, MethodCallExpr):
             # Check for static method calls: Type.method()
             if isinstance(expr.object, Identifier):

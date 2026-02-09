@@ -1520,9 +1520,8 @@ class ExpressionGenerator:
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
-                # Trigger GC and wait for completion (synchronous)
+                # Trigger GC cycle (async — signals GC thread and returns)
                 cg.builder.call(cg.gc.gc_async, [])
-                cg.builder.call(cg.gc.gc_wait_for_completion, [])
                 return ir.Constant(ir.IntType(64), 0)
 
             if name == "gc_async":
@@ -1574,10 +1573,9 @@ class ExpressionGenerator:
                 return result
 
             if name == "gc_compact":
-                # Trigger compaction via the background GC thread (non-blocking).
-                # gc_compact only sets flags and signals; actual compaction
-                # happens in the GC thread. No reload needed since compaction
-                # hasn't happened yet when this returns.
+                # Trigger a GC cycle (async — signals GC thread and returns).
+                # Compaction is always the second phase of every GC cycle,
+                # so this is identical to gc().
                 cg.builder.call(cg.gc.gc_compact, [])
                 return ir.Constant(ir.IntType(64), 0)
 

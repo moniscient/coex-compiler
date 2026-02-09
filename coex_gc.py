@@ -5185,12 +5185,8 @@ class GarbageCollector:
         check_trigger = func.append_basic_block("check_trigger")
         wait_for_trigger = func.append_basic_block("wait_for_trigger")
         do_collection = func.append_basic_block("do_collection")
-        check_compact = func.append_basic_block("check_compact")
         poison_prev = func.append_basic_block("poison_prev")
         after_poison = func.append_basic_block("after_poison")
-        maybe_compact = func.append_basic_block("maybe_compact")
-        do_compact = func.append_basic_block("do_compact")
-        after_compact = func.append_basic_block("after_compact")
         signal_done = func.append_basic_block("signal_done")
         exit_thread = func.append_basic_block("exit_thread")
 
@@ -5228,9 +5224,6 @@ class GarbageCollector:
         # Do collection
         builder.position_at_end(do_collection)
 
-        # Load gc_compact_requested into a local BEFORE clearing trigger
-        compact_requested = builder.load(self.gc_compact_requested)
-
         # Clear trigger flag before collection (prevents re-trigger during collection)
         builder.store(ir.Constant(self.i64, 0), self.gc_trigger_requested)
 
@@ -5238,18 +5231,13 @@ class GarbageCollector:
         mutex_ptr3 = builder.load(self.gc_mutex)
         builder.call(self.pthread_mutex_unlock, [mutex_ptr3])
 
-        # Check if compact was requested — if so, poison prev buffer before collect
-        builder.branch(check_compact)
-
-        builder.position_at_end(check_compact)
-        wants_compact = builder.icmp_unsigned("!=", compact_requested, ir.Constant(self.i64, 0))
-        builder.cbranch(wants_compact, poison_prev, after_poison)
-
         # Poison the previous compact buffer's live_count BEFORE gc_collect.
         # During gc_collect's sweep, objects in the prev compact buffer may die,
         # which decrements live_count. If live_count reaches 0, sweep will
         # munmap the buffer. But gc_compact_impl needs it alive to copy from.
         # The sentinel value prevents live_count from ever reaching 0.
+        builder.branch(poison_prev)
+
         builder.position_at_end(poison_prev)
         prev_compact = builder.load(self.gc_compact_prev_buffer)
         prev_compact_int = builder.ptrtoint(prev_compact, self.i64)
@@ -5265,27 +5253,16 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0x7FFFFFFFFFFFFFFF), prev_live_ptr)
         builder.branch(after_poison)
 
-        # After optional poisoning, run gc_collect
+        # After poisoning, run gc_collect
         builder.position_at_end(after_poison)
 
         # Run the collection - gc_collect handles all marking and sweeping
         # It also handles gc_phase transitions and watermark resets
         builder.call(self.gc_collect, [])
 
-        # After collection, check if we need to compact
-        builder.branch(maybe_compact)
-
-        builder.position_at_end(maybe_compact)
-        wants_compact2 = builder.icmp_unsigned("!=", compact_requested, ir.Constant(self.i64, 0))
-        builder.cbranch(wants_compact2, do_compact, after_compact)
-
-        # Run compaction and clear the flag
-        builder.position_at_end(do_compact)
+        # Compaction is the second phase of every GC cycle — always runs
         builder.call(self.gc_compact_impl, [])
-        builder.store(ir.Constant(self.i64, 0), self.gc_compact_requested)
-        builder.branch(after_compact)
 
-        builder.position_at_end(after_compact)
         builder.branch(signal_done)
 
         # Signal completion to any waiting threads
@@ -5319,18 +5296,12 @@ class GarbageCollector:
         2. Signaling the GC thread's condition variable to wake it up
 
         The function returns immediately without waiting for collection to complete.
-        Use gc_wait_for_completion() if you need to wait for the cycle to finish.
+        The GC cycle includes both collection and compaction.
         """
         func = self.gc_async
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
-
-        # Clear gc_complete so gc_wait_for_completion will actually wait
-        complete_ptr = builder.gep(self.gc_state, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), complete_ptr)
 
         # Set trigger flag to request collection
         builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
@@ -9771,6 +9742,15 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), objects_moved_alloca)
         builder.store(ir.Constant(self.i64, 0), bytes_moved_alloca)
 
+        # Load gc_compact_prev_buffer once for the newborn-override check.
+        # Objects in the prev buffer MUST be moved — Phase 4 frees it unconditionally.
+        # Without this, "floating garbage" objects (unreachable but generation ==
+        # gc_current_mark_value from previous mark phase) match the newborn check
+        # and get skipped, leaving handles pointing to freed memory.
+        prev_buf_alloca = builder.alloca(self.i8_ptr, name="prev_buf_for_check")
+        prev_buf_val = builder.load(self.gc_compact_prev_buffer)
+        builder.store(prev_buf_val, prev_buf_alloca)
+
         # NOTE: Poisoning of gc_compact_prev_buffer's live_count is done in
         # gc_compact() BEFORE gc_collect, not here. See _implement_gc_compact.
 
@@ -10083,10 +10063,14 @@ class GarbageCollector:
         ], inbounds=True)
         flags2 = builder.load(flags_ptr2)
 
-        # Skip pinned or newborn objects
-        # Newborn objects (generation == gc_current_mark_value) may still be
-        # under initialization by the mutator — moving them would corrupt
-        # partially-written fields.
+        # Skip pinned or newborn objects — BUT always move objects from
+        # the prev compact buffer.  Phase 4 unconditionally frees the prev
+        # buffer, so any handle left pointing into it becomes dangling.
+        #
+        # "Floating garbage" objects (unreachable, not re-traced this cycle)
+        # keep their generation from the PREVIOUS mark phase (== current
+        # gc_current_mark_value) and would match the newborn check.  They
+        # MUST be moved out of the prev buffer before Phase 4 frees it.
         pinned_bit2 = builder.and_(flags2, ir.Constant(self.i64, self.FLAG_PINNED))
         is_pinned2 = builder.icmp_unsigned('!=', pinned_bit2, ir.Constant(self.i64, 0))
         gen_ptr2 = builder.gep(header2, [
@@ -10095,7 +10079,20 @@ class GarbageCollector:
         gen_val2 = builder.load(gen_ptr2)
         current_gen2 = builder.load_atomic(self.gc_current_mark_value, ordering='acquire', align=8)
         is_newborn2 = builder.icmp_unsigned('==', gen_val2, current_gen2)
-        skip_obj2 = builder.or_(is_pinned2, is_newborn2)
+
+        # Check if object is in the prev compact buffer (must move regardless)
+        node_tlab_base_ptr2 = builder.gep(node_typed2, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
+        ], inbounds=True)
+        node_tlab_base2 = builder.load(node_tlab_base_ptr2)
+        prev_buf_check = builder.load(prev_buf_alloca)
+        prev_buf_check_int = builder.ptrtoint(prev_buf_check, self.i64)
+        node_tlab_int2 = builder.ptrtoint(node_tlab_base2, self.i64)
+        in_prev_buffer = builder.icmp_unsigned('==', node_tlab_int2, prev_buf_check_int)
+
+        # Override: newborn skip only applies outside the prev buffer
+        newborn_and_safe = builder.and_(is_newborn2, builder.not_(in_prev_buffer))
+        skip_obj2 = builder.or_(is_pinned2, newborn_and_safe)
         builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
 
         # Check if buffer has capacity for this object
@@ -10187,35 +10184,20 @@ class GarbageCollector:
         builder.cbranch(was_last_in_tlab, tlab_now_empty, copy_after_old)
 
         builder.position_at_end(tlab_now_empty)
-        # Old TLAB is now empty - add to deferred dead TLAB list
-        # Allocate a node: { i8* tlab_ptr, i64 tlab_size, i8* next }
-        tlab_node_type = ir.LiteralStructType([self.i8_ptr, self.i64, self.i8_ptr])
-        tlab_node_size = ir.Constant(self.i64, 24)  # 3 * 8 bytes
-        tlab_node_raw = builder.call(self.codegen.malloc, [tlab_node_size])
-        tlab_node = builder.bitcast(tlab_node_raw, tlab_node_type.as_pointer())
-
-        # Set tlab_ptr (field 0)
-        tlab_ptr_field = builder.gep(tlab_node, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        builder.store(old_tlab_base, tlab_ptr_field)
-
-        # Set tlab_size (field 1) - use TLAB_SIZE constant
-        tlab_size_field = builder.gep(tlab_node, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, self.TLAB_SIZE), tlab_size_field)
-
-        # Set next (field 2) - link to current list head
-        tlab_next_field = builder.gep(tlab_node, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        old_dead_tlab_head = builder.load(self.gc_compact_dead_tlab_list)
-        builder.store(old_dead_tlab_head, tlab_next_field)
-        builder.store(tlab_node_raw, self.gc_compact_dead_tlab_list)
+        # Old TLAB is now empty (all objects moved to compact buffer).
+        # DO NOT add to deferred dead TLAB list for munmap!
+        # The alloc_nodes for the moved objects are still physically in this
+        # TLAB's memory and are still referenced by the alloc list chain.
+        # Freeing the TLAB would corrupt the alloc list, causing the next
+        # cycle's sweep/compact to walk through freed (and potentially
+        # reused) memory → data corruption.
+        #
+        # The TLAB will be leaked (it only contains alloc_node metadata,
+        # not object data). This is a small cost for correctness.
+        # TODO: Implement alloc_node migration to compact buffer to allow
+        # freeing empty TLABs.
 
         # Reset thread's TLAB fields if this is the thread's current TLAB.
-        # Safe during synchronous gc()/gc_compact(); deferred munmap provides safety for async.
         thread_tlab_base_ptr_c = builder.gep(curr_thread2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
         ], inbounds=True)
@@ -10422,9 +10404,12 @@ class GarbageCollector:
                     new_ptr = builder.call(self.gc_handle_deref, [handle_from_old])
                     builder.store(new_ptr, field_ptr)
 
-        # Switch on type_id for types that contain raw pointer fields
+        # Switch on type_id for types that contain raw pointer fields.
+        # NOTE: STRING is intentionally excluded — after arena removal, the
+        # owner field stores a handle (i64 index), not a raw pointer.
+        # Handles are stable across compaction (handle table is updated by
+        # the copy phase), so no fixup is needed.
         fixup_list = func.append_basic_block("fixup_list")
-        fixup_string = func.append_basic_block("fixup_string")
         fixup_map = func.append_basic_block("fixup_map")
         fixup_set = func.append_basic_block("fixup_set")
         fixup_array = func.append_basic_block("fixup_array")
@@ -10432,7 +10417,6 @@ class GarbageCollector:
 
         switch = builder.switch(type_id_fixup, fixup_next_node)
         switch.add_case(ir.Constant(self.i64, self.TYPE_LIST), fixup_list)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_STRING), fixup_string)
         switch.add_case(ir.Constant(self.i64, self.TYPE_MAP), fixup_map)
         switch.add_case(ir.Constant(self.i64, self.TYPE_SET), fixup_set)
         switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), fixup_array)
@@ -10452,16 +10436,6 @@ class GarbageCollector:
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
         fixup_ptr_field(tail_field_ptr)
-        builder.branch(fixup_next_node)
-
-        # --- Fix up String: owner (field 0) ---
-        builder.position_at_end(fixup_string)
-        string_struct_type = ir.LiteralStructType([self.i64] * 4)  # 4 i64 fields
-        string_typed_fixup = builder.bitcast(data_ptr_fixup, string_struct_type.as_pointer())
-        owner_field_ptr = builder.gep(string_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        fixup_ptr_field(owner_field_ptr)
         builder.branch(fixup_next_node)
 
         # --- Fix up Map: root (field 0) --- HAMT uses tag bit 0 for leaf/node
@@ -10591,31 +10565,16 @@ class GarbageCollector:
     def _implement_gc_compact(self):
         """User-facing gc_compact() builtin.
 
-        Sets gc_compact_requested and gc_trigger_requested flags, then signals
-        the GC thread to wake up. The GC thread will handle poisoning the prev
-        buffer, running gc_collect(), and running gc_compact_impl().
-
-        Same pattern as gc_async — never runs collection or compaction in the
-        calling thread.
+        Identical to gc_async — requests a GC cycle and returns immediately.
+        Compaction is always the second phase of every GC cycle, so there is
+        no separate compact request. This builtin exists for API compatibility.
         """
         func = self.gc_compact
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        # Set compact requested flag so GC thread knows to compact after collection
-        builder.store(ir.Constant(self.i64, 1), self.gc_compact_requested)
-
-        # Set trigger flag to request collection (compact requires collect first)
-        builder.store(ir.Constant(self.i64, 1), self.gc_trigger_requested)
-
-        # Signal the GC thread to wake up.
-        # Lock/unlock mutex around cond_signal to ensure the signal is not lost.
-        # No data is protected — purely condvar signaling correctness.
-        mutex_ptr = builder.load(self.gc_mutex)
-        builder.call(self.pthread_mutex_lock, [mutex_ptr])
-        cond_start = builder.load(self.gc_cond_start)
-        builder.call(self.pthread_cond_signal, [cond_start])
-        builder.call(self.pthread_mutex_unlock, [mutex_ptr])
+        # Request a GC cycle (compaction always follows collection)
+        builder.call(self.gc_async, [])
 
         builder.ret_void()

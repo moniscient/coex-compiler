@@ -1789,3 +1789,17 @@ func main() -> int
 - **Files**: `coex_gc.py` (gc_mark_object)
 - **Status**: Fixed (2026-02-06)
 - **Note**: Root cause may be stale handles in shadow stack slots surviving across function calls. The threshold fix is a safety net.
+
+---
+
+### BUG-108: String concatenation data lost after gc_compact()
+- **Discovered**: 2026-02-08, during GC concurrent verification testing
+- **Category**: GC/Codegen
+- **Severity**: High
+- **Reproduction**: `c = a + " " + b; gc(); gc_compact(); print(c)` — prints empty string
+- **Observed**: After gc() or gc_compact(), concatenated string `c` has correct `.len()` (11) but `print(c)` outputs empty. String literals `a` and `b` print correctly.
+- **Expected**: `print(c)` should output "hello world"
+- **Root Cause**: Type inference missing `BinaryExpr` (`codegen/generics.py:infer_type_from_expr`): `a + " " + b` is a `BinaryExpr` but the function had no case for it, defaulting to `PrimitiveType("int")`. This caused `collect_heap_vars_from_body()` to not recognize the variable as heap-allocated, so no shadow stack root was registered. The STRING and STRING_DATA objects were swept as garbage.
+- **Fix**: Added `BinaryExpr`, `UnaryExpr`, `TernaryExpr` cases to `infer_type_from_expr`. Also removed STRING from compact fixup switch (owner field stores a handle since arena removal, not a raw pointer).
+- **Files**: `codegen/generics.py`, `coex_gc.py`
+- **Status**: Fixed (2026-02-08)
