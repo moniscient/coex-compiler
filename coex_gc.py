@@ -42,9 +42,7 @@ class GarbageCollector:
     # Generation marking: header field 4 stores a generation counter.
     # Objects are stamped with gc_current_mark_value at allocation.
     # GC increments gc_current_mark_value before marking; sweep retires
-    # objects whose generation != current. Arena objects use UINT64_MAX
-    # as a sentinel (never matches any generation).
-    GC_ARENA_GENERATION = 0xFFFFFFFFFFFFFFFF  # -1 as u64: sentinel for arena objects
+    # objects whose generation != current.
 
     # Trace levels for debugging infrastructure (Phase 0)
     GC_TRACE_NONE = 0        # No tracing output
@@ -396,10 +394,7 @@ class GarbageCollector:
         self._implement_gc_alloc_to_thread_list()
         self._implement_gc_sweep_thread_lists()
         self._implement_gc_grow_heaps()
-        # Phase 6: Scope arena functions
-        self._implement_gc_arena_push()
-        self._implement_gc_arena_alloc()
-        self._implement_gc_arena_pop()
+        # Phase 6: Arena removed - alloc_arena_or_gc now always uses GC
         self._implement_gc_alloc_arena_or_gc()
         self._implement_gc_promote_to_heap()
         # Phase 5: Mark worklist functions for concurrent marking
@@ -451,7 +446,7 @@ class GarbageCollector:
             self.i64,  # 8: type_id (was i32, now i64)
             self.i64,  # 16: flags (FORWARDED, PINNED, FINALIZER, TLAB)
             self.i64,  # 24: forward pointer (for compaction, 0 if not forwarded)
-            self.i64,  # 32: generation (GC cycle counter; UINT64_MAX = arena)
+            self.i64,  # 32: generation (GC cycle counter)
         ])
 
         # Allocation node: { i8* next, i64 handle, i64 size }
@@ -590,10 +585,10 @@ class GarbageCollector:
             self.i8_ptr,  # 96:  segment_base - first segment pointer (never changes)
             self.i8_ptr,  # 104: segment_current - active segment pointer
             self.i64,     # 112: slot_index - current absolute slot position (= watermark)
-            # Scope arena fields (Phase 6) - per-function bump allocation
-            self.i8_ptr,  # 120: arena_cursor - current arena allocation position
-            self.i8_ptr,  # 128: arena_start - start of current arena (for bulk free)
-            self.i8_ptr,  # 136: arena_parent_start - parent arena's start (for nesting)
+            # Reserved (formerly arena fields, Phase 6 - removed)
+            self.i8_ptr,  # 120: reserved
+            self.i8_ptr,  # 128: reserved
+            self.i8_ptr,  # 136: reserved
             # Per-thread handle pool fields (Phase 7) - lock-free handle allocation
             self.i64,     # 144: handle_pool_start - first handle index in pool
             self.i64,     # 152: handle_pool_next - next available handle in pool
@@ -1324,36 +1319,15 @@ class GarbageCollector:
         # Scope Arena Functions (Phase 6) - per-function bump allocation
         # ============================================================
 
-        # gc_arena_push() -> i8*
-        # Save current TLAB cursor as arena start. Returns start for later pop.
-        # Called at function entry for formula functions.
-        gc_arena_push_ty = ir.FunctionType(self.i8_ptr, [])
-        self.gc_arena_push = ir.Function(self.module, gc_arena_push_ty, name="coex_gc_arena_push")
-
-        # gc_arena_alloc(size: i64) -> i8*
-        # Bump allocation from arena. Returns NULL if arena full (caller uses GC alloc).
-        # Arena objects have NO header, NO handle, and are NOT tracked by GC.
-        gc_arena_alloc_ty = ir.FunctionType(self.i8_ptr, [self.i64])
-        self.gc_arena_alloc = ir.Function(self.module, gc_arena_alloc_ty, name="coex_gc_arena_alloc")
-
-        # gc_arena_pop(start: i8*) -> void
-        # Reset TLAB cursor to arena start (bulk free). Restore parent arena.
-        # Called before function return for formula functions.
-        gc_arena_pop_ty = ir.FunctionType(self.void, [self.i8_ptr])
-        self.gc_arena_pop = ir.Function(self.module, gc_arena_pop_ty, name="coex_gc_arena_pop")
-
         # gc_alloc_arena_or_gc(size: i64, type_id: i32) -> i8*
-        # Runtime function that tries arena allocation first, falls back to GC.
-        # Unlike gc_arena_alloc, this handles header initialization and fallback.
+        # Arena removed: now always uses GC allocation.
         gc_alloc_arena_or_gc_ty = ir.FunctionType(self.i8_ptr, [self.i64, self.i32])
         self.gc_alloc_arena_or_gc = ir.Function(self.module, gc_alloc_arena_or_gc_ty, name="coex_gc_alloc_arena_or_gc")
         # Mark return as noalias to prevent optimizer from incorrectly eliminating stores
         self.gc_alloc_arena_or_gc.return_value.add_attribute('noalias')
 
         # gc_promote_to_heap(ptr: i8*) -> i8*
-        # Promotes an arena-allocated object to the GC heap.
-        # If the object is already on the heap (generation != UINT64_MAX), returns ptr unchanged.
-        # If arena-allocated, copies the object to GC heap and returns new pointer.
+        # Passthrough - arena removed, all objects are already on GC heap.
         gc_promote_to_heap_ty = ir.FunctionType(self.i8_ptr, [self.i8_ptr])
         self.gc_promote_to_heap = ir.Function(self.module, gc_promote_to_heap_ty, name="coex_gc_promote_to_heap")
 
@@ -2247,14 +2221,14 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), slot_idx_ptr)
 
         # ============================================================
-        # Scope Arena Initialization (Phase 6)
+        # Reserved Fields (formerly arena, Phase 6 - removed)
         # ============================================================
-        # Fields 15-17: arena pointers = null (no active arena at thread start)
+        # Fields 15-17: reserved = null
         for i in [15, 16, 17]:
-            arena_ptr = builder.gep(new_entry, [
+            reserved_ptr = builder.gep(new_entry, [
                 ir.Constant(self.i32, 0), ir.Constant(self.i32, i)
             ], inbounds=True)
-            builder.store(ir.Constant(self.i8_ptr, None), arena_ptr)
+            builder.store(ir.Constant(self.i8_ptr, None), reserved_ptr)
 
         # ============================================================
         # Per-Thread Handle Pool Initialization (Phase 7)
@@ -3519,17 +3493,15 @@ class GarbageCollector:
         builder.call(self.gc_mark_hamt, [set_root_ptr, set_flags])
         builder.branch(done)
 
-        # Mark String: owner pointer at field 0
-        # String struct: { i64 owner (0), i64 offset (1), i64 len (2), i64 size (3) }
-        # Owner stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
+        # Mark String: owner handle at field 0
+        # String struct: { i64 owner_handle (0), i64 offset (1), i64 len (2), i64 size (3) }
+        # Owner field stores a GC handle directly (not a raw pointer)
         builder.position_at_end(mark_string)
         string_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64]).as_pointer()
         string_typed = builder.bitcast(ptr, string_ptr_type)
-        owner_i64_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        owner_i64 = builder.load(owner_i64_ptr)
-        owner_ptr = builder.inttoptr(owner_i64, self.i8_ptr)  # Convert i64 to pointer
-        str_owner_handle = builder.call(self.gc_ptr_to_handle, [owner_ptr])
-        builder.call(self.gc_mark_push, [str_owner_handle])  # Push to worklist
+        owner_handle_ptr = builder.gep(string_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
+        owner_handle = builder.load(owner_handle_ptr)
+        builder.call(self.gc_mark_push, [owner_handle])  # Owner IS the handle, push directly
         builder.branch(done)
 
         # Mark Channel: buffer pointer at offset 32 (4th i64 field)
@@ -4847,18 +4819,7 @@ class GarbageCollector:
 
     def alloc_arena_or_gc(self, builder: ir.IRBuilder, size: ir.Value,
                           type_id: ir.Value) -> ir.Value:
-        """Allocate from arena if active, otherwise fall back to GC allocation.
-
-        Phase 6: Arena allocation for formula functions. This calls a runtime
-        function that checks if an arena is active and uses arena allocation
-        if so. Otherwise falls back to GC allocation.
-
-        Arena-allocated objects:
-        - Have the same header layout as GC objects (40 bytes)
-        - Have generation == UINT64_MAX as sentinel (no handle, bulk-freed)
-        - Are NOT added to the allocation list
-        - Are NOT tracked by GC
-        - Are bulk-freed when arena scope ends
+        """Allocate via GC (arena removed - all objects get handles).
 
         Args:
             builder: LLVM IR builder
@@ -4868,7 +4829,7 @@ class GarbageCollector:
         Returns:
             i8* pointer to the allocated memory (user area after header)
         """
-        # Call the runtime function that handles arena vs GC allocation
+        # Call the runtime function (now always uses GC allocation)
         ptr = builder.call(self.gc_alloc_arena_or_gc, [size, type_id])
         return ptr
 
@@ -6472,240 +6433,13 @@ class GarbageCollector:
         builder.ret_void()
 
     # ========================================================================
-    # Phase 6: Scope Arena Functions - per-function bump allocation
+    # Phase 6: Arena functions removed - all allocation uses GC handles
     # ========================================================================
-
-    def _implement_gc_arena_push(self):
-        """Push a new arena scope onto the thread's arena stack.
-
-        Saves the current TLAB cursor as the arena start, and stores the
-        previous arena's start for nesting support. Returns the arena start
-        pointer which must be passed to gc_arena_pop() on scope exit.
-
-        ThreadEntry arena fields:
-          15: arena_cursor - current arena allocation position
-          16: arena_start - start of current arena
-          17: arena_parent_start - parent arena's start (for nesting)
-        """
-        func = self.gc_arena_push
-
-        entry = func.append_basic_block("entry")
-        have_entry = func.append_basic_block("have_entry")
-        no_entry = func.append_basic_block("no_entry")
-
-        builder = ir.IRBuilder(entry)
-
-        # Get current thread entry via pthread TLS
-        tls_key = builder.load(self.tls_thread_entry_key)
-        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
-        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
-        thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
-
-        # Check if we have a thread entry
-        is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_entry, no_entry, have_entry)
-
-        builder.position_at_end(have_entry)
-
-        # Load current tlab_cursor (field 7) - this becomes the arena start
-        tlab_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        cursor = builder.load(tlab_cursor_ptr)
-
-        # Load current arena_start (field 16) - becomes parent start
-        arena_start_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 16)
-        ], inbounds=True)
-        old_arena_start = builder.load(arena_start_ptr)
-
-        # Store old arena_start as arena_parent_start (field 17)
-        arena_parent_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 17)
-        ], inbounds=True)
-        builder.store(old_arena_start, arena_parent_ptr)
-
-        # Set new arena_start = cursor (field 16)
-        builder.store(cursor, arena_start_ptr)
-
-        # Set arena_cursor = cursor (field 15)
-        arena_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 15)
-        ], inbounds=True)
-        builder.store(cursor, arena_cursor_ptr)
-
-        # Return the arena start (for gc_arena_pop)
-        builder.ret(cursor)
-
-        # No thread entry - return NULL
-        builder.position_at_end(no_entry)
-        builder.ret(ir.Constant(self.i8_ptr, None))
-
-    def _implement_gc_arena_alloc(self):
-        """Bump allocation from the current arena.
-
-        Allocates `size` bytes from the arena's bump pointer.
-        Returns pointer to allocated memory, or NULL if arena is full
-        (caller should fall back to gc_alloc for GC-tracked allocation).
-
-        Arena objects have:
-          - NO 32-byte header
-          - NO handle in handle table
-          - NO entry in allocation list
-          - NOT tracked by GC
-
-        This makes allocation extremely fast (just a pointer bump) but
-        arena objects CANNOT survive beyond their scope.
-        """
-        func = self.gc_arena_alloc
-        func.args[0].name = "size"
-
-        entry = func.append_basic_block("entry")
-        have_entry = func.append_basic_block("have_entry")
-        check_arena = func.append_basic_block("check_arena")
-        do_alloc = func.append_basic_block("do_alloc")
-        no_space = func.append_basic_block("no_space")
-
-        builder = ir.IRBuilder(entry)
-
-        size = func.args[0]
-
-        # Align size to 8 bytes
-        seven = ir.Constant(self.i64, 7)
-        aligned_size = builder.add(size, seven)
-        aligned_size = builder.and_(aligned_size, builder.not_(seven))
-
-        # Get current thread entry via pthread TLS
-        tls_key = builder.load(self.tls_thread_entry_key)
-        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
-        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
-        thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
-
-        # Check if we have a thread entry
-        is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_entry, no_space, have_entry)
-
-        builder.position_at_end(have_entry)
-
-        # Load arena_cursor (field 15)
-        arena_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 15)
-        ], inbounds=True)
-        cursor = builder.load(arena_cursor_ptr)
-
-        # Check if cursor is valid (arena active)
-        cursor_int = builder.ptrtoint(cursor, self.i64)
-        is_null_cursor = builder.icmp_unsigned("==", cursor_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_cursor, no_space, check_arena)
-
-        builder.position_at_end(check_arena)
-
-        # Load tlab_limit (field 8) - arena shares TLAB's limit
-        tlab_limit_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 8)
-        ], inbounds=True)
-        limit = builder.load(tlab_limit_ptr)
-
-        # Calculate new cursor position
-        new_cursor = builder.gep(cursor, [aligned_size])
-
-        # Check if new_cursor <= limit
-        new_cursor_int = builder.ptrtoint(new_cursor, self.i64)
-        limit_int = builder.ptrtoint(limit, self.i64)
-        has_space = builder.icmp_unsigned("<=", new_cursor_int, limit_int)
-        builder.cbranch(has_space, do_alloc, no_space)
-
-        # Allocate from arena
-        builder.position_at_end(do_alloc)
-        # Update arena_cursor
-        builder.store(new_cursor, arena_cursor_ptr)
-        # Also update tlab_cursor so arena and TLAB stay in sync
-        tlab_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        builder.store(new_cursor, tlab_cursor_ptr)
-        # Return old cursor (the allocated memory)
-        builder.ret(cursor)
-
-        # No space - return NULL (caller should use gc_alloc)
-        builder.position_at_end(no_space)
-        builder.ret(ir.Constant(self.i8_ptr, None))
-
-    def _implement_gc_arena_pop(self):
-        """Pop the arena scope, bulk-freeing all arena allocations.
-
-        Resets the TLAB cursor to the arena start, effectively freeing all
-        objects allocated in the arena. Restores the parent arena's start
-        for nested arena support.
-
-        The `start` parameter must be the value returned by gc_arena_push().
-        """
-        func = self.gc_arena_pop
-        func.args[0].name = "start"
-
-        entry = func.append_basic_block("entry")
-        have_entry = func.append_basic_block("have_entry")
-        done = func.append_basic_block("done")
-
-        builder = ir.IRBuilder(entry)
-
-        start = func.args[0]
-
-        # Get current thread entry via pthread TLS
-        tls_key = builder.load(self.tls_thread_entry_key)
-        thread_entry_i8 = builder.call(self.pthread_getspecific, [tls_key])
-        thread_entry = builder.bitcast(thread_entry_i8, self.thread_entry_type.as_pointer())
-        thread_entry_int = builder.ptrtoint(thread_entry, self.i64)
-
-        # Check if we have a thread entry
-        is_null_entry = builder.icmp_unsigned("==", thread_entry_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_entry, done, have_entry)
-
-        builder.position_at_end(have_entry)
-
-        # Reset tlab_cursor to start (bulk free!)
-        tlab_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 7)
-        ], inbounds=True)
-        builder.store(start, tlab_cursor_ptr)
-
-        # Load arena_parent_start (field 17) - restore parent arena
-        arena_parent_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 17)
-        ], inbounds=True)
-        parent_start = builder.load(arena_parent_ptr)
-
-        # Set arena_start to parent_start (field 16)
-        arena_start_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 16)
-        ], inbounds=True)
-        builder.store(parent_start, arena_start_ptr)
-
-        # Set arena_cursor to parent_start (field 15)
-        arena_cursor_ptr = builder.gep(thread_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 15)
-        ], inbounds=True)
-        builder.store(parent_start, arena_cursor_ptr)
-
-        # Clear arena_parent_start (field 17) - parent's parent is now parent
-        # Note: for deeply nested arenas, this would need a stack, but
-        # for typical 2-3 deep nesting this works fine
-        builder.store(ir.Constant(self.i8_ptr, None), arena_parent_ptr)
-
-        builder.branch(done)
-
-        builder.position_at_end(done)
-        builder.ret_void()
+    # gc_arena_push, gc_arena_alloc, gc_arena_pop are no longer implemented.
+    # Their LLVM function declarations are kept as stubs (no call sites remain).
 
     def _implement_gc_alloc_arena_or_gc(self):
-        """Allocate from arena if active, otherwise fall back to GC allocation.
-
-        This is a runtime function that:
-        1. Calculates total size (user_size + header)
-        2. Tries arena allocation via gc_arena_alloc
-        3. If arena returns NULL, falls back to gc_alloc
-        4. Initializes the header for arena objects
-        5. Returns pointer to user area (after header)
+        """Allocate via GC (arena removed - all objects get handles).
 
         Args (via function parameters):
             size: i64 - Size of user data in bytes
@@ -6719,89 +6453,17 @@ class GarbageCollector:
         func.args[1].name = "type_id"
 
         entry = func.append_basic_block("entry")
-        arena_ok = func.append_basic_block("arena_ok")
-        arena_fallback = func.append_basic_block("arena_fallback")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
         size = func.args[0]
         type_id = func.args[1]
 
-        # Total size = header + user_size
-        header_size = ir.Constant(self.i64, self.HEADER_SIZE)
-        total_size = builder.add(size, header_size)
-
-        # Align to 8 bytes
-        seven = ir.Constant(self.i64, 7)
-        aligned_size = builder.and_(
-            builder.add(total_size, seven),
-            ir.Constant(self.i64, ~7 & 0xFFFFFFFFFFFFFFFF)
-        )
-
-        # Try arena allocation (returns NULL if arena not active or full)
-        arena_block = builder.call(self.gc_arena_alloc, [aligned_size])
-        arena_block_int = builder.ptrtoint(arena_block, self.i64)
-        arena_success = builder.icmp_unsigned("!=", arena_block_int, ir.Constant(self.i64, 0))
-
-        builder.cbranch(arena_success, arena_ok, arena_fallback)
-
-        # Arena allocation succeeded - initialize header
-        builder.position_at_end(arena_ok)
-        header_ptr = builder.bitcast(arena_block, self.header_type.as_pointer())
-
-        # Store size
-        size_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        builder.store(size, size_ptr)
-
-        # Store type_id (widen i32 to i64)
-        type_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        type_id_64 = builder.zext(type_id, self.i64)
-        builder.store(type_id_64, type_ptr)
-
-        # Store flags with just FLAG_TLAB (generation field handles arena identity)
-        flags_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, self.FLAG_TLAB), flags_ptr)
-
-        # Store forward = 0 (no handle for arena objects)
-        forward_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, 0), forward_ptr)
-
-        # Store generation = UINT64_MAX (-1) as arena sentinel
-        gen_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        builder.store(ir.Constant(self.i64, self.GC_ARENA_GENERATION), gen_ptr)
-
-        # Get user pointer (after header)
-        user_ptr_arena = builder.gep(arena_block, [header_size])
-        builder.branch(done)
-
-        # Arena not active or full - fall back to GC allocation
-        builder.position_at_end(arena_fallback)
+        # Always use GC allocation - all objects get handles
         handle = builder.call(self.gc_alloc, [size, type_id])
-        user_ptr_gc = builder.call(self.gc_handle_deref, [handle])
-        builder.branch(done)
-
-        # Merge paths
-        builder.position_at_end(done)
-        user_ptr = builder.phi(self.i8_ptr, name="user_ptr")
-        user_ptr.add_incoming(user_ptr_arena, arena_ok)
-        user_ptr.add_incoming(user_ptr_gc, arena_fallback)
+        user_ptr = builder.call(self.gc_handle_deref, [handle])
 
         # Zero the user data area to prevent the GC from tracing
-        # uninitialized memory. The GC scans buffer contents based on
-        # type_id (e.g. TYPE_LIST_TAIL scans all capacity slots,
-        # TYPE_PV_NODE scans all 32 children). Without zeroing,
-        # stale TLAB/heap data appears as random handles/pointers.
+        # uninitialized memory
         builder.call(self.codegen.memset, [
             user_ptr, ir.Constant(ir.IntType(8), 0), size
         ])
@@ -6809,96 +6471,22 @@ class GarbageCollector:
         builder.ret(user_ptr)
 
     def _implement_gc_promote_to_heap(self):
-        """Promote an arena-allocated object to the GC heap.
-
-        This function is called when a formula returns a value that was
-        allocated in the arena. Since the arena is bulk-freed on function
-        return, escaping values must be copied to the GC heap.
-
-        Algorithm:
-        1. Check if ptr is NULL -> return NULL
-        2. Read the header (ptr - HEADER_SIZE)
-        3. Check generation == UINT64_MAX (arena sentinel)
-        4. If not arena-allocated, return ptr unchanged (already on heap)
-        5. If arena-allocated:
-           - Read size and type_id from header
-           - Call gc_alloc(size, type_id) to get handle + new ptr
-           - memcpy(new_ptr, old_ptr, size)
-           - Return new_ptr
+        """Passthrough - arena removed, all objects are already on GC heap.
 
         Args (via function parameters):
             ptr: i8* - Pointer to user data of the object
 
         Returns:
-            i8* - Pointer to user data (either same ptr or new heap copy)
+            i8* - Same pointer (no promotion needed)
         """
         func = self.gc_promote_to_heap
         func.args[0].name = "ptr"
 
         entry = func.append_basic_block("entry")
-        check_arena = func.append_basic_block("check_arena")
-        do_promote = func.append_basic_block("do_promote")
-        done = func.append_basic_block("done")
-
         builder = ir.IRBuilder(entry)
 
-        ptr = func.args[0]
-
-        # Check if ptr is NULL
-        ptr_int = builder.ptrtoint(ptr, self.i64)
-        is_null = builder.icmp_unsigned("==", ptr_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null, done, check_arena)
-
-        # Check if arena-allocated
-        builder.position_at_end(check_arena)
-
-        # Get header pointer (ptr - HEADER_SIZE)
-        header_size = ir.Constant(self.i64, self.HEADER_SIZE)
-        neg_header = builder.sub(ir.Constant(self.i64, 0), header_size)
-        header_raw = builder.gep(ptr, [neg_header])
-        header_ptr = builder.bitcast(header_raw, self.header_type.as_pointer())
-
-        # Check if arena-allocated via generation == UINT64_MAX
-        gen_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        gen_val = builder.load(gen_ptr)
-        is_arena_set = builder.icmp_unsigned("==", gen_val, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
-
-        builder.cbranch(is_arena_set, do_promote, done)
-
-        # Promote: copy to GC heap
-        builder.position_at_end(do_promote)
-
-        # Read size (field 0)
-        size_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        size = builder.load(size_ptr)
-
-        # Read type_id (field 1)
-        type_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        type_id_64 = builder.load(type_ptr)
-        type_id = builder.trunc(type_id_64, self.i32)
-
-        # Allocate on GC heap
-        handle = builder.call(self.gc_alloc, [size, type_id])
-        new_ptr = builder.call(self.gc_handle_deref, [handle])
-
-        # memcpy(new_ptr, old_ptr, size)
-        builder.call(self.codegen.memcpy, [new_ptr, ptr, size])
-
-        builder.branch(done)
-
-        # Merge paths
-        builder.position_at_end(done)
-        result = builder.phi(self.i8_ptr, name="result")
-        result.add_incoming(ptr, entry)  # NULL case
-        result.add_incoming(ptr, check_arena)  # Not arena-allocated
-        result.add_incoming(new_ptr, do_promote)  # Promoted
-        builder.ret(result)
+        # All objects are GC-allocated, just return the input pointer
+        builder.ret(func.args[0])
 
     def _implement_gc_alloc_to_thread_list(self):
         """Add allocation node to current thread's allocation list (lock-free).
@@ -10288,17 +9876,8 @@ class GarbageCollector:
         pinned_bit = builder.and_(flags, ir.Constant(self.i64, self.FLAG_PINNED))
         is_pinned = builder.icmp_unsigned('!=', pinned_bit, ir.Constant(self.i64, 0))
 
-        # Skip arena objects (generation == UINT64_MAX)
-        gen_ptr = builder.gep(header_ptr, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
-        ], inbounds=True)
-        gen_val = builder.load(gen_ptr)
-        is_arena = builder.icmp_unsigned('==', gen_val, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
-
-        skip_obj = builder.or_(is_pinned, is_arena)
-
         size_do_accumulate = func.append_basic_block("size_do_accumulate")
-        builder.cbranch(skip_obj, size_next_node, size_do_accumulate)
+        builder.cbranch(is_pinned, size_next_node, size_do_accumulate)
 
         builder.position_at_end(size_do_accumulate)
         # Read user_size from header (field 0) - this is user data only, NOT total
@@ -10504,7 +10083,7 @@ class GarbageCollector:
         ], inbounds=True)
         flags2 = builder.load(flags_ptr2)
 
-        # Skip pinned, arena, or newborn objects
+        # Skip pinned or newborn objects
         # Newborn objects (generation == gc_current_mark_value) may still be
         # under initialization by the mutator — moving them would corrupt
         # partially-written fields.
@@ -10514,10 +10093,9 @@ class GarbageCollector:
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)
         ], inbounds=True)
         gen_val2 = builder.load(gen_ptr2)
-        is_arena2 = builder.icmp_unsigned('==', gen_val2, ir.Constant(self.i64, self.GC_ARENA_GENERATION))
         current_gen2 = builder.load_atomic(self.gc_current_mark_value, ordering='acquire', align=8)
         is_newborn2 = builder.icmp_unsigned('==', gen_val2, current_gen2)
-        skip_obj2 = builder.or_(is_pinned2, builder.or_(is_arena2, is_newborn2))
+        skip_obj2 = builder.or_(is_pinned2, is_newborn2)
         builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
 
         # Check if buffer has capacity for this object

@@ -318,7 +318,7 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, node_size, type_id)
         node_ptr = builder.bitcast(raw_ptr, cg.hamt_node_struct.as_pointer())
 
-        # Save handle for re-derivation (arena objects have forward=0, no handle)
+        # Save handle for re-derivation after children allocation
         node_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Store bitmap
@@ -339,18 +339,14 @@ class HamtGenerator:
             with otherwise:
                 children_raw = cg.gc.alloc_arena_or_gc(builder, children_size, ir.Constant(i32, 0))
                 children_ptr = builder.bitcast(children_raw, i64_ptr)
-                # Re-derive node_ptr: arena (handle==0) don't move; GC re-derive via handle
-                is_arena_node = builder.icmp_unsigned('==', node_handle, ir.Constant(i64, 0))
-                deref_node = builder.call(cg.gc.gc_handle_deref, [node_handle])
-                node_raw2 = builder.select(is_arena_node, raw_ptr, deref_node)
+                # Re-derive node_ptr via handle (may have moved during children allocation)
+                node_raw2 = builder.call(cg.gc.gc_handle_deref, [node_handle])
                 node_ptr2 = builder.bitcast(node_raw2, cg.hamt_node_struct.as_pointer())
                 children_field2 = builder.gep(node_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
                 builder.store(children_ptr, children_field2)
 
-        # Re-derive node_ptr for return
-        is_arena_final = builder.icmp_unsigned('==', node_handle, ir.Constant(i64, 0))
-        deref_final = builder.call(cg.gc.gc_handle_deref, [node_handle])
-        node_raw_final = builder.select(is_arena_final, raw_ptr, deref_final)
+        # Re-derive node_ptr for return via handle
+        node_raw_final = builder.call(cg.gc.gc_handle_deref, [node_handle])
         node_ptr_final = builder.bitcast(node_raw_final, cg.hamt_node_struct.as_pointer())
         builder.ret(node_ptr_final)
 

@@ -303,7 +303,7 @@ class ArrayGenerator:
         array_size_const = ir.Constant(i64, ARRAY_STRUCT_SIZE)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
-        # Save handle for re-derivation (arena objects have forward=0, no handle)
+        # Save handle for re-derivation after second allocation
         array_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer: len * elem_size
@@ -311,10 +311,8 @@ class ArrayGenerator:
         array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA)
         data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
-        # Re-derive: arena objects (handle==0) don't move; GC objects re-derive via handle
-        is_arena = builder.icmp_unsigned('==', array_handle, ir.Constant(i64, 0))
-        deref_ptr = builder.call(cg.gc.gc_handle_deref, [array_handle])
-        array_raw2 = builder.select(is_arena, raw_ptr, deref_ptr)
+        # Re-derive via handle (may have moved during data buffer allocation)
+        array_raw2 = builder.call(cg.gc.gc_handle_deref, [array_handle])
         array_ptr = builder.bitcast(array_raw2, cg.array_struct.as_pointer())
 
         # Initialize all fields for 1D array
@@ -344,7 +342,7 @@ class ArrayGenerator:
         array_size_const = ir.Constant(i64, ARRAY_STRUCT_SIZE)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
-        # Save handle for re-derivation (arena objects have forward=0, no handle)
+        # Save handle for re-derivation after second allocation
         array_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer: size * elem_size
@@ -352,10 +350,8 @@ class ArrayGenerator:
         array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA)
         data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
-        # Re-derive: arena objects (handle==0) don't move; GC objects re-derive via handle
-        is_arena = builder.icmp_unsigned('==', array_handle, ir.Constant(i64, 0))
-        deref_ptr = builder.call(cg.gc.gc_handle_deref, [array_handle])
-        array_raw2 = builder.select(is_arena, raw_ptr, deref_ptr)
+        # Re-derive via handle (may have moved during data buffer allocation)
+        array_raw2 = builder.call(cg.gc.gc_handle_deref, [array_handle])
         array_ptr = builder.bitcast(array_raw2, cg.array_struct.as_pointer())
 
         # Initialize all fields for 1D array
@@ -386,7 +382,7 @@ class ArrayGenerator:
         array_size_const = ir.Constant(i64, ARRAY_STRUCT_SIZE)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
-        # Save handle for re-derivation (arena objects have forward=0, no handle)
+        # Save handle for re-derivation after second allocation
         array_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer: len * elem_size with TYPE_ARRAY_DATA_REF for GC tracing
@@ -394,10 +390,8 @@ class ArrayGenerator:
         array_data_type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_ARRAY_DATA_REF)
         data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
-        # Re-derive: arena objects (handle==0) don't move; GC objects re-derive via handle
-        is_arena = builder.icmp_unsigned('==', array_handle, ir.Constant(i64, 0))
-        deref_ptr = builder.call(cg.gc.gc_handle_deref, [array_handle])
-        array_raw2 = builder.select(is_arena, raw_ptr, deref_ptr)
+        # Re-derive via handle (may have moved during data buffer allocation)
+        array_raw2 = builder.call(cg.gc.gc_handle_deref, [array_handle])
         array_ptr = builder.bitcast(array_raw2, cg.array_struct.as_pointer())
 
         # Initialize all fields for 1D array
@@ -721,10 +715,8 @@ class ArrayGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, array_type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
-        # Re-derive: arena objects (handle==0) don't move; GC objects re-derive via handle
-        is_arena_data = builder.icmp_unsigned('==', new_data_handle, ir.Constant(i64, 0))
-        deref_data = builder.call(cg.gc.gc_handle_deref, [new_data_handle])
-        new_data_raw2 = builder.select(is_arena_data, new_data, deref_data)
+        # Re-derive via handle (may have moved during descriptor allocation)
+        new_data_raw2 = builder.call(cg.gc.gc_handle_deref, [new_data_handle])
 
         # Copy all fields from source, but with new data buffer and offset=0
 

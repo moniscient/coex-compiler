@@ -2401,7 +2401,7 @@ class JsonGenerator:
         str_ptr = func.args[0]
         owner_handle_ptr = builder.gep(str_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(str_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset_val = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset_val])

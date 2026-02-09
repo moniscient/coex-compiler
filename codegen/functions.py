@@ -818,20 +818,9 @@ class FunctionGenerator:
             # Store mapping of var_name -> root_index
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
 
-        # ====================================================================
-        # Scope Arena for Formula Functions (Phase 6)
-        # ====================================================================
-        # Formulas are pure functions - all their temporary allocations can use
-        # the arena, which is bulk-freed on return. This provides ~10x faster
-        # allocation for temporaries that don't escape.
+        # Arena removed - all allocation uses GC handles
         cg.arena_start = None
-        if func.kind == FunctionKind.FORMULA and cg.gc is not None:
-            # Push arena scope - saves TLAB cursor as arena start
-            cg.arena_start = cg.builder.call(cg.gc.gc_arena_push, [])
-            cg.use_arena_allocation = True
-        else:
-            cg.use_arena_allocation = False
-        # ====================================================================
+        cg.use_arena_allocation = False
 
         # ====================================================================
         # Task Nursery Initialization
@@ -899,10 +888,6 @@ class FunctionGenerator:
             # Join task nursery for lightweight tasks
             if cg._task is not None and cg._task.has_active_task_nursery():
                 cg._task.join_task_nursery(cg.builder)
-
-            # Pop arena before GC frame (Phase 6)
-            if cg.arena_start is not None and cg.gc is not None:
-                cg.builder.call(cg.gc.gc_arena_pop, [cg.arena_start])
 
             # Pop GC frame before implicit return
             if cg.gc_frame is not None and cg.gc is not None:
@@ -1051,10 +1036,6 @@ class FunctionGenerator:
 
         # Add implicit return
         if not cg.builder.block.is_terminated:
-            # Pop arena before GC frame (Phase 6)
-            if cg.arena_start is not None and cg.gc is not None:
-                cg.builder.call(cg.gc.gc_arena_pop, [cg.arena_start])
-
             # Pop GC frame before implicit return
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)
@@ -1420,10 +1401,6 @@ class FunctionGenerator:
 
         # Add implicit return if needed
         if not cg.builder.block.is_terminated:
-            # Pop arena before GC frame (Phase 6)
-            if cg.arena_start is not None and cg.gc is not None:
-                cg.builder.call(cg.gc.gc_arena_pop, [cg.arena_start])
-
             # Pop GC frame before implicit return
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)

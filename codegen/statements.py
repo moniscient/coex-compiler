@@ -1358,19 +1358,6 @@ class StatementGenerator:
             if cg._task is not None and cg._task.has_active_task_nursery():
                 cg._task.join_task_nursery(cg.builder)
 
-            # Promote escaping values before arena pop (Phase 6)
-            # If returning a pointer and we have an arena, the value might be arena-allocated
-            if getattr(cg, 'arena_start', None) is not None and cg.gc is not None:
-                if isinstance(ret_type, ir.PointerType):
-                    # Promote to heap - returns same ptr if already on heap
-                    ret_val_i8 = cg.builder.bitcast(ret_val, ir.IntType(8).as_pointer())
-                    promoted = cg.builder.call(cg.gc.gc_promote_to_heap, [ret_val_i8])
-                    ret_val = cg.builder.bitcast(promoted, ret_type)
-
-            # Pop arena before GC frame (Phase 6)
-            if getattr(cg, 'arena_start', None) is not None and cg.gc is not None:
-                cg.builder.call(cg.gc.gc_arena_pop, [cg.arena_start])
-
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)
 
@@ -1382,10 +1369,6 @@ class StatementGenerator:
             # Join task nursery for lightweight tasks
             if cg._task is not None and cg._task.has_active_task_nursery():
                 cg._task.join_task_nursery(cg.builder)
-
-            # Pop arena before GC frame (Phase 6)
-            if getattr(cg, 'arena_start', None) is not None and cg.gc is not None:
-                cg.builder.call(cg.gc.gc_arena_pop, [cg.arena_start])
 
             if cg.gc_frame is not None and cg.gc is not None:
                 cg.gc.pop_frame(cg.builder, cg.gc_frame)

@@ -289,8 +289,8 @@ class StringGenerator:
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
 
-        # Convert handle to pointer
-        owner_ptr = builder.inttoptr(owner_handle, i8_ptr)
+        # Dereference handle to get pointer
+        owner_ptr = builder.call(self.cg.gc.gc_handle_deref, [owner_handle])
 
         # Load offset from field 1
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -337,8 +337,8 @@ class StringGenerator:
         null_ptr = builder.gep(data_raw, [byte_len])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
-        # Store owner_handle - pointer to data buffer
-        owner_handle = builder.ptrtoint(data_raw, i64)
+        # Store owner_handle - GC handle to data buffer
+        owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [data_raw])
         owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
 
@@ -426,8 +426,8 @@ class StringGenerator:
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
 
-        # Store owner_handle at field 0 - pointer to data buffer
-        owner_handle = builder.ptrtoint(data_buf, i64)
+        # Store owner_handle at field 0 - GC handle to data buffer
+        owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [data_buf])
         owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
 
@@ -515,7 +515,7 @@ class StringGenerator:
         builder.position_at_end(in_bounds)
         owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -571,7 +571,7 @@ class StringGenerator:
         source_offset = builder.load(source_offset_ptr)
 
         new_offset = builder.add(source_offset, start_clamped)
-        source_owner = builder.inttoptr(source_owner_handle, i8_ptr)
+        source_owner = builder.call(cg.gc.gc_handle_deref, [source_owner_handle])
         slice_start = builder.gep(source_owner, [new_offset])
 
         idx_ptr = builder.alloca(ir.IntType(64), name="idx")
@@ -660,8 +660,7 @@ class StringGenerator:
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        # Save handle for re-derivation after second allocation.
-        # Arena objects have forward=0 (no handle); GC objects have forward=handle.
+        # Save handle for re-derivation after second allocation
         string_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer
@@ -672,7 +671,7 @@ class StringGenerator:
 
         a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         a_owner_handle = builder.load(a_owner_handle_ptr)
-        a_owner = builder.inttoptr(a_owner_handle, i8_ptr)
+        a_owner = builder.call(cg.gc.gc_handle_deref, [a_owner_handle])
         a_offset_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         a_offset = builder.load(a_offset_ptr)
         a_data = builder.gep(a_owner, [a_offset])
@@ -681,7 +680,7 @@ class StringGenerator:
         b_dest = builder.gep(dest_data, [a_size])
         b_owner_handle_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         b_owner_handle = builder.load(b_owner_handle_ptr)
-        b_owner = builder.inttoptr(b_owner_handle, i8_ptr)
+        b_owner = builder.call(cg.gc.gc_handle_deref, [b_owner_handle])
         b_offset_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
@@ -691,15 +690,11 @@ class StringGenerator:
         null_ptr = builder.gep(dest_data, [total_size])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
 
-        # Re-derive string_ptr: arena objects (handle==0) don't move, use raw_ptr.
-        # GC objects may have been moved by compaction, re-derive via handle.
-        is_arena_obj = builder.icmp_unsigned('==', string_handle, ir.Constant(i64, 0))
-        deref_ptr = builder.call(cg.gc.gc_handle_deref, [string_handle])
-        # gc_handle_deref(0) returns NULL; select picks raw_ptr for arena case
-        string_raw2 = builder.select(is_arena_obj, raw_ptr, deref_ptr)
+        # Re-derive string_ptr via handle (may have moved during data buffer allocation)
+        string_raw2 = builder.call(cg.gc.gc_handle_deref, [string_handle])
         string_ptr2 = builder.bitcast(string_raw2, cg.string_struct.as_pointer())
 
-        owner_handle = builder.ptrtoint(dest_data, i64)
+        owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [dest_data])
         owner_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         builder.store(owner_handle, owner_ptr)
 
@@ -810,8 +805,7 @@ class StringGenerator:
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        # Save handle for re-derivation after second allocation.
-        # Arena objects have forward=0 (no handle); GC objects have forward=handle.
+        # Save handle for re-derivation after second allocation
         result_str_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer
@@ -820,14 +814,12 @@ class StringGenerator:
         alloc_size = builder.add(total_size, ir.Constant(i64, 1))
         dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
 
-        # Re-derive: arena objects (handle==0) don't move, use raw_ptr.
-        is_arena_str = builder.icmp_unsigned('==', result_str_handle, ir.Constant(i64, 0))
-        deref_str = builder.call(cg.gc.gc_handle_deref, [result_str_handle])
-        result_str_raw2 = builder.select(is_arena_str, raw_ptr, deref_str)
+        # Re-derive via handle (may have moved during data buffer allocation)
+        result_str_raw2 = builder.call(cg.gc.gc_handle_deref, [result_str_handle])
         result_str = builder.bitcast(result_str_raw2, string_ptr_ty)
 
         owner_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        owner_handle = builder.ptrtoint(dest_data, i64)
+        owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [dest_data])
         builder.store(owner_handle, owner_ptr)
         offset_ptr = builder.gep(result_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), offset_ptr)
@@ -864,7 +856,7 @@ class StringGenerator:
         sep_dest = builder.gep(dest_data, [write_pos])
         sep_owner_handle_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         sep_owner_handle = builder.load(sep_owner_handle_ptr)
-        sep_owner = builder.inttoptr(sep_owner_handle, ir.IntType(8).as_pointer())
+        sep_owner = builder.call(cg.gc.gc_handle_deref, [sep_owner_handle])
         sep_offset_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         sep_offset = builder.load(sep_offset_ptr)
         sep_data = builder.gep(sep_owner, [sep_offset])
@@ -889,7 +881,7 @@ class StringGenerator:
 
         elem_owner_handle_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         elem_owner_handle = builder.load(elem_owner_handle_ptr)
-        elem_owner = builder.inttoptr(elem_owner_handle, ir.IntType(8).as_pointer())
+        elem_owner = builder.call(cg.gc.gc_handle_deref, [elem_owner_handle])
         elem_offset_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         elem_offset = builder.load(elem_offset_ptr)
         elem_size_ptr = builder.gep(elem_str, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -944,14 +936,14 @@ class StringGenerator:
         builder.position_at_end(check_data)
         a_owner_handle_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         a_owner_handle = builder.load(a_owner_handle_ptr)
-        a_owner = builder.inttoptr(a_owner_handle, ir.IntType(8).as_pointer())
+        a_owner = builder.call(cg.gc.gc_handle_deref, [a_owner_handle])
         a_offset_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         a_offset = builder.load(a_offset_ptr)
         a_data = builder.gep(a_owner, [a_offset])
 
         b_owner_handle_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         b_owner_handle = builder.load(b_owner_handle_ptr)
-        b_owner = builder.inttoptr(b_owner_handle, ir.IntType(8).as_pointer())
+        b_owner = builder.call(cg.gc.gc_handle_deref, [b_owner_handle])
         b_offset_ptr = builder.gep(b, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
@@ -1011,14 +1003,14 @@ class StringGenerator:
 
         s_owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         s_owner_handle = builder.load(s_owner_handle_ptr)
-        s_owner = builder.inttoptr(s_owner_handle, ir.IntType(8).as_pointer())
+        s_owner = builder.call(cg.gc.gc_handle_deref, [s_owner_handle])
         s_offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         s_offset = builder.load(s_offset_ptr)
         s_data = builder.gep(s_owner, [s_offset])
 
         needle_owner_handle_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         needle_owner_handle = builder.load(needle_owner_handle_ptr)
-        needle_owner = builder.inttoptr(needle_owner_handle, ir.IntType(8).as_pointer())
+        needle_owner = builder.call(cg.gc.gc_handle_deref, [needle_owner_handle])
         needle_offset_ptr = builder.gep(needle, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         needle_offset = builder.load(needle_offset_ptr)
         needle_data = builder.gep(needle_owner, [needle_offset])
@@ -1092,7 +1084,7 @@ class StringGenerator:
 
         owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -1121,7 +1113,7 @@ class StringGenerator:
 
         owner_handle_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -1160,7 +1152,7 @@ class StringGenerator:
 
         src_owner_handle_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         src_owner_handle = builder.load(src_owner_handle_ptr)
-        src_owner = builder.inttoptr(src_owner_handle, i8_ptr)
+        src_owner = builder.call(cg.gc.gc_handle_deref, [src_owner_handle])
 
         src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
@@ -1184,7 +1176,7 @@ class StringGenerator:
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_owner_handle = builder.ptrtoint(new_data, i64)
+        new_owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_data])
         builder.store(new_owner_handle, new_owner_ptr)
 
         new_offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -1227,7 +1219,7 @@ class StringGenerator:
         builder.position_at_end(init_loop)
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner_ptr = builder.inttoptr(owner_handle, ir.IntType(8).as_pointer())
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data_ptr = builder.gep(owner_ptr, [offset])
@@ -1296,7 +1288,7 @@ class StringGenerator:
         source_size = builder.load(source_size_ptr)
         source_owner_handle_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         source_owner_handle = builder.load(source_owner_handle_ptr)
-        source_owner = builder.inttoptr(source_owner_handle, i8_ptr)
+        source_owner = builder.call(cg.gc.gc_handle_deref, [source_owner_handle])
         source_offset_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         source_offset = builder.load(source_offset_ptr)
         source_data = builder.gep(source_owner, [source_offset])
@@ -1305,7 +1297,7 @@ class StringGenerator:
         orig_size = builder.load(orig_size_ptr)
         orig_owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         orig_owner_handle = builder.load(orig_owner_handle_ptr)
-        orig_owner = builder.inttoptr(orig_owner_handle, i8_ptr)
+        orig_owner = builder.call(cg.gc.gc_handle_deref, [orig_owner_handle])
         orig_offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         orig_offset = builder.load(orig_offset_ptr)
         orig_data = builder.gep(orig_owner, [orig_offset])
@@ -1402,7 +1394,7 @@ class StringGenerator:
 
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner = builder.inttoptr(owner_handle, i8_ptr)
+        owner = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
@@ -1465,7 +1457,7 @@ class StringGenerator:
 
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner = builder.inttoptr(owner_handle, i8_ptr)
+        owner = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
@@ -1518,7 +1510,7 @@ class StringGenerator:
 
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
-        owner = builder.inttoptr(owner_handle, i8_ptr)
+        owner = builder.call(cg.gc.gc_handle_deref, [owner_handle])
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         offset = builder.load(offset_ptr)
         data = builder.gep(owner, [offset])
