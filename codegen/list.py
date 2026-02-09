@@ -5,11 +5,11 @@ This module provides the List type implementation for the Coex compiler.
 List uses a persistent vector structure with structural sharing for
 efficient immutable operations.
 
-List struct (Phase 4 - all i64):
-    Field 0: root_handle (i64) - 0 for empty/small lists
+List struct (all i64):
+    Field 0: root_handle (i64) - GC handle to PVNode, 0 for empty/small lists
     Field 1: len (i64) - total element count
     Field 2: depth (i64) - tree depth (0 = tail only)
-    Field 3: tail_handle (i64) - rightmost leaf array handle
+    Field 3: tail_handle (i64) - GC handle to rightmost leaf array
     Field 4: tail_len (i64) - elements in tail (0-32)
     Field 5: elem_size (i64)
 
@@ -164,9 +164,9 @@ class ListGenerator:
         # TaggedValues and we don't want uninitialized type_id values
         builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(8), 0), tail_size])
 
-        # Phase 4: Store as i64 handle
+        # Store as GC handle (stable across compaction)
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        tail_handle = builder.ptrtoint(tail_ptr, i64)
+        tail_handle = builder.call(cg.gc.gc_ptr_to_handle, [tail_ptr])
         builder.store(tail_handle, tail_field_ptr)
 
         # tail_len = 0 (field 4) - Phase 4: i64
@@ -219,10 +219,10 @@ class ListGenerator:
         old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_depth = builder.load(old_depth_ptr)
 
-        # tail_handle (field 3) - Phase 4: i64 handle
+        # tail_handle (field 3) - GC handle, deref to get pointer
         old_tail_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         old_tail_handle = builder.load(old_tail_handle_ptr)
-        old_tail = builder.inttoptr(old_tail_handle, ir.IntType(8).as_pointer())
+        old_tail = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
 
         # tail_len (field 4) - Phase 4: i64
         old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
@@ -236,10 +236,11 @@ class ListGenerator:
         old_flags_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         old_flags = builder.load(old_flags_ptr)
 
-        # root_handle (field 0) - Phase 4: i64 handle
+        # root_handle (field 0) - GC handle, deref to get pointer
         old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         old_root_handle = builder.load(old_root_handle_ptr)
-        old_root = builder.inttoptr(old_root_handle, cg.pv_node_struct.as_pointer())
+        old_root_i8 = builder.call(cg.gc.gc_handle_deref, [old_root_handle])
+        old_root = builder.bitcast(old_root_i8, cg.pv_node_struct.as_pointer())
 
         # Create new list with same flags
         new_list = builder.call(cg.list_new, [old_elem_size, old_flags])
@@ -266,14 +267,17 @@ class ListGenerator:
         new_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_depth, new_depth_ptr)
 
-        # Get new tail pointer (already allocated by list_new) - Phase 4: handle
+        # Get new tail pointer (already allocated by list_new) - deref GC handle
         new_tail_handle_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         new_tail_handle = builder.load(new_tail_handle_ptr_field)
-        new_tail = builder.inttoptr(new_tail_handle, ir.IntType(8).as_pointer())
+        new_tail = builder.call(cg.gc.gc_handle_deref, [new_tail_handle])
+
+        # Re-derive old_tail after list_new allocation (BUG-110: stale-pointer-across-allocation)
+        old_tail_fresh = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
 
         # Copy old tail contents to new tail - Phase 4: old_tail_len is already i64
         old_tail_size = builder.mul(old_tail_len, old_elem_size)
-        builder.call(cg.memcpy, [new_tail, old_tail, old_tail_size])
+        builder.call(cg.memcpy, [new_tail, old_tail_fresh, old_tail_size])
 
         # Append new element at position old_tail_len
         new_elem_offset = builder.mul(old_tail_len, old_elem_size)
@@ -311,7 +315,11 @@ class ListGenerator:
         # Copy the old tail data into a new leaf buffer
         leaf_size = builder.mul(ir.Constant(i64, 32), old_elem_size)
         leaf_data = cg.gc.alloc_arena_or_gc(builder, leaf_size, leaf_type_id)
-        builder.call(cg.memcpy, [leaf_data, old_tail, leaf_size])
+
+        # Re-derive old_tail after allocations (BUG-110: stale-pointer-across-allocation)
+        old_tail_fresh_full = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
+
+        builder.call(cg.memcpy, [leaf_data, old_tail_fresh_full, leaf_size])
 
         # Calculate how many leaves are currently in the tree
         # tree_elements = old_len - old_tail_len (where old_tail_len = 32 since tail is full)
@@ -382,8 +390,12 @@ class ListGenerator:
         builder.call(cg.memset, [uber_children_i8, ir.Constant(ir.IntType(8), 0), children_array_size])
 
         # Put old root at children[0] (field 0 is children)
+        # Re-derive old_root after allocation (BUG-110: stale-pointer-across-allocation)
+        old_root_i8_re_inc = builder.call(cg.gc.gc_handle_deref, [old_root_handle])
+        old_root_re_inc = builder.bitcast(old_root_i8_re_inc, cg.pv_node_struct.as_pointer())
+
         uber_child0_ptr = builder.gep(new_uber_root, [ir.Constant(i32, 0), ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_as_i8ptr = builder.bitcast(old_root, ir.IntType(8).as_pointer())
+        old_root_as_i8ptr = builder.bitcast(old_root_re_inc, ir.IntType(8).as_pointer())
         builder.store(old_root_as_i8ptr, uber_child0_ptr)
 
         # No refcount increment - GC handles shared references
@@ -427,8 +439,14 @@ class ListGenerator:
         new_root_raw_add = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root_add = builder.bitcast(new_root_raw_add, cg.pv_node_struct.as_pointer())
 
+        # Re-derive working_root after allocation (BUG-110: stale-pointer-across-allocation)
+        working_root_i8 = builder.bitcast(working_root, ir.IntType(8).as_pointer())
+        working_root_handle = builder.call(cg.gc.gc_ptr_to_handle, [working_root_i8])
+        working_root_fresh_i8 = builder.call(cg.gc.gc_handle_deref, [working_root_handle])
+        working_root_fresh = builder.bitcast(working_root_fresh_i8, cg.pv_node_struct.as_pointer())
+
         # Copy root's children (field 0 is children)
-        old_children_ptr = builder.gep(working_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        old_children_ptr = builder.gep(working_root_fresh, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         new_children_ptr = builder.gep(new_root_add, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         old_children_i8 = builder.bitcast(old_children_ptr, ir.IntType(8).as_pointer())
         new_children_i8 = builder.bitcast(new_children_ptr, ir.IntType(8).as_pointer())
@@ -511,9 +529,14 @@ class ListGenerator:
 
         # Copy existing child node (no refcount - GC handles it)
         builder.position_at_end(copy_child_block)
-        old_child_node = builder.bitcast(old_child_i8, cg.pv_node_struct.as_pointer())
         new_child_raw_copy = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_child_copy = builder.bitcast(new_child_raw_copy, cg.pv_node_struct.as_pointer())
+
+        # Re-derive old_child after allocation (BUG-110: stale-pointer-across-allocation)
+        old_child_handle_re = builder.call(cg.gc.gc_ptr_to_handle, [old_child_i8])
+        old_child_i8_fresh = builder.call(cg.gc.gc_handle_deref, [old_child_handle_re])
+        old_child_node = builder.bitcast(old_child_i8_fresh, cg.pv_node_struct.as_pointer())
+
         # Copy children from old node (field 0 is children)
         old_child_children = builder.gep(old_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         new_child_children = builder.gep(new_child_copy, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -580,19 +603,20 @@ class ListGenerator:
         new_depth_phi.add_incoming(working_depth, depth_1_insert_block)
         new_depth_phi.add_incoming(working_depth, descend_done)
 
-        # Set new list's root - Phase 4: store as i64 handle
+        # Set new list's root - store as GC handle (stable across compaction)
         new_list_root_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_handle = builder.ptrtoint(new_root_phi, i64)
+        new_root_i8 = builder.bitcast(new_root_phi, ir.IntType(8).as_pointer())
+        new_root_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_root_i8])
         builder.store(new_root_handle, new_list_root_ptr)
 
         # Set new list's depth - Phase 4: i64
         new_list_depth_ptr = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(new_depth_phi, new_list_depth_ptr)
 
-        # Create new tail with just the appended element - Phase 4: load handle
+        # Create new tail with just the appended element - deref GC handle
         new_list_tail_handle_ptr_field = builder.gep(new_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         new_list_tail_handle = builder.load(new_list_tail_handle_ptr_field)
-        new_list_tail = builder.inttoptr(new_list_tail_handle, ir.IntType(8).as_pointer())
+        new_list_tail = builder.call(cg.gc.gc_handle_deref, [new_list_tail_handle])
 
         # Copy element to new tail at position 0
         builder.call(cg.memcpy, [new_list_tail, elem_ptr, elem_size])
@@ -639,10 +663,10 @@ class ListGenerator:
         depth_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         depth = builder.load(depth_ptr)
 
-        # tail_handle (field 3) - Phase 4: i64 handle
+        # tail_handle (field 3) - GC handle, deref to get pointer
         tail_handle_ptr_field = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.load(tail_handle_ptr_field)
-        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
+        tail = builder.call(cg.gc.gc_handle_deref, [tail_handle])
 
         # tail_len (field 4) - Phase 4: i64
         tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
@@ -652,10 +676,11 @@ class ListGenerator:
         elem_size_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
 
-        # root_handle (field 0) - Phase 4: i64 handle
+        # root_handle (field 0) - GC handle, deref to get pointer
         root_handle_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         root_handle = builder.load(root_handle_ptr)
-        root = builder.inttoptr(root_handle, cg.pv_node_struct.as_pointer())
+        root_i8 = builder.call(cg.gc.gc_handle_deref, [root_handle])
+        root = builder.bitcast(root_i8, cg.pv_node_struct.as_pointer())
 
         # Calculate tail_start = len - tail_len - Phase 4: both are i64
         tail_start = builder.sub(list_len, tail_len)
@@ -795,10 +820,10 @@ class ListGenerator:
         old_depth_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_depth = builder.load(old_depth_ptr)
 
-        # tail_handle (field 3) - Phase 4: i64 handle
+        # tail_handle (field 3) - GC handle, deref to get pointer
         old_tail_handle_ptr_field = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         old_tail_handle = builder.load(old_tail_handle_ptr_field)
-        old_tail = builder.inttoptr(old_tail_handle, ir.IntType(8).as_pointer())
+        old_tail = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
 
         # tail_len (field 4) - Phase 4: i64
         old_tail_len_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
@@ -812,10 +837,11 @@ class ListGenerator:
         old_flags_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         old_flags = builder.load(old_flags_ptr)
 
-        # root_handle (field 0) - Phase 4: i64 handle
+        # root_handle (field 0) - GC handle, deref to get pointer
         old_root_handle_ptr = builder.gep(old_list, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         old_root_handle = builder.load(old_root_handle_ptr)
-        old_root = builder.inttoptr(old_root_handle, cg.pv_node_struct.as_pointer())
+        old_root_i8 = builder.call(cg.gc.gc_handle_deref, [old_root_handle])
+        old_root = builder.bitcast(old_root_i8, cg.pv_node_struct.as_pointer())
 
         # Calculate tail_start = len - tail_len - Phase 4: both are i64
         tail_start = builder.sub(old_len, old_tail_len)
@@ -842,14 +868,17 @@ class ListGenerator:
         new_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(old_len, new_len_ptr_t)
 
-        # Get new tail pointer (allocated by list_new) - Phase 4: handle
+        # Get new tail pointer (allocated by list_new) - deref GC handle
         new_tail_handle_ptr_field_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         new_tail_handle_t = builder.load(new_tail_handle_ptr_field_t)
-        new_tail_t = builder.inttoptr(new_tail_handle_t, ir.IntType(8).as_pointer())
+        new_tail_t = builder.call(cg.gc.gc_handle_deref, [new_tail_handle_t])
+
+        # Re-derive old_tail after list_new allocation (BUG-110: stale-pointer-across-allocation)
+        old_tail_fresh_t = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
 
         # Copy old tail contents to new tail - Phase 4: old_tail_len is already i64
         old_tail_size_t = builder.mul(old_tail_len, stored_elem_size)
-        builder.call(cg.memcpy, [new_tail_t, old_tail, old_tail_size_t])
+        builder.call(cg.memcpy, [new_tail_t, old_tail_fresh_t, old_tail_size_t])
 
         # Set new tail_len - Phase 4: i64
         new_tail_len_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
@@ -875,12 +904,16 @@ class ListGenerator:
         new_depth_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_depth, new_depth_ptr_tr)
 
-        # Copy tail (tail is unchanged, just copy the whole thing) - Phase 4: handle
+        # Copy tail (tail is unchanged, just copy the whole thing) - deref GC handle
         new_tail_handle_ptr_field_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         new_tail_handle_tr = builder.load(new_tail_handle_ptr_field_tr)
-        new_tail_tr = builder.inttoptr(new_tail_handle_tr, ir.IntType(8).as_pointer())
+        new_tail_tr = builder.call(cg.gc.gc_handle_deref, [new_tail_handle_tr])
+
+        # Re-derive old_tail after list_new allocation (BUG-110: stale-pointer-across-allocation)
+        old_tail_fresh_tr = builder.call(cg.gc.gc_handle_deref, [old_tail_handle])
+
         old_tail_size_tr = builder.mul(old_tail_len, stored_elem_size)  # Phase 4: old_tail_len is i64
-        builder.call(cg.memcpy, [new_tail_tr, old_tail, old_tail_size_tr])
+        builder.call(cg.memcpy, [new_tail_tr, old_tail_fresh_tr, old_tail_size_tr])
         new_tail_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(old_tail_len, new_tail_len_ptr_tr)
 
@@ -910,6 +943,10 @@ class ListGenerator:
         new_root_raw = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_root = builder.bitcast(new_root_raw, cg.pv_node_struct.as_pointer())
 
+        # Re-derive old_root after allocation (BUG-110: stale-pointer-across-allocation)
+        old_root_i8_re = builder.call(cg.gc.gc_handle_deref, [old_root_handle])
+        old_root = builder.bitcast(old_root_i8_re, cg.pv_node_struct.as_pointer())
+
         # Copy children pointers from old root (field 0 is children)
         old_root_children = builder.gep(old_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         new_root_children = builder.gep(new_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -918,9 +955,10 @@ class ListGenerator:
         new_root_children_i8 = builder.bitcast(new_root_children, ir.IntType(8).as_pointer())
         builder.call(cg.memcpy, [new_root_children_i8, old_root_children_i8, children_size])
 
-        # Store new root in new list - Phase 4: store as i64 handle
+        # Store new root in new list - store as GC handle (stable across compaction)
         new_root_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_handle_tr = builder.ptrtoint(new_root, i64)
+        new_root_i8_tr = builder.bitcast(new_root, ir.IntType(8).as_pointer())
+        new_root_handle_tr = builder.call(cg.gc.gc_ptr_to_handle, [new_root_i8_tr])
         builder.store(new_root_handle_tr, new_root_ptr_tr)
 
         # For depth=1 (most common case), we just need to:
@@ -951,6 +989,11 @@ class ListGenerator:
         # Create new leaf (copy of old leaf)
         leaf_size_d1 = builder.mul(ir.Constant(i64, 32), stored_elem_size)
         new_leaf_d1 = cg.gc.alloc_arena_or_gc(builder, leaf_size_d1, leaf_type_id)
+
+        # Re-derive old_leaf after allocation (BUG-110: stale-pointer-across-allocation)
+        old_leaf_handle_d1 = builder.call(cg.gc.gc_ptr_to_handle, [old_leaf_d1])
+        old_leaf_d1 = builder.call(cg.gc.gc_handle_deref, [old_leaf_handle_d1])
+
         builder.call(cg.memcpy, [new_leaf_d1, old_leaf_d1, leaf_size_d1])
 
         # Modify element in new leaf at position index & 0x1F - Phase 4: i64
@@ -1006,7 +1049,13 @@ class ListGenerator:
         child_idx_path = builder.and_(child_idx_path, ir.Constant(i64, 0x1F))
 
         # Get old child node (field 0 is children) - Phase 4: i64 GEP index
-        old_node_curr = builder.load(current_old_node)
+        # Re-derive old_node_curr from handle (BUG-110: previous loop iteration's alloc may have staled it)
+        old_node_curr_raw = builder.load(current_old_node)
+        old_node_curr_i8 = builder.bitcast(old_node_curr_raw, ir.IntType(8).as_pointer())
+        old_node_curr_handle = builder.call(cg.gc.gc_ptr_to_handle, [old_node_curr_i8])
+        old_node_curr_fresh_i8 = builder.call(cg.gc.gc_handle_deref, [old_node_curr_handle])
+        old_node_curr = builder.bitcast(old_node_curr_fresh_i8, cg.pv_node_struct.as_pointer())
+
         old_child_ptr = builder.gep(old_node_curr, [ir.Constant(i32, 0), ir.Constant(i32, 0), child_idx_path], inbounds=True)
         old_child_raw = builder.load(old_child_ptr)
         old_child = builder.bitcast(old_child_raw, cg.pv_node_struct.as_pointer())
@@ -1014,6 +1063,12 @@ class ListGenerator:
         # Create new child node (no refcount - GC handles memory)
         new_child_raw = cg.gc.alloc_arena_or_gc(builder, pv_node_size, pv_node_type_id)
         new_child = builder.bitcast(new_child_raw, cg.pv_node_struct.as_pointer())
+
+        # Re-derive old_child after allocation (BUG-110: stale-pointer-across-allocation)
+        old_child_i8_for_handle = builder.bitcast(old_child, ir.IntType(8).as_pointer())
+        old_child_handle_re = builder.call(cg.gc.gc_ptr_to_handle, [old_child_i8_for_handle])
+        old_child_i8_re = builder.call(cg.gc.gc_handle_deref, [old_child_handle_re])
+        old_child = builder.bitcast(old_child_i8_re, cg.pv_node_struct.as_pointer())
 
         # Copy children array from old child (field 0 is children)
         old_child_children = builder.gep(old_child, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -1045,13 +1100,24 @@ class ListGenerator:
         leaf_idx_multi = builder.and_(leaf_idx_multi, ir.Constant(i64, 0x1F))
 
         # Get old leaf from current old node (field 0 is children)
-        final_old_node = builder.load(current_old_node)
+        # Re-derive final_old_node from handle (BUG-110: loop body allocations may have staled it)
+        final_old_node_raw = builder.load(current_old_node)
+        final_old_node_i8 = builder.bitcast(final_old_node_raw, ir.IntType(8).as_pointer())
+        final_old_handle = builder.call(cg.gc.gc_ptr_to_handle, [final_old_node_i8])
+        final_old_fresh_i8 = builder.call(cg.gc.gc_handle_deref, [final_old_handle])
+        final_old_node = builder.bitcast(final_old_fresh_i8, cg.pv_node_struct.as_pointer())
+
         old_leaf_ptr_m = builder.gep(final_old_node, [ir.Constant(i32, 0), ir.Constant(i32, 0), leaf_idx_multi], inbounds=True)
         old_leaf_m = builder.load(old_leaf_ptr_m)
 
         # Create new leaf
         leaf_size_m = builder.mul(ir.Constant(i64, 32), stored_elem_size)
         new_leaf_m = cg.gc.alloc_arena_or_gc(builder, leaf_size_m, leaf_type_id)
+
+        # Re-derive old_leaf after allocation (BUG-110: stale-pointer-across-allocation)
+        old_leaf_handle_m = builder.call(cg.gc.gc_ptr_to_handle, [old_leaf_m])
+        old_leaf_m = builder.call(cg.gc.gc_handle_deref, [old_leaf_handle_m])
+
         builder.call(cg.memcpy, [new_leaf_m, old_leaf_m, leaf_size_m])
 
         # Modify element in new leaf - Phase 4: i64

@@ -202,18 +202,27 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-### BUG-103: gc_compact() crashes with memory corruption in game loop
-- **Discovered**: 2026-02-05, during compiling and running galaxian.coex
+---
+
+### BUG-109: HAMT nodes lack type_id — Phase 3b pointer fixup skips them, causing stale internal pointers after compaction
+- **Discovered**: 2026-02-09, during TLAB memory leak fix (attempting to re-enable TLAB freeing in Phase 3)
 - **Category**: GC
-- **Severity**: Critical
-- **Reproduction**: Compile and run `examples/galaxian.coex` with `gc_compact()` enabled (line 234). Crashes on first frame.
-- **Observed**: Abort trap on thread #2. Two crash signatures: (1) `coex_gc_mark_object` EXC_BAD_ACCESS at invalid address during mark phase, (2) `malloc: pointer being freed was not allocated` during compaction. The GC background thread corrupts object pointers when `gc_compact_impl` copies live objects to a new buffer.
-- **Expected**: `gc_compact()` should safely compact the heap without corrupting pointers or freeing invalid memory.
-- **Hypothesis**: The compactor's pointer fixup is not correctly updating all references. Possible causes: (a) handle table entries not updated after objects move, (b) stale pointers in shadow stack frames, (c) race condition between compaction on thread #2 and allocation on thread #1, (d) objects allocated by the C runtime (cJSON, ImGui) being treated as GC-managed objects during sweep.
-- **Files**: `coex_gc.py` (functions: `_implement_gc_compact_impl`, `_implement_gc_compact`, `_implement_gc_compact_deferred_cleanup`)
+- **Severity**: High
+- **Reproduction**: Any program using maps or sets under GC compaction pressure. Currently masked because Phase 3 does not free emptied TLABs (HAMT stale pointers read from still-mapped leaked TLABs). Becomes a crash if TLAB freeing is re-enabled.
+- **Observed**: HAMTNode (allocated in `codegen/hamt.py:318` with `type_id=0`) and HAMT children buffers (allocated at `codegen/hamt.py:340` with `type_id=0`) are invisible to the Phase 3b fixup switch statement (`coex_gc.py:10474`). After compaction copies these objects, their internal raw pointers are stale:
+  - `HAMTNode.children` (field 1): raw i64* pointer to children buffer — not fixed up
+  - Children array entries: tagged i64 pointers (bit 0 = leaf) to leaves/nodes — not fixed up
+  - `HAMTLeaf.key` and `HAMTLeaf.value`: may contain raw pointers for reference types — not fixed up
+- **Expected**: After compaction, all internal raw pointers should be updated to point to new locations in the compact buffer.
+- **Hypothesis**: Need to:
+  1. Define `TYPE_HAMT_NODE` and `TYPE_HAMT_LEAF` constants in `coex_gc.py`
+  2. Use them when allocating HAMT structures in `codegen/hamt.py`
+  3. Add fixup cases in Phase 3b for these types (handle tag bits for children entries)
+  4. Also add proper gc_mark_object cases for these type_ids (currently marked indirectly via `gc_mark_hamt`)
+- **Files**: `coex_gc.py` (fixup phase, type constants), `codegen/hamt.py` (allocations)
 - **Status**: Open
-- **Workaround**: Comment out `gc_compact()` in game loop. Note: `gc()` also has known crash issues (commented out in galaxian.coex).
+- **Blocking**: Re-enabling TLAB freeing in Phase 3's `tlab_now_empty` block (TLAB memory leak fix)
 
 ---
 
-**Next valid BUG ID: BUG-109**
+**Next valid BUG ID: BUG-113**

@@ -23,6 +23,11 @@ Write simple tests for bug completion and feature implementation. Then write str
 
 Write benchmarks that show the possibility of pathologically long run time compared to reasonable expectation from other langauges. Ask about long run times to determine whether they should be investigated as bugs or architectural immprovements.
 
+## Compact Instructions
+**MANDATORY** When compacting, ALWAYS preserve these invariants in the summary:
+- NEVER run the full test suite. I will run the full test suite. Only run targeted tests.
+- Always re-read this CLAUDE.md after compaction before taking any action.
+
 ## Bug Tracking Protocol
 
 **MANDATORY**: When encountering any unexpected behavior, test failure, or anomaly during development—even if worked around or tangential to the current task—immediately append a bug report to `BUGS.md` before continuing. You must never continue past a discovered bug without first documenting it.
@@ -93,9 +98,8 @@ The GC uses a **handle-based** design where all heap references are i64 indices 
 | **Handle** | i64 index into handle table; 0 = null |
 | **Handle Table** | Global array mapping handles to object pointers |
 | **Shadow Stack** | Per-function frames tracking live handles for root scanning |
-| **Birth-marking** | New objects allocated with current mark bit (survive immediate GC) |
-| **Mark Inversion** | Alternating mark bit value each cycle (0↔1) avoids clearing phase |
-| **Deferred Reclamation** | Freed handles go to retired list, available after next cycle (MI-6) |
+| **Generation counter** | New objects allocated with current generation so they survive at lease one phase as "birth marked" |
+| **Deferred Reclamation** | Freed handles go to retired list, available after next cycle |
 
 ### Object Header (32 bytes)
 ```
@@ -105,7 +109,7 @@ The GC uses a **handle-based** design where all heap references are i64 indices 
 - `forward`: stores handle for pointer-to-handle recovery
 
 ### GC Cycle
-1. Flip `gc_current_mark_value` (0↔1)
+1. Generation counter
 2. Promote retired handles to free list (from previous cycle)
 3. Scan shadow stacks, mark reachable objects via handles
 4. Sweep: unmarked objects → retire their handles

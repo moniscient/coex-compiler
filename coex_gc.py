@@ -2919,7 +2919,7 @@ class GarbageCollector:
             # TLAB header is at tlab_base, live_count is field 0
             tlab_header = builder.bitcast(tlab_base_for_node, self.tlab_header_type.as_pointer())
             live_count_ptr = builder.gep(tlab_header, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-            builder.atomic_rmw('add', live_count_ptr, ir.Constant(self.i64, 1), 'monotonic')
+            builder.atomic_rmw('add', live_count_ptr, ir.Constant(self.i64, 1), 'release')
 
         # Add to per-thread allocation list (lock-free - thread-local data only)
         builder.call(self.gc_alloc_to_thread_list, [raw_node])
@@ -3437,23 +3437,19 @@ class GarbageCollector:
         builder.call(self.gc_mark_hamt, [map_root_ptr, map_flags])
         builder.branch(done)
 
-        # Mark List: root (field 0) and tail (field 3) pointers
+        # Mark List: root (field 0) and tail (field 3) GC handles
         # List struct: { i64 root (0), i64 len (1), i64 depth (2), i64 tail (3), i64 tail_len (4), i64 elem_size (5), i64 flags (6) }
-        # Root and tail store raw pointers as i64 (via ptrtoint), need inttoptr to get pointers
+        # Root and tail store GC handles (i64 indices) directly — no pointer conversion needed
         builder.position_at_end(mark_list)
         list_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i64, self.i64, self.i64]).as_pointer()
         list_typed = builder.bitcast(ptr, list_ptr_type)
-        # Mark root - push to worklist
+        # Mark root - push handle to worklist
         root_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_i64_ptr)
-        root_ptr = builder.inttoptr(root_i64, self.i8_ptr)  # Convert i64 to pointer
-        root_handle = builder.call(self.gc_ptr_to_handle, [root_ptr])
+        root_handle = builder.load(root_i64_ptr)
         builder.call(self.gc_mark_push, [root_handle])  # Push to worklist
-        # Mark tail - push to worklist
+        # Mark tail - push handle to worklist
         tail_i64_ptr = builder.gep(list_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)], inbounds=True)
-        tail_i64 = builder.load(tail_i64_ptr)
-        tail_ptr = builder.inttoptr(tail_i64, self.i8_ptr)  # Convert i64 to pointer
-        tail_handle = builder.call(self.gc_ptr_to_handle, [tail_ptr])
+        tail_handle = builder.load(tail_i64_ptr)
         builder.call(self.gc_mark_push, [tail_handle])  # Push to worklist
         builder.branch(done)
 
@@ -9062,7 +9058,14 @@ class GarbageCollector:
         """Dereference a handle to get the object pointer.
 
         Returns NULL if handle is 0 (null handle).
-        Otherwise returns gc_handle_table[handle].
+        Otherwise returns gc_handle_table[handle] with acquire ordering.
+
+        CONCURRENCY: The acquire load forms a release-acquire pair with
+        gc_handle_store's release store.  On ARM64, this ensures that when
+        the mutator reads a NEW pointer (written by compaction), all preceding
+        writes (the memcpy of object data to the new location) are visible.
+        Without acquire, the mutator can see the new pointer but read zeroed
+        mmap pages (memcpy not yet flushed from GC thread's store buffer).
         """
         func = self.gc_handle_deref
         func.args[0].name = "handle"
@@ -9083,17 +9086,26 @@ class GarbageCollector:
         builder.position_at_end(is_null)
         builder.ret(ir.Constant(self.i8_ptr, None))
 
-        # Dereference non-null handle
+        # Dereference non-null handle — acquire ordering
         builder.position_at_end(not_null)
         table = builder.load(self.gc_handle_table)
         slot_ptr = builder.gep(table, [handle])
-        ptr = builder.load(slot_ptr)
+        # Bitcast i8** slot to i64* for atomic load (llvmlite requires integer type)
+        slot_i64_ptr = builder.bitcast(slot_ptr, self.i64.as_pointer())
+        ptr_as_i64 = builder.load_atomic(slot_i64_ptr, ordering='acquire', align=8)
+        ptr = builder.inttoptr(ptr_as_i64, self.i8_ptr)
         builder.ret(ptr)
 
     def _implement_gc_handle_store(self):
-        """Store a pointer in a handle slot.
+        """Store a pointer in a handle slot with release ordering.
 
         gc_handle_table[handle] = ptr
+
+        CONCURRENCY: The release store ensures all preceding writes (e.g.,
+        memcpy of object data during compaction) are visible to any thread
+        that subsequently reads this slot with acquire ordering (gc_handle_deref).
+        On ARM64, without release, the handle table store can become visible
+        before the memcpy data, causing the mutator to read zeroed pages.
         """
         func = self.gc_handle_store
         func.args[0].name = "handle"
@@ -9107,7 +9119,10 @@ class GarbageCollector:
 
         table = builder.load(self.gc_handle_table)
         slot_ptr = builder.gep(table, [handle])
-        builder.store(ptr, slot_ptr)
+        # Bitcast i8** slot to i64* for atomic store (llvmlite requires integer type)
+        slot_i64_ptr = builder.bitcast(slot_ptr, self.i64.as_pointer())
+        ptr_as_i64 = builder.ptrtoint(ptr, self.i64)
+        builder.store_atomic(ptr_as_i64, slot_i64_ptr, ordering='release', align=8)
 
         builder.ret_void()
 
@@ -9642,8 +9657,31 @@ class GarbageCollector:
         ], inbounds=True)
         tlab_size = builder.load(tlab_size_ptr)
 
-        # munmap the TLAB
+        # Re-check live_count: if the mutator allocated into this TLAB
+        # between decrement-to-zero and now, skip the munmap.
+        recheck_hdr = builder.bitcast(tlab_ptr, self.tlab_header_type.as_pointer())
+        recheck_live_ptr = builder.gep(recheck_hdr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)  # live_count field
+        ], inbounds=True)
+        recheck_live = builder.load(recheck_live_ptr)
+        recheck_live.ordering = 'acquire'
+        tlab_still_dead = builder.icmp_unsigned('==', recheck_live, ir.Constant(self.i64, 0))
+
+        do_munmap = func.append_basic_block("do_munmap")
+        skip_munmap = func.append_basic_block("skip_munmap")
+        after_munmap = func.append_basic_block("after_munmap")
+        builder.cbranch(tlab_still_dead, do_munmap, skip_munmap)
+
+        # TLAB confirmed dead — safe to munmap
+        builder.position_at_end(do_munmap)
         builder.call(self.munmap, [tlab_ptr, tlab_size])
+        builder.branch(after_munmap)
+
+        # TLAB was reused — don't free. Sweep will handle it later.
+        builder.position_at_end(skip_munmap)
+        builder.branch(after_munmap)
+
+        builder.position_at_end(after_munmap)
 
         # Load next (field 2) and advance
         next_tlab_ptr = builder.gep(tlab_node, [
@@ -10186,16 +10224,14 @@ class GarbageCollector:
         builder.position_at_end(tlab_now_empty)
         # Old TLAB is now empty (all objects moved to compact buffer).
         # DO NOT add to deferred dead TLAB list for munmap!
-        # The alloc_nodes for the moved objects are still physically in this
-        # TLAB's memory and are still referenced by the alloc list chain.
-        # Freeing the TLAB would corrupt the alloc list, causing the next
-        # cycle's sweep/compact to walk through freed (and potentially
-        # reused) memory → data corruption.
-        #
-        # The TLAB will be leaked (it only contains alloc_node metadata,
-        # not object data). This is a small cost for correctness.
-        # TODO: Implement alloc_node migration to compact buffer to allow
-        # freeing empty TLABs.
+        # HAMT nodes (HAMTNode, HAMT leaves, children buffers) are allocated
+        # with type_id=0, which the Phase 3b pointer fixup does not handle.
+        # Their internal raw pointers (HAMTNode.children, children array
+        # entries with tag bits) remain stale after compaction, still pointing
+        # to original TLAB locations. Munmapping these TLABs would turn the
+        # stale pointers into dangling pointers, crashing the main thread.
+        # See BUG-109 for the HAMT fixup issue that must be resolved before
+        # TLAB freeing can be re-enabled here.
 
         # Reset thread's TLAB fields if this is the thread's current TLAB.
         thread_tlab_base_ptr_c = builder.gep(curr_thread2, [
@@ -10405,38 +10441,20 @@ class GarbageCollector:
                     builder.store(new_ptr, field_ptr)
 
         # Switch on type_id for types that contain raw pointer fields.
-        # NOTE: STRING is intentionally excluded — after arena removal, the
-        # owner field stores a handle (i64 index), not a raw pointer.
+        # NOTE: STRING and LIST are intentionally excluded — after handle
+        # conversion, their fields store handles (i64 indices), not raw pointers.
         # Handles are stable across compaction (handle table is updated by
         # the copy phase), so no fixup is needed.
-        fixup_list = func.append_basic_block("fixup_list")
         fixup_map = func.append_basic_block("fixup_map")
         fixup_set = func.append_basic_block("fixup_set")
         fixup_array = func.append_basic_block("fixup_array")
         fixup_pv_node = func.append_basic_block("fixup_pv_node")
 
         switch = builder.switch(type_id_fixup, fixup_next_node)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_LIST), fixup_list)
         switch.add_case(ir.Constant(self.i64, self.TYPE_MAP), fixup_map)
         switch.add_case(ir.Constant(self.i64, self.TYPE_SET), fixup_set)
         switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), fixup_array)
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), fixup_pv_node)
-
-        # --- Fix up List: root (field 0) and tail (field 3) ---
-        builder.position_at_end(fixup_list)
-        list_struct_type = ir.LiteralStructType([self.i64] * 7)  # 7 i64 fields
-        list_typed_fixup = builder.bitcast(data_ptr_fixup, list_struct_type.as_pointer())
-        # Fix root (field 0)
-        root_field_ptr = builder.gep(list_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        fixup_ptr_field(root_field_ptr)
-        # Fix tail (field 3)
-        tail_field_ptr = builder.gep(list_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        fixup_ptr_field(tail_field_ptr)
-        builder.branch(fixup_next_node)
 
         # --- Fix up Map: root (field 0) --- HAMT uses tag bit 0 for leaf/node
         builder.position_at_end(fixup_map)

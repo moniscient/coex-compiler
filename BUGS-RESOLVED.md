@@ -4,6 +4,19 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-103: gc_compact() crashes with memory corruption in game loop
+- **Discovered**: 2026-02-05, during compiling and running galaxian.coex
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Auto-play Galaxian (auto-fire every 10 frames) crashes at frame 52 when first enemy destroyed.
+- **Observed**: `EXC_BAD_ACCESS (KERN_INVALID_ADDRESS)` in `coex_list_get` — stale raw pointer to munmapped TLAB.
+- **Root Cause**: `codegen/list.py` stored tail/root buffer references as raw pointers via `ptrtoint`. After compaction moved buffers, handle table was updated but raw pointers in list struct became stale.
+- **Fix**: Converted list root (field 0) and tail (field 3) from raw pointers to GC handles. 3 write sites changed from `ptrtoint` to `gc_ptr_to_handle`, 10 read sites from `inttoptr` to `gc_handle_deref`. Simplified GC mark_list (handles loaded directly, no `inttoptr`+`gc_ptr_to_handle` round-trip). Removed TYPE_LIST from Phase 3b fixup (handles don't need fixup).
+- **Files**: `codegen/list.py`, `coex_gc.py`
+- **Status**: Fixed (2026-02-09)
+
+---
+
 ### BUG-099: GC during scheduler task execution crashes — task frame not traced
 - **Discovered**: 2026-02-04, during full test suite run
 - **Category**: GC/Runtime
@@ -1803,3 +1816,43 @@ func main() -> int
 - **Fix**: Added `BinaryExpr`, `UnaryExpr`, `TernaryExpr` cases to `infer_type_from_expr`. Also removed STRING from compact fixup switch (owner field stores a handle since arena removal, not a raw pointer).
 - **Files**: `codegen/generics.py`, `coex_gc.py`
 - **Status**: Fixed (2026-02-08)
+
+### BUG-110: list_set and list_append stale-pointer-across-allocation causes segfault
+- **Discovered**: 2026-02-09, during Galaxian firing crash investigation
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian example, begin firing at enemies. Game segfaults within 10 seconds. Also reproduced by `test_list_set_with_gc_pressure` stress test.
+- **Observed**: Segfault when `enemy_alive.set(i, 0)` is called under GC pressure. Game runs indefinitely without firing (no list mutations).
+- **Expected**: list.set() should work correctly regardless of GC timing.
+- **Root Cause**: `_implement_list_set` and `_implement_list_append` in `codegen/list.py` obtain raw pointers via `gc_handle_deref()` early in the function, then allocate new objects via `list_new` or `alloc_arena_or_gc`. These allocations can trigger GC + compaction, which moves objects to new locations. The previously-obtained raw pointers become stale and the subsequent `memcpy` reads from freed/moved memory.
+- **Fix**: Re-derive all raw pointers from their handles after every allocation. 12 instances fixed across both functions: tail case, tree case tail copy, root copy, depth=1 leaf copy, depth>1 loop node copy, depth>1 leaf copy (×2 for set and append).
+- **Files**: codegen/list.py
+- **Status**: Fixed (2026-02-09)
+
+### BUG-111: Local variable allocas hold stale raw pointers after GC compaction — Galaxian crash
+- **Discovered**: 2026-02-09, during continued Galaxian crash investigation after BUG-110 fix
+- **Category**: Codegen/GC
+- **Severity**: Critical
+- **Reproduction**: Any program that reads a reference-type variable (List, String, Map, Set, Array, Json) after GC compaction has moved the object AND the old TLAB has been munmapped. Specifically reproduces the Galaxian firing crash: the rendering loop reads `enemy_alive` 38 times with heavy JSON/string allocations between reads, but never reassigns it. Two GC cycles during a single frame cause the TLAB to be munmapped.
+- **Observed**: Segfault reading reference-type variables after GC compaction. 4 targeted tests all crash: list read after GC cycles, string read after GC cycles, interleaved reads with allocations, set-then-read-after-GC.
+- **Expected**: Variables should always return valid pointers regardless of GC compaction timing.
+- **Root Cause**: `generate_identifier` in `codegen/expressions.py` loads raw pointers from variable allocas (`builder.load(cg.locals[name])`). After GC compaction moves an object and the old TLAB is munmapped (deferred cleanup in next cycle), the raw pointer in the alloca points to unmapped memory. The shadow stack has the correct handle, but it was never consulted during variable reads.
+- **Fix**: Modified `generate_identifier` to re-derive reference-type pointers from the shadow stack handle on every variable read. For variables with shadow stack slots (`gc_root_indices`), the fix reads the handle via `gc_segment_get_root`, dereferences it via `gc_handle_deref` to get the current pointer, and returns the fresh pointer. This adds ~3 instructions per reference-type variable access but ensures correctness after compaction.
+- **Files**: codegen/expressions.py (generate_identifier, lines 167-196)
+- **Tests**: tests/test_stale_var_pointer.py (4 new tests)
+- **Status**: Fixed (2026-02-09)
+
+---
+
+### BUG-112: Handle table load/store missing memory ordering — ARM64 race in gc_handle_deref/gc_handle_store
+- **Discovered**: 2026-02-09, during Galaxian crash investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Any program with concurrent GC compaction and mutator handle dereferences on Apple Silicon (ARM64). Crash timing is highly variable (3-30 seconds) — classic store buffer reordering race.
+- **Observed**: `gc_handle_deref` used plain load (no acquire) and `gc_handle_store` used plain store (no release) on handle table slots. On ARM64 weak memory model, compaction's memcpy of object data to a new location is NOT guaranteed visible to the mutator when the handle table update (pointing to new location) IS visible. Mutator reads zeroed mmap pages at new location → null pointer dereference → SIGSEGV.
+- **Expected**: Handle table slot reads/writes must form release-acquire pairs so that object data is guaranteed visible when a new pointer is published.
+- **Root Cause**: Compaction does `memcpy(new_loc, old_data)` then `gc_handle_store(handle, new_ptr)`. Without `release` on the store, ARM64 can reorder store buffer so handle table update is visible before memcpy data. Mutator does `ptr = gc_handle_deref(handle)`. Without `acquire` on the load, subsequent data reads see uninitialized (zeroed) mmap pages. Result: null dereference in struct field access → SIGSEGV.
+- **Fix**: Changed `gc_handle_store` to use `store_atomic(..., ordering='release', align=8)`. Changed `gc_handle_deref` to use `load_atomic(..., ordering='acquire', align=8)`. Both use bitcast to `i64*` for llvmlite atomic operation compatibility.
+- **Files**: `coex_gc.py` (`_implement_gc_handle_deref`, `_implement_gc_handle_store`)
+- **Note**: On x86-64 (TSO memory model), plain loads/stores provide implicit acquire/release, masking this bug. Only manifests on weak-memory architectures (ARM64/Apple Silicon).
+- **Status**: Fixed (2026-02-09)
