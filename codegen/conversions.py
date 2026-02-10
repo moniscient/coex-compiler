@@ -76,11 +76,11 @@ class ConversionGenerator:
         else:
             array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, array_elem_size])
 
-        # Array data: compute handle + offset
-        # Field 0: handle, Field 4: offset
+        # Array data: deref handle + offset
+        # Field 0: handle (GC handle i64), Field 4: offset
         array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
-        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
         array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
@@ -169,11 +169,11 @@ class ConversionGenerator:
         # Check if TaggedValue mode is enabled
         use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
 
-        # Get array data pointer: compute handle + offset
-        # Field 0: handle, Field 4: offset
+        # Get array data pointer: deref handle + offset
+        # Field 0: handle (GC handle i64), Field 4: offset
         array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
-        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
         array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
@@ -263,11 +263,11 @@ class ConversionGenerator:
         elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         array_elem_size = self.cg.builder.load(elem_size_ptr)
 
-        # Get Array data: compute handle + offset
-        # Field 0: handle, Field 4: offset
+        # Get Array data: deref handle + offset
+        # Field 0: handle (GC handle i64), Field 4: offset
         array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
-        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
         array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
@@ -360,11 +360,11 @@ class ConversionGenerator:
         elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.cg.builder.load(elem_size_ptr)
 
-        # Get Array data: compute handle + offset
-        # Field 0: handle, Field 4: offset
+        # Get Array data: deref handle + offset
+        # Field 0: handle (GC handle i64), Field 4: offset
         array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
-        array_base = self.cg.builder.inttoptr(array_handle, i8_ptr)
+        array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
         array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])

@@ -514,7 +514,7 @@ class ExpressionGenerator:
             list_flags = ir.Constant(i64, 0)  # No special flags needed - GC reads type_id from elements
             list_ptr = cg.builder.call(cg.list_new, [elem_size, list_flags])
 
-            # Get TaggedValue type ID for this element type
+            # Get TaggedValue type ID for this element type (default for homogeneous lists)
             tv_type_id = cg.gc.get_tv_type_id(elem_coex_type) if elem_coex_type else cg.gc.TV_TYPE_INT
 
             # Append each element as TaggedValue
@@ -524,8 +524,22 @@ class ExpressionGenerator:
                 else:
                     elem_val = self.generate_expression(elem_expr)
 
+                # For heterogeneous lists, compute per-element type info
+                per_elem_type_id = tv_type_id
+                per_elem_is_ref = is_ref_type
+                if isinstance(elem_val, ir.Function) or (
+                    isinstance(elem_val.type, ir.PointerType) and
+                    isinstance(elem_val.type.pointee, ir.FunctionType)):
+                    per_elem_type_id = cg.gc.TV_TYPE_FUNC
+                    per_elem_is_ref = False
+                elif i > 0:
+                    per_coex_type = cg._infer_type_from_expr(elem_expr)
+                    if per_coex_type is not None:
+                        per_elem_type_id = cg.gc.get_tv_type_id(per_coex_type)
+                        per_elem_is_ref = cg._is_reference_type(per_coex_type)
+
                 # Create TaggedValue on stack
-                tv_ptr = cg.gc.create_tagged_value(cg.builder, tv_type_id, self._to_i64_value(elem_val, is_ref_type))
+                tv_ptr = cg.gc.create_tagged_value(cg.builder, per_elem_type_id, self._to_i64_value(elem_val, per_elem_is_ref))
 
                 # Append - list_append copies the TaggedValue (16 bytes)
                 tv_i8 = cg.builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
@@ -598,8 +612,11 @@ class ExpressionGenerator:
         elif isinstance(val.type, ir.DoubleType):
             return cg.builder.bitcast(val, i64)
         elif isinstance(val.type, ir.PointerType):
-            # BUG-081 FIX: Pointer types should use gc_ptr_to_handle, not ptrtoint
-            # This fallback case handles pointers not explicitly marked as ref types
+            # Check if this is a function pointer (code pointer, not heap object)
+            if isinstance(val.type.pointee, ir.FunctionType) or isinstance(val, ir.Function):
+                # Function pointers are NOT GC-allocated - use ptrtoint
+                return cg.builder.ptrtoint(val, i64)
+            # BUG-081 FIX: Heap object pointers use gc_ptr_to_handle, not ptrtoint
             val_i8 = cg.builder.bitcast(val, ir.IntType(8).as_pointer())
             return cg.builder.call(cg.gc.gc_ptr_to_handle, [val_i8])
         else:
@@ -2127,13 +2144,13 @@ class ExpressionGenerator:
                     # Allocate the array
                     array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
 
-                    # Get data pointer: handle (field 0) + offset (field 4)
+                    # Get data pointer: deref handle (field 0) + offset (field 4)
                     handle_ptr = cg.builder.gep(array_ptr, [
                         ir.Constant(ir.IntType(32), 0),
                         ir.Constant(ir.IntType(32), 0)
                     ], inbounds=True)
                     handle = cg.builder.load(handle_ptr)
-                    base_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+                    base_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
                     offset_ptr = cg.builder.gep(array_ptr, [
                         ir.Constant(ir.IntType(32), 0),
                         ir.Constant(ir.IntType(32), 4)
@@ -2191,10 +2208,10 @@ class ExpressionGenerator:
                     elem_size = ir.Constant(ir.IntType(64), 8)
                     array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
 
-                    # Get data pointer
+                    # Get data pointer (deref GC handle)
                     handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
                     handle = cg.builder.load(handle_ptr)
-                    base_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+                    base_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
                     offset_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 4)], inbounds=True)
                     offset = cg.builder.load(offset_ptr)
                     data_ptr = cg.builder.gep(base_ptr, [offset])
@@ -2247,10 +2264,10 @@ class ExpressionGenerator:
                     # Create 2D array
                     array_ptr = cg.builder.call(cg.array_new_2d, [n_val, n_val, elem_size])
 
-                    # Get data pointer
+                    # Get data pointer (deref GC handle)
                     handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
                     handle = cg.builder.load(handle_ptr)
-                    data_ptr = cg.builder.inttoptr(handle, ir.IntType(8).as_pointer())
+                    data_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
 
                     # Fill diagonal with 1s using a loop
                     func = cg.builder.function

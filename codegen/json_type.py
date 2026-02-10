@@ -3123,11 +3123,15 @@ class JsonGenerator:
         builder = cg.builder
         i64 = ir.IntType(64)
 
-        # Extract value from TaggedValue {i64 type_id, i64 value}
+        # Extract type_id and value from TaggedValue {i64 type_id, i64 value}
         tv_ptr = builder.bitcast(elem_data_ptr, cg.gc.tagged_value_ptr_type)
-        _, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
+        type_id, elem_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
 
-        # Convert based on type
+        # For List<any>, dispatch at runtime based on the TaggedValue's type_id
+        if elem_type is not None and hasattr(elem_type, 'name') and elem_type.name == "any":
+            return self._convert_any_element_to_json(type_id, elem_i64)
+
+        # Convert based on compile-time type
         if elem_type is None:
             # Default: treat as integer
             return builder.call(cg.json_new_int, [elem_i64])
@@ -3171,6 +3175,125 @@ class JsonGenerator:
 
         # Default fallback: treat as integer
         return builder.call(cg.json_new_int, [elem_i64])
+
+    def _convert_any_element_to_json(self, type_id: ir.Value, elem_i64: ir.Value) -> ir.Value:
+        """Runtime dispatch for List<any> elements based on TaggedValue type_id.
+
+        Generates a chain of comparisons to convert the element based on its
+        runtime type_id.
+        """
+        cg = self.cg
+        builder = cg.builder
+        i64 = ir.IntType(64)
+        func = builder.function
+        json_ptr_type = cg.json_struct.as_pointer()
+
+        # Allocate result storage
+        with builder.goto_entry_block():
+            result_ptr = builder.alloca(json_ptr_type, name="any_json_result")
+
+        # Create blocks for each type case
+        bb_is_float = func.append_basic_block("any_is_float")
+        bb_is_bool = func.append_basic_block("any_is_bool")
+        bb_is_string = func.append_basic_block("any_is_string")
+        bb_is_func = func.append_basic_block("any_is_func")
+        bb_is_list = func.append_basic_block("any_is_list")
+        bb_is_map = func.append_basic_block("any_is_map")
+        bb_default = func.append_basic_block("any_default")
+        bb_merge = func.append_basic_block("any_merge")
+
+        # Check float
+        is_float = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_FLOAT))
+        builder.cbranch(is_float, bb_is_float, bb_is_bool)
+
+        # Float case
+        builder.position_at_end(bb_is_float)
+        elem_double = builder.bitcast(elem_i64, ir.DoubleType())
+        float_json = builder.call(cg.json_new_float, [elem_double])
+        builder.store(float_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Check bool (from the not-float block, which is bb_is_bool's predecessor)
+        builder.position_at_end(bb_is_bool)
+        is_bool = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_BOOL))
+        bb_bool_body = func.append_basic_block("any_bool_body")
+        builder.cbranch(is_bool, bb_bool_body, bb_is_string)
+
+        builder.position_at_end(bb_bool_body)
+        elem_bool = builder.trunc(elem_i64, ir.IntType(1))
+        bool_json = builder.call(cg.json_new_bool, [elem_bool])
+        builder.store(bool_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Check string
+        builder.position_at_end(bb_is_string)
+        is_string = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_STRING))
+        bb_string_body = func.append_basic_block("any_string_body")
+        builder.cbranch(is_string, bb_string_body, bb_is_func)
+
+        builder.position_at_end(bb_string_body)
+        str_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+        str_ptr = builder.bitcast(str_i8, cg.string_struct.as_pointer())
+        str_json = builder.call(cg.json_new_string, [str_ptr])
+        builder.store(str_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Check function
+        builder.position_at_end(bb_is_func)
+        is_func = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_FUNC))
+        bb_func_body = func.append_basic_block("any_func_body")
+        builder.cbranch(is_func, bb_func_body, bb_is_list)
+
+        builder.position_at_end(bb_func_body)
+        # Create function annotation: {"@coex:func": "anonymous"}
+        flags = ir.Constant(i64, cg.MAP_FLAG_KEY_IS_PTR | cg.MAP_FLAG_VALUE_IS_HANDLE)
+        ann_map = builder.call(cg.map_new, [flags])
+        key_str = cg._get_string_ptr("@coex:func")
+        name_str = cg._get_string_ptr("anonymous")
+        name_json = builder.call(cg.json_new_string, [name_str])
+        name_json_i8 = builder.bitcast(name_json, ir.IntType(8).as_pointer())
+        name_json_promoted = builder.call(cg.gc.gc_promote_to_heap, [name_json_i8])
+        name_json_handle = builder.call(cg.gc.gc_ptr_to_handle, [name_json_promoted])
+        ann_map = builder.call(cg.map_set_string, [ann_map, key_str, name_json_handle])
+        func_json = builder.call(cg.json_new_object, [ann_map])
+        builder.store(func_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Check list (heap type)
+        builder.position_at_end(bb_is_list)
+        is_list = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_LIST))
+        bb_list_body = func.append_basic_block("any_list_body")
+        builder.cbranch(is_list, bb_list_body, bb_is_map)
+
+        builder.position_at_end(bb_list_body)
+        list_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+        list_ptr = builder.bitcast(list_i8, cg.list_struct.as_pointer())
+        list_json = self.convert_list_to_json_array(list_ptr, None)
+        builder.store(list_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Check map (heap type)
+        builder.position_at_end(bb_is_map)
+        is_map = builder.icmp_unsigned("==", type_id, ir.Constant(i64, cg.gc.TV_TYPE_MAP))
+        bb_map_body = func.append_basic_block("any_map_body")
+        builder.cbranch(is_map, bb_map_body, bb_default)
+
+        builder.position_at_end(bb_map_body)
+        map_i8 = builder.call(cg.gc.gc_handle_deref, [elem_i64])
+        map_ptr = builder.bitcast(map_i8, cg.map_struct.as_pointer())
+        map_json = self.convert_map_to_json_object(map_ptr, None)
+        builder.store(map_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Default: treat as integer
+        builder.position_at_end(bb_default)
+        int_json = builder.call(cg.json_new_int, [elem_i64])
+        builder.store(int_json, result_ptr)
+        builder.branch(bb_merge)
+
+        # Merge: load result
+        builder.position_at_end(bb_merge)
+        return builder.load(result_ptr)
 
     def convert_udt_to_json(self, value: ir.Value, type_name: str) -> ir.Value:
         """Convert a user-defined type or enum to JSON with _type metadata."""

@@ -1888,3 +1888,17 @@ func main() -> int
 - **Fix**: Disabled in-place optimization when GC is active (`cg.gc is not None` → return False). The normal reassignment path is correct and performance difference is negligible.
 - **Files**: `codegen/statements.py` (try_generate_inplace_update)
 - **Status**: Fixed (2026-02-09)
+
+---
+
+### BUG-114: Intermittent data corruption in list.set under GC pressure
+- **Discovered**: 2026-02-09, during investigation of pre-existing test failures
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Run test_list_set_gc_stress.py::test_list_set_with_gc_pressure repeatedly. Fails ~60% of runs.
+- **Observed**: `alive.get(i) != 1` after setting all 38 elements to 1. Data corruption at round 30-40.
+- **Expected**: All elements should read as 1 after resetting them.
+- **Root Cause**: Race between async GC Phase 3b fixup (PV_NODE raw pointer patching) and mutator reads. After compaction copies objects to new buffer and updates handle table, the mutator sees new locations via gc_handle_deref but Phase 3b hasn't yet fixed internal PV_NODE raw pointers. Mutator reads stale internal pointers → accesses wrong PV_NODE data → silent data corruption.
+- **Fix**: Converted PV_NODE children and Array data handle from raw pointers to GC handles (i64). This eliminated the need for Phase 3b entirely — handles are stable across compaction (handle table updated by copy phase). Phase 3b removed.
+- **Files**: `codegen/core.py`, `codegen/list.py`, `codegen/array.py`, `codegen/conversions.py`, `codegen/expressions.py`, `coex_gc.py`
+- **Status**: Fixed (2026-02-10)

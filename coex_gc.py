@@ -87,6 +87,7 @@ class GarbageCollector:
     TV_TYPE_JSON_BOOL = 7    # value = 0 or 1
     TV_TYPE_JSON_INT = 8     # value = raw i64
     TV_TYPE_JSON_FLOAT = 9   # value = f64 bitcast to i64
+    TV_TYPE_FUNC = 10        # value = ptrtoint(function_ptr) - NOT a GC handle
 
     # Heap reference threshold - all types >= this have GC handles
     TYPE_HEAP_BASE = 64
@@ -3438,7 +3439,7 @@ class GarbageCollector:
         builder.call(self.gc_mark_push, [tail_handle])  # Push to worklist
         builder.branch(done)
 
-        # Mark Array: handle pointer at field 0
+        # Mark Array: handle at field 0
         # N-D Array struct (104 bytes):
         #   Field 0: handle (i64) - GC handle for data buffer
         #   Field 1: ndim (i64) - number of dimensions
@@ -3447,14 +3448,11 @@ class GarbageCollector:
         #   Field 4: offset (i64) - byte offset for views
         #   Field 5: elem_size (i64) - element size
         #   Field 6: type_id (i64) - element type
-        # Handle stores raw pointer as i64 (via ptrtoint), need inttoptr to get pointer
+        # Field 0 IS the GC handle directly — push to worklist
         builder.position_at_end(mark_array)
-        # Just read the first i64 at offset 0 (the handle field)
         handle_i64_ptr = builder.bitcast(ptr, self.i64.as_pointer())
         handle_i64 = builder.load(handle_i64_ptr)
-        handle_ptr = builder.inttoptr(handle_i64, self.i8_ptr)  # Convert i64 to pointer
-        owner_handle = builder.call(self.gc_ptr_to_handle, [handle_ptr])
-        builder.call(self.gc_mark_push, [owner_handle])  # Push to worklist
+        builder.call(self.gc_mark_push, [handle_i64])  # Field 0 IS the handle
         builder.branch(done)
 
         # Mark Set: HAMT-based, root at offset 0
@@ -3495,7 +3493,7 @@ class GarbageCollector:
         builder.branch(done)
 
         # Mark PVNode: iterate through 32 children and mark each non-null one
-        # PVNode struct: { i8* children[32] }
+        # PVNode struct: { [32 x i64] } — children are GC handles (i64)
         builder.position_at_end(mark_pv_node)
         # Store ptr for use in loop
         pv_ptr_alloca = builder.alloca(self.i8_ptr, name="pv_ptr")
@@ -3511,28 +3509,27 @@ class GarbageCollector:
         done_children = builder.icmp_unsigned(">=", idx, ir.Constant(self.i64, 32))
         builder.cbranch(done_children, done, pv_node_check)
 
-        # Check if child is non-null
+        # Check if child handle is non-null (0 = null handle)
         builder.position_at_end(pv_node_check)
         pv_ptr_val = builder.load(pv_ptr_alloca)
-        # PVNode is just an array of 32 pointers at the user data area
-        pv_children = builder.bitcast(pv_ptr_val, self.i8_ptr_ptr)
+        # PVNode is an array of 32 i64 handles at the user data area
+        pv_children = builder.bitcast(pv_ptr_val, self.i64.as_pointer())
         child_idx = builder.load(pv_idx)
-        child_ptr_ptr = builder.gep(pv_children, [child_idx], inbounds=False)
-        child_ptr = builder.load(child_ptr_ptr)
-        is_child_null = builder.icmp_unsigned("==", child_ptr, ir.Constant(self.i8_ptr, None))
+        child_handle_ptr = builder.gep(pv_children, [child_idx], inbounds=False)
+        child_handle = builder.load(child_handle_ptr)
+        is_child_null = builder.icmp_unsigned("==", child_handle, ir.Constant(self.i64, 0))
         builder.cbranch(is_child_null, pv_node_next, pv_node_mark_child)
 
-        # Mark child (child_ptr was loaded and checked in pv_node_check)
+        # Mark child (child_handle is the GC handle directly — push to worklist)
         builder.position_at_end(pv_node_mark_child)
-        # Re-load the child pointer for this block
+        # Re-load the child handle for this block
         pv_ptr_val2 = builder.load(pv_ptr_alloca)
-        pv_children2 = builder.bitcast(pv_ptr_val2, self.i8_ptr_ptr)
+        pv_children2 = builder.bitcast(pv_ptr_val2, self.i64.as_pointer())
         child_idx2 = builder.load(pv_idx)
-        child_ptr_ptr2 = builder.gep(pv_children2, [child_idx2], inbounds=False)
-        child_to_mark = builder.load(child_ptr_ptr2)
-        # Convert pointer to handle and push to worklist
-        child_handle = builder.call(self.gc_ptr_to_handle, [child_to_mark])
-        builder.call(self.gc_mark_push, [child_handle])  # Push to worklist
+        child_handle_ptr2 = builder.gep(pv_children2, [child_idx2], inbounds=False)
+        child_handle_to_mark = builder.load(child_handle_ptr2)
+        # Handle IS the handle directly — push to worklist
+        builder.call(self.gc_mark_push, [child_handle_to_mark])
         builder.branch(pv_node_next)
 
         # Increment index and continue
@@ -9731,15 +9728,6 @@ class GarbageCollector:
         copy_old_is_malloc = func.append_basic_block("copy_old_is_malloc")
         copy_next_node = func.append_basic_block("copy_next_node")
         copy_next_thread = func.append_basic_block("copy_next_thread")
-        # Pointer fixup phase blocks
-        fixup_start = func.append_basic_block("fixup_start")
-        fixup_thread_check = func.append_basic_block("fixup_thread_check")
-        fixup_process_thread = func.append_basic_block("fixup_process_thread")
-        fixup_node_loop = func.append_basic_block("fixup_node_loop")
-        fixup_process_node = func.append_basic_block("fixup_process_node")
-        fixup_check_type = func.append_basic_block("fixup_check_type")
-        fixup_next_node = func.append_basic_block("fixup_next_node")
-        fixup_next_thread = func.append_basic_block("fixup_next_thread")
         update_stats = func.append_basic_block("update_stats")
         done = func.append_basic_block("done")
 
@@ -10002,7 +9990,7 @@ class GarbageCollector:
         curr_thread2 = builder.load(thread_alloca)
         thread_int2 = builder.ptrtoint(curr_thread2, self.i64)
         is_null_thread2 = builder.icmp_unsigned('==', thread_int2, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_thread2, fixup_start, copy_process_thread)
+        builder.cbranch(is_null_thread2, update_stats, copy_process_thread)
 
         builder.position_at_end(copy_process_thread)
 
@@ -10331,188 +10319,10 @@ class GarbageCollector:
         builder.store(next_thread_typed2, thread_alloca)
         builder.branch(copy_thread_check)
 
-        # ====================================================================
-        # Phase 3b: Pointer Fixup Pass
-        # ====================================================================
-        # After all objects have been copied and handles updated, internal raw
-        # pointer fields in container types (List root/tail, String owner,
-        # Map/Set HAMT root, Array data handle) still hold OLD addresses.
-        # Fix them up by: old_ptr -> gc_ptr_to_handle -> gc_handle_deref -> new_ptr
-        # Old memory is still valid (deferred cleanup hasn't run yet).
-
-        builder.position_at_end(fixup_start)
-        # Re-walk all threads' alloc lists
-        first_thread_fixup = builder.load(self.gc_thread_registry)
-        builder.store(first_thread_fixup, thread_alloca)
-        builder.branch(fixup_thread_check)
-
-        # --- Thread loop for fixup phase ---
-        builder.position_at_end(fixup_thread_check)
-        curr_thread_fixup = builder.load(thread_alloca)
-        thread_int_fixup = builder.ptrtoint(curr_thread_fixup, self.i64)
-        is_null_thread_fixup = builder.icmp_unsigned('==', thread_int_fixup, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_thread_fixup, update_stats, fixup_process_thread)
-
-        builder.position_at_end(fixup_process_thread)
-
-        # Skip dead entries
-        fixup_skip_dead = func.append_basic_block("fixup_skip_dead")
-        fixup_live_thread = func.append_basic_block("fixup_live_thread")
-        wm_fixup_ptr = builder.gep(curr_thread_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        wm_fixup_val = builder.load(wm_fixup_ptr)
-        is_dead_fixup = builder.icmp_unsigned('==', wm_fixup_val, ir.Constant(self.i64, 0xDEAD))
-        builder.cbranch(is_dead_fixup, fixup_skip_dead, fixup_live_thread)
-
-        builder.position_at_end(fixup_skip_dead)
-        builder.branch(fixup_next_thread)
-
-        builder.position_at_end(fixup_live_thread)
-        alloc_list_ptr_fixup = builder.gep(curr_thread_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
-        ], inbounds=True)
-        list_head_fixup = builder.load(alloc_list_ptr_fixup)
-        builder.store(list_head_fixup, node_alloca)
-        builder.branch(fixup_node_loop)
-
-        # --- Node loop for fixup phase ---
-        builder.position_at_end(fixup_node_loop)
-        curr_node_fixup = builder.load(node_alloca)
-        node_int_fixup = builder.ptrtoint(curr_node_fixup, self.i64)
-        is_null_node_fixup = builder.icmp_unsigned('==', node_int_fixup, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_node_fixup, fixup_next_thread, fixup_process_node)
-
-        builder.position_at_end(fixup_process_node)
-        node_typed_fixup = builder.bitcast(curr_node_fixup, self.alloc_node_type.as_pointer())
-
-        # Get handle (field 1)
-        handle_ptr_fixup = builder.gep(node_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        handle_fixup = builder.load(handle_ptr_fixup)
-
-        # Skip null handles
-        is_null_handle_fixup = builder.icmp_unsigned('==', handle_fixup, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_handle_fixup, fixup_next_node, fixup_check_type)
-
-        builder.position_at_end(fixup_check_type)
-        # Deref handle to get current data pointer.
-        # IMPORTANT: Fix up ALL live objects, not just those in the compact buffer.
-        # Newborn objects in TLABs may contain raw pointers to the prev compact
-        # buffer (set at allocation time when handles pointed there). Phase 4
-        # frees the prev buffer, so these pointers must be updated to the new
-        # compact buffer locations via gc_ptr_to_handle → gc_handle_deref.
-        data_ptr_fixup = builder.call(self.gc_handle_deref, [handle_fixup])
-        data_int_fixup = builder.ptrtoint(data_ptr_fixup, self.i64)
-
-        # Skip null data pointers
-        is_null_data_fixup = builder.icmp_unsigned('==', data_int_fixup, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_data_fixup, fixup_next_node, func.append_basic_block("fixup_do_type"))
-
-        # --- Do type-specific fixup ---
-        fixup_do_type = list(func.basic_blocks)[-1]  # The block we just appended
-        builder.position_at_end(fixup_do_type)
-
-        # Read type_id from header
-        header_int_fixup = builder.sub(data_int_fixup, ir.Constant(self.i64, self.HEADER_SIZE))
-
-        header_ptr_fixup = builder.inttoptr(header_int_fixup, self.i8_ptr)
-        header_fixup = builder.bitcast(header_ptr_fixup, self.header_type.as_pointer())
-        type_id_ptr_fixup = builder.gep(header_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
-        ], inbounds=True)
-        type_id_fixup = builder.load(type_id_ptr_fixup)
-
-        # Helper to fix up one raw-pointer-as-i64 field:
-        # Reads old ptr, converts to handle, dereferences to new ptr, stores back
-        def fixup_ptr_field(field_ptr, tag_mask=0):
-            old_val = builder.load(field_ptr)
-            # Strip tag bits before pointer operations
-            if tag_mask:
-                stripped_val = builder.and_(old_val, ir.Constant(self.i64, ~tag_mask & 0xFFFFFFFFFFFFFFFF))
-                tag_bits = builder.and_(old_val, ir.Constant(self.i64, tag_mask))
-            else:
-                stripped_val = old_val
-            old_ptr = builder.inttoptr(stripped_val, self.i8_ptr)
-            old_ptr_int = builder.ptrtoint(old_ptr, self.i64)
-            is_nonnull = builder.icmp_unsigned('>', old_ptr_int, ir.Constant(self.i64, 0x10000))
-            with builder.if_then(is_nonnull):
-                handle_from_old = builder.call(self.gc_ptr_to_handle, [old_ptr])
-                handle_valid = builder.icmp_unsigned('!=', handle_from_old, ir.Constant(self.i64, 0))
-                with builder.if_then(handle_valid):
-                    new_ptr = builder.call(self.gc_handle_deref, [handle_from_old])
-                    new_val = builder.ptrtoint(new_ptr, self.i64)
-                    # Restore tag bits
-                    if tag_mask:
-                        new_val = builder.or_(new_val, tag_bits)
-                    builder.store(new_val, field_ptr)
-
-        # Helper to fix up one raw i8* pointer field:
-        # Loads i8* ptr, converts to handle, dereferences, stores new i8* back
-        def fixup_raw_ptr_field(field_ptr):
-            """Fix up an i8* field that stores a raw pointer to a GC-managed object."""
-            old_ptr = builder.load(field_ptr)
-            old_ptr_int = builder.ptrtoint(old_ptr, self.i64)
-            is_nonnull = builder.icmp_unsigned('>', old_ptr_int, ir.Constant(self.i64, 0x10000))
-            with builder.if_then(is_nonnull):
-                handle_from_old = builder.call(self.gc_ptr_to_handle, [old_ptr])
-                handle_valid = builder.icmp_unsigned('!=', handle_from_old, ir.Constant(self.i64, 0))
-                with builder.if_then(handle_valid):
-                    new_ptr = builder.call(self.gc_handle_deref, [handle_from_old])
-                    builder.store(new_ptr, field_ptr)
-
-        # Switch on type_id for types that contain raw pointer fields.
-        # NOTE: STRING, LIST, MAP, SET, and all HAMT types are intentionally
-        # excluded — after handle conversion, their internal fields store handles
-        # (i64 indices), not raw pointers. Handles are stable across compaction
-        # (handle table is updated by the copy phase), so no fixup is needed.
-        # Only Array and PV_NODE still use raw pointers that need fixup.
-        fixup_array = func.append_basic_block("fixup_array")
-        fixup_pv_node = func.append_basic_block("fixup_pv_node")
-
-        switch = builder.switch(type_id_fixup, fixup_next_node)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), fixup_array)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), fixup_pv_node)
-
-        # --- Fix up Array: handle/data ptr (field 0) ---
-        builder.position_at_end(fixup_array)
-        array_handle_ptr = builder.bitcast(data_ptr_fixup, self.i64.as_pointer())
-        fixup_ptr_field(array_handle_ptr)
-        builder.branch(fixup_next_node)
-
-        # --- Fix up PV_NODE: 32 children (each i8*) ---
-        builder.position_at_end(fixup_pv_node)
-        # PV_NODE struct is { [32 x i8*] } — array of 32 raw pointers
-        pv_node_type = ir.LiteralStructType([ir.ArrayType(self.i8_ptr, 32)])
-        pv_typed_fixup = builder.bitcast(data_ptr_fixup, pv_node_type.as_pointer())
-        # Loop over all 32 children
-        for child_idx in range(32):
-            child_ptr_ptr = builder.gep(pv_typed_fixup, [
-                ir.Constant(self.i32, 0), ir.Constant(self.i32, 0),
-                ir.Constant(self.i32, child_idx)
-            ], inbounds=True)
-            fixup_raw_ptr_field(child_ptr_ptr)
-        builder.branch(fixup_next_node)
-
-        # --- Advance to next node in fixup phase ---
-        builder.position_at_end(fixup_next_node)
-        next_ptr_fixup = builder.gep(node_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        next_val_fixup = builder.load(next_ptr_fixup)
-        builder.store(next_val_fixup, node_alloca)
-        builder.branch(fixup_node_loop)
-
-        # --- Advance to next thread in fixup phase ---
-        builder.position_at_end(fixup_next_thread)
-        next_thread_ptr_fixup = builder.gep(curr_thread_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
-        ], inbounds=True)
-        next_thread_i8_fixup = builder.load(next_thread_ptr_fixup)
-        next_thread_typed_fixup = builder.bitcast(next_thread_i8_fixup, self.thread_entry_type.as_pointer())
-        builder.store(next_thread_typed_fixup, thread_alloca)
-        builder.branch(fixup_thread_check)
+        # Phase 3b (Pointer Fixup) has been eliminated — all internal fields
+        # now store GC handles (i64 indices), which are stable across compaction.
+        # Array field 0, PV_NODE children, List root/tail, String owner, and
+        # HAMT nodes all use handles. No fixup needed.
 
         # ====================================================================
         # Phase 4: Update Statistics

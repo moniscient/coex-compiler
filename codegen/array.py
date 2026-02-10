@@ -182,15 +182,15 @@ class ArrayGenerator:
     def _get_array_data_ptr(self, builder, array_ptr):
         """Get pointer to data buffer from array struct.
 
-        Returns: i8* pointing to (handle + offset)
+        Returns: i8* pointing to (gc_handle_deref(handle) + offset)
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get handle (field 0)
+        # Get handle (field 0) — this is a GC handle (i64)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
         handle = builder.load(handle_ptr)
-        data_base = builder.inttoptr(handle, ir.IntType(8).as_pointer())
+        data_base = builder.call(self.cg.gc.gc_handle_deref, [handle])
 
         # Get offset (field 4)
         offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_OFFSET)], inbounds=True)
@@ -239,9 +239,9 @@ class ArrayGenerator:
         if offset is None:
             offset = zero
 
-        # Field 0: handle (pointer as i64)
+        # Field 0: handle (GC handle i64)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        handle = builder.ptrtoint(data_ptr, i64)
+        handle = builder.call(self.cg.gc.gc_ptr_to_handle, [data_ptr])
         builder.store(handle, handle_ptr)
 
         # Field 1: ndim = 1
@@ -715,15 +715,11 @@ class ArrayGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, array_type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
-        # Re-derive via handle (may have moved during descriptor allocation)
-        new_data_raw2 = builder.call(cg.gc.gc_handle_deref, [new_data_handle])
-
         # Copy all fields from source, but with new data buffer and offset=0
 
-        # Field 0: handle = new_data (use re-derived pointer)
+        # Field 0: handle = new_data GC handle (re-derived via handle, stable across compaction)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        handle = builder.ptrtoint(new_data_raw2, i64)
-        builder.store(handle, handle_ptr)
+        builder.store(new_data_handle, handle_ptr)
 
         # Field 1: ndim (copy from source)
         src_ndim_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
@@ -945,9 +941,9 @@ class ArrayGenerator:
         array_data_type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY_DATA)
         data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
-        # Field 0: handle
+        # Field 0: handle (GC handle i64)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        handle = builder.ptrtoint(data_ptr, i64)
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [data_ptr])
         builder.store(handle, handle_ptr)
 
         # Field 1: ndim = 2
@@ -1008,10 +1004,10 @@ class ArrayGenerator:
         col = func.args[2]
         i32 = ir.IntType(32)
 
-        # Get data base pointer
+        # Get data base pointer via GC handle deref
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
         handle = builder.load(handle_ptr)
-        data_base = builder.inttoptr(handle, ir.IntType(8).as_pointer())
+        data_base = builder.call(cg.gc.gc_handle_deref, [handle])
 
         # Get offset
         offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_OFFSET)], inbounds=True)

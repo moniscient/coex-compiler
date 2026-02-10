@@ -1259,6 +1259,9 @@ class StatementGenerator:
                         var_name = target.object.name
                         if var_name in cg.locals:
                             cg.builder.store(new_list, cg.locals[var_name])
+                            if var_name in cg.gc_root_indices and cg.gc is not None:
+                                root_idx = cg.gc_root_indices[var_name]
+                                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_list)
                     return
 
                 if pointee.name == "struct.Array":
@@ -1288,6 +1291,9 @@ class StatementGenerator:
                         var_name = target.object.name
                         if var_name in cg.locals:
                             cg.builder.store(new_array, cg.locals[var_name])
+                            if var_name in cg.gc_root_indices and cg.gc is not None:
+                                root_idx = cg.gc_root_indices[var_name]
+                                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_array)
                     return
 
     def generate_slice_assignment(self, stmt: SliceAssignment):
@@ -1325,6 +1331,9 @@ class StatementGenerator:
                     var_name = stmt.target.name
                     if var_name in cg.locals:
                         cg.builder.store(new_obj, cg.locals[var_name])
+                        if var_name in cg.gc_root_indices and cg.gc is not None:
+                            root_idx = cg.gc_root_indices[var_name]
+                            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_obj)
                 return
 
         if isinstance(obj.type, ir.PointerType):
@@ -1335,6 +1344,9 @@ class StatementGenerator:
                     var_name = stmt.target.name
                     if var_name in cg.locals:
                         cg.builder.store(new_list, cg.locals[var_name])
+                        if var_name in cg.gc_root_indices and cg.gc is not None:
+                            root_idx = cg.gc_root_indices[var_name]
+                            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_list)
 
     def generate_return(self, stmt: ReturnStmt):
         """Generate return statement"""

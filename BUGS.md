@@ -206,4 +206,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-**Next valid BUG ID: BUG-114**
+**Next valid BUG ID: BUG-115**

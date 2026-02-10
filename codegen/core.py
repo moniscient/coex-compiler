@@ -358,12 +358,13 @@ class CodeGenerator:
         self._false_conv_str = self._create_global_string("false", "false_conv_str")
         
         # Create Persistent Vector Node structure (for List's tree structure)
-        # struct PVNode { void* children[32] }
+        # struct PVNode { i64 children[32] (GC handles) }
         # 32-way branching trie for O(log32 n) access
         # NOTE: No refcount - structural sharing works via GC
+        # Children store GC handles (i64), not raw pointers
         self.pv_node_struct = ir.global_context.get_identified_type("struct.PVNode")
         self.pv_node_struct.set_body(
-            ir.ArrayType(ir.IntType(8).as_pointer(), 32)  # children[32] (field 0) - either PVNode* or element pointers
+            ir.ArrayType(ir.IntType(64), 32)  # children[32] (field 0) - GC handles to PVNode or leaf data
         )
 
         # Create list struct type using Persistent Vector structure
@@ -2834,11 +2835,11 @@ class CodeGenerator:
         array_ptr = self.builder.call(self.array_new, [capacity, elem_size])
 
         # Fill the array with the initial value
-        # Get data pointer: compute handle + offset
-        # Field 0: handle, Field 4: offset
+        # Get data pointer: deref handle + offset
+        # Field 0: handle (GC handle i64), Field 4: offset
         handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         handle_val = self.builder.load(handle_ptr)
-        base_ptr = self.builder.inttoptr(handle_val, ir.IntType(8).as_pointer())
+        base_ptr = self.builder.call(self.gc.gc_handle_deref, [handle_val])
         offset_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         offset_val = self.builder.load(offset_ptr)
         data_ptr = self.builder.gep(base_ptr, [offset_val])
