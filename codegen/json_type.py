@@ -3086,26 +3086,32 @@ class JsonGenerator:
                 val_bool = builder.trunc(val_i64, ir.IntType(1))
                 return builder.call(cg.json_new_bool, [val_bool])
             elif value_type.name == "string":
-                val_str = builder.inttoptr(val_i64, cg.string_struct.as_pointer())
+                val_str_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+                val_str = builder.bitcast(val_str_i8, cg.string_struct.as_pointer())
                 return builder.call(cg.json_new_string, [val_str])
             elif value_type.name == "json":
-                return builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+                val_json_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+                return builder.bitcast(val_json_i8, cg.json_struct.as_pointer())
 
         if isinstance(value_type, NamedType):
             if value_type.name in ("Json", "json"):
-                return builder.inttoptr(val_i64, cg.json_struct.as_pointer())
+                val_json_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+                return builder.bitcast(val_json_i8, cg.json_struct.as_pointer())
             elif value_type.name == "String":
-                val_str = builder.inttoptr(val_i64, cg.string_struct.as_pointer())
+                val_str_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+                val_str = builder.bitcast(val_str_i8, cg.string_struct.as_pointer())
                 return builder.call(cg.json_new_string, [val_str])
-            val_ptr = builder.inttoptr(val_i64, ir.IntType(8).as_pointer())
+            val_ptr = builder.call(cg.gc.gc_handle_deref, [val_i64])
             return self.convert_udt_to_json(val_ptr, value_type.name)
 
         if isinstance(value_type, ListType):
-            val_list = builder.inttoptr(val_i64, cg.list_struct.as_pointer())
+            val_list_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+            val_list = builder.bitcast(val_list_i8, cg.list_struct.as_pointer())
             return self.convert_list_to_json_array(val_list, None)
 
         if isinstance(value_type, MapType):
-            val_map = builder.inttoptr(val_i64, cg.map_struct.as_pointer())
+            val_map_i8 = builder.call(cg.gc.gc_handle_deref, [val_i64])
+            val_map = builder.bitcast(val_map_i8, cg.map_struct.as_pointer())
             return self.convert_map_to_json_object(val_map, None)
 
         return builder.call(cg.json_new_int, [val_i64])
@@ -3285,7 +3291,8 @@ class JsonGenerator:
                 bool_val = builder.trunc(elem_val, ir.IntType(1))
                 json_elem = builder.call(cg.json_new_bool, [bool_val])
             elif elem_type.name == "string":
-                str_ptr = builder.inttoptr(elem_val, cg.string_struct.as_pointer())
+                str_i8 = builder.call(cg.gc.gc_handle_deref, [elem_val])
+                str_ptr = builder.bitcast(str_i8, cg.string_struct.as_pointer())
                 json_elem = builder.call(cg.json_new_string, [str_ptr])
             else:
                 json_elem = builder.call(cg.json_new_int, [elem_val])

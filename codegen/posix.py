@@ -457,10 +457,10 @@ class PosixGenerator:
         elem_size = ir.Constant(i64, 1)
         byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
-        # Get the tail pointer from the new list and copy data there (Phase 4: handle)
+        # Get the tail pointer from the new list via handle deref (tail field is a GC handle)
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.load(tail_handle_ptr)
-        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
+        tail = builder.call(cg.gc.gc_handle_deref, [tail_handle])
 
         # Copy bytes_read bytes from buf to tail
         builder.call(cg.memcpy, [tail, buf, bytes_read])
@@ -530,10 +530,10 @@ class PosixGenerator:
         len_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         data_len = builder.load(len_ptr)
 
-        # Get tail pointer from list (where byte data is stored) - Phase 4: handle
+        # Get tail pointer from list via handle deref (tail field is a GC handle)
         tail_handle_ptr = builder.gep(data, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.load(tail_handle_ptr)
-        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
+        tail = builder.call(cg.gc.gc_handle_deref, [tail_handle])
 
         # Call write(fd, tail, len)
         bytes_written = builder.call(cg.write_syscall, [fd, tail, data_len])
@@ -823,10 +823,10 @@ class PosixGenerator:
         elem_size = ir.Constant(i64, 1)
         byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
-        # Get the tail pointer and read directly into it - Phase 4: handle
+        # Get the tail pointer via handle deref (tail field is a GC handle)
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         tail_handle = builder.load(tail_handle_ptr)
-        tail = builder.inttoptr(tail_handle, ir.IntType(8).as_pointer())
+        tail = builder.call(cg.gc.gc_handle_deref, [tail_handle])
 
         # Read count bytes into tail
         builder.call(cg.posix_read_syscall, [fd, tail, count])
