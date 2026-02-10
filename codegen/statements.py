@@ -101,6 +101,14 @@ class StatementGenerator:
         """
         cg = self.cg
 
+        # BUG-113: In-place optimization is incompatible with the always-compact GC.
+        # It mutates through raw pointers loaded from allocas, but GC compaction
+        # moves objects and updates the handle table. The raw pointer becomes stale,
+        # so writes go to the old (non-canonical) location and mutations are lost.
+        # The normal reassignment path is safe (BUG-111 re-derives from handles).
+        if cg.gc is not None:
+            return False
+
         # Check if this is an update pattern
         if not can_optimize_statement(stmt):
             return False

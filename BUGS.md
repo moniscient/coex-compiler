@@ -204,25 +204,6 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
-### BUG-109: HAMT nodes lack type_id — Phase 3b pointer fixup skips them, causing stale internal pointers after compaction
-- **Discovered**: 2026-02-09, during TLAB memory leak fix (attempting to re-enable TLAB freeing in Phase 3)
-- **Category**: GC
-- **Severity**: High
-- **Reproduction**: Any program using maps or sets under GC compaction pressure. Currently masked because Phase 3 does not free emptied TLABs (HAMT stale pointers read from still-mapped leaked TLABs). Becomes a crash if TLAB freeing is re-enabled.
-- **Observed**: HAMTNode (allocated in `codegen/hamt.py:318` with `type_id=0`) and HAMT children buffers (allocated at `codegen/hamt.py:340` with `type_id=0`) are invisible to the Phase 3b fixup switch statement (`coex_gc.py:10474`). After compaction copies these objects, their internal raw pointers are stale:
-  - `HAMTNode.children` (field 1): raw i64* pointer to children buffer — not fixed up
-  - Children array entries: tagged i64 pointers (bit 0 = leaf) to leaves/nodes — not fixed up
-  - `HAMTLeaf.key` and `HAMTLeaf.value`: may contain raw pointers for reference types — not fixed up
-- **Expected**: After compaction, all internal raw pointers should be updated to point to new locations in the compact buffer.
-- **Hypothesis**: Need to:
-  1. Define `TYPE_HAMT_NODE` and `TYPE_HAMT_LEAF` constants in `coex_gc.py`
-  2. Use them when allocating HAMT structures in `codegen/hamt.py`
-  3. Add fixup cases in Phase 3b for these types (handle tag bits for children entries)
-  4. Also add proper gc_mark_object cases for these type_ids (currently marked indirectly via `gc_mark_hamt`)
-- **Files**: `coex_gc.py` (fixup phase, type constants), `codegen/hamt.py` (allocations)
-- **Status**: Open
-- **Blocking**: Re-enabling TLAB freeing in Phase 3's `tlab_now_empty` block (TLAB memory leak fix)
-
 ---
 
-**Next valid BUG ID: BUG-113**
+**Next valid BUG ID: BUG-114**

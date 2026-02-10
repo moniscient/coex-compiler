@@ -102,10 +102,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root (stored as i64, convert to pointer for HAMT ops)
+        # Get old root (tagged handle i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -117,13 +116,11 @@ class InplaceOpsGenerator:
         # Alloca for "added" flag
         added_ptr = builder.alloca(i32, name="added")
 
-        # Insert into HAMT (value = 1 for sets)
-        # This allocates new path nodes via structural sharing
+        # Insert into HAMT (value = 1 for sets, returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
 
-        # MUTATION: Store new root in existing wrapper (convert pointer to i64)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root in existing wrapper (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Compute and store new len
         added = builder.load(added_ptr)
@@ -150,10 +147,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (tagged handle i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -165,12 +161,11 @@ class InplaceOpsGenerator:
         # Alloca for "removed" flag
         removed_ptr = builder.alloca(i32, name="removed")
 
-        # Remove from HAMT
+        # Remove from HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
-        # MUTATION: Store new root
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Update len
         removed = builder.load(removed_ptr)
@@ -196,10 +191,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (tagged handle i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -211,14 +205,11 @@ class InplaceOpsGenerator:
         # Alloca for "added" flag
         added_ptr = builder.alloca(i32, name="added")
 
-        # Insert into HAMT using string variant (value = 1 for sets)
-        # The key is stored as pointer-to-int for HAMT
-        key_as_i64 = builder.ptrtoint(key, i64)
+        # Insert into HAMT using string variant (value = 1 for sets, returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert_string, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
 
-        # MUTATION: Store new root
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Update len
         added = builder.load(added_ptr)
@@ -270,10 +261,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (tagged handle i64)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -285,12 +275,11 @@ class InplaceOpsGenerator:
         # Alloca for "added" flag
         added_ptr = builder.alloca(i32, name="added")
 
-        # Insert into HAMT
+        # Insert into HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
 
-        # MUTATION: Store new root
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Update len
         added = builder.load(added_ptr)
@@ -316,10 +305,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (tagged handle i64)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -331,12 +319,11 @@ class InplaceOpsGenerator:
         # Alloca for "removed" flag
         removed_ptr = builder.alloca(i32, name="removed")
 
-        # Remove from HAMT
+        # Remove from HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
-        # MUTATION: Store new root
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Update len
         removed = builder.load(removed_ptr)
@@ -364,10 +351,9 @@ class InplaceOpsGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root
+        # Get old root (tagged handle i64)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -379,12 +365,11 @@ class InplaceOpsGenerator:
         # Alloca for "added" flag
         added_ptr = builder.alloca(i32, name="added")
 
-        # Insert into HAMT using string variant
+        # Insert into HAMT using string variant (returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert_string, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
 
-        # MUTATION: Store new root
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, root_field)
+        # MUTATION: Store new root (already tagged handle i64)
+        builder.store(new_root, root_field)
 
         # MUTATION: Update len
         added = builder.load(added_ptr)

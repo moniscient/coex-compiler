@@ -152,7 +152,12 @@ class GarbageCollector:
     # used for new allocations.
     TYPE_LIST_TAIL_REF = 21  # [DEPRECATED] List tail buffer - REFERENCE elements
     TYPE_ARRAY_DATA_REF = 22 # [DEPRECATED] Array data buffer - REFERENCE elements
-    TYPE_FIRST_USER = 23     # First ID for user-defined types
+    # ---- HAMT (Hash Array Mapped Trie) internal types ----
+    TYPE_HAMT_NODE = 23      # HAMT internal node {i32 bitmap, i64* children}
+    TYPE_HAMT_CHILDREN = 24  # HAMT children buffer [n x i64] (tagged pointers)
+    TYPE_HAMT_LEAF = 25      # HAMT leaf {i64 hash, i64 key, i64 value} - int key
+    TYPE_HAMT_LEAF_KPTR = 26 # HAMT leaf with pointer key (string key maps/sets)
+    TYPE_FIRST_USER = 27     # First ID for user-defined types
 
     # ------------------------------------------------------------
     # Type ID Mapping (Legacy <-> TaggedValue)
@@ -1077,6 +1082,10 @@ class GarbageCollector:
         self.gc_compact_prev_buffer_size.initializer = ir.Constant(self.i64, 0)
         self.gc_compact_prev_buffer_size.linkage = 'internal'
 
+        # NOTE: Two-generation buffer (prev_prev_buffer) REMOVED.
+        # With HAMT handle conversion, all HAMT internal references are handles
+        # (stable across compaction), so no extra-cycle buffer retention is needed.
+
     def _declare_functions(self):
         """Declare GC runtime functions"""
         # gc_init() -> void
@@ -1150,10 +1159,12 @@ class GarbageCollector:
         gc_safepoint_ty = ir.FunctionType(self.void, [])
         self.gc_safepoint = ir.Function(self.module, gc_safepoint_ty, name="coex_gc_safepoint")
 
-        # gc_mark_hamt(root: i8*, flags: i32) -> void
+        # gc_mark_hamt(root: i64, flags: i32) -> void
         # Recursively mark HAMT nodes/leaves (used by Map and Set marking)
+        # root is a tagged handle: 0=null, bit0=1 leaf, bit0=0 internal node
+        # handle = root >> 1
         # flags: bit 0 = key is heap ptr, bit 1 = value is heap ptr
-        gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i8_ptr, self.i32])
+        gc_mark_hamt_ty = ir.FunctionType(self.void, [self.i64, self.i32])
         self.gc_mark_hamt = ir.Function(self.module, gc_mark_hamt_ty, name="coex_gc_mark_hamt")
 
         # ============================================================
@@ -2956,28 +2967,30 @@ class GarbageCollector:
     def _implement_gc_mark_hamt(self):
         """Recursively mark HAMT nodes and leaves.
 
-        HAMT uses pointer tagging:
-        - bit 0 = 1: leaf node
-        - bit 0 = 0: internal node (or null)
+        HAMT uses tagged handle encoding:
+        - 0 = null
+        - bit 0 = 1: leaf (handle = root >> 1)
+        - bit 0 = 0: internal node (handle = root >> 1)
 
-        HAMT node struct: { i32 bitmap, i8** children }
+        HAMT node struct: { i32 bitmap, i64 children_handle }
         HAMT leaf struct: { i64 hash, i64 key, i64 value }
+        Children array: i64[] of tagged handles
 
-        Both are allocated via gc_alloc, so we need to mark them.
+        Both nodes, leaves, and children arrays are GC-allocated.
+        String keys (when flag bit 0 set) are stored as GC handles in leaf field 1.
 
         flags parameter (from Map/Set struct):
-        - bit 0: key is a heap pointer (mark it)
-        - bit 1: value is a heap pointer (mark it)
+        - bit 0: key is a heap pointer (string key — stored as GC handle, mark it)
+        - bit 1: value is a raw pointer (mark via gc_ptr_to_handle)
+        - bit 2: value is a GC handle (mark directly)
         """
         func = self.gc_mark_hamt
         func.args[0].name = "root"
         func.args[1].name = "flags"
 
         entry = func.append_basic_block("entry")
-        validate_ptr = func.append_basic_block("validate_ptr")
         check_tag = func.append_basic_block("check_tag")
         is_leaf = func.append_basic_block("is_leaf")
-        process_leaf = func.append_basic_block("process_leaf")
         mark_key = func.append_basic_block("mark_key")
         after_key = func.append_basic_block("after_key")
         mark_value = func.append_basic_block("mark_value")
@@ -2985,70 +2998,46 @@ class GarbageCollector:
         is_internal = func.append_basic_block("is_internal")
         child_loop = func.append_basic_block("child_loop")
         child_body = func.append_basic_block("child_body")
-        validate_child = func.append_basic_block("validate_child")
         recurse_child = func.append_basic_block("recurse_child")
+        next_child = func.append_basic_block("next_child")
         done = func.append_basic_block("done")
 
         builder = ir.IRBuilder(entry)
         root = func.args[0]
         flags = func.args[1]
 
-        # Null check
-        is_null = builder.icmp_unsigned("==", root, ir.Constant(self.i8_ptr, None))
-        builder.cbranch(is_null, done, validate_ptr)
-
-        # Validate pointer looks reasonable (>= 0x10000)
-        builder.position_at_end(validate_ptr)
-        ptr_int_val = builder.ptrtoint(root, self.i64)
-        min_valid_ptr = ir.Constant(self.i64, 0x10000)
-        ptr_looks_valid = builder.icmp_unsigned(">=", ptr_int_val, min_valid_ptr)
-        builder.cbranch(ptr_looks_valid, check_tag, done)
+        # Null check: tagged handle 0 means empty
+        is_null = builder.icmp_unsigned("==", root, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null, done, check_tag)
 
         # Check tag bit (bit 0)
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(root, self.i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(self.i64, 1))
+        low_bit = builder.and_(root, ir.Constant(self.i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(self.i64, 0))
         builder.cbranch(is_leaf_tag, is_leaf, is_internal)
 
-        # Handle leaf - untag and mark, plus mark key/value if flags indicate
+        # ---- LEAF ----
         builder.position_at_end(is_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(self.i64, ~1 & 0xFFFFFFFFFFFFFFFF))
-        # Store untagged_int for use in process_leaf
-        untagged_int_ptr = builder.alloca(self.i64, name="untagged_int_storage")
-        builder.store(untagged_int, untagged_int_ptr)
-        # Validate untagged leaf pointer looks reasonable
-        min_valid_leaf = ir.Constant(self.i64, 0x10000)
-        leaf_looks_valid = builder.icmp_unsigned(">=", untagged_int, min_valid_leaf)
-        builder.cbranch(leaf_looks_valid, process_leaf, done)
+        leaf_handle = builder.lshr(root, ir.Constant(self.i64, 1))
+        # Mark the leaf object itself
+        builder.call(self.gc_mark_object, [leaf_handle])
 
-        # Process validated leaf
-        builder.position_at_end(process_leaf)
-        untagged_int_loaded = builder.load(untagged_int_ptr)
-        untagged_ptr = builder.inttoptr(untagged_int_loaded, self.i8_ptr)
-        # Convert pointer to handle for gc_mark_object
-        untagged_handle = builder.call(self.gc_ptr_to_handle, [untagged_ptr])
-        builder.call(self.gc_mark_object, [untagged_handle])
-
-        # Leaf struct: { i64 hash, i64 key, i64 value }
+        # Deref to access leaf fields
+        leaf_raw = builder.call(self.gc_handle_deref, [leaf_handle])
         leaf_type = ir.LiteralStructType([self.i64, self.i64, self.i64])
-        leaf_ptr = builder.bitcast(untagged_ptr, leaf_type.as_pointer())
+        leaf_ptr = builder.bitcast(leaf_raw, leaf_type.as_pointer())
 
-        # Check if key needs marking (flag bit 0)
+        # Check if key needs marking (flag bit 0 = key is heap handle)
         key_is_ptr = builder.and_(flags, ir.Constant(self.i32, 1))
         key_needs_mark = builder.icmp_unsigned("!=", key_is_ptr, ir.Constant(self.i32, 0))
         builder.cbranch(key_needs_mark, mark_key, after_key)
 
-        # Mark key as heap object
+        # Mark key — stored as GC handle directly (not raw pointer)
         builder.position_at_end(mark_key)
-        key_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        key_as_int = builder.load(key_ptr_ptr)
-        key_as_ptr = builder.inttoptr(key_as_int, self.i8_ptr)
-        # Null check for key
-        key_is_null = builder.icmp_unsigned("==", key_as_ptr, ir.Constant(self.i8_ptr, None))
-        with builder.if_then(builder.not_(key_is_null)):
-            # Convert pointer to handle for gc_mark_object
-            key_handle = builder.call(self.gc_ptr_to_handle, [key_as_ptr])
+        key_field_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        key_handle = builder.load(key_field_ptr)
+        key_not_null = builder.icmp_unsigned("!=", key_handle, ir.Constant(self.i64, 0))
+        with builder.if_then(key_not_null):
             builder.call(self.gc_mark_object, [key_handle])
         builder.branch(after_key)
 
@@ -3062,15 +3051,15 @@ class GarbageCollector:
 
         # Mark value as heap object
         builder.position_at_end(mark_value)
-        value_ptr_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
-        value_as_int = builder.load(value_ptr_ptr)
+        value_field_ptr = builder.gep(leaf_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
+        value_as_int = builder.load(value_field_ptr)
 
         # Check if value is stored as a handle (MAP_FLAG_VALUE_IS_HANDLE, bit 2)
-        is_handle = builder.icmp_unsigned("!=", value_is_handle, ir.Constant(self.i32, 0))
-        mark_as_handle = builder.function.append_basic_block("mark_val_handle")
-        mark_as_ptr = builder.function.append_basic_block("mark_val_ptr")
-        mark_val_done = builder.function.append_basic_block("mark_val_done")
-        builder.cbranch(is_handle, mark_as_handle, mark_as_ptr)
+        is_val_handle = builder.icmp_unsigned("!=", value_is_handle, ir.Constant(self.i32, 0))
+        mark_as_handle = func.append_basic_block("mark_val_handle")
+        mark_as_ptr = func.append_basic_block("mark_val_ptr")
+        mark_val_done = func.append_basic_block("mark_val_done")
+        builder.cbranch(is_val_handle, mark_as_handle, mark_as_ptr)
 
         # Path 1: Value is a GC handle - use directly
         builder.position_at_end(mark_as_handle)
@@ -3081,9 +3070,9 @@ class GarbageCollector:
 
         # Path 2: Value is a raw pointer - convert via gc_ptr_to_handle
         builder.position_at_end(mark_as_ptr)
-        value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
-        value_is_null = builder.icmp_unsigned("==", value_as_ptr, ir.Constant(self.i8_ptr, None))
+        value_is_null = builder.icmp_unsigned("==", value_as_int, ir.Constant(self.i64, 0))
         with builder.if_then(builder.not_(value_is_null)):
+            value_as_ptr = builder.inttoptr(value_as_int, self.i8_ptr)
             value_handle = builder.call(self.gc_ptr_to_handle, [value_as_ptr])
             builder.call(self.gc_mark_object, [value_handle])
         builder.branch(mark_val_done)
@@ -3094,15 +3083,17 @@ class GarbageCollector:
         builder.position_at_end(after_value)
         builder.branch(done)
 
-        # Handle internal node
+        # ---- INTERNAL NODE ----
         builder.position_at_end(is_internal)
-        # Mark the node itself (convert pointer to handle)
-        root_handle = builder.call(self.gc_ptr_to_handle, [root])
-        builder.call(self.gc_mark_object, [root_handle])
+        node_handle = builder.lshr(root, ir.Constant(self.i64, 1))
+        # Mark the node object itself
+        builder.call(self.gc_mark_object, [node_handle])
 
-        # HAMT node struct: { i32 bitmap, i8** children }
-        hamt_node_type = ir.LiteralStructType([self.i32, self.i8_ptr.as_pointer()])
-        node_ptr = builder.bitcast(root, hamt_node_type.as_pointer())
+        # Deref to access node fields
+        node_raw = builder.call(self.gc_handle_deref, [node_handle])
+        # HAMT node struct: { i32 bitmap, i64 children_handle }
+        hamt_node_type = ir.LiteralStructType([self.i32, self.i64])
+        node_ptr = builder.bitcast(node_raw, hamt_node_type.as_pointer())
 
         # Get bitmap to count children
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
@@ -3137,25 +3128,22 @@ class GarbageCollector:
         builder.position_at_end(popcount_done)
         child_count = builder.load(count_ptr)
 
-        # Get children array pointer
-        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        # Get children handle (field 1 is now i64 handle, not i8**)
+        children_handle_ptr = builder.gep(node_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
 
-        # Validate children array pointer before marking
-        children_int = builder.ptrtoint(builder.bitcast(children_ptr, self.i8_ptr), self.i64)
-        min_valid_children = ir.Constant(self.i64, 0x10000)
-        children_looks_valid = builder.icmp_unsigned(">=", children_int, min_valid_children)
-
-        # Only mark and iterate children if pointer is valid
+        # Validate children handle (must be non-zero)
+        children_valid = builder.icmp_unsigned("!=", children_handle, ir.Constant(self.i64, 0))
         mark_children = func.append_basic_block("mark_children")
-        builder.cbranch(children_looks_valid, mark_children, done)
+        builder.cbranch(children_valid, mark_children, done)
 
         builder.position_at_end(mark_children)
-        # Mark the children array itself (it's also gc_alloc'd)
-        children_as_i8 = builder.bitcast(children_ptr, self.i8_ptr)
-        # Convert pointer to handle for gc_mark_object
-        children_handle = builder.call(self.gc_ptr_to_handle, [children_as_i8])
+        # Mark the children buffer object itself
         builder.call(self.gc_mark_object, [children_handle])
+
+        # Deref children handle to get the i64[] array
+        children_raw = builder.call(self.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, self.i64.as_pointer())
 
         # Iterate over children and recursively mark
         idx_ptr = builder.alloca(self.i32, name="idx")
@@ -3169,22 +3157,20 @@ class GarbageCollector:
 
         builder.position_at_end(child_body)
         idx_64 = builder.zext(idx, self.i64)
-        child_ptr_ptr = builder.gep(children_ptr, [idx_64], inbounds=True)
-        child_ptr = builder.load(child_ptr_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [idx_64], inbounds=True)
+        child_tagged_handle = builder.load(child_entry_ptr)
 
-        # Validate child pointer before recursive call
-        child_int = builder.ptrtoint(child_ptr, self.i64)
-        min_valid_child = ir.Constant(self.i64, 0x10000)
-        child_looks_valid = builder.icmp_unsigned(">=", child_int, min_valid_child)
-        builder.cbranch(child_looks_valid, validate_child, recurse_child)
+        # Null check: skip zero entries
+        child_not_null = builder.icmp_unsigned("!=", child_tagged_handle, ir.Constant(self.i64, 0))
+        builder.cbranch(child_not_null, recurse_child, next_child)
 
-        # Valid child - recurse
-        builder.position_at_end(validate_child)
-        builder.call(func, [child_ptr, flags])
-        builder.branch(recurse_child)
-
-        # Invalid or done - continue to next
+        # Recurse with tagged handle
         builder.position_at_end(recurse_child)
+        builder.call(func, [child_tagged_handle, flags])
+        builder.branch(next_child)
+
+        # Next child
+        builder.position_at_end(next_child)
         next_idx = builder.add(idx, ir.Constant(self.i32, 1))
         builder.store(next_idx, idx_ptr)
         builder.branch(child_loop)
@@ -3429,12 +3415,11 @@ class GarbageCollector:
         map_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64]).as_pointer()
         map_typed = builder.bitcast(ptr, map_ptr_type)
         map_root_i64_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        map_root_i64 = builder.load(map_root_i64_ptr)
-        map_root_ptr = builder.inttoptr(map_root_i64, self.i8_ptr)  # Convert i64 to pointer
+        map_root_i64 = builder.load(map_root_i64_ptr)  # Tagged handle i64 — pass directly
         map_flags_ptr = builder.gep(map_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         map_flags_i64 = builder.load(map_flags_ptr)
         map_flags = builder.trunc(map_flags_i64, self.i32)  # Truncate to i32 for gc_mark_hamt
-        builder.call(self.gc_mark_hamt, [map_root_ptr, map_flags])
+        builder.call(self.gc_mark_hamt, [map_root_i64, map_flags])
         builder.branch(done)
 
         # Mark List: root (field 0) and tail (field 3) GC handles
@@ -3481,12 +3466,11 @@ class GarbageCollector:
         set_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64]).as_pointer()
         set_typed = builder.bitcast(ptr, set_ptr_type)
         set_root_i64_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)], inbounds=True)
-        set_root_i64 = builder.load(set_root_i64_ptr)
-        set_root_ptr = builder.inttoptr(set_root_i64, self.i8_ptr)  # Convert i64 to pointer
+        set_root_i64 = builder.load(set_root_i64_ptr)  # Tagged handle i64 — pass directly
         set_flags_ptr = builder.gep(set_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)], inbounds=True)
         set_flags_i64 = builder.load(set_flags_ptr)
         set_flags = builder.trunc(set_flags_i64, self.i32)  # Truncate to i32 for gc_mark_hamt
-        builder.call(self.gc_mark_hamt, [set_root_ptr, set_flags])
+        builder.call(self.gc_mark_hamt, [set_root_i64, set_flags])
         builder.branch(done)
 
         # Mark String: owner handle at field 0
@@ -9780,8 +9764,8 @@ class GarbageCollector:
         builder.store(ir.Constant(self.i64, 0), objects_moved_alloca)
         builder.store(ir.Constant(self.i64, 0), bytes_moved_alloca)
 
-        # Load gc_compact_prev_buffer once for the newborn-override check.
-        # Objects in the prev buffer MUST be moved — Phase 4 frees it unconditionally.
+        # Load gc_compact_prev_buffer for newborn-override.
+        # Objects in prev_buffer MUST be moved (it will be freed by Phase 4).
         # Without this, "floating garbage" objects (unreachable but generation ==
         # gc_current_mark_value from previous mark phase) match the newborn check
         # and get skipped, leaving handles pointing to freed memory.
@@ -10118,17 +10102,18 @@ class GarbageCollector:
         current_gen2 = builder.load_atomic(self.gc_current_mark_value, ordering='acquire', align=8)
         is_newborn2 = builder.icmp_unsigned('==', gen_val2, current_gen2)
 
-        # Check if object is in the prev compact buffer (must move regardless)
+        # Check if object is in prev compact buffer (must move — Phase 4 frees it)
         node_tlab_base_ptr2 = builder.gep(node_typed2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
         ], inbounds=True)
         node_tlab_base2 = builder.load(node_tlab_base_ptr2)
+        node_tlab_int2 = builder.ptrtoint(node_tlab_base2, self.i64)
+
         prev_buf_check = builder.load(prev_buf_alloca)
         prev_buf_check_int = builder.ptrtoint(prev_buf_check, self.i64)
-        node_tlab_int2 = builder.ptrtoint(node_tlab_base2, self.i64)
         in_prev_buffer = builder.icmp_unsigned('==', node_tlab_int2, prev_buf_check_int)
 
-        # Override: newborn skip only applies outside the prev buffer
+        # Override: newborn skip only applies outside prev buffer
         newborn_and_safe = builder.and_(is_newborn2, builder.not_(in_prev_buffer))
         skip_obj2 = builder.or_(is_pinned2, newborn_and_safe)
         builder.cbranch(skip_obj2, copy_next_node, copy_check_capacity)
@@ -10223,16 +10208,26 @@ class GarbageCollector:
 
         builder.position_at_end(tlab_now_empty)
         # Old TLAB is now empty (all objects moved to compact buffer).
-        # DO NOT add to deferred dead TLAB list for munmap!
-        # HAMT nodes (HAMTNode, HAMT leaves, children buffers) are allocated
-        # with type_id=0, which the Phase 3b pointer fixup does not handle.
-        # Their internal raw pointers (HAMTNode.children, children array
-        # entries with tag bits) remain stale after compaction, still pointing
-        # to original TLAB locations. Munmapping these TLABs would turn the
-        # stale pointers into dangling pointers, crashing the main thread.
-        # See BUG-109 for the HAMT fixup issue that must be resolved before
-        # TLAB freeing can be re-enabled here.
+        # BUG-109 FIXED: HAMT nodes now have proper type_ids and Phase 3b
+        # fixes up all internal raw pointers (including newborn objects in TLABs).
+        # Safe to defer TLAB for munmap.
 
+        # Re-check live_count with acquire ordering: a mutator may have
+        # allocated into this TLAB between the decrement-to-zero above and now.
+        old_tlab_hdr_recheck = builder.bitcast(old_tlab_base, self.tlab_header_type.as_pointer())
+        recheck_live_ptr_c = builder.gep(old_tlab_hdr_recheck, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        recheck_live_c = builder.load(recheck_live_ptr_c)
+        recheck_live_c.ordering = 'acquire'
+        tlab_still_dead_c = builder.icmp_unsigned("==", recheck_live_c, ir.Constant(self.i64, 0))
+
+        compact_defer_tlab = func.append_basic_block("compact_defer_tlab")
+        compact_skip_tlab = func.append_basic_block("compact_skip_tlab")
+        builder.cbranch(tlab_still_dead_c, compact_defer_tlab, compact_skip_tlab)
+
+        # TLAB confirmed dead — defer for munmap in next cycle
+        builder.position_at_end(compact_defer_tlab)
         # Reset thread's TLAB fields if this is the thread's current TLAB.
         thread_tlab_base_ptr_c = builder.gep(curr_thread2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 6)  # tlab_base field
@@ -10253,6 +10248,32 @@ class GarbageCollector:
             ], inbounds=True)
             builder.store(ir.Constant(self.i8_ptr, None), thread_tlab_limit_ptr_c)
 
+        # Allocate defer node: { i8* tlab_ptr, i64 tlab_size, i8* next }
+        tlab_defer_node_type_c = ir.LiteralStructType([self.i8_ptr, self.i64, self.i8_ptr])
+        tlab_defer_raw_c = builder.call(self.codegen.malloc, [ir.Constant(self.i64, 24)])
+        tlab_defer_node_c = builder.bitcast(tlab_defer_raw_c, tlab_defer_node_type_c.as_pointer())
+        # Set tlab_ptr (field 0)
+        tlab_defer_ptr_c = builder.gep(tlab_defer_node_c, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
+        ], inbounds=True)
+        builder.store(old_tlab_base, tlab_defer_ptr_c)
+        # Set tlab_size (field 1)
+        tlab_defer_size_c = builder.gep(tlab_defer_node_c, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        builder.store(ir.Constant(self.i64, self.TLAB_SIZE), tlab_defer_size_c)
+        # Set next (field 2) — link to current list head
+        tlab_defer_next_c = builder.gep(tlab_defer_node_c, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 2)
+        ], inbounds=True)
+        old_compact_head_c = builder.load(self.gc_compact_dead_tlab_list)
+        builder.store(old_compact_head_c, tlab_defer_next_c)
+        builder.store(tlab_defer_raw_c, self.gc_compact_dead_tlab_list)
+
+        builder.branch(copy_after_old)
+
+        # TLAB was reused by mutator — skip
+        builder.position_at_end(compact_skip_tlab)
         builder.branch(copy_after_old)
 
         # --- Old object was malloc'd ---
@@ -10376,18 +10397,18 @@ class GarbageCollector:
         builder.cbranch(is_null_handle_fixup, fixup_next_node, fixup_check_type)
 
         builder.position_at_end(fixup_check_type)
-        # Deref handle to get current data pointer (in compact buffer)
+        # Deref handle to get current data pointer.
+        # IMPORTANT: Fix up ALL live objects, not just those in the compact buffer.
+        # Newborn objects in TLABs may contain raw pointers to the prev compact
+        # buffer (set at allocation time when handles pointed there). Phase 4
+        # frees the prev buffer, so these pointers must be updated to the new
+        # compact buffer locations via gc_ptr_to_handle → gc_handle_deref.
         data_ptr_fixup = builder.call(self.gc_handle_deref, [handle_fixup])
         data_int_fixup = builder.ptrtoint(data_ptr_fixup, self.i64)
 
-        # Check if this object is in the compact buffer (only fix up moved objects)
-        buffer_base_int_fixup = builder.ptrtoint(builder.load(buffer_base_alloca), self.i64)
-        buffer_limit_int_fixup = builder.ptrtoint(builder.load(buffer_limit_alloca), self.i64)
-        in_buffer = builder.and_(
-            builder.icmp_unsigned('>=', data_int_fixup, buffer_base_int_fixup),
-            builder.icmp_unsigned('<', data_int_fixup, buffer_limit_int_fixup)
-        )
-        builder.cbranch(in_buffer, func.append_basic_block("fixup_do_type"), fixup_next_node)
+        # Skip null data pointers
+        is_null_data_fixup = builder.icmp_unsigned('==', data_int_fixup, ir.Constant(self.i64, 0))
+        builder.cbranch(is_null_data_fixup, fixup_next_node, func.append_basic_block("fixup_do_type"))
 
         # --- Do type-specific fixup ---
         fixup_do_type = list(func.basic_blocks)[-1]  # The block we just appended
@@ -10395,6 +10416,7 @@ class GarbageCollector:
 
         # Read type_id from header
         header_int_fixup = builder.sub(data_int_fixup, ir.Constant(self.i64, self.HEADER_SIZE))
+
         header_ptr_fixup = builder.inttoptr(header_int_fixup, self.i8_ptr)
         header_fixup = builder.bitcast(header_ptr_fixup, self.header_type.as_pointer())
         type_id_ptr_fixup = builder.gep(header_fixup, [
@@ -10441,40 +10463,17 @@ class GarbageCollector:
                     builder.store(new_ptr, field_ptr)
 
         # Switch on type_id for types that contain raw pointer fields.
-        # NOTE: STRING and LIST are intentionally excluded — after handle
-        # conversion, their fields store handles (i64 indices), not raw pointers.
-        # Handles are stable across compaction (handle table is updated by
-        # the copy phase), so no fixup is needed.
-        fixup_map = func.append_basic_block("fixup_map")
-        fixup_set = func.append_basic_block("fixup_set")
+        # NOTE: STRING, LIST, MAP, SET, and all HAMT types are intentionally
+        # excluded — after handle conversion, their internal fields store handles
+        # (i64 indices), not raw pointers. Handles are stable across compaction
+        # (handle table is updated by the copy phase), so no fixup is needed.
+        # Only Array and PV_NODE still use raw pointers that need fixup.
         fixup_array = func.append_basic_block("fixup_array")
         fixup_pv_node = func.append_basic_block("fixup_pv_node")
 
         switch = builder.switch(type_id_fixup, fixup_next_node)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_MAP), fixup_map)
-        switch.add_case(ir.Constant(self.i64, self.TYPE_SET), fixup_set)
         switch.add_case(ir.Constant(self.i64, self.TYPE_ARRAY), fixup_array)
         switch.add_case(ir.Constant(self.i64, self.TYPE_PV_NODE), fixup_pv_node)
-
-        # --- Fix up Map: root (field 0) --- HAMT uses tag bit 0 for leaf/node
-        builder.position_at_end(fixup_map)
-        map_struct_type = ir.LiteralStructType([self.i64] * 3)  # 3 i64 fields
-        map_typed_fixup = builder.bitcast(data_ptr_fixup, map_struct_type.as_pointer())
-        map_root_field_ptr = builder.gep(map_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        fixup_ptr_field(map_root_field_ptr, tag_mask=1)
-        builder.branch(fixup_next_node)
-
-        # --- Fix up Set: root (field 0) --- HAMT uses tag bit 0 for leaf/node
-        builder.position_at_end(fixup_set)
-        set_struct_type = ir.LiteralStructType([self.i64] * 3)  # 3 i64 fields
-        set_typed_fixup = builder.bitcast(data_ptr_fixup, set_struct_type.as_pointer())
-        set_root_field_ptr = builder.gep(set_typed_fixup, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
-        ], inbounds=True)
-        fixup_ptr_field(set_root_field_ptr, tag_mask=1)
-        builder.branch(fixup_next_node)
 
         # --- Fix up Array: handle/data ptr (field 0) ---
         builder.position_at_end(fixup_array)
@@ -10541,24 +10540,26 @@ class GarbageCollector:
         final_bytes = builder.load(bytes_moved_alloca)
         builder.store(final_bytes, bytes_ptr)
 
-        # Free the previous compact buffer now that all objects have been
-        # copied out of it into the new buffer.
-        prev_buf = builder.load(self.gc_compact_prev_buffer)
-        prev_buf_int = builder.ptrtoint(prev_buf, self.i64)
-        has_prev_buf = builder.icmp_unsigned('!=', prev_buf_int, ir.Constant(self.i64, 0))
+        # Free prev_buffer (from previous cycle). With HAMT handle conversion,
+        # no two-generation buffer is needed — all HAMT internal references are
+        # now handles, stable across compaction.
+        # Chain: free(prev) → prev = new_buffer
+        prev_buf_to_free = builder.load(self.gc_compact_prev_buffer)
+        prev_buf_to_free_int = builder.ptrtoint(prev_buf_to_free, self.i64)
+        has_prev = builder.icmp_unsigned('!=', prev_buf_to_free_int, ir.Constant(self.i64, 0))
 
-        free_prev_buf = func.append_basic_block("free_prev_buf")
+        free_prev = func.append_basic_block("free_prev_buf")
         after_free_prev = func.append_basic_block("after_free_prev")
-        builder.cbranch(has_prev_buf, free_prev_buf, after_free_prev)
+        builder.cbranch(has_prev, free_prev, after_free_prev)
 
-        builder.position_at_end(free_prev_buf)
-        prev_size = builder.load(self.gc_compact_prev_buffer_size)
-        builder.call(self.munmap, [prev_buf, prev_size])
+        builder.position_at_end(free_prev)
+        prev_size_to_free = builder.load(self.gc_compact_prev_buffer_size)
+        builder.call(self.munmap, [prev_buf_to_free, prev_size_to_free])
         builder.branch(after_free_prev)
 
         builder.position_at_end(after_free_prev)
 
-        # Save the NEW compact buffer for deferred cleanup in the next compaction
+        # Save the NEW compact buffer as prev
         compact_buffer = builder.load(buffer_base_alloca)
         builder.store(compact_buffer, self.gc_compact_prev_buffer)
         compact_size = builder.load(buffer_limit_alloca)

@@ -1947,11 +1947,13 @@ class JsonGenerator:
         # Loop body - build "key":value string and append to list
         builder.position_at_end(body_block)
 
-        # Get key string - list_get returns i8* to TaggedValue {i64 type_id, i64 value}
+        # Get key string handle - list_get returns i8* to TaggedValue {i64 type_id, i64 value}
+        # For string-keyed maps, the key is a GC handle (not a raw pointer)
         key_data_ptr = builder.call(cg.list_get, [keys_list, idx])
         tv_ptr = builder.bitcast(key_data_ptr, cg.gc.tagged_value_ptr_type)
-        _, key_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
-        key_str = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
+        _, key_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
+        key_str_i8 = builder.call(cg.gc.gc_handle_deref, [key_handle])
+        key_str = builder.bitcast(key_str_i8, cg.string_struct.as_pointer())
 
         # Build "key": string
         quote_str = self._get_or_create_global_string(builder, '"', "quote2")
@@ -2345,11 +2347,13 @@ class JsonGenerator:
         # Add child indent
         curr_str = builder.call(cg.string_concat, [curr_str, child_indent])
 
-        # Get key string - extract from TaggedValue
+        # Get key string handle - extract from TaggedValue
+        # For string-keyed maps, the key is a GC handle (not a raw pointer)
         key_data_ptr = builder.call(cg.list_get, [keys_list, idx])
         tv_ptr = builder.bitcast(key_data_ptr, cg.gc.tagged_value_ptr_type)
-        _, key_i64 = cg.gc.extract_tagged_value(builder, tv_ptr)
-        key_str = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
+        _, key_handle = cg.gc.extract_tagged_value(builder, tv_ptr)
+        key_str_i8 = builder.call(cg.gc.gc_handle_deref, [key_handle])
+        key_str = builder.bitcast(key_str_i8, cg.string_struct.as_pointer())
 
         # Add quoted key: "key":
         quote_str = self._get_or_create_global_string(builder, '"', "pretty_quote2")
@@ -3030,8 +3034,9 @@ class JsonGenerator:
         is_string_key = (isinstance(key_type, PrimitiveType) and key_type.name == "string") or \
                         (isinstance(key_type, NamedType) and key_type.name == "String")
         if is_string_key:
-            # Key is a String* stored as raw ptrtoint in HAMT leaf
-            string_key = builder.inttoptr(key_i64, cg.string_struct.as_pointer())
+            # Key is a GC handle to String (not a raw pointer)
+            string_key_i8 = builder.call(cg.gc.gc_handle_deref, [key_i64])
+            string_key = builder.bitcast(string_key_i8, cg.string_struct.as_pointer())
         else:
             # Int or other key - convert to string
             string_key = builder.call(cg.string_from_int, [key_i64])

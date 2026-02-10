@@ -8,25 +8,28 @@ This module provides:
 
 HAMTNode layout (internal nodes):
     i32 bitmap   - 32-bit mask indicating which children are present
-    i64* children - array of child pointers (size = popcount(bitmap))
-    Children point to HAMTNode*, HAMTLeaf*, or HAMTCollision*
+    i64 children_handle - GC handle to children buffer (array of i64 tagged handles)
 
 HAMTLeaf layout (single key-value entry):
     i64 hash     - full hash for collision detection
-    i64 key      - key (int value or String pointer)
-    i64 value    - value (int value or pointer)
+    i64 key      - key (int value or GC handle for strings)
+    i64 value    - value (int value or GC handle)
 
 Map layout:
-    i64 root     - void pointer to root node (stored as i64)
+    i64 root     - tagged handle to root node
     i64 len      - number of key-value pairs
     i64 flags    - type info (bit 0 = key is ptr, bit 1 = value is ptr)
 
 Set layout:
-    i64 root     - void pointer to root node (stored as i64)
+    i64 root     - tagged handle to root node
     i64 len      - number of elements
     i64 flags    - type info (bit 0 = element is ptr)
 
-Pointer tagging: bit 0 = 1 for leaf, 0 for node
+Handle-based tag encoding (all HAMT references are i64):
+    stored = (handle << 1) | tag_bit
+    tag_bit 0 = internal node, tag_bit 1 = leaf
+    handle = stored >> 1 (unsigned right shift)
+    null = 0 (naturally: (0 << 1) | 0 = 0)
 """
 from typing import TYPE_CHECKING
 from llvmlite import ir
@@ -63,11 +66,12 @@ class HamtGenerator:
             ir.IntType(64)   # value (field 2)
         )
 
-        # HAMTNode struct: { i32 bitmap, i64* children } - Phase 5: children are i64 handles
+        # HAMTNode struct: { i32 bitmap, i64 children_handle }
+        # children_handle is a GC handle to the children buffer (deref to get i64*)
         cg.hamt_node_struct = ir.global_context.get_identified_type("struct.HAMTNode")
         cg.hamt_node_struct.set_body(
             ir.IntType(32),  # bitmap (field 0)
-            ir.IntType(64).as_pointer()  # children (field 1) - Phase 5: i64 array
+            ir.IntType(64)   # children_handle (field 1) - GC handle to i64[] buffer
         )
 
         # HAMTCollision struct: { i64 hash, i32 count, i64 entries }
@@ -147,56 +151,56 @@ class HamtGenerator:
         popcount_ty = ir.FunctionType(i32, [i32])
         cg.hamt_popcount = ir.Function(cg.module, popcount_ty, name="coex_hamt_popcount")
 
-        # HAMT internal: hamt_node_new(bitmap: i32, child_count: i32) -> HAMTNode*
-        hamt_node_new_ty = ir.FunctionType(hamt_node_ptr, [i32, i32])
+        # HAMT internal: hamt_node_new(bitmap: i32, child_count: i32) -> i64 (tagged handle)
+        hamt_node_new_ty = ir.FunctionType(i64, [i32, i32])
         cg.hamt_node_new = ir.Function(cg.module, hamt_node_new_ty, name="coex_hamt_node_new")
 
-        # HAMT internal: hamt_leaf_new(hash: i64, key: i64, value: i64) -> HAMTLeaf*
-        hamt_leaf_new_ty = ir.FunctionType(hamt_leaf_ptr, [i64, i64, i64])
+        # HAMT internal: hamt_leaf_new(hash: i64, key: i64, value: i64, type_id: i32) -> i64 (tagged handle)
+        hamt_leaf_new_ty = ir.FunctionType(i64, [i64, i64, i64, ir.IntType(32)])
         cg.hamt_leaf_new = ir.Function(cg.module, hamt_leaf_new_ty, name="coex_hamt_leaf_new")
 
-        # HAMT internal: hamt_insert(node: void*, hash: i64, key: i64, value: i64, shift: i32, added: i32*) -> void*
-        hamt_insert_ty = ir.FunctionType(void_ptr, [void_ptr, i64, i64, i64, i32, i32.as_pointer()])
+        # HAMT internal: hamt_insert(node: i64, hash: i64, key: i64, value: i64, shift: i32, added: i32*) -> i64
+        hamt_insert_ty = ir.FunctionType(i64, [i64, i64, i64, i64, i32, i32.as_pointer()])
         cg.hamt_insert = ir.Function(cg.module, hamt_insert_ty, name="coex_hamt_insert")
 
-        # HAMT internal: hamt_lookup(node: void*, hash: i64, key: i64, shift: i32) -> i64
-        hamt_lookup_ty = ir.FunctionType(i64, [void_ptr, i64, i64, i32])
+        # HAMT internal: hamt_lookup(node: i64, hash: i64, key: i64, shift: i32) -> i64
+        hamt_lookup_ty = ir.FunctionType(i64, [i64, i64, i64, i32])
         cg.hamt_lookup = ir.Function(cg.module, hamt_lookup_ty, name="coex_hamt_lookup")
 
-        # HAMT internal: hamt_contains(node: void*, hash: i64, key: i64, shift: i32) -> bool
-        hamt_contains_ty = ir.FunctionType(i1, [void_ptr, i64, i64, i32])
+        # HAMT internal: hamt_contains(node: i64, hash: i64, key: i64, shift: i32) -> bool
+        hamt_contains_ty = ir.FunctionType(i1, [i64, i64, i64, i32])
         cg.hamt_contains = ir.Function(cg.module, hamt_contains_ty, name="coex_hamt_contains")
 
-        # HAMT internal: hamt_remove(node: void*, hash: i64, key: i64, shift: i32, removed: i32*) -> void*
-        hamt_remove_ty = ir.FunctionType(void_ptr, [void_ptr, i64, i64, i32, i32.as_pointer()])
+        # HAMT internal: hamt_remove(node: i64, hash: i64, key: i64, shift: i32, removed: i32*) -> i64
+        hamt_remove_ty = ir.FunctionType(i64, [i64, i64, i64, i32, i32.as_pointer()])
         cg.hamt_remove = ir.Function(cg.module, hamt_remove_ty, name="coex_hamt_remove")
 
-        # HAMT internal: hamt_collect_keys(node: void*, list: List*) -> List*
+        # HAMT internal: hamt_collect_keys(node: i64, list: List*) -> List*
         list_ptr_type = cg.list_struct.as_pointer()
-        hamt_collect_ty = ir.FunctionType(list_ptr_type, [void_ptr, list_ptr_type])
+        hamt_collect_ty = ir.FunctionType(list_ptr_type, [i64, list_ptr_type])
         cg.hamt_collect_keys = ir.Function(cg.module, hamt_collect_ty, name="coex_hamt_collect_keys")
 
         # Collect all values into a list
-        hamt_collect_values_ty = ir.FunctionType(list_ptr_type, [void_ptr, list_ptr_type])
+        hamt_collect_values_ty = ir.FunctionType(list_ptr_type, [i64, list_ptr_type])
         cg.hamt_collect_values = ir.Function(cg.module, hamt_collect_values_ty, name="coex_hamt_collect_values")
 
         # HAMT string variants
         string_ptr = cg.string_struct.as_pointer()
 
-        # hamt_insert_string
-        hamt_insert_string_ty = ir.FunctionType(void_ptr, [void_ptr, i64, string_ptr, i64, i32, i32.as_pointer()])
+        # hamt_insert_string(node: i64, hash: i64, key: String*, value: i64, shift: i32, added: i32*) -> i64
+        hamt_insert_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i64, i32, i32.as_pointer()])
         cg.hamt_insert_string = ir.Function(cg.module, hamt_insert_string_ty, name="coex_hamt_insert_string")
 
-        # hamt_lookup_string
-        hamt_lookup_string_ty = ir.FunctionType(i64, [void_ptr, i64, string_ptr, i32])
+        # hamt_lookup_string(node: i64, hash: i64, key: String*, shift: i32) -> i64
+        hamt_lookup_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i32])
         cg.hamt_lookup_string = ir.Function(cg.module, hamt_lookup_string_ty, name="coex_hamt_lookup_string")
 
-        # hamt_contains_string
-        hamt_contains_string_ty = ir.FunctionType(i1, [void_ptr, i64, string_ptr, i32])
+        # hamt_contains_string(node: i64, hash: i64, key: String*, shift: i32) -> bool
+        hamt_contains_string_ty = ir.FunctionType(i1, [i64, i64, string_ptr, i32])
         cg.hamt_contains_string = ir.Function(cg.module, hamt_contains_string_ty, name="coex_hamt_contains_string")
 
-        # hamt_remove_string
-        hamt_remove_string_ty = ir.FunctionType(void_ptr, [void_ptr, i64, string_ptr, i32, i32.as_pointer()])
+        # hamt_remove_string(node: i64, hash: i64, key: String*, shift: i32, removed: i32*) -> i64
+        hamt_remove_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i32, i32.as_pointer()])
         cg.hamt_remove_string = ir.Function(cg.module, hamt_remove_string_ty, name="coex_hamt_remove_string")
 
         # String-key map variants
@@ -298,7 +302,8 @@ class HamtGenerator:
         builder.ret(final_count)
 
     def _implement_hamt_node_new(self):
-        """Create a new HAMT internal node with given bitmap and child count."""
+        """Create a new HAMT internal node with given bitmap and child count.
+        Returns tagged handle: (handle << 1) | 0 (tag 0 = node)."""
         cg = self.cg
         func = cg.hamt_node_new
         func.args[0].name = "bitmap"
@@ -328,30 +333,31 @@ class HamtGenerator:
         # Allocate children array
         child_count_64 = builder.zext(child_count, i64)
         children_size = builder.mul(child_count_64, ir.Constant(i64, 8))
-        i64_ptr = ir.IntType(64).as_pointer()
 
         zero_children = builder.icmp_unsigned("==", child_count, ir.Constant(i32, 0))
         with builder.if_else(zero_children) as (then, otherwise):
             with then:
+                # Store 0 as children handle (null)
                 children_field = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-                null_ptr = ir.Constant(i64_ptr, None)
-                builder.store(null_ptr, children_field)
+                builder.store(ir.Constant(i64, 0), children_field)
             with otherwise:
-                children_raw = cg.gc.alloc_arena_or_gc(builder, children_size, ir.Constant(i32, 0))
-                children_ptr = builder.bitcast(children_raw, i64_ptr)
+                children_raw = cg.gc.alloc_arena_or_gc(builder, children_size, ir.Constant(i32, cg.gc.TYPE_HAMT_CHILDREN))
+                # Get handle for children buffer
+                children_handle = builder.call(cg.gc.gc_ptr_to_handle, [children_raw])
                 # Re-derive node_ptr via handle (may have moved during children allocation)
                 node_raw2 = builder.call(cg.gc.gc_handle_deref, [node_handle])
                 node_ptr2 = builder.bitcast(node_raw2, cg.hamt_node_struct.as_pointer())
                 children_field2 = builder.gep(node_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-                builder.store(children_ptr, children_field2)
+                # Store handle (i64) instead of raw pointer
+                builder.store(children_handle, children_field2)
 
-        # Re-derive node_ptr for return via handle
-        node_raw_final = builder.call(cg.gc.gc_handle_deref, [node_handle])
-        node_ptr_final = builder.bitcast(node_raw_final, cg.hamt_node_struct.as_pointer())
-        builder.ret(node_ptr_final)
+        # Return tagged handle: (node_handle << 1) | 0  (tag 0 = node)
+        tagged_handle = builder.shl(node_handle, ir.Constant(i64, 1))
+        builder.ret(tagged_handle)
 
     def _implement_hamt_leaf_new(self):
-        """Create a new HAMT leaf node with hash, key, and value."""
+        """Create a new HAMT leaf node with hash, key, and value.
+        Returns tagged handle: (handle << 1) | 1 (tag 1 = leaf)."""
         cg = self.cg
         func = cg.hamt_leaf_new
         func.args[0].name = "hash"
@@ -364,12 +370,13 @@ class HamtGenerator:
         hash_val = func.args[0]
         key = func.args[1]
         value = func.args[2]
+        leaf_type_id = func.args[3]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
         # Allocate HAMTLeaf struct (24 bytes)
         leaf_size = ir.Constant(i64, 24)
-        type_id = ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF if hasattr(cg.gc, 'TYPE_HAMT_LEAF') else 0)
+        type_id = leaf_type_id
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, leaf_size, type_id)
         leaf_ptr = builder.bitcast(raw_ptr, cg.hamt_leaf_struct.as_pointer())
 
@@ -383,16 +390,14 @@ class HamtGenerator:
         value_field = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(value, value_field)
 
-        # Tag the pointer (bit 0 = 1 for leaf)
-        void_ptr = ir.IntType(8).as_pointer()
-        leaf_void = builder.bitcast(leaf_ptr, void_ptr)
-        leaf_int = builder.ptrtoint(leaf_void, i64)
-        tagged_int = builder.or_(leaf_int, ir.Constant(i64, 1))
-        tagged_ptr = builder.inttoptr(tagged_int, cg.hamt_leaf_struct.as_pointer())
-        builder.ret(tagged_ptr)
+        # Return tagged handle: (handle << 1) | 1  (tag 1 = leaf)
+        leaf_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
+        shifted = builder.shl(leaf_handle, ir.Constant(i64, 1))
+        tagged = builder.or_(shifted, ir.Constant(i64, 1))
+        builder.ret(tagged)
 
     def _implement_hamt_lookup(self):
-        """Look up a value in the HAMT by hash and key."""
+        """Look up a value in the HAMT by hash and key. Node is i64 tagged handle."""
         cg = self.cg
         func = cg.hamt_lookup
         func.args[0].name = "node"
@@ -415,24 +420,22 @@ class HamtGenerator:
         shift = func.args[3]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        # Check if node is null
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        # Check if node is null (tagged handle 0 = null)
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
         builder.cbranch(is_null, not_found, check_tag)
 
-        # Check low bit for leaf/node
+        # Check low bit for leaf/node (node is already i64)
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
         builder.cbranch(is_leaf_tag, is_leaf, is_node)
 
-        # Leaf case
+        # Leaf case: decode handle = node >> 1, deref to get leaf ptr
         builder.position_at_end(is_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         leaf_key = builder.load(leaf_key_ptr)
         keys_match = builder.icmp_signed("==", leaf_key, key)
@@ -445,9 +448,11 @@ class HamtGenerator:
         leaf_value = builder.load(leaf_value_ptr)
         builder.ret(leaf_value)
 
-        # Node case
+        # Node case: decode handle = node >> 1, deref to get node ptr
         builder.position_at_end(is_node)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        node_ptr = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -465,22 +470,24 @@ class HamtGenerator:
         lower_bits = builder.and_(bitmap, lower_mask)
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
 
-        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        # Children field is now a handle (i64), deref to get i64*
+        children_handle_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         new_shift = builder.add(shift, ir.Constant(i32, 5))
-        result = builder.call(cg.hamt_lookup, [child_ptr, hash_val, key, new_shift])
+        result = builder.call(cg.hamt_lookup, [child_tagged_handle, hash_val, key, new_shift])
         builder.ret(result)
 
         builder.position_at_end(not_found)
         builder.ret(ir.Constant(i64, 0))
 
     def _implement_hamt_contains(self):
-        """Check if a key exists in the HAMT."""
+        """Check if a key exists in the HAMT. Node is i64 tagged handle."""
         cg = self.cg
         func = cg.hamt_contains
         func.args[0].name = "node"
@@ -504,28 +511,30 @@ class HamtGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i1 = ir.IntType(1)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
         builder.cbranch(is_null, not_found, check_tag)
 
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
         builder.cbranch(is_leaf_tag, is_leaf, is_node)
 
+        # Leaf: decode handle, deref, compare key
         builder.position_at_end(is_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         leaf_key = builder.load(leaf_key_ptr)
         keys_match = builder.icmp_signed("==", leaf_key, key)
         builder.ret(keys_match)
 
+        # Node: decode handle, deref, descend
         builder.position_at_end(is_node)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        node_ptr = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -543,22 +552,23 @@ class HamtGenerator:
         lower_bits = builder.and_(bitmap, lower_mask)
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
 
-        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        children_handle_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         new_shift = builder.add(shift, ir.Constant(i32, 5))
-        result = builder.call(cg.hamt_contains, [child_ptr, hash_val, key, new_shift])
+        result = builder.call(cg.hamt_contains, [child_tagged_handle, hash_val, key, new_shift])
         builder.ret(result)
 
         builder.position_at_end(not_found)
         builder.ret(ir.Constant(i1, 0))
 
     def _implement_hamt_insert(self):
-        """Insert a key-value pair into the HAMT, returning a new root."""
+        """Insert a key-value pair into the HAMT, returning a new root (i64 tagged handle)."""
         cg = self.cg
         func = cg.hamt_insert
         func.args[0].name = "node"
@@ -578,7 +588,7 @@ class HamtGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        node = func.args[0]
+        node = func.args[0]  # i64 tagged handle
         hash_val = func.args[1]
         key = func.args[2]
         value = func.args[3]
@@ -586,30 +596,27 @@ class HamtGenerator:
         added_ptr = func.args[5]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        # Case 1: Node is null - create new leaf
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        # Case 1: Node is null (tagged handle 0)
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
         builder.cbranch(is_null, create_leaf_null, check_tag)
 
         builder.position_at_end(create_leaf_null)
-        new_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key, value])
+        new_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF)])
         builder.store(ir.Constant(i32, 1), added_ptr)
-        new_leaf_void = builder.bitcast(new_leaf, void_ptr)
-        builder.ret(new_leaf_void)
+        builder.ret(new_leaf)  # Already a tagged handle from hamt_leaf_new
 
-        # Check pointer tag
+        # Check tag bit
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
         builder.cbranch(is_leaf_tag, is_leaf, is_internal_node)
 
-        # Handle leaf case
+        # Handle leaf case: decode handle, deref
         builder.position_at_end(is_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
 
         leaf_hash_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         leaf_hash = builder.load(leaf_hash_ptr)
@@ -622,12 +629,11 @@ class HamtGenerator:
         expand_to_node = func.append_basic_block("expand_to_node")
         builder.cbranch(same_key, update_leaf, expand_to_node)
 
-        # Update existing leaf
+        # Update existing leaf — create new leaf with same key, new value
         builder.position_at_end(update_leaf)
-        updated_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key, value])
+        updated_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF)])
         builder.store(ir.Constant(i32, 0), added_ptr)
-        updated_leaf_void = builder.bitcast(updated_leaf, void_ptr)
-        builder.ret(updated_leaf_void)
+        builder.ret(updated_leaf)
 
         # Expand to node (different keys)
         builder.position_at_end(expand_to_node)
@@ -651,16 +657,21 @@ class HamtGenerator:
 
         single_bit_mask = builder.shl(ir.Constant(i32, 1), old_hash_bits)
         single_child_node = builder.call(cg.hamt_node_new, [single_bit_mask, ir.Constant(i32, 1)])
-        single_children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        single_children_ptr = builder.load(single_children_ptr_ptr)
-        sub_result_i64 = builder.ptrtoint(sub_result, i64)
-        builder.store(sub_result_i64, builder.gep(single_children_ptr, [ir.Constant(i64, 0)]))
-        single_child_node_void = builder.bitcast(single_child_node, void_ptr)
-        builder.ret(single_child_node_void)
+        # Decode the new node to store child — node_new returns tagged handle
+        sc_node_handle = builder.lshr(single_child_node, ir.Constant(i64, 1))
+        sc_node_raw = builder.call(cg.gc.gc_handle_deref, [sc_node_handle])
+        sc_node_ptr = builder.bitcast(sc_node_raw, cg.hamt_node_struct.as_pointer())
+        sc_children_handle_ptr = builder.gep(sc_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        sc_children_handle = builder.load(sc_children_handle_ptr)
+        sc_children_raw = builder.call(cg.gc.gc_handle_deref, [sc_children_handle])
+        sc_children_ptr = builder.bitcast(sc_children_raw, i64.as_pointer())
+        # sub_result is already a tagged handle — store directly
+        builder.store(sub_result, builder.gep(sc_children_ptr, [ir.Constant(i64, 0)]))
+        builder.ret(single_child_node)
 
         # Different hash bits - create node with two children
         builder.position_at_end(create_split_node)
-        new_leaf4 = builder.call(cg.hamt_leaf_new, [hash_val, key, value])
+        new_leaf4 = builder.call(cg.hamt_leaf_new, [hash_val, key, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF)])
         builder.store(ir.Constant(i32, 1), added_ptr)
 
         old_bit_mask = builder.shl(ir.Constant(i32, 1), old_hash_bits)
@@ -668,8 +679,14 @@ class HamtGenerator:
         combined_bitmap = builder.or_(old_bit_mask, new_bit_mask)
 
         split_node = builder.call(cg.hamt_node_new, [combined_bitmap, ir.Constant(i32, 2)])
-        split_children_ptr_ptr = builder.gep(split_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        split_children_ptr = builder.load(split_children_ptr_ptr)
+        # Decode split node to access children
+        sp_node_handle = builder.lshr(split_node, ir.Constant(i64, 1))
+        sp_node_raw = builder.call(cg.gc.gc_handle_deref, [sp_node_handle])
+        sp_node_ptr = builder.bitcast(sp_node_raw, cg.hamt_node_struct.as_pointer())
+        sp_children_handle_ptr = builder.gep(sp_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        sp_children_handle = builder.load(sp_children_handle_ptr)
+        sp_children_raw = builder.call(cg.gc.gc_handle_deref, [sp_children_handle])
+        split_children_ptr = builder.bitcast(sp_children_raw, i64.as_pointer())
 
         old_lower = builder.icmp_unsigned("<", old_hash_bits, new_hash_bits)
         old_idx = builder.select(old_lower, ir.Constant(i32, 0), ir.Constant(i32, 1))
@@ -681,18 +698,17 @@ class HamtGenerator:
         old_child_ptr = builder.gep(split_children_ptr, [old_idx_64])
         new_child_ptr = builder.gep(split_children_ptr, [new_idx_64])
 
-        new_leaf4_void = builder.bitcast(new_leaf4, void_ptr)
-        node_i64 = builder.ptrtoint(node, i64)
-        new_leaf4_i64 = builder.ptrtoint(new_leaf4_void, i64)
-        builder.store(node_i64, old_child_ptr)
-        builder.store(new_leaf4_i64, new_child_ptr)
+        # node is the existing leaf (already a tagged handle), new_leaf4 is the new leaf (tagged handle)
+        builder.store(node, old_child_ptr)
+        builder.store(new_leaf4, new_child_ptr)
 
-        split_node_void = builder.bitcast(split_node, void_ptr)
-        builder.ret(split_node_void)
+        builder.ret(split_node)
 
-        # Handle internal node case
+        # Handle internal node case: decode handle, deref
         builder.position_at_end(is_internal_node)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        inode_handle = builder.lshr(node, ir.Constant(i64, 1))
+        inode_raw = builder.call(cg.gc.gc_handle_deref, [inode_handle])
+        node_ptr = builder.bitcast(inode_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -703,6 +719,11 @@ class HamtGenerator:
         bit_mask_2 = builder.shl(ir.Constant(i32, 1), hash_bits_2)
         bit_and_2 = builder.and_(bitmap, bit_mask_2)
         bit_is_set_2 = builder.icmp_unsigned("!=", bit_and_2, ir.Constant(i32, 0))
+
+        # Load children handle BEFORE branch — needed by both bit_exists and bit_not_exists
+        children_handle_ptr_2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle_2 = builder.load(children_handle_ptr_2)
+
         builder.cbranch(bit_is_set_2, bit_exists, bit_not_exists)
 
         # Bit exists - update existing child
@@ -711,20 +732,28 @@ class HamtGenerator:
         lower_bits_2 = builder.and_(bitmap, lower_mask_2)
         child_idx_2 = builder.call(cg.hamt_popcount, [lower_bits_2])
         old_count_2 = builder.call(cg.hamt_popcount, [bitmap])
-
-        children_ptr_ptr_2 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr_2 = builder.load(children_ptr_ptr_2)
+        children_raw_2 = builder.call(cg.gc.gc_handle_deref, [children_handle_2])
+        children_ptr_2 = builder.bitcast(children_raw_2, i64.as_pointer())
         child_idx_64_2 = builder.zext(child_idx_2, i64)
-        child_ptr_ptr_2 = builder.gep(children_ptr_2, [child_idx_64_2])
-        old_child_handle = builder.load(child_ptr_ptr_2)
-        old_child = builder.inttoptr(old_child_handle, void_ptr)
+        child_entry_ptr_2 = builder.gep(children_ptr_2, [child_idx_64_2])
+        old_child_tagged = builder.load(child_entry_ptr_2)
 
         next_shift_2 = builder.add(shift, ir.Constant(i32, 5))
-        new_child = builder.call(cg.hamt_insert, [old_child, hash_val, key, value, next_shift_2, added_ptr])
+        new_child = builder.call(cg.hamt_insert, [old_child_tagged, hash_val, key, value, next_shift_2, added_ptr])
 
         new_node = builder.call(cg.hamt_node_new, [bitmap, old_count_2])
-        new_children_ptr_ptr = builder.gep(new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        new_children_ptr = builder.load(new_children_ptr_ptr)
+        # Decode new node to get children ptr
+        nn_handle = builder.lshr(new_node, ir.Constant(i64, 1))
+        nn_raw = builder.call(cg.gc.gc_handle_deref, [nn_handle])
+        nn_ptr = builder.bitcast(nn_raw, cg.hamt_node_struct.as_pointer())
+        nn_ch_handle_ptr = builder.gep(nn_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        nn_ch_handle = builder.load(nn_ch_handle_ptr)
+        nn_ch_raw = builder.call(cg.gc.gc_handle_deref, [nn_ch_handle])
+        new_children_ptr = builder.bitcast(nn_ch_raw, i64.as_pointer())
+
+        # Re-deref old children (may have moved during hamt_node_new allocation)
+        children_raw_2b = builder.call(cg.gc.gc_handle_deref, [children_handle_2])
+        children_ptr_2b = builder.bitcast(children_raw_2b, i64.as_pointer())
 
         copy_idx_ptr = builder.alloca(i32, name="copy_idx")
         builder.store(ir.Constant(i32, 0), copy_idx_ptr)
@@ -742,12 +771,12 @@ class HamtGenerator:
 
         builder.position_at_end(copy_body)
         copy_idx_64 = builder.zext(copy_idx, i64)
-        src_ptr = builder.gep(children_ptr_2, [copy_idx_64])
+        src_ptr = builder.gep(children_ptr_2b, [copy_idx_64])
         dst_ptr = builder.gep(new_children_ptr, [copy_idx_64])
 
         is_updated_child = builder.icmp_signed("==", copy_idx, child_idx_2)
-        new_child_i64 = builder.ptrtoint(new_child, i64)
-        child_to_store = builder.select(is_updated_child, new_child_i64, builder.load(src_ptr))
+        # new_child is already a tagged handle from recursive insert
+        child_to_store = builder.select(is_updated_child, new_child, builder.load(src_ptr))
         builder.store(child_to_store, dst_ptr)
 
         next_copy_idx = builder.add(copy_idx, ir.Constant(i32, 1))
@@ -755,8 +784,7 @@ class HamtGenerator:
         builder.branch(copy_loop)
 
         builder.position_at_end(copy_done_exists)
-        new_node_void = builder.bitcast(new_node, void_ptr)
-        builder.ret(new_node_void)
+        builder.ret(new_node)
 
         # Bit doesn't exist - add new child
         builder.position_at_end(bit_not_exists)
@@ -767,15 +795,22 @@ class HamtGenerator:
         new_bitmap_3 = builder.or_(bitmap, bit_mask_2)
 
         new_node_3 = builder.call(cg.hamt_node_new, [new_bitmap_3, new_count_3])
-        new_children_ptr_ptr_3 = builder.gep(new_node_3, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        new_children_ptr_3 = builder.load(new_children_ptr_ptr_3)
+        # Decode new node
+        nn3_handle = builder.lshr(new_node_3, ir.Constant(i64, 1))
+        nn3_raw = builder.call(cg.gc.gc_handle_deref, [nn3_handle])
+        nn3_ptr = builder.bitcast(nn3_raw, cg.hamt_node_struct.as_pointer())
+        nn3_ch_handle_ptr = builder.gep(nn3_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        nn3_ch_handle = builder.load(nn3_ch_handle_ptr)
+        nn3_ch_raw = builder.call(cg.gc.gc_handle_deref, [nn3_ch_handle])
+        new_children_ptr_3 = builder.bitcast(nn3_ch_raw, i64.as_pointer())
 
         lower_mask_3 = builder.sub(bit_mask_2, ir.Constant(i32, 1))
         lower_bits_3 = builder.and_(new_bitmap_3, lower_mask_3)
         insert_idx = builder.call(cg.hamt_popcount, [lower_bits_3])
 
-        children_ptr_ptr_3 = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr_3 = builder.load(children_ptr_ptr_3)
+        # Re-deref old children (may have moved during node_new alloc)
+        children_raw_3 = builder.call(cg.gc.gc_handle_deref, [children_handle_2])
+        children_ptr_3 = builder.bitcast(children_raw_3, i64.as_pointer())
 
         copy_idx_ptr_2 = builder.alloca(i32, name="copy_idx_2")
         builder.store(ir.Constant(i32, 0), copy_idx_ptr_2)
@@ -800,14 +835,20 @@ class HamtGenerator:
         builder.store(next_copy_idx_2, copy_idx_ptr_2)
         builder.branch(copy_before)
 
-        # Insert new leaf
+        # Insert new leaf — leaf_new returns tagged handle directly
         builder.position_at_end(insert_new)
-        new_leaf_5 = builder.call(cg.hamt_leaf_new, [hash_val, key, value])
-        new_leaf_5_void = builder.bitcast(new_leaf_5, void_ptr)
-        new_leaf_5_i64 = builder.ptrtoint(new_leaf_5_void, i64)
+        new_leaf_5 = builder.call(cg.hamt_leaf_new, [hash_val, key, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF)])
         insert_idx_64 = builder.zext(insert_idx, i64)
         insert_ptr = builder.gep(new_children_ptr_3, [insert_idx_64])
-        builder.store(new_leaf_5_i64, insert_ptr)
+        # Re-deref new_children after leaf allocation (may have moved)
+        nn3_ch_raw2 = builder.call(cg.gc.gc_handle_deref, [nn3_ch_handle])
+        new_children_ptr_3b = builder.bitcast(nn3_ch_raw2, i64.as_pointer())
+        insert_ptr_b = builder.gep(new_children_ptr_3b, [insert_idx_64])
+        builder.store(new_leaf_5, insert_ptr_b)
+
+        # Re-deref old children after leaf allocation
+        children_raw_3b = builder.call(cg.gc.gc_handle_deref, [children_handle_2])
+        children_ptr_3b = builder.bitcast(children_raw_3b, i64.as_pointer())
 
         copy_after = func.append_basic_block("copy_after")
         copy_after_body = func.append_basic_block("copy_after_body")
@@ -822,20 +863,19 @@ class HamtGenerator:
 
         builder.position_at_end(copy_after_body)
         copy_idx_3_64 = builder.zext(copy_idx_3, i64)
-        src_ptr_3 = builder.gep(children_ptr_3, [copy_idx_3_64])
+        src_ptr_3 = builder.gep(children_ptr_3b, [copy_idx_3_64])
         dst_idx_64 = builder.add(copy_idx_3_64, ir.Constant(i64, 1))
-        dst_ptr_3 = builder.gep(new_children_ptr_3, [dst_idx_64])
+        dst_ptr_3 = builder.gep(new_children_ptr_3b, [dst_idx_64])
         builder.store(builder.load(src_ptr_3), dst_ptr_3)
         next_copy_idx_3 = builder.add(copy_idx_3, ir.Constant(i32, 1))
         builder.store(next_copy_idx_3, copy_idx_ptr_2)
         builder.branch(copy_after)
 
         builder.position_at_end(copy_done_not_exists)
-        new_node_3_void = builder.bitcast(new_node_3, void_ptr)
-        builder.ret(new_node_3_void)
+        builder.ret(new_node_3)
 
     def _implement_hamt_remove(self):
-        """Remove a key from the HAMT, returning a new root."""
+        """Remove a key from the HAMT, returning a new root (i64 tagged handle)."""
         cg = self.cg
         func = cg.hamt_remove
         func.args[0].name = "node"
@@ -847,17 +887,16 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        node = func.args[0]
+        node = func.args[0]  # i64 tagged handle
         hash_val = func.args[1]
         key = func.args[2]
         shift = func.args[3]
         removed_ptr = func.args[4]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
         # Check null
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         not_found = func.append_basic_block("not_found")
         check_tag = func.append_basic_block("check_tag")
@@ -868,21 +907,20 @@ class HamtGenerator:
         builder.store(ir.Constant(i32, 0), removed_ptr)
         builder.ret(node)
 
-        # Check pointer tag
+        # Check tag bit
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         is_leaf_block = func.append_basic_block("is_leaf_block")
         is_node_block = func.append_basic_block("is_node_block")
         builder.cbranch(is_leaf_tag, is_leaf_block, is_node_block)
 
-        # Leaf case
+        # Leaf case: decode handle, deref
         builder.position_at_end(is_leaf_block)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         leaf_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         leaf_key = builder.load(leaf_key_ptr)
         keys_match = builder.icmp_signed("==", leaf_key, key)
@@ -893,15 +931,17 @@ class HamtGenerator:
 
         builder.position_at_end(remove_leaf)
         builder.store(ir.Constant(i32, 1), removed_ptr)
-        builder.ret(ir.Constant(void_ptr, None))
+        builder.ret(ir.Constant(i64, 0))  # null tagged handle
 
         builder.position_at_end(keep_leaf)
         builder.store(ir.Constant(i32, 0), removed_ptr)
         builder.ret(node)
 
-        # Node case
+        # Node case: decode handle, deref
         builder.position_at_end(is_node_block)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        inode_handle = builder.lshr(node, ir.Constant(i64, 1))
+        inode_raw = builder.call(cg.gc.gc_handle_deref, [inode_handle])
+        node_ptr = builder.bitcast(inode_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -927,15 +967,17 @@ class HamtGenerator:
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
         old_count = builder.call(cg.hamt_popcount, [bitmap])
 
-        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        # Deref children handle
+        children_handle_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        old_child_handle = builder.load(child_ptr_ptr)
-        old_child = builder.inttoptr(old_child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [child_idx_64])
+        old_child_tagged = builder.load(child_entry_ptr)
 
         next_shift = builder.add(shift, ir.Constant(i32, 5))
-        new_child = builder.call(cg.hamt_remove, [old_child, hash_val, key, next_shift, removed_ptr])
+        new_child = builder.call(cg.hamt_remove, [old_child_tagged, hash_val, key, next_shift, removed_ptr])
 
         was_removed = builder.load(removed_ptr)
         key_was_removed = builder.icmp_unsigned("!=", was_removed, ir.Constant(i32, 0))
@@ -949,7 +991,7 @@ class HamtGenerator:
 
         # Check if child became null
         builder.position_at_end(check_collapse)
-        child_is_null = builder.icmp_unsigned("==", new_child, ir.Constant(void_ptr, None))
+        child_is_null = builder.icmp_unsigned("==", new_child, ir.Constant(i64, 0))
 
         remove_child = func.append_basic_block("remove_child")
         keep_child = func.append_basic_block("keep_child")
@@ -967,7 +1009,7 @@ class HamtGenerator:
         builder.cbranch(node_empty, return_null, create_smaller_node)
 
         builder.position_at_end(return_null)
-        builder.ret(ir.Constant(void_ptr, None))
+        builder.ret(ir.Constant(i64, 0))  # null tagged handle
 
         builder.position_at_end(create_smaller_node)
         only_one = builder.icmp_unsigned("==", new_count, ir.Constant(i32, 1))
@@ -981,8 +1023,18 @@ class HamtGenerator:
 
         builder.position_at_end(no_collapse)
         smaller_node = builder.call(cg.hamt_node_new, [new_bitmap, new_count])
-        smaller_children_ptr_ptr = builder.gep(smaller_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        smaller_children_ptr = builder.load(smaller_children_ptr_ptr)
+        # Decode smaller node to get children
+        sm_handle = builder.lshr(smaller_node, ir.Constant(i64, 1))
+        sm_raw = builder.call(cg.gc.gc_handle_deref, [sm_handle])
+        sm_ptr = builder.bitcast(sm_raw, cg.hamt_node_struct.as_pointer())
+        sm_ch_handle_ptr = builder.gep(sm_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        sm_ch_handle = builder.load(sm_ch_handle_ptr)
+        sm_ch_raw = builder.call(cg.gc.gc_handle_deref, [sm_ch_handle])
+        smaller_children_ptr = builder.bitcast(sm_ch_raw, i64.as_pointer())
+
+        # Re-deref old children after node_new alloc
+        children_raw_b = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr_b = builder.bitcast(children_raw_b, i64.as_pointer())
 
         src_idx_ptr = builder.alloca(i32, name="src_idx")
         dst_idx_ptr = builder.alloca(i32, name="dst_idx")
@@ -1016,7 +1068,7 @@ class HamtGenerator:
         src_idx_64 = builder.zext(src_idx, i64)
         dst_idx = builder.load(dst_idx_ptr)
         dst_idx_64 = builder.zext(dst_idx, i64)
-        src_child_ptr = builder.gep(children_ptr, [src_idx_64])
+        src_child_ptr = builder.gep(children_ptr_b, [src_idx_64])
         dst_child_ptr = builder.gep(smaller_children_ptr, [dst_idx_64])
         builder.store(builder.load(src_child_ptr), dst_child_ptr)
 
@@ -1027,14 +1079,23 @@ class HamtGenerator:
         builder.branch(copy_loop_remove)
 
         builder.position_at_end(copy_done_remove)
-        smaller_void = builder.bitcast(smaller_node, void_ptr)
-        builder.ret(smaller_void)
+        builder.ret(smaller_node)
 
         # Keep child (just update it)
         builder.position_at_end(keep_child)
         updated_node = builder.call(cg.hamt_node_new, [bitmap, old_count])
-        updated_children_ptr_ptr = builder.gep(updated_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        updated_children_ptr = builder.load(updated_children_ptr_ptr)
+        # Decode updated node
+        un_handle = builder.lshr(updated_node, ir.Constant(i64, 1))
+        un_raw = builder.call(cg.gc.gc_handle_deref, [un_handle])
+        un_ptr = builder.bitcast(un_raw, cg.hamt_node_struct.as_pointer())
+        un_ch_handle_ptr = builder.gep(un_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        un_ch_handle = builder.load(un_ch_handle_ptr)
+        un_ch_raw = builder.call(cg.gc.gc_handle_deref, [un_ch_handle])
+        updated_children_ptr = builder.bitcast(un_ch_raw, i64.as_pointer())
+
+        # Re-deref old children after node_new alloc
+        children_raw_c = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr_c = builder.bitcast(children_raw_c, i64.as_pointer())
 
         copy_idx_ptr_3 = builder.alloca(i32, name="copy_idx_3")
         builder.store(ir.Constant(i32, 0), copy_idx_ptr_3)
@@ -1052,11 +1113,11 @@ class HamtGenerator:
 
         builder.position_at_end(copy_body_keep)
         copy_idx_4_64 = builder.zext(copy_idx_4, i64)
-        src_ptr_4 = builder.gep(children_ptr, [copy_idx_4_64])
+        src_ptr_4 = builder.gep(children_ptr_c, [copy_idx_4_64])
         dst_ptr_4 = builder.gep(updated_children_ptr, [copy_idx_4_64])
         is_updated = builder.icmp_signed("==", copy_idx_4, child_idx)
-        new_child_i64 = builder.ptrtoint(new_child, i64)
-        to_store = builder.select(is_updated, new_child_i64, builder.load(src_ptr_4))
+        # new_child is already a tagged handle
+        to_store = builder.select(is_updated, new_child, builder.load(src_ptr_4))
         builder.store(to_store, dst_ptr_4)
 
         next_copy_4 = builder.add(copy_idx_4, ir.Constant(i32, 1))
@@ -1064,11 +1125,10 @@ class HamtGenerator:
         builder.branch(copy_loop_keep)
 
         builder.position_at_end(copy_done_keep)
-        updated_void = builder.bitcast(updated_node, void_ptr)
-        builder.ret(updated_void)
+        builder.ret(updated_node)
 
     def _implement_hamt_collect_keys(self):
-        """Collect all keys from the HAMT into a list."""
+        """Collect all keys from the HAMT into a list. Node is i64 tagged handle."""
         cg = self.cg
         func = cg.hamt_collect_keys
         func.args[0].name = "node"
@@ -1077,13 +1137,12 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        node = func.args[0]
+        node = func.args[0]  # i64 tagged handle
         list_ptr = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         return_unchanged = func.append_basic_block("return_unchanged")
         check_tag = func.append_basic_block("check_tag")
@@ -1093,30 +1152,24 @@ class HamtGenerator:
         builder.ret(list_ptr)
 
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Leaf - add key to list
+        # Leaf - decode handle, deref, add key to list
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         key = builder.load(key_ptr)
 
-        # Check if TaggedValue mode is enabled
         use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
         if use_tagged:
-            # Create TaggedValue for the key
-            # Use TV_TYPE_INT as default - keys in Map are either int or string
-            # String keys would be stored as handles but we use INT type here
-            # as the iteration returns raw values that the caller interprets
             tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, key)
             tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
@@ -1130,15 +1183,18 @@ class HamtGenerator:
 
         builder.ret(new_list)
 
-        # Node - recurse through children
+        # Node - decode handle, deref, recurse through children
         builder.position_at_end(handle_node)
-        as_node = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        as_node = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
         popcount = builder.call(cg.hamt_popcount, [bitmap])
 
-        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        # Deref children handle
+        children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
 
         result_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
         builder.store(list_ptr, result_ptr)
@@ -1158,13 +1214,15 @@ class HamtGenerator:
         builder.cbranch(done, loop_done, loop_body)
 
         builder.position_at_end(loop_body)
+        # Re-deref children each iteration (list_append may trigger GC)
+        ch_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(ch_raw, i64.as_pointer())
         idx_64 = builder.zext(idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         current_list = builder.load(result_ptr)
-        updated_list = builder.call(cg.hamt_collect_keys, [child_ptr, current_list])
+        updated_list = builder.call(cg.hamt_collect_keys, [child_tagged_handle, current_list])
         builder.store(updated_list, result_ptr)
 
         next_idx = builder.add(idx, ir.Constant(i32, 1))
@@ -1176,7 +1234,7 @@ class HamtGenerator:
         builder.ret(final_list)
 
     def _implement_hamt_collect_values(self):
-        """Collect all values from the HAMT into a list."""
+        """Collect all values from the HAMT into a list. Node is i64 tagged handle."""
         cg = self.cg
         func = cg.hamt_collect_values
         func.args[0].name = "node"
@@ -1185,13 +1243,12 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        node = func.args[0]
+        node = func.args[0]  # i64 tagged handle
         list_ptr = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         return_unchanged = func.append_basic_block("return_unchanged")
         check_tag = func.append_basic_block("check_tag")
@@ -1201,29 +1258,24 @@ class HamtGenerator:
         builder.ret(list_ptr)
 
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Leaf - add value to list (index 2)
+        # Leaf - decode handle, deref, add value to list
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         value_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         value = builder.load(value_ptr)
 
-        # Check if TaggedValue mode is enabled
         use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
 
         if use_tagged:
-            # Create TaggedValue for the value
-            # Use TV_TYPE_INT as default - values in Map are stored as raw i64
-            # The caller will interpret based on the Map's value type
             tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, value)
             tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
@@ -1237,15 +1289,17 @@ class HamtGenerator:
 
         builder.ret(new_list)
 
-        # Node - recurse
+        # Node - decode handle, deref, recurse
         builder.position_at_end(handle_node)
-        as_node = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        as_node = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
         popcount = builder.call(cg.hamt_popcount, [bitmap])
 
-        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
 
         result_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
         builder.store(list_ptr, result_ptr)
@@ -1265,13 +1319,15 @@ class HamtGenerator:
         builder.cbranch(done, loop_done, loop_body)
 
         builder.position_at_end(loop_body)
+        # Re-deref children each iteration (list_append may trigger GC)
+        ch_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(ch_raw, i64.as_pointer())
         idx_64 = builder.zext(idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         current_list = builder.load(result_ptr)
-        updated_list = builder.call(cg.hamt_collect_values, [child_ptr, current_list])
+        updated_list = builder.call(cg.hamt_collect_values, [child_tagged_handle, current_list])
         builder.store(updated_list, result_ptr)
 
         next_idx = builder.add(idx, ir.Constant(i32, 1))
@@ -1283,7 +1339,7 @@ class HamtGenerator:
         builder.ret(final_list)
 
     def _implement_hamt_lookup_string(self):
-        """Look up a string key in the HAMT. Uses string_eq for comparison."""
+        """Look up a string key in the HAMT. Node is i64 tagged handle."""
         cg = self.cg
         func = cg.hamt_lookup_string
         func.args[0].name = "node"
@@ -1294,16 +1350,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        node = func.args[0]
+        node = func.args[0]  # i64 tagged handle
         hash_val = func.args[1]
         key = func.args[2]
         shift = func.args[3]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
         string_ptr_type = cg.string_struct.as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         return_zero = func.append_basic_block("return_zero")
         check_tag = func.append_basic_block("check_tag")
@@ -1313,23 +1368,23 @@ class HamtGenerator:
         builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Leaf - compare keys
+        # Leaf - decode handle, deref, compare string keys
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
 
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_i64 = builder.load(stored_key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)  # Now a GC handle, not raw ptr
+        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
+        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
 
         keys_match = builder.call(cg.string_eq, [stored_key, key])
 
@@ -1345,9 +1400,11 @@ class HamtGenerator:
         builder.position_at_end(return_not_found)
         builder.ret(ir.Constant(i64, 0))
 
-        # Node - descend
+        # Node - decode handle, deref, descend
         builder.position_at_end(handle_node)
-        as_node = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        as_node = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -1371,19 +1428,25 @@ class HamtGenerator:
         lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
 
-        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         new_shift = builder.add(shift, five)
-        result = builder.call(cg.hamt_lookup_string, [child_ptr, hash_val, key, new_shift])
+        result = builder.call(cg.hamt_lookup_string, [child_tagged_handle, hash_val, key, new_shift])
         builder.ret(result)
 
     def _implement_hamt_contains_string(self):
-        """Check if a string key exists in the HAMT."""
+        """Check if a string key exists in the HAMT.
+
+        Node parameter is a tagged handle (i64):
+          0 = null, bit0=1 → leaf (handle = node>>1), bit0=0 → internal node (handle = node>>1)
+        String keys stored as GC handles in leaf field 1.
+        """
         cg = self.cg
         func = cg.hamt_contains_string
         func.args[0].name = "node"
@@ -1401,10 +1464,10 @@ class HamtGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i1 = ir.IntType(1)
-        void_ptr = ir.IntType(8).as_pointer()
         string_ptr_type = cg.string_struct.as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        # Null check: tagged handle 0 means empty
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         return_false = func.append_basic_block("return_false")
         check_tag = func.append_basic_block("check_tag")
@@ -1413,29 +1476,32 @@ class HamtGenerator:
         builder.position_at_end(return_false)
         builder.ret(ir.Constant(i1, 0))
 
+        # Tag check: bit 0
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Leaf - compare keys
+        # Leaf - decode handle, deref, compare string keys
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_i64 = builder.load(stored_key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)
+        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
+        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
         keys_match = builder.call(cg.string_eq, [stored_key, key])
         builder.ret(keys_match)
 
-        # Node - descend
+        # Node - decode handle, deref, descend
         builder.position_at_end(handle_node)
-        as_node = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        as_node = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         bitmap_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
 
@@ -1459,19 +1525,26 @@ class HamtGenerator:
         lower_bits = builder.and_(bitmap, builder.sub(bit_pos, ir.Constant(i32, 1)))
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
 
-        children_ptr_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
+        children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        child_ptr_ptr = builder.gep(children_ptr, [child_idx_64])
-        child_handle = builder.load(child_ptr_ptr)
-        child_ptr = builder.inttoptr(child_handle, void_ptr)
+        child_entry_ptr = builder.gep(children_ptr, [child_idx_64])
+        child_tagged_handle = builder.load(child_entry_ptr)
 
         new_shift = builder.add(shift, five)
-        result = builder.call(cg.hamt_contains_string, [child_ptr, hash_val, key, new_shift])
+        result = builder.call(cg.hamt_contains_string, [child_tagged_handle, hash_val, key, new_shift])
         builder.ret(result)
 
     def _implement_hamt_insert_string(self):
-        """Insert a string key-value pair into the HAMT."""
+        """Insert a string key-value pair into the HAMT.
+
+        Node parameter is a tagged handle (i64):
+          0 = null, bit0=1 → leaf (handle = node>>1), bit0=0 → internal node (handle = node>>1)
+        String keys stored as GC handles in leaf field 1.
+        Returns tagged handle (i64).
+        """
         cg = self.cg
         func = cg.hamt_insert_string
         func.args[0].name = "node"
@@ -1492,46 +1565,47 @@ class HamtGenerator:
         added_ptr = func.args[5]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
+        i8_ptr = ir.IntType(8).as_pointer()
         string_ptr_type = cg.string_struct.as_pointer()
 
-        key_i64 = builder.ptrtoint(key, i64)
+        # Convert string key pointer to GC handle for storage in leaves
+        key_as_i8 = builder.bitcast(key, i8_ptr)
+        key_handle = builder.call(cg.gc.gc_ptr_to_handle, [key_as_i8])
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        # Null check: tagged handle 0 means empty
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         create_leaf_null = func.append_basic_block("create_leaf_null")
         check_tag = func.append_basic_block("check_tag")
         builder.cbranch(is_null, create_leaf_null, check_tag)
 
+        # Create new leaf for null slot
         builder.position_at_end(create_leaf_null)
-        new_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key_i64, value])
-        new_leaf_void = builder.bitcast(new_leaf, void_ptr)
-        new_leaf_int = builder.ptrtoint(new_leaf_void, i64)
-        new_leaf_tagged_int = builder.or_(new_leaf_int, ir.Constant(i64, 1))
-        new_leaf_tagged = builder.inttoptr(new_leaf_tagged_int, void_ptr)
+        new_leaf_tagged = builder.call(cg.hamt_leaf_new, [hash_val, key_handle, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF_KPTR)])
         builder.store(ir.Constant(i32, 1), added_ptr)
         builder.ret(new_leaf_tagged)
 
+        # Tag check: bit 0
         builder.position_at_end(check_tag)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Handle leaf
+        # Handle leaf - decode handle, deref, compare string keys
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
 
         stored_hash_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         stored_hash = builder.load(stored_hash_ptr)
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_i64 = builder.load(stored_key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)
+        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
+        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
 
         keys_match = builder.call(cg.string_eq, [stored_key, key])
 
@@ -1539,17 +1613,13 @@ class HamtGenerator:
         split_leaf = func.append_basic_block("split_leaf")
         builder.cbranch(keys_match, update_leaf, split_leaf)
 
-        # Same key - update value
+        # Same key - update value (create new leaf with same key handle)
         builder.position_at_end(update_leaf)
-        updated_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key_i64, value])
-        updated_leaf_void = builder.bitcast(updated_leaf, void_ptr)
-        updated_leaf_int = builder.ptrtoint(updated_leaf_void, i64)
-        updated_leaf_tagged_int = builder.or_(updated_leaf_int, ir.Constant(i64, 1))
-        updated_leaf_tagged = builder.inttoptr(updated_leaf_tagged_int, void_ptr)
+        updated_leaf_tagged = builder.call(cg.hamt_leaf_new, [hash_val, key_handle, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF_KPTR)])
         builder.store(ir.Constant(i32, 0), added_ptr)
         builder.ret(updated_leaf_tagged)
 
-        # Different key - split
+        # Different key - split into node
         builder.position_at_end(split_leaf)
         builder.store(ir.Constant(i32, 1), added_ptr)
 
@@ -1568,18 +1638,22 @@ class HamtGenerator:
         create_node = func.append_basic_block("create_node")
         builder.cbranch(same_idx, recurse_split, create_node)
 
-        # Same index - recurse
+        # Same index - recurse deeper
         builder.position_at_end(recurse_split)
         next_shift = builder.add(shift, five)
         sub_result = builder.call(cg.hamt_insert_string, [node, hash_val, key, value, next_shift, added_ptr])
         single_bit = builder.shl(ir.Constant(i32, 1), old_idx)
-        single_child_node = builder.call(cg.hamt_node_new, [single_bit, ir.Constant(i32, 1)])
-        children_ptr_ptr = builder.gep(single_child_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children_ptr = builder.load(children_ptr_ptr)
-        sub_result_i64 = builder.ptrtoint(sub_result, i64)
-        builder.store(sub_result_i64, builder.gep(children_ptr, [ir.Constant(i64, 0)]))
-        single_node_void = builder.bitcast(single_child_node, void_ptr)
-        builder.ret(single_node_void)
+        single_child_node_tagged = builder.call(cg.hamt_node_new, [single_bit, ir.Constant(i32, 1)])
+        # Re-deref after allocation (hamt_node_new allocates)
+        single_node_handle = builder.lshr(single_child_node_tagged, ir.Constant(i64, 1))
+        single_node_raw = builder.call(cg.gc.gc_handle_deref, [single_node_handle])
+        single_node_ptr = builder.bitcast(single_node_raw, cg.hamt_node_struct.as_pointer())
+        children_handle_ptr = builder.gep(single_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children_ptr = builder.bitcast(children_raw, i64.as_pointer())
+        builder.store(sub_result, builder.gep(children_ptr, [ir.Constant(i64, 0)]))
+        builder.ret(single_child_node_tagged)
 
         # Different indices - create node with 2 children
         builder.position_at_end(create_node)
@@ -1587,15 +1661,19 @@ class HamtGenerator:
         new_bit = builder.shl(ir.Constant(i32, 1), new_idx)
         combined_bitmap = builder.or_(old_bit, new_bit)
 
-        split_node = builder.call(cg.hamt_node_new, [combined_bitmap, ir.Constant(i32, 2)])
-        split_children_ptr_ptr = builder.gep(split_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        split_children = builder.load(split_children_ptr_ptr)
+        split_node_tagged = builder.call(cg.hamt_node_new, [combined_bitmap, ir.Constant(i32, 2)])
 
-        new_key_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key_i64, value])
-        new_key_leaf_void = builder.bitcast(new_key_leaf, void_ptr)
-        new_key_leaf_int = builder.ptrtoint(new_key_leaf_void, i64)
-        new_key_leaf_tagged_int = builder.or_(new_key_leaf_int, ir.Constant(i64, 1))
-        new_key_leaf_tagged = builder.inttoptr(new_key_leaf_tagged_int, void_ptr)
+        # Create new leaf for the new key (allocates — re-deref after)
+        new_key_leaf_tagged = builder.call(cg.hamt_leaf_new, [hash_val, key_handle, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF_KPTR)])
+
+        # Re-deref split_node after leaf allocation
+        split_node_handle = builder.lshr(split_node_tagged, ir.Constant(i64, 1))
+        split_node_raw = builder.call(cg.gc.gc_handle_deref, [split_node_handle])
+        split_node_ptr = builder.bitcast(split_node_raw, cg.hamt_node_struct.as_pointer())
+        split_ch_handle_ptr = builder.gep(split_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        split_ch_handle = builder.load(split_ch_handle_ptr)
+        split_ch_raw = builder.call(cg.gc.gc_handle_deref, [split_ch_handle])
+        split_children = builder.bitcast(split_ch_raw, i64.as_pointer())
 
         old_lower = builder.and_(combined_bitmap, builder.sub(old_bit, ir.Constant(i32, 1)))
         old_pos = builder.call(cg.hamt_popcount, [old_lower])
@@ -1604,17 +1682,17 @@ class HamtGenerator:
         new_pos = builder.call(cg.hamt_popcount, [new_lower])
         new_pos_64 = builder.zext(new_pos, i64)
 
-        node_i64 = builder.ptrtoint(node, i64)
-        new_key_leaf_i64 = builder.ptrtoint(new_key_leaf_tagged, i64)
-        builder.store(node_i64, builder.gep(split_children, [old_pos_64]))
-        builder.store(new_key_leaf_i64, builder.gep(split_children, [new_pos_64]))
+        # Store old leaf (node) and new leaf as tagged handles
+        builder.store(node, builder.gep(split_children, [old_pos_64]))
+        builder.store(new_key_leaf_tagged, builder.gep(split_children, [new_pos_64]))
 
-        split_node_void = builder.bitcast(split_node, void_ptr)
-        builder.ret(split_node_void)
+        builder.ret(split_node_tagged)
 
-        # Handle internal node
+        # Handle internal node - decode handle, deref
         builder.position_at_end(handle_node)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        node_ptr = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
         n_bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         n_bitmap = builder.load(n_bitmap_ptr)
 
@@ -1626,6 +1704,10 @@ class HamtGenerator:
         n_has_child = builder.and_(n_bitmap, n_bit_pos)
         n_is_present = builder.icmp_unsigned("!=", n_has_child, ir.Constant(i32, 0))
 
+        # Load children handle BEFORE branch — needed by both descend_existing and add_new_child
+        e_children_handle_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        e_children_handle = builder.load(e_children_handle_ptr)
+
         descend_existing = func.append_basic_block("descend_existing")
         add_new_child = func.append_basic_block("add_new_child")
         builder.cbranch(n_is_present, descend_existing, add_new_child)
@@ -1635,20 +1717,31 @@ class HamtGenerator:
         e_lower_bits = builder.and_(n_bitmap, builder.sub(n_bit_pos, ir.Constant(i32, 1)))
         e_child_idx = builder.call(cg.hamt_popcount, [e_lower_bits])
         e_old_count = builder.call(cg.hamt_popcount, [n_bitmap])
-
-        e_children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        e_children = builder.load(e_children_ptr_ptr)
+        e_children_raw = builder.call(cg.gc.gc_handle_deref, [e_children_handle])
+        e_children = builder.bitcast(e_children_raw, i64.as_pointer())
         e_child_idx_64 = builder.zext(e_child_idx, i64)
-        e_old_child_handle = builder.load(builder.gep(e_children, [e_child_idx_64]))
-        e_old_child = builder.inttoptr(e_old_child_handle, void_ptr)
+        e_old_child_tagged = builder.load(builder.gep(e_children, [e_child_idx_64]))
 
         e_next_shift = builder.add(shift, five)
-        e_new_child = builder.call(cg.hamt_insert_string, [e_old_child, hash_val, key, value, e_next_shift, added_ptr])
+        e_new_child = builder.call(cg.hamt_insert_string, [e_old_child_tagged, hash_val, key, value, e_next_shift, added_ptr])
 
-        e_new_node = builder.call(cg.hamt_node_new, [n_bitmap, e_old_count])
-        e_new_children_ptr_ptr = builder.gep(e_new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        e_new_children = builder.load(e_new_children_ptr_ptr)
+        # Create new node (allocates — must re-deref old children after)
+        e_new_node_tagged = builder.call(cg.hamt_node_new, [n_bitmap, e_old_count])
 
+        # Re-deref new node to get its children
+        e_new_node_handle = builder.lshr(e_new_node_tagged, ir.Constant(i64, 1))
+        e_new_node_raw = builder.call(cg.gc.gc_handle_deref, [e_new_node_handle])
+        e_new_node_ptr = builder.bitcast(e_new_node_raw, cg.hamt_node_struct.as_pointer())
+        e_new_ch_handle_ptr = builder.gep(e_new_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        e_new_ch_handle = builder.load(e_new_ch_handle_ptr)
+        e_new_ch_raw = builder.call(cg.gc.gc_handle_deref, [e_new_ch_handle])
+        e_new_children = builder.bitcast(e_new_ch_raw, i64.as_pointer())
+
+        # Re-deref old children (may have moved during hamt_node_new allocation)
+        e_old_ch_raw2 = builder.call(cg.gc.gc_handle_deref, [e_children_handle])
+        e_old_children2 = builder.bitcast(e_old_ch_raw2, i64.as_pointer())
+
+        # Copy children, replacing updated child
         e_i_ptr = builder.alloca(i32, name="e_i")
         builder.store(ir.Constant(i32, 0), e_i_ptr)
 
@@ -1666,9 +1759,8 @@ class HamtGenerator:
         builder.position_at_end(e_loop_body)
         e_is_updated = builder.icmp_unsigned("==", e_i, e_child_idx)
         e_i_64 = builder.zext(e_i, i64)
-        e_old_val = builder.load(builder.gep(e_children, [e_i_64]))
-        e_new_child_i64 = builder.ptrtoint(e_new_child, i64)
-        e_copy_val = builder.select(e_is_updated, e_new_child_i64, e_old_val)
+        e_old_val = builder.load(builder.gep(e_old_children2, [e_i_64]))
+        e_copy_val = builder.select(e_is_updated, e_new_child, e_old_val)
         builder.store(e_copy_val, builder.gep(e_new_children, [e_i_64]))
 
         e_next_i = builder.add(e_i, ir.Constant(i32, 1))
@@ -1676,8 +1768,7 @@ class HamtGenerator:
         builder.branch(e_loop_cond)
 
         builder.position_at_end(e_loop_done)
-        e_result = builder.bitcast(e_new_node, void_ptr)
-        builder.ret(e_result)
+        builder.ret(e_new_node_tagged)
 
         # Add new child to node
         builder.position_at_end(add_new_child)
@@ -1687,22 +1778,29 @@ class HamtGenerator:
         a_new_count = builder.add(a_old_count, ir.Constant(i32, 1))
         a_new_bitmap = builder.or_(n_bitmap, n_bit_pos)
 
-        a_new_node = builder.call(cg.hamt_node_new, [a_new_bitmap, a_new_count])
-        a_new_children_ptr_ptr = builder.gep(a_new_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        a_new_children = builder.load(a_new_children_ptr_ptr)
+        # Create new node (allocates)
+        a_new_node_tagged = builder.call(cg.hamt_node_new, [a_new_bitmap, a_new_count])
 
         a_lower_bits = builder.and_(a_new_bitmap, builder.sub(n_bit_pos, ir.Constant(i32, 1)))
         a_insert_idx = builder.call(cg.hamt_popcount, [a_lower_bits])
 
-        a_new_leaf = builder.call(cg.hamt_leaf_new, [hash_val, key_i64, value])
-        a_new_leaf_void = builder.bitcast(a_new_leaf, void_ptr)
-        a_new_leaf_int = builder.ptrtoint(a_new_leaf_void, i64)
-        a_new_leaf_tagged_int = builder.or_(a_new_leaf_int, ir.Constant(i64, 1))
-        a_new_leaf_tagged = builder.inttoptr(a_new_leaf_tagged_int, void_ptr)
+        # Create new leaf (allocates — must re-deref new node after)
+        a_new_leaf_tagged = builder.call(cg.hamt_leaf_new, [hash_val, key_handle, value, ir.Constant(i32, cg.gc.TYPE_HAMT_LEAF_KPTR)])
 
-        a_old_children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        a_old_children = builder.load(a_old_children_ptr_ptr)
+        # Re-deref new node's children after leaf allocation
+        a_new_node_handle = builder.lshr(a_new_node_tagged, ir.Constant(i64, 1))
+        a_new_node_raw = builder.call(cg.gc.gc_handle_deref, [a_new_node_handle])
+        a_new_node_ptr = builder.bitcast(a_new_node_raw, cg.hamt_node_struct.as_pointer())
+        a_new_ch_handle_ptr = builder.gep(a_new_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        a_new_ch_handle = builder.load(a_new_ch_handle_ptr)
+        a_new_ch_raw = builder.call(cg.gc.gc_handle_deref, [a_new_ch_handle])
+        a_new_children = builder.bitcast(a_new_ch_raw, i64.as_pointer())
 
+        # Re-deref old node's children after allocations
+        a_old_ch_raw = builder.call(cg.gc.gc_handle_deref, [e_children_handle])
+        a_old_children = builder.bitcast(a_old_ch_raw, i64.as_pointer())
+
+        # Copy old children + insert new leaf
         a_src_i_ptr = builder.alloca(i32, name="a_src_i")
         a_dst_i_ptr = builder.alloca(i32, name="a_dst_i")
         builder.store(ir.Constant(i32, 0), a_src_i_ptr)
@@ -1730,8 +1828,7 @@ class HamtGenerator:
         builder.cbranch(a_is_insert, insert_new_block, copy_old_block)
 
         builder.position_at_end(insert_new_block)
-        a_new_leaf_i64 = builder.ptrtoint(a_new_leaf_tagged, i64)
-        builder.store(a_new_leaf_i64, builder.gep(a_new_children, [a_dst_i_64]))
+        builder.store(a_new_leaf_tagged, builder.gep(a_new_children, [a_dst_i_64]))
         builder.branch(after_insert)
 
         builder.position_at_end(copy_old_block)
@@ -1749,11 +1846,16 @@ class HamtGenerator:
         builder.branch(a_loop_cond)
 
         builder.position_at_end(a_loop_done)
-        a_result = builder.bitcast(a_new_node, void_ptr)
-        builder.ret(a_result)
+        builder.ret(a_new_node_tagged)
 
     def _implement_hamt_remove_string(self):
-        """Remove a string key from the HAMT."""
+        """Remove a string key from the HAMT.
+
+        Node parameter is a tagged handle (i64):
+          0 = null, bit0=1 → leaf (handle = node>>1), bit0=0 → internal node (handle = node>>1)
+        String keys stored as GC handles in leaf field 1.
+        Returns tagged handle (i64). Returns 0 for null/removed.
+        """
         cg = self.cg
         func = cg.hamt_remove_string
         func.args[0].name = "node"
@@ -1772,10 +1874,10 @@ class HamtGenerator:
         removed_ptr = func.args[4]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        void_ptr = ir.IntType(8).as_pointer()
         string_ptr_type = cg.string_struct.as_pointer()
 
-        is_null = builder.icmp_unsigned("==", node, ir.Constant(void_ptr, None))
+        # Null check: tagged handle 0 means empty
+        is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
         return_null = func.append_basic_block("return_null")
         check_type = func.append_basic_block("check_type")
@@ -1783,25 +1885,26 @@ class HamtGenerator:
 
         builder.position_at_end(return_null)
         builder.store(ir.Constant(i32, 0), removed_ptr)
-        builder.ret(ir.Constant(void_ptr, None))
+        builder.ret(ir.Constant(i64, 0))
 
+        # Tag check: bit 0
         builder.position_at_end(check_type)
-        ptr_as_int = builder.ptrtoint(node, i64)
-        low_bit = builder.and_(ptr_as_int, ir.Constant(i64, 1))
+        low_bit = builder.and_(node, ir.Constant(i64, 1))
         is_leaf_tag = builder.icmp_unsigned("!=", low_bit, ir.Constant(i64, 0))
 
         handle_leaf = func.append_basic_block("handle_leaf")
         handle_node = func.append_basic_block("handle_node")
         builder.cbranch(is_leaf_tag, handle_leaf, handle_node)
 
-        # Handle leaf
+        # Handle leaf - decode handle, deref, compare string keys
         builder.position_at_end(handle_leaf)
-        untagged_int = builder.and_(ptr_as_int, ir.Constant(i64, -2))
-        untagged_ptr = builder.inttoptr(untagged_int, void_ptr)
-        leaf_ptr = builder.bitcast(untagged_ptr, cg.hamt_leaf_struct.as_pointer())
+        leaf_handle = builder.lshr(node, ir.Constant(i64, 1))
+        leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
+        leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_i64 = builder.load(stored_key_ptr)
-        stored_key = builder.inttoptr(stored_key_i64, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)
+        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
+        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
 
         keys_match = builder.call(cg.string_eq, [stored_key, key])
 
@@ -1811,15 +1914,17 @@ class HamtGenerator:
 
         builder.position_at_end(remove_leaf)
         builder.store(ir.Constant(i32, 1), removed_ptr)
-        builder.ret(ir.Constant(void_ptr, None))
+        builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(keep_leaf)
         builder.store(ir.Constant(i32, 0), removed_ptr)
         builder.ret(node)
 
-        # Handle node
+        # Handle node - decode handle, deref
         builder.position_at_end(handle_node)
-        node_ptr = builder.bitcast(node, cg.hamt_node_struct.as_pointer())
+        node_handle = builder.lshr(node, ir.Constant(i64, 1))
+        node_raw = builder.call(cg.gc.gc_handle_deref, [node_handle])
+        node_ptr = builder.bitcast(node_raw, cg.hamt_node_struct.as_pointer())
 
         bitmap_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         bitmap = builder.load(bitmap_ptr)
@@ -1846,14 +1951,16 @@ class HamtGenerator:
         child_idx = builder.call(cg.hamt_popcount, [lower_bits])
         old_count = builder.call(cg.hamt_popcount, [bitmap])
 
-        children_ptr_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        children = builder.load(children_ptr_ptr)
+        # Load children handle, deref
+        children_handle_ptr = builder.gep(node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        children_handle = builder.load(children_handle_ptr)
+        children_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        children = builder.bitcast(children_raw, i64.as_pointer())
         child_idx_64 = builder.zext(child_idx, i64)
-        old_child_handle = builder.load(builder.gep(children, [child_idx_64]))
-        old_child = builder.inttoptr(old_child_handle, void_ptr)
+        old_child_tagged = builder.load(builder.gep(children, [child_idx_64]))
 
         next_shift = builder.add(shift, five)
-        new_child = builder.call(cg.hamt_remove_string, [old_child, hash_val, key, next_shift, removed_ptr])
+        new_child = builder.call(cg.hamt_remove_string, [old_child_tagged, hash_val, key, next_shift, removed_ptr])
 
         was_removed = builder.load(removed_ptr)
         did_remove = builder.icmp_unsigned("!=", was_removed, ir.Constant(i32, 0))
@@ -1866,7 +1973,7 @@ class HamtGenerator:
         builder.ret(node)
 
         builder.position_at_end(update_node)
-        new_child_null = builder.icmp_unsigned("==", new_child, ir.Constant(void_ptr, None))
+        new_child_null = builder.icmp_unsigned("==", new_child, ir.Constant(i64, 0))
 
         shrink_node = func.append_basic_block("shrink_node")
         replace_child = func.append_basic_block("replace_child")
@@ -1882,13 +1989,24 @@ class HamtGenerator:
         builder.cbranch(is_empty, return_null_node, create_smaller)
 
         builder.position_at_end(return_null_node)
-        builder.ret(ir.Constant(void_ptr, None))
+        builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(create_smaller)
         new_bitmap = builder.and_(bitmap, builder.not_(bit_pos))
-        smaller_node = builder.call(cg.hamt_node_new, [new_bitmap, new_count])
-        smaller_children_ptr_ptr = builder.gep(smaller_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        smaller_children = builder.load(smaller_children_ptr_ptr)
+        smaller_node_tagged = builder.call(cg.hamt_node_new, [new_bitmap, new_count])
+
+        # Re-deref smaller node's children and old children after allocation
+        smaller_node_h = builder.lshr(smaller_node_tagged, ir.Constant(i64, 1))
+        smaller_node_raw = builder.call(cg.gc.gc_handle_deref, [smaller_node_h])
+        smaller_node_ptr = builder.bitcast(smaller_node_raw, cg.hamt_node_struct.as_pointer())
+        smaller_ch_handle_ptr = builder.gep(smaller_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        smaller_ch_handle = builder.load(smaller_ch_handle_ptr)
+        smaller_ch_raw = builder.call(cg.gc.gc_handle_deref, [smaller_ch_handle])
+        smaller_children = builder.bitcast(smaller_ch_raw, i64.as_pointer())
+
+        # Re-deref old children (may have moved during hamt_node_new allocation)
+        old_ch_raw2 = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        old_children2 = builder.bitcast(old_ch_raw2, i64.as_pointer())
 
         s_src_ptr = builder.alloca(i32, name="s_src")
         s_dst_ptr = builder.alloca(i32, name="s_dst")
@@ -1920,7 +2038,7 @@ class HamtGenerator:
         builder.position_at_end(s_do_copy)
         s_dst = builder.load(s_dst_ptr)
         s_dst_64 = builder.zext(s_dst, i64)
-        s_val = builder.load(builder.gep(children, [s_src_64]))
+        s_val = builder.load(builder.gep(old_children2, [s_src_64]))
         builder.store(s_val, builder.gep(smaller_children, [s_dst_64]))
         s_next_dst = builder.add(s_dst, ir.Constant(i32, 1))
         builder.store(s_next_dst, s_dst_ptr)
@@ -1932,14 +2050,24 @@ class HamtGenerator:
         builder.branch(s_loop_cond)
 
         builder.position_at_end(s_loop_done)
-        smaller_result = builder.bitcast(smaller_node, void_ptr)
-        builder.ret(smaller_result)
+        builder.ret(smaller_node_tagged)
 
         # Replace child
         builder.position_at_end(replace_child)
-        updated_node = builder.call(cg.hamt_node_new, [bitmap, old_count])
-        updated_children_ptr_ptr = builder.gep(updated_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        updated_children = builder.load(updated_children_ptr_ptr)
+        updated_node_tagged = builder.call(cg.hamt_node_new, [bitmap, old_count])
+
+        # Re-deref updated node's children and old children after allocation
+        updated_node_h = builder.lshr(updated_node_tagged, ir.Constant(i64, 1))
+        updated_node_raw = builder.call(cg.gc.gc_handle_deref, [updated_node_h])
+        updated_node_ptr = builder.bitcast(updated_node_raw, cg.hamt_node_struct.as_pointer())
+        updated_ch_handle_ptr = builder.gep(updated_node_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        updated_ch_handle = builder.load(updated_ch_handle_ptr)
+        updated_ch_raw = builder.call(cg.gc.gc_handle_deref, [updated_ch_handle])
+        updated_children = builder.bitcast(updated_ch_raw, i64.as_pointer())
+
+        # Re-deref old children
+        u_old_ch_raw = builder.call(cg.gc.gc_handle_deref, [children_handle])
+        u_old_children = builder.bitcast(u_old_ch_raw, i64.as_pointer())
 
         u_i_ptr = builder.alloca(i32, name="u_i")
         builder.store(ir.Constant(i32, 0), u_i_ptr)
@@ -1957,9 +2085,8 @@ class HamtGenerator:
         builder.position_at_end(u_loop_body)
         u_is_updated = builder.icmp_unsigned("==", u_i, child_idx)
         u_i_64 = builder.zext(u_i, i64)
-        u_old_val = builder.load(builder.gep(children, [u_i_64]))
-        new_child_i64 = builder.ptrtoint(new_child, i64)
-        u_copy_val = builder.select(u_is_updated, new_child_i64, u_old_val)
+        u_old_val = builder.load(builder.gep(u_old_children, [u_i_64]))
+        u_copy_val = builder.select(u_is_updated, new_child, u_old_val)
         builder.store(u_copy_val, builder.gep(updated_children, [u_i_64]))
 
         u_next_i = builder.add(u_i, ir.Constant(i32, 1))
@@ -1967,8 +2094,7 @@ class HamtGenerator:
         builder.branch(u_loop_cond)
 
         builder.position_at_end(u_loop_done)
-        updated_result = builder.bitcast(updated_node, void_ptr)
-        builder.ret(updated_result)
+        builder.ret(updated_node_tagged)
 
     # ========================================================================
     # Map Method Implementations
@@ -2057,10 +2183,9 @@ class HamtGenerator:
         # Compute hash of key
         hash_val = builder.call(cg.map_hash, [key])
 
-        # Get old root (stored as i64, convert to pointer for HAMT ops)
+        # Get old root (stored as tagged handle i64)
         root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2074,7 +2199,7 @@ class HamtGenerator:
         added_ptr = builder.alloca(i32, name="added")
         builder.store(ir.Constant(i32, 0), added_ptr)
 
-        # Insert into HAMT
+        # Insert into HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
 
         # Create new Map with new root
@@ -2083,10 +2208,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_field)
+        builder.store(new_root, new_root_field)
 
         # Update len if new key was added
         added = builder.load(added_ptr)
@@ -2122,10 +2246,9 @@ class HamtGenerator:
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
 
-        # Get root (stored as i64, convert to pointer)
+        # Get root (tagged handle i64)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_field)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_field)
 
         # Lookup in HAMT
         result = builder.call(cg.hamt_lookup, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -2150,10 +2273,9 @@ class HamtGenerator:
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
 
-        # Get root (stored as i64, convert to pointer)
+        # Get root (tagged handle i64)
         root_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_field)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_field)
 
         # Check in HAMT
         result = builder.call(cg.hamt_contains, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -2181,10 +2303,9 @@ class HamtGenerator:
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
 
-        # Get old root (stored as i64, convert to pointer)
+        # Get old root (tagged handle i64)
         root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2198,7 +2319,7 @@ class HamtGenerator:
         removed_ptr = builder.alloca(i32, name="removed")
         builder.store(ir.Constant(i32, 0), removed_ptr)
 
-        # Remove from HAMT
+        # Remove from HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
         # Create new Map with new root
@@ -2207,10 +2328,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_field)
+        builder.store(new_root, new_root_field)
 
         # Update len if key was removed
         removed = builder.load(removed_ptr)
@@ -2312,16 +2432,15 @@ class HamtGenerator:
         # Compute string hash
         hash_val = builder.call(cg.string_hash, [key])
 
-        # Get old root (stored as i64, convert to pointer), len, and flags
+        # Get old root (tagged handle i64), len, and flags
         old_root_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(old_root_ptr)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(old_root_ptr)
         old_len_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         old_len = builder.load(old_len_ptr)
         old_flags_ptr = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_flags = builder.load(old_flags_ptr)
 
-        # Insert into HAMT using string comparison
+        # Insert into HAMT using string comparison (returns tagged handle i64)
         added_ptr = builder.alloca(i32, name="added")
         builder.store(ir.Constant(i32, 0), added_ptr)
         new_root = builder.call(cg.hamt_insert_string, [old_root, hash_val, key, value, ir.Constant(i32, 0), added_ptr])
@@ -2332,10 +2451,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, map_ptr_type)
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_ptr)
+        builder.store(new_root, new_root_ptr)
 
         # Update len if key was added
         added = builder.load(added_ptr)
@@ -2369,10 +2487,9 @@ class HamtGenerator:
         # Compute string hash
         hash_val = builder.call(cg.string_hash, [key])
 
-        # Get root (stored as i64, convert to pointer)
+        # Get root (tagged handle i64)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Lookup in HAMT using string comparison
         result = builder.call(cg.hamt_lookup_string, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -2397,10 +2514,9 @@ class HamtGenerator:
         # Compute string hash
         hash_val = builder.call(cg.string_hash, [key])
 
-        # Get root (stored as i64, convert to pointer)
+        # Get root (tagged handle i64)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Check existence in HAMT using string comparison
         result = builder.call(cg.hamt_contains_string, [root, hash_val, key, ir.Constant(i32, 0)])
@@ -2425,10 +2541,9 @@ class HamtGenerator:
         # Compute string hash
         hash_val = builder.call(cg.string_hash, [key])
 
-        # Get old root (stored as i64, convert to pointer)
+        # Get old root (tagged handle i64)
         root_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(old_map, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2442,7 +2557,7 @@ class HamtGenerator:
         removed_ptr = builder.alloca(i32, name="removed")
         builder.store(ir.Constant(i32, 0), removed_ptr)
 
-        # Remove from HAMT using string comparison
+        # Remove from HAMT using string comparison (returns tagged handle i64)
         new_root = builder.call(cg.hamt_remove_string, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
         # Create new Map with new root
@@ -2451,10 +2566,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, map_size, type_id)
         new_map = builder.bitcast(raw_ptr, cg.map_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_field)
+        builder.store(new_root, new_root_field)
 
         # Update len if key was removed
         removed = builder.load(removed_ptr)
@@ -2491,10 +2605,9 @@ class HamtGenerator:
             elem_size = ir.Constant(i64, 8)
         empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
-        # Get HAMT root (stored as i64, convert to pointer)
+        # Get HAMT root (tagged handle i64)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Collect all keys from HAMT into list
         result = builder.call(cg.hamt_collect_keys, [root, empty_list])
@@ -2522,10 +2635,9 @@ class HamtGenerator:
             elem_size = ir.Constant(i64, 8)
         empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
-        # Get HAMT root (stored as i64, convert to pointer)
+        # Get HAMT root (tagged handle i64)
         root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Collect all values from HAMT into list
         result = builder.call(cg.hamt_collect_values, [root, empty_list])
@@ -2591,7 +2703,7 @@ class HamtGenerator:
 
         # Set struct: { i64 root, i64 len, i64 flags } - HAMT-based like Map
         # All fields are i64 for consistent cross-platform layout (no padding ambiguity)
-        # Root is stored as i64, converted with inttoptr/ptrtoint when used as pointer
+        # Root is stored as i64 tagged handle: (handle << 1) | tag_bit
         # flags: bit 0 = element is heap pointer (e.g., string)
         cg.set_struct = ir.global_context.get_identified_type("struct.Set")
         cg.set_struct.set_body(
@@ -2763,10 +2875,9 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root (stored as i64, convert to pointer for HAMT ops)
+        # Get old root (tagged handle i64)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2782,7 +2893,7 @@ class HamtGenerator:
         # Alloca for "added" flag
         added_ptr = builder.alloca(i32, name="added")
 
-        # Insert into HAMT (value = 1 for sets)
+        # Insert into HAMT (value = 1 for sets, returns tagged handle i64)
         new_root = builder.call(cg.hamt_insert, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
 
         # Allocate new Set struct (24 bytes)
@@ -2791,10 +2902,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_field)
+        builder.store(new_root, new_root_field)
 
         # Compute new len (old_len + added)
         added = builder.load(added_ptr)
@@ -2825,10 +2935,9 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get root (stored as i64, convert to pointer)
+        # Get root (tagged handle i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_field)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_field)
 
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
@@ -2856,10 +2965,9 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root (stored as i64, convert to pointer for HAMT ops)
+        # Get old root (tagged handle i64)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_field)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_field)
 
         # Get old len
         len_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2875,7 +2983,7 @@ class HamtGenerator:
         # Alloca for "removed" flag
         removed_ptr = builder.alloca(i32, name="removed")
 
-        # Remove from HAMT
+        # Remove from HAMT (returns tagged handle i64)
         new_root = builder.call(cg.hamt_remove, [old_root, hash_val, key, ir.Constant(i32, 0), removed_ptr])
 
         # Allocate new Set struct (24 bytes)
@@ -2884,10 +2992,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_field)
+        builder.store(new_root, new_root_field)
 
         # Compute new len (old_len - removed)
         removed = builder.load(removed_ptr)
@@ -2992,10 +3099,9 @@ class HamtGenerator:
             elem_size = ir.Constant(i64, 8)
         result_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
 
-        # Get root from the set (stored as i64, convert to pointer)
+        # Get root from the set (tagged handle i64)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Use hamt_collect_keys to gather all keys into the list
         final_list = builder.call(cg.hamt_collect_keys, [root, result_list])
@@ -3034,10 +3140,9 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get root from set (stored as i64, convert to pointer)
+        # Get root from set (tagged handle i64)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        root_i64 = builder.load(root_ptr)
-        root = builder.inttoptr(root_i64, void_ptr)
+        root = builder.load(root_ptr)
 
         # Hash the string key
         hash_val = builder.call(cg.string_hash, [key])
@@ -3063,10 +3168,9 @@ class HamtGenerator:
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Get old root (stored as i64, convert to pointer for HAMT ops)
+        # Get old root (tagged handle i64)
         root_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        old_root_i64 = builder.load(root_ptr)
-        old_root = builder.inttoptr(old_root_i64, void_ptr)
+        old_root = builder.load(root_ptr)
 
         # Get len and flags
         len_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -3077,8 +3181,7 @@ class HamtGenerator:
         # Hash the string key
         hash_val = builder.call(cg.string_hash, [key])
 
-        # Insert using hamt_insert_string (value = 1 for sets)
-        # Note: hamt_insert_string expects String* as key
+        # Insert using hamt_insert_string (value = 1 for sets, returns tagged handle i64)
         added_ptr = builder.alloca(i32, name="added")
         new_root = builder.call(cg.hamt_insert_string, [old_root, hash_val, key, ir.Constant(i64, 1), ir.Constant(i32, 0), added_ptr])
         added = builder.load(added_ptr)
@@ -3093,10 +3196,9 @@ class HamtGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, set_size, type_id)
         new_set = builder.bitcast(raw_ptr, cg.set_struct.as_pointer())
 
-        # Store new root (convert pointer to i64)
+        # Store new root (already a tagged handle i64)
         new_root_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_root_i64 = builder.ptrtoint(new_root, i64)
-        builder.store(new_root_i64, new_root_ptr)
+        builder.store(new_root, new_root_ptr)
 
         # Store len and flags
         new_len_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)

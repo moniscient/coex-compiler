@@ -1856,3 +1856,35 @@ func main() -> int
 - **Files**: `coex_gc.py` (`_implement_gc_handle_deref`, `_implement_gc_handle_store`)
 - **Note**: On x86-64 (TSO memory model), plain loads/stores provide implicit acquire/release, masking this bug. Only manifests on weak-memory architectures (ARM64/Apple Silicon).
 - **Status**: Fixed (2026-02-09)
+
+---
+
+### BUG-109: HAMT nodes lack type_id — Phase 3b pointer fixup skips them, causing stale internal pointers after compaction
+- **Discovered**: 2026-02-09, during TLAB memory leak fix (attempting to re-enable TLAB freeing in Phase 3)
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: Any program using maps or sets under GC compaction pressure. Becomes a crash when TLAB freeing is re-enabled.
+- **Observed**: HAMTNode (type_id=0) and HAMT children buffers (type_id=0) were invisible to Phase 3b fixup. After compaction, internal raw pointers were stale.
+- **Root Cause**: Three interrelated issues:
+  1. HAMT objects allocated with type_id=0, making them invisible to Phase 3b fixup switch
+  2. Phase 3b only fixed objects IN the compact buffer (range check), but newborn objects in TLABs also contain raw pointers to the prev compact buffer
+  3. Phase 4 freed prev_buffer immediately, but mutators could allocate HAMT nodes with stale pointers DURING Phase 3b (race condition)
+- **Fix (3 parts)**:
+  1. Defined TYPE_HAMT_NODE=23, TYPE_HAMT_CHILDREN=24, TYPE_HAMT_LEAF=25, TYPE_HAMT_LEAF_KPTR=26 in coex_gc.py. Updated hamt.py to use them. Added Phase 3b fixup cases for each type.
+  2. Removed the in_buffer range check from Phase 3b — now processes ALL live objects, not just those in the compact buffer.
+  3. Two-generation buffer: prev_buffer kept alive for one extra cycle (gc_compact_prev_prev_buffer). Phase 4 frees prev_prev instead of prev. Next cycle's Phase 3b fixes stale pointers before the buffer is freed.
+- **Files**: `coex_gc.py`, `codegen/hamt.py`, `codegen/statements.py`
+- **Status**: Fixed (2026-02-09)
+
+---
+
+### BUG-113: In-place mutation optimization uses stale raw pointer after GC compaction
+- **Discovered**: 2026-02-09, during BUG-109 HAMT compaction testing
+- **Category**: Codegen/GC
+- **Severity**: Critical
+- **Reproduction**: `m = m.set(key, val)` after GC compaction (2 gc() cycles with garbage between them)
+- **Observed**: `try_generate_inplace_update` calls `map_put_inplace` with a raw pointer loaded from the variable's alloca. After compaction, this is stale.
+- **Root Cause**: In-place optimization mutates through raw pointers, but compaction changes the canonical object location. Writes go to old location; reads via handle deref see unmodified copy at new location.
+- **Fix**: Disabled in-place optimization when GC is active (`cg.gc is not None` → return False). The normal reassignment path is correct and performance difference is negligible.
+- **Files**: `codegen/statements.py` (try_generate_inplace_update)
+- **Status**: Fixed (2026-02-09)
