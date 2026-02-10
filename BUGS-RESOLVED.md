@@ -4,6 +4,41 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-115: JSON codegen stale-pointer-across-allocation bugs (9 sites)
+- **Discovered**: 2026-02-10, during json_type.py audit
+- **Category**: Codegen/GC
+- **Severity**: High
+- **Reproduction**: Any JSON stringify, parse, set_field, to_struct, or list/map conversion under GC pressure
+- **Root Cause**: 9 sites in `codegen/json_type.py` derived raw pointers via `gc_handle_deref` then used them across allocating operations. If GC compaction ran during any allocation, the raw pointer became stale.
+- **Fix**: Re-derive raw pointers from GC handles after every potentially-allocating call in all 9 sites:
+  1. `_stringify_object`: Re-derive `map_ptr`, `keys_list`, `key_str` from handles each loop iteration
+  2. `_stringify_array`: Re-derive `list_ptr` from handle each loop iteration
+  3. `_pretty_array`: Re-derive `list_ptr` from handle each loop iteration
+  4. `_pretty_object`: Re-derive `map_ptr`, `keys_list`, `key_str` from handles each loop iteration
+  5. `_implement_json_parse`: Re-derive `data_ptr` from `owner_handle` after `alloc_arena_or_gc` in both array and object parse blocks
+  6. `generate_json_to_struct`: Re-derive `map_ptr` and `struct_ptr` from handles in field extraction loop
+  7. `_convert_list_runtime_to_json_array`: Save `list_ptr` as handle, re-derive each loop iteration
+  8. `convert_map_to_json_object`: Save `keys_list`/`values_list` handles, re-derive each iteration; re-derive `string_key` before `map_set_string`
+  9. `_implement_json_set_field`: Move `gc_handle_deref` after `gc_promote_to_heap`
+- **Files**: `codegen/json_type.py`
+- **Status**: Fixed (2026-02-10)
+
+---
+
+### BUG-099b: Task closure result storage uses raw pointers instead of handles
+- **Discovered**: 2026-02-05, during BUG-092 audit
+- **Category**: Codegen/GC
+- **Severity**: High
+- **Reproduction**: Parallel for/first-assign/most-assign returning reference types (strings, lists, etc.) with GC pressure between task completion and result consumption
+- **Observed**: `codegen/thread.py` trampoline used `ptrtoint` to store task results in closure. For reference type results, these were raw pointers, not handles. If GC compaction ran between task completion and result consumption, pointers went stale.
+- **Root Cause**: Trampoline stored `ptrtoint(result)` for pointer results. TaggedValues in for-assign/most-assign always used `TV_TYPE_INT` regardless of actual return type.
+- **Fix**: (1) Trampoline now calls `gc_ptr_to_handle` for heap-type pointer results, storing the handle as i64. (2) Added GC root slot for result handle in trampoline frame. (3) For-assign and most-assign TaggedValues now use `get_tv_type_id(task_decl.return_type)` for correct type tagging.
+- **Files**: `codegen/thread.py`, `codegen/loops.py`
+- **Status**: Fixed (2026-02-10)
+- **Note**: BUG ID 099 was previously used for a different bug (task frame GC roots). This is suffixed 'b' to avoid conflict.
+
+---
+
 ### BUG-103: gc_compact() crashes with memory corruption in game loop
 - **Discovered**: 2026-02-05, during compiling and running galaxian.coex
 - **Category**: GC
@@ -1901,4 +1936,16 @@ func main() -> int
 - **Root Cause**: Race between async GC Phase 3b fixup (PV_NODE raw pointer patching) and mutator reads. After compaction copies objects to new buffer and updates handle table, the mutator sees new locations via gc_handle_deref but Phase 3b hasn't yet fixed internal PV_NODE raw pointers. Mutator reads stale internal pointers → accesses wrong PV_NODE data → silent data corruption.
 - **Fix**: Converted PV_NODE children and Array data handle from raw pointers to GC handles (i64). This eliminated the need for Phase 3b entirely — handles are stable across compaction (handle table updated by copy phase). Phase 3b removed.
 - **Files**: `codegen/core.py`, `codegen/list.py`, `codegen/array.py`, `codegen/conversions.py`, `codegen/expressions.py`, `coex_gc.py`
+- **Status**: Fixed (2026-02-10)
+
+### BUG-116: Mixed-type map literal to JSON conversion uses wrong value types
+- **Discovered**: 2026-02-10, during BUG-115 test writing
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: `data: json := {"name": "test", "value": 42}; print(data.stringify())` — segfault or corrupted output
+- **Observed**: Segfault or value corruption when converting map literals with mixed value types to JSON. For `{"name": "test", "value": 42}`, the integer 42 is treated as a string GC handle → `gc_handle_deref(42)` reads garbage → crash. For `{"a": 1, "b": "y"}`, string "y" is treated as an integer → corrupted value.
+- **Expected**: Each value should be converted using its own compile-time type
+- **Root Cause**: `convert_map_to_json_object` in `codegen/json_type.py` infers a SINGLE `value_type` from `_infer_type_from_expr` (based on the first map entry) and applies it to ALL values. For mixed-type map literals, this misapplies the wrong type to subsequent values. The runtime `map_values()` API cannot help because HAMT stores raw i64 without per-value type information — all values get the same TV type_id regardless of actual type.
+- **Fix**: Added `_build_json_from_map_expr` method that intercepts `MapExpr` in `convert_to_json` and builds JSON directly from expression entries, converting each value individually with its correct compile-time type. This bypasses the broken single-type loop in `convert_map_to_json_object`.
+- **Files**: `codegen/json_type.py`
 - **Status**: Fixed (2026-02-10)

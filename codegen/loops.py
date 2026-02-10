@@ -2191,7 +2191,9 @@ class LoopGenerator:
         result_val = cg.builder.ptrtoint(result_ptr, i64)
 
         # Append to result list as TaggedValue
-        tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, result_val)
+        # BUG-099: Use correct TV_TYPE for the task's return type
+        tv_type_id = cg.gc.get_tv_type_id(task_decl.return_type) if task_decl.return_type else cg.gc.TV_TYPE_INT
+        tv_ptr = cg.gc.create_tagged_value(cg.builder, tv_type_id, result_val)
         tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
         current_list = cg.builder.load(result_alloca)
@@ -2812,7 +2814,9 @@ class LoopGenerator:
         result_val = cg.builder.ptrtoint(result_ptr, i64)
 
         # Append result as TaggedValue
-        tv_result = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_INT, result_val)
+        # BUG-099: Use correct TV_TYPE for the task's return type
+        tv_type_id = cg.gc.get_tv_type_id(task_decl.return_type) if task_decl.return_type else cg.gc.TV_TYPE_INT
+        tv_result = cg.gc.create_tagged_value(cg.builder, tv_type_id, result_val)
         tv_result_i8 = cg.builder.bitcast(tv_result, i8_ptr)
         current_results = cg.builder.load(results_alloca)
         new_results = cg.builder.call(cg.list_append, [current_results, tv_result_i8, elem_size])

@@ -449,7 +449,7 @@ class ThreadGenerator:
         # 1b. Set current task closure for safepoint checks (TLS)
         builder.call(self.task_set_current, [closure_ptr])
 
-        # 2. Push GC frame for HEAP-TYPE parameters only
+        # 2. Push GC frame for HEAP-TYPE parameters AND result handle
         # CRITICAL: Only allocate slots for heap types (list, map, string, etc.)
         # Primitive types (int, float, bool) must NOT be rooted - their values would
         # be misinterpreted as handle indices during GC root scanning!
@@ -460,9 +460,13 @@ class ThreadGenerator:
                 heap_param_indices.append(i)
                 num_heap_params += 1
 
+        # BUG-099: Also need a slot for heap-type return values
+        returns_heap_type = (task_func.return_type is not None and cg._is_heap_type(task_func.return_type))
+        total_gc_slots = num_heap_params + (1 if returns_heap_type else 0)
+
         frame_ptr = None
-        if cg.gc is not None and num_heap_params > 0:
-            frame_ptr = cg.gc.push_frame(builder, num_heap_params)
+        if cg.gc is not None and total_gc_slots > 0:
+            frame_ptr = cg.gc.push_frame(builder, total_gc_slots)
 
         # 3. Extract parameters from closure->params
         params_ptr_field = builder.gep(
@@ -511,19 +515,32 @@ class ThreadGenerator:
             inbounds=True,
             name="result_field"
         )
-        # Convert result to i8* (store as pointer)
+        # Convert result to i8* for storage in closure
+        # BUG-099: For heap-type pointer results, convert to GC handle first
+        # so the stored i64 is a stable handle, not a raw pointer that goes stale
+        result_handle = None
         if result.type == i64:
             result_ptr = builder.inttoptr(result, i8_ptr)
         elif result.type == ir.VoidType():
             result_ptr = ir.Constant(i8_ptr, None)
+        elif result.type.is_pointer and returns_heap_type and cg.gc is not None:
+            # Heap-type pointer result: convert to handle
+            result_i8 = builder.bitcast(result, i8_ptr) if result.type != i8_ptr else result
+            result_handle = builder.call(cg.gc.gc_ptr_to_handle, [result_i8], name="result_handle")
+            result_ptr = builder.inttoptr(result_handle, i8_ptr)
         else:
-            # Cast other types through i64
+            # Non-heap pointer or primitive: bit-preserving cast through i64
             result_i64 = builder.ptrtoint(result, i64) if result.type.is_pointer else builder.zext(result, i64)
             result_ptr = builder.inttoptr(result_i64, i8_ptr)
         builder.store(result_ptr, result_field)
 
+        # BUG-099: Root the result handle so it survives GC between task
+        # completion and main thread consumption
+        if returns_heap_type and result_handle is not None and frame_ptr is not None:
+            cg.gc.set_root(builder, frame_ptr, num_heap_params, result_handle)
+
         # 6. Pop GC frame
-        if cg.gc is not None and num_heap_params > 0:
+        if cg.gc is not None and total_gc_slots > 0:
             cg.gc.pop_frame(builder, frame_ptr)
 
         # 7. Clear current task closure TLS before signaling completion

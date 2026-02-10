@@ -102,17 +102,6 @@
 
 ---
 
-### BUG-099: Task closure result storage uses raw pointers instead of handles
-- **Discovered**: 2026-02-05, during BUG-092 audit
-- **Category**: Codegen/GC
-- **Severity**: High
-- **Reproduction**: Parallel for/first-assign/most-assign returning reference types (strings, lists, etc.) with GC pressure between task completion and result consumption
-- **Observed**: `codegen/thread.py` lines 519-522 use `ptrtoint` to store task results in closure. Retrieval in `codegen/loops.py` (lines 2191, 2497, 2812) uses `ptrtoint` roundtrip to recover i64 value stored in TaggedValue. For reference type results, these are raw pointers, not handles.
-- **Expected**: Task results containing reference types should use `gc_promote_to_heap + gc_ptr_to_handle` for storage, with matching `gc_handle_deref` at retrieval sites.
-- **Hypothesis**: Requires coordinated changes at storage (thread.py) and all retrieval sites (loops.py), plus ensuring TaggedValue consumers treat values as handles for reference types.
-- **Files**: `codegen/thread.py`, `codegen/loops.py`
-- **Status**: Open
-
 ---
 
 ### BUG-093: Replace compile-time type inference with runtime TYPE_ID lookup where appropriate
@@ -204,6 +193,4 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
----
-
-**Next valid BUG ID: BUG-115**
+**Next valid BUG ID: BUG-117**
