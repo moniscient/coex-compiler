@@ -9057,6 +9057,10 @@ class GarbageCollector:
         Returns NULL if handle is 0 (null handle).
         Otherwise returns gc_handle_table[handle] with acquire ordering.
 
+        VALIDATION: Checks handle < gc_handle_table_size. If out of bounds,
+        prints diagnostic and aborts. This catches raw pointers being passed
+        as handles (e.g. BUG-120: raw pointer 0x10b030338 >> table_size).
+
         CONCURRENCY: The acquire load forms a release-acquire pair with
         gc_handle_store's release store.  On ARM64, this ensures that when
         the mutator reads a NEW pointer (written by compaction), all preceding
@@ -9070,6 +9074,8 @@ class GarbageCollector:
         entry = func.append_basic_block("entry")
         is_null = func.append_basic_block("is_null")
         not_null = func.append_basic_block("not_null")
+        bounds_ok = func.append_basic_block("bounds_ok")
+        bounds_fail = func.append_basic_block("bounds_fail")
 
         builder = ir.IRBuilder(entry)
 
@@ -9083,8 +9089,44 @@ class GarbageCollector:
         builder.position_at_end(is_null)
         builder.ret(ir.Constant(self.i8_ptr, None))
 
-        # Dereference non-null handle — acquire ordering
+        # Bounds check: handle < gc_handle_table_size
         builder.position_at_end(not_null)
+        table_size = builder.load(self.gc_handle_table_size)
+        in_bounds = builder.icmp_unsigned('<', handle, table_size)
+        builder.cbranch(in_bounds, bounds_ok, bounds_fail)
+
+        # Out-of-bounds: print diagnostic and abort
+        builder.position_at_end(bounds_fail)
+
+        # Get or declare printf
+        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
+        if "printf" in self.module.globals:
+            printf = self.module.globals["printf"]
+        else:
+            printf = ir.Function(self.module, printf_ty, name="printf")
+
+        # Get or declare abort
+        abort_ty = ir.FunctionType(self.void, [])
+        if "abort" in self.module.globals:
+            abort_fn = self.module.globals["abort"]
+        else:
+            abort_fn = ir.Function(self.module, abort_ty, name="abort")
+            abort_fn.attributes.add('noreturn')
+
+        fmt_str = "FATAL: gc_handle_deref: handle %lld >= table_size %lld (raw pointer passed as handle?)\n"
+        fmt_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(fmt_str) + 1),
+                                       name=".gc_handle_deref_bounds_fmt")
+        fmt_global.global_constant = True
+        fmt_global.linkage = 'private'
+        fmt_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(fmt_str) + 1),
+                                             bytearray(fmt_str.encode('utf-8')) + bytearray([0]))
+        fmt_ptr = builder.bitcast(fmt_global, self.i8_ptr)
+        builder.call(printf, [fmt_ptr, handle, table_size])
+        builder.call(abort_fn, [])
+        builder.unreachable()
+
+        # Dereference non-null, in-bounds handle — acquire ordering
+        builder.position_at_end(bounds_ok)
         table = builder.load(self.gc_handle_table)
         slot_ptr = builder.gep(table, [handle])
         # Bitcast i8** slot to i64* for atomic load (llvmlite requires integer type)
