@@ -2022,3 +2022,16 @@ func main() -> int
 - **Fix**: Replaced ring buffer + mutex with Vyukov MPSC queue (lock-free FIFO) for values and Treiber stack for task waiters. Send is fully lock-free: mpsc_push + Treiber pop for waiter wakeup. Try_receive is fully lock-free: mpsc_try_pop. Blocking receive uses condvar only in slow path (when queue empty). Mutex retained solely for POSIX condvar API compliance.
 - **Files**: `runtime/coex_channel.h`, `runtime/coex_channel.c`
 - **Status**: Fixed (2026-02-11)
+
+---
+
+### BUG-120: C runtime coex_string.c stores raw pointers in owner_handle instead of GC handles
+- **Discovered**: 2026-02-11, during Galaxian crash debugging
+- **Category**: Runtime
+- **Severity**: Critical
+- **Reproduction**: Compile galaxian.coex and run — crashes immediately at frame 2 in gc_handle_deref
+- **Observed**: SIGSEGV in coex_gc_handle_deref called from string_data. Register x0 contains a raw pointer (0x10b030338) instead of a handle index. Crash occurs when ui.render returns a string created by coex_string_from_cstring_take, which stored a raw pointer in owner_handle. Codegen's coex_string_data calls gc_handle_deref on owner_handle, expecting a GC handle.
+- **Root cause**: runtime/coex_string.c was written when arena allocation existed and owner_handle stored raw pointers via ptrtoint. After arena removal (Feb 2026), all codegen switched to treating owner_handle as a GC handle, but the C runtime was never updated.
+- **Fix**: (1) Added extern declarations for coex_gc_ptr_to_handle and coex_gc_handle_deref to coex_string.c. (2) string_create_internal now stores gc_ptr_to_handle(data_buf) in owner_handle and includes stale-pointer-across-allocation protection (saves string handle before second alloc, re-derives after). (3) coex_string_get_data now uses gc_handle_deref(owner_handle) instead of raw cast.
+- **Files**: `runtime/coex_string.c`, `runtime/coex_string.h`
+- **Status**: Fixed (2026-02-11)

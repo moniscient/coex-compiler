@@ -30,17 +30,16 @@ extern "C" {
  * CoexString - 32 byte GC-managed string structure
  *
  * Fields:
- *   owner_handle - raw pointer to data buffer (stored as i64)
+ *   owner_handle - GC handle (i64 index into handle table) for data buffer
  *   offset       - byte offset into owner's data (for slice views)
  *   len          - UTF-8 codepoint count (what .len() returns)
  *   size         - byte count of string's extent
  *
- * Note: owner_handle stores a raw pointer (via ptrtoint), not a GC handle,
- * because string data can be arena-allocated. The String struct itself is
- * GC-tracked and keeps the data buffer alive.
+ * Note: owner_handle stores a GC handle, not a raw pointer. Use
+ * coex_gc_handle_deref(owner_handle) to get the current data pointer.
  */
 typedef struct CoexString {
-    int64_t owner_handle;  /* Field 0: pointer to data buffer (as i64) */
+    int64_t owner_handle;  /* Field 0: GC handle for data buffer */
     int64_t offset;        /* Field 1: byte offset into data */
     int64_t len;           /* Field 2: UTF-8 codepoint count */
     int64_t size;          /* Field 3: byte size */

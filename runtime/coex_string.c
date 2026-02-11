@@ -16,12 +16,24 @@
 
 /*
  * GC allocation function.
- * Allocates memory on the GC heap. Uses arena allocation when available
- * (in formula context), otherwise falls back to GC allocation.
+ * Allocates memory on the GC heap.
  *
  * Returns raw pointer (i8*) suitable for C interop.
  */
 extern void* coex_gc_alloc_arena_or_gc(int64_t size, int32_t type_id);
+
+/*
+ * Get the GC handle for an object from its raw pointer.
+ * Reads the handle from the object's header forward field.
+ * Returns 0 if ptr is NULL.
+ */
+extern int64_t coex_gc_ptr_to_handle(void* ptr);
+
+/*
+ * Dereference a GC handle to get the current raw pointer.
+ * Returns NULL if handle is 0.
+ */
+extern void* coex_gc_handle_deref(int64_t handle);
 
 /* ========================================================================
  * Internal Helpers
@@ -89,14 +101,23 @@ static CoexString* string_create_internal(const char* data, size_t byte_len) {
         return NULL;
     }
 
+    /* Save handle for str BEFORE second allocation.
+     * The second GC allocation can trigger compaction, moving str. */
+    int64_t str_handle = coex_gc_ptr_to_handle(str);
+
     /* Allocate data buffer (byte_len + 1 for null terminator) */
     size_t alloc_size = byte_len + 1;
     char* data_buf = (char*)coex_gc_alloc_arena_or_gc(
         (int64_t)alloc_size, GC_TYPE_STRING_DATA);
     if (!data_buf) {
-        /* Note: str is GC-managed, will be collected eventually */
         return NULL;
     }
+
+    /* Re-derive str pointer — second alloc may have triggered compaction */
+    str = (CoexString*)coex_gc_handle_deref(str_handle);
+
+    /* Get handle for data buffer */
+    int64_t data_handle = coex_gc_ptr_to_handle(data_buf);
 
     /* Copy data */
     if (byte_len > 0) {
@@ -108,8 +129,8 @@ static CoexString* string_create_internal(const char* data, size_t byte_len) {
     /* Count UTF-8 codepoints */
     int64_t codepoint_count = coex_utf8_codepoint_count(data, byte_len);
 
-    /* Initialize String struct */
-    str->owner_handle = (int64_t)(uintptr_t)data_buf;  /* Store pointer as i64 */
+    /* Initialize String struct — owner_handle stores GC handle, not raw pointer */
+    str->owner_handle = data_handle;
     str->offset = 0;
     str->len = codepoint_count;
     str->size = (int64_t)byte_len;
@@ -162,8 +183,8 @@ const char* coex_string_get_data(const CoexString* str) {
         return NULL;
     }
 
-    /* Get data pointer from owner_handle and apply offset */
-    char* base = (char*)(uintptr_t)str->owner_handle;
+    /* Get data pointer from owner_handle (GC handle) and apply offset */
+    char* base = (char*)coex_gc_handle_deref(str->owner_handle);
     return base + str->offset;
 }
 
