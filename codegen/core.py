@@ -586,6 +586,17 @@ class CodeGenerator:
         """Delegate to ConversionGenerator."""
         return self._conversions.is_collection_coex_type(coex_type)
 
+    def _get_struct_for_type_id_const(self, type_id_int: int):
+        """Map a known TYPE_ID constant to the corresponding LLVM struct type."""
+        mapping = {
+            self.gc.TYPE_LIST: self.list_struct,
+            self.gc.TYPE_STRING: self.string_struct,
+            self.gc.TYPE_MAP: self.map_struct,
+            self.gc.TYPE_SET: self.set_struct,
+            self.gc.TYPE_ARRAY: self.array_struct,
+        }
+        return mapping.get(type_id_int)
+
     def _get_receiver_type(self, expr: Expr) -> Optional[Type]:
         """Delegate to ConversionGenerator."""
         return self._conversions.get_receiver_type(expr)

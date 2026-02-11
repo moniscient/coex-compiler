@@ -9123,6 +9123,20 @@ class GarbageCollector:
 
         builder.ret_void()
 
+    def get_runtime_type_id(self, builder, obj_ptr):
+        """Load TYPE_ID (i64) from a GC object's header at runtime.
+
+        obj_ptr: i8* pointing to the start of the object body (after header).
+        Returns i64 type_id from header field 1 (offset 8).
+        """
+        obj_int = builder.ptrtoint(obj_ptr, self.i64)
+        header_int = builder.sub(obj_int, ir.Constant(self.i64, self.HEADER_SIZE))
+        header_ptr = builder.inttoptr(header_int, self.header_type.as_pointer())
+        type_id_ptr = builder.gep(header_ptr, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)
+        ], inbounds=True)
+        return builder.load(type_id_ptr)
+
     def _implement_gc_ptr_to_handle(self):
         """Get the handle for an object from its pointer.
 

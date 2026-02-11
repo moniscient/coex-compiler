@@ -884,17 +884,10 @@ class JsonGenerator:
         """Helper: Get type_id from JSON object's GC header.
 
         Returns the type_id (i64) from the object header at ptr - HEADER_SIZE.
+        Delegates to the shared GC helper.
         """
-        cg = self.cg
-        i32 = ir.IntType(32)
-        i64 = ir.IntType(64)
-
         json_i8 = builder.bitcast(json_ptr, ir.IntType(8).as_pointer())
-        json_int = builder.ptrtoint(json_i8, i64)
-        header_int = builder.sub(json_int, ir.Constant(i64, cg.gc.HEADER_SIZE))
-        header_ptr = builder.inttoptr(header_int, cg.gc.header_type.as_pointer())
-        type_id_ptr = builder.gep(header_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        return builder.load(type_id_ptr)
+        return self.cg.gc.get_runtime_type_id(builder, json_i8)
 
     def _implement_json_get_field(self):
         """Implement json_get_field(Json*, String*): get field from object, return null json if not found.

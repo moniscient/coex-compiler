@@ -523,20 +523,10 @@ class StatementGenerator:
 
             # Handle i64 values that are actually handles to heap types
             # This happens with Channel.receive() which returns handles (i64).
-            # Use the inferred Coex type to determine the correct pointer type,
-            # then dereference the handle via gc_handle_deref.
+            # Use the inferred Coex type (or type annotation fallback) to determine
+            # the correct pointer type, then dereference the handle via gc_handle_deref.
             if isinstance(init_value.type, ir.IntType) and init_value.type.width == 64:
-                target_struct = None
-                if isinstance(inferred_coex_type, ListType):
-                    target_struct = cg.list_struct
-                elif isinstance(inferred_coex_type, MapType):
-                    target_struct = cg.map_struct
-                elif isinstance(inferred_coex_type, SetType):
-                    target_struct = cg.set_struct
-                elif isinstance(inferred_coex_type, ArrayType):
-                    target_struct = cg.array_struct
-                elif isinstance(inferred_coex_type, PrimitiveType) and inferred_coex_type.name == "string":
-                    target_struct = cg.string_struct
+                target_struct = self._resolve_heap_target_struct(inferred_coex_type, stmt)
 
                 if target_struct is not None:
                     # Convert handle (i64) to typed pointer via gc_handle_deref
@@ -819,6 +809,34 @@ class StatementGenerator:
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
+
+    def _resolve_heap_target_struct(self, inferred_coex_type, stmt):
+        """Resolve LLVM struct type for a heap object handle.
+
+        Tries: (1) inferred Coex type from initializer expression,
+               (2) explicit type annotation on the variable declaration.
+        """
+        cg = self.cg
+        coex_type = inferred_coex_type
+
+        # Fallback: use explicit type annotation if inference didn't produce a type
+        if coex_type is None and hasattr(stmt, 'type_annotation') and stmt.type_annotation:
+            coex_type = stmt.type_annotation
+
+        if coex_type is None:
+            return None
+
+        if isinstance(coex_type, ListType):
+            return cg.list_struct
+        elif isinstance(coex_type, MapType):
+            return cg.map_struct
+        elif isinstance(coex_type, SetType):
+            return cg.set_struct
+        elif isinstance(coex_type, ArrayType):
+            return cg.array_struct
+        elif isinstance(coex_type, PrimitiveType) and coex_type.name == "string":
+            return cg.string_struct
+        return None
 
     def _infer_coex_type_from_initializer(self, stmt: VarDecl):
         """Infer Coex type from initializer expression"""
