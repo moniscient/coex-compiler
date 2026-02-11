@@ -6069,9 +6069,17 @@ class GarbageCollector:
 
         # Allocate TLAB buffer via mmap
         # mmap(NULL, TLAB_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+        # Platform-specific mmap flags:
+        #   macOS: MAP_ANON = 0x1000, MAP_PRIVATE = 0x0002 → 0x1002
+        #   Linux: MAP_ANON = 0x0020, MAP_PRIVATE = 0x0002 → 0x0022
+        import sys
+        if sys.platform == 'darwin':
+            tlab_mmap_flags = 0x1002  # MAP_PRIVATE | MAP_ANON (macOS)
+        else:
+            tlab_mmap_flags = 0x0022  # MAP_PRIVATE | MAP_ANONYMOUS (Linux)
         tlab_size = ir.Constant(self.i64, self.TLAB_SIZE)
         prot = ir.Constant(self.i32, 3)  # PROT_READ | PROT_WRITE
-        flags = ir.Constant(self.i32, 0x1002)  # MAP_PRIVATE | MAP_ANON (macOS)
+        flags = ir.Constant(self.i32, tlab_mmap_flags)
         fd = ir.Constant(self.i32, -1)
         offset = ir.Constant(self.i64, 0)
 
@@ -6309,9 +6317,17 @@ class GarbageCollector:
         thread_entry_typed = thread_entry  # Already correctly typed
 
         # Allocate new TLAB buffer via mmap
+        # Platform-specific mmap flags:
+        #   macOS: MAP_ANON = 0x1000, MAP_PRIVATE = 0x0002 → 0x1002
+        #   Linux: MAP_ANON = 0x0020, MAP_PRIVATE = 0x0002 → 0x0022
+        import sys
+        if sys.platform == 'darwin':
+            refill_mmap_flags = 0x1002  # MAP_PRIVATE | MAP_ANON (macOS)
+        else:
+            refill_mmap_flags = 0x0022  # MAP_PRIVATE | MAP_ANONYMOUS (Linux)
         tlab_size = ir.Constant(self.i64, self.TLAB_SIZE)
         prot = ir.Constant(self.i32, 3)  # PROT_READ | PROT_WRITE
-        flags = ir.Constant(self.i32, 0x1002)  # MAP_PRIVATE | MAP_ANON (macOS)
+        flags = ir.Constant(self.i32, refill_mmap_flags)
         fd = ir.Constant(self.i32, -1)
         offset = ir.Constant(self.i64, 0)
 

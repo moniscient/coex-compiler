@@ -1949,3 +1949,15 @@ func main() -> int
 - **Fix**: Added `_build_json_from_map_expr` method that intercepts `MapExpr` in `convert_to_json` and builds JSON directly from expression entries, converting each value individually with its correct compile-time type. This bypasses the broken single-type loop in `convert_map_to_json_object`.
 - **Files**: `codegen/json_type.py`
 - **Status**: Fixed (2026-02-10)
+
+### BUG-118: Hardcoded macOS mmap flags in TLAB allocation break Linux
+- **Discovered**: 2026-02-10, during Linux CI investigation of `test_list_set_38_elements_tail_and_tree`
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run any GC stress test on Linux (e.g., `test_list_set_38_elements_tail_and_tree`)
+- **Observed**: `malloc(): unaligned fastbin chunk detected` (glibc heap corruption). All tests pass on macOS.
+- **Expected**: TLAB allocation via mmap should work on both macOS and Linux
+- **Root Cause**: `gc_tlab_init` (line 6074) and `gc_tlab_refill` (line 6314) hardcoded mmap flags to `0x1002` (macOS: MAP_PRIVATE | MAP_ANON). On Linux, `0x1002` = MAP_PRIVATE (0x0002) | MAP_EXECUTABLE (0x1000, deprecated). Missing MAP_ANONYMOUS (0x0020) causes mmap with fd=-1 to fail (MAP_FAILED). ALL TLAB allocations fail, forcing every GC object through the malloc fallback path. With all objects malloc'd instead of TLAB-allocated, GC compaction/sweep interactions with malloc'd memory cause heap corruption detected by glibc's fastbin checks. Two other mmap callsites (`gc_segment_alloc` line 5474 and `gc_compact_impl` line 9930) already had correct platform-specific flags.
+- **Fix**: Added `sys.platform` check to both `gc_tlab_init` and `gc_tlab_refill`, matching the existing pattern in `gc_segment_alloc` and `gc_compact_impl`: macOS uses 0x1002, Linux uses 0x0022.
+- **Files**: `coex_gc.py` (lines 6070-6077, 6311-6325)
+- **Status**: Fixed (2026-02-10)
