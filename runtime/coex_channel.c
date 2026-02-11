@@ -1,6 +1,9 @@
 /**
  * Coex TaskChannel Implementation
  *
+ * Lock-free MPSC (Vyukov) queue for values, lock-free Treiber stack for
+ * task waiters. Mutex retained only for blocking receive (condvar API).
+ *
  * See coex_channel.h for documentation.
  */
 
@@ -10,125 +13,74 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Initial buffer capacity (must be power of 2) */
-#define INITIAL_BUFFER_CAPACITY 16
-
 /* ============================================================================
- * Buffer Operations
+ * MPSC Queue Operations (Vyukov pattern)
+ *
+ * Lock-free, FIFO, multi-producer single-consumer.
+ * - Push: atomic_exchange on tail, then link prev->next (single CAS per push)
+ * - Pop: read head->next; if non-NULL, advance head and return value
+ *
+ * Inconsistent state window: between exchange(tail) and prev->next store,
+ * the consumer may see head->next == NULL (false empty). For blocking
+ * receive, the condvar while-loop retries. For try_receive, returning
+ * false-empty is acceptable (caller retries or suspends).
  * ============================================================================ */
 
-ChannelBuffer* channel_buffer_new(int64_t initial_capacity) {
-    ChannelBuffer* buffer = (ChannelBuffer*)malloc(sizeof(ChannelBuffer));
-    if (!buffer) return NULL;
-
-    buffer->data = (int64_t*)malloc(initial_capacity * sizeof(int64_t));
-    if (!buffer->data) {
-        free(buffer);
-        return NULL;
-    }
-
-    buffer->capacity = initial_capacity;
-    buffer->head = 0;
-    buffer->tail = 0;
-    buffer->count = 0;
-
-    return buffer;
+static void mpsc_init(TaskChannel* ch) {
+    ch->stub.value = 0;
+    atomic_store_explicit(&ch->stub.next, NULL, memory_order_relaxed);
+    atomic_store_explicit(&ch->mpsc_head, &ch->stub, memory_order_relaxed);
+    atomic_store_explicit(&ch->mpsc_tail, &ch->stub, memory_order_relaxed);
 }
 
-void channel_buffer_push(ChannelBuffer* buffer, int64_t value) {
-    /* Grow if full */
-    if (buffer->count == buffer->capacity) {
-        channel_buffer_grow(buffer);
-    }
-
-    /* Add at tail */
-    buffer->data[buffer->tail] = value;
-    buffer->tail = (buffer->tail + 1) % buffer->capacity;
-    buffer->count++;
+static void mpsc_push(TaskChannel* ch, ChannelNode* node) {
+    atomic_store_explicit(&node->next, NULL, memory_order_relaxed);
+    ChannelNode* prev = atomic_exchange_explicit(&ch->mpsc_tail, node, memory_order_acq_rel);
+    /* Linearization point: prev->next = node makes value visible to consumer */
+    atomic_store_explicit(&prev->next, node, memory_order_release);
 }
 
-int64_t channel_buffer_pop(ChannelBuffer* buffer) {
-    /* Assumes count > 0 */
-    int64_t value = buffer->data[buffer->head];
-    buffer->head = (buffer->head + 1) % buffer->capacity;
-    buffer->count--;
-    return value;
-}
-
-void channel_buffer_grow(ChannelBuffer* buffer) {
-    int64_t new_capacity = buffer->capacity * 2;
-    int64_t* new_data = (int64_t*)malloc(new_capacity * sizeof(int64_t));
-    if (!new_data) {
-        fprintf(stderr, "FATAL: Failed to grow channel buffer\n");
-        abort();
+static ChannelNode* mpsc_try_pop(TaskChannel* ch) {
+    ChannelNode* head = atomic_load_explicit(&ch->mpsc_head, memory_order_acquire);
+    ChannelNode* next = atomic_load_explicit(&head->next, memory_order_acquire);
+    if (next == NULL) {
+        return NULL;  /* Empty (or inconsistent state — producer hasn't linked yet) */
     }
-
-    /* Copy data to contiguous region starting at index 0 */
-    for (int64_t i = 0; i < buffer->count; i++) {
-        int64_t old_idx = (buffer->head + i) % buffer->capacity;
-        new_data[i] = buffer->data[old_idx];
+    /* Advance head past the sentinel to the real node */
+    atomic_store_explicit(&ch->mpsc_head, next, memory_order_release);
+    /* The old head becomes garbage (it was the previous sentinel).
+     * If it's the original stub, don't free it (it's embedded in the channel).
+     * Otherwise, free the retired sentinel. */
+    if (head != &ch->stub) {
+        free(head);
     }
-
-    free(buffer->data);
-    buffer->data = new_data;
-    buffer->capacity = new_capacity;
-    buffer->head = 0;
-    buffer->tail = buffer->count;
+    return next;
 }
 
 /* ============================================================================
- * Wait Queue Operations
+ * Waiter Stack Operations (lock-free Treiber stack)
  * ============================================================================ */
 
-ChannelWaitQueue* channel_waitqueue_new(void) {
-    ChannelWaitQueue* queue = (ChannelWaitQueue*)malloc(sizeof(ChannelWaitQueue));
-    if (!queue) return NULL;
-
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->count = 0;
-
-    return queue;
+static void waiter_push(TaskChannel* ch, ChannelWaiterNode* node) {
+    ChannelWaiterNode* old_head = atomic_load_explicit(&ch->waiter_head, memory_order_relaxed);
+    do {
+        atomic_store_explicit(&node->next, old_head, memory_order_relaxed);
+    } while (!atomic_compare_exchange_weak_explicit(
+        &ch->waiter_head, &old_head, node,
+        memory_order_release, memory_order_relaxed));
 }
 
-void channel_waitqueue_push(ChannelWaitQueue* queue, SchedulerTask* task) {
-    ChannelWaitNode* node = (ChannelWaitNode*)malloc(sizeof(ChannelWaitNode));
-    if (!node) {
-        fprintf(stderr, "FATAL: Failed to allocate wait node\n");
-        abort();
+static ChannelWaiterNode* waiter_pop(TaskChannel* ch) {
+    ChannelWaiterNode* old_head = atomic_load_explicit(&ch->waiter_head, memory_order_acquire);
+    while (old_head != NULL) {
+        ChannelWaiterNode* next = atomic_load_explicit(&old_head->next, memory_order_relaxed);
+        if (atomic_compare_exchange_weak_explicit(
+                &ch->waiter_head, &old_head, next,
+                memory_order_acquire, memory_order_relaxed)) {
+            return old_head;
+        }
     }
-
-    node->task = task;
-    node->next = NULL;
-
-    if (queue->tail == NULL) {
-        queue->head = node;
-        queue->tail = node;
-    } else {
-        queue->tail->next = node;
-        queue->tail = node;
-    }
-
-    queue->count++;
-}
-
-SchedulerTask* channel_waitqueue_pop(ChannelWaitQueue* queue) {
-    if (queue->head == NULL) {
-        return NULL;
-    }
-
-    ChannelWaitNode* node = queue->head;
-    SchedulerTask* task = node->task;
-
-    queue->head = node->next;
-    if (queue->head == NULL) {
-        queue->tail = NULL;
-    }
-
-    queue->count--;
-    free(node);
-
-    return task;
+    return NULL;
 }
 
 /* ============================================================================
@@ -141,145 +93,112 @@ TaskChannel* coex_channel_new(int64_t elem_size) {
         fprintf(stderr, "FATAL: Failed to allocate channel\n");
         abort();
     }
+    memset(channel, 0, sizeof(TaskChannel));
 
-    /* Initialize buffer */
-    ChannelBuffer* buffer = channel_buffer_new(INITIAL_BUFFER_CAPACITY);
-    if (!buffer) {
-        free(channel);
-        fprintf(stderr, "FATAL: Failed to allocate channel buffer\n");
-        abort();
-    }
-
-    /* Initialize wait queue */
-    ChannelWaitQueue* waiters = channel_waitqueue_new();
-    if (!waiters) {
-        free(buffer->data);
-        free(buffer);
-        free(channel);
-        fprintf(stderr, "FATAL: Failed to allocate wait queue\n");
-        abort();
-    }
-
-    /* Store pointers as i64 for GC compatibility */
-    channel->buffer_ptr = (int64_t)(intptr_t)buffer;
-    channel->head = 0;
-    channel->tail = 0;
-    channel->count = 0;
-    channel->waiters_ptr = (int64_t)(intptr_t)waiters;
     channel->elem_size = elem_size;
 
-    /* Initialize synchronization for func/thread callers */
-    pthread_mutex_init(&channel->sync.mutex, NULL);
-    pthread_cond_init(&channel->sync.cond, NULL);
-    atomic_store(&channel->sync.buffer_count, 0);
+    /* Initialize MPSC queue */
+    mpsc_init(channel);
+
+    /* Initialize waiter stack */
+    atomic_store_explicit(&channel->waiter_head, NULL, memory_order_relaxed);
+
+    /* Initialize blocking receive support */
+    atomic_store_explicit(&channel->blocking_count, 0, memory_order_relaxed);
+    pthread_mutex_init(&channel->block_mutex, NULL);
+    pthread_cond_init(&channel->block_cond, NULL);
 
     return channel;
 }
 
 void coex_channel_send(TaskChannel* channel, int64_t value) {
-    ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
-    ChannelWaitQueue* waiters = (ChannelWaitQueue*)(intptr_t)channel->waiters_ptr;
+    /* Allocate node and push to MPSC queue (lock-free) */
+    ChannelNode* node = (ChannelNode*)malloc(sizeof(ChannelNode));
+    if (!node) {
+        fprintf(stderr, "FATAL: Failed to allocate channel node\n");
+        abort();
+    }
+    node->value = value;
+    mpsc_push(channel, node);
 
-    /* Lock for thread-safety */
-    pthread_mutex_lock(&channel->sync.mutex);
-
-    /* Check if any task receivers are waiting */
-    if (waiters->count > 0) {
-        /* Direct handoff - wake receiver with value */
-        SchedulerTask* task = channel_waitqueue_pop(waiters);
-        if (task) {
-            /* Store value in task's resolved field */
-            task->resolved_value = value;
-
-            pthread_mutex_unlock(&channel->sync.mutex);
-
-            /* Add task back to ready queue */
-            /* Note: This requires scheduler integration */
-            coex_scheduler_ready_task(task);
-            return;
-        }
+    /* Try to wake a task waiter (lock-free Treiber stack pop) */
+    ChannelWaiterNode* waiter = waiter_pop(channel);
+    if (waiter) {
+        struct SchedulerTask* task = waiter->task;
+        free(waiter);
+        /* Re-derive value for the woken task: it will call try_receive itself
+         * after being re-scheduled. Store a sentinel so it knows to retry. */
+        coex_scheduler_ready_task(task);
+        return;
     }
 
-    /* No task waiters - buffer the value */
-    channel_buffer_push(buffer, value);
-
-    /* Update cached counts */
-    channel->count = buffer->count;
-    channel->head = buffer->head;
-    channel->tail = buffer->tail;
-
-    /* Update atomic count and signal waiting threads/funcs */
-    atomic_store(&channel->sync.buffer_count, buffer->count);
-    pthread_cond_signal(&channel->sync.cond);
-
-    pthread_mutex_unlock(&channel->sync.mutex);
+    /* No task waiters — check if any blocking threads are waiting */
+    if (atomic_load_explicit(&channel->blocking_count, memory_order_acquire) > 0) {
+        pthread_mutex_lock(&channel->block_mutex);
+        pthread_cond_signal(&channel->block_cond);
+        pthread_mutex_unlock(&channel->block_mutex);
+    }
 }
 
 int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value) {
-    ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
-
-    /* Lock for thread-safe access */
-    pthread_mutex_lock(&channel->sync.mutex);
-
-    if (buffer->count > 0) {
-        /* Data available - return immediately */
-        *out_value = channel_buffer_pop(buffer);
-
-        /* Update cached counts */
-        channel->count = buffer->count;
-        channel->head = buffer->head;
-        channel->tail = buffer->tail;
-        atomic_store(&channel->sync.buffer_count, buffer->count);
-
-        pthread_mutex_unlock(&channel->sync.mutex);
+    /* Lock-free pop from MPSC queue */
+    ChannelNode* node = mpsc_try_pop(channel);
+    if (node) {
+        *out_value = node->value;
+        /* node is now the new head sentinel — do not free it.
+         * mpsc_try_pop sets head = next and frees old head.
+         * The returned node's value field has the data we want. */
         return 0;  /* Success */
     }
-
-    pthread_mutex_unlock(&channel->sync.mutex);
-    /* No data - caller should suspend */
-    return -1;  /* Should suspend */
+    return -1;  /* Empty — caller should suspend */
 }
 
 int64_t coex_channel_receive(TaskChannel* channel) {
-    ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
-
-    /* Lock for thread-safe access */
-    pthread_mutex_lock(&channel->sync.mutex);
-
-    /* Wait for data using condition variable */
-    while (buffer->count == 0) {
-        /* Block on condvar - releases mutex while waiting, reacquires on wake */
-        pthread_cond_wait(&channel->sync.cond, &channel->sync.mutex);
+    /* Fast path: lock-free try */
+    int64_t value;
+    if (coex_channel_try_receive(channel, &value) == 0) {
+        return value;
     }
 
-    int64_t value = channel_buffer_pop(buffer);
+    /* Slow path: block on condvar */
+    pthread_mutex_lock(&channel->block_mutex);
+    atomic_fetch_add_explicit(&channel->blocking_count, 1, memory_order_release);
 
-    /* Update cached counts */
-    channel->count = buffer->count;
-    channel->head = buffer->head;
-    channel->tail = buffer->tail;
-    atomic_store(&channel->sync.buffer_count, buffer->count);
+    while (coex_channel_try_receive(channel, &value) != 0) {
+        pthread_cond_wait(&channel->block_cond, &channel->block_mutex);
+    }
 
-    pthread_mutex_unlock(&channel->sync.mutex);
+    atomic_fetch_sub_explicit(&channel->blocking_count, 1, memory_order_release);
+    pthread_mutex_unlock(&channel->block_mutex);
 
     return value;
 }
 
 void coex_channel_add_waiter(TaskChannel* channel, SchedulerTask* task) {
-    ChannelWaitQueue* waiters = (ChannelWaitQueue*)(intptr_t)channel->waiters_ptr;
-
-    /* Lock for thread-safe access to wait queue */
-    pthread_mutex_lock(&channel->sync.mutex);
-    channel_waitqueue_push(waiters, task);
-    pthread_mutex_unlock(&channel->sync.mutex);
+    /* Lock-free Treiber stack push */
+    ChannelWaiterNode* node = (ChannelWaiterNode*)malloc(sizeof(ChannelWaiterNode));
+    if (!node) {
+        fprintf(stderr, "FATAL: Failed to allocate waiter node\n");
+        abort();
+    }
+    node->task = task;
+    waiter_push(channel, node);
 }
 
 SchedulerTask* coex_channel_wake_waiter(TaskChannel* channel) {
-    ChannelWaitQueue* waiters = (ChannelWaitQueue*)(intptr_t)channel->waiters_ptr;
-    return channel_waitqueue_pop(waiters);
+    /* Lock-free Treiber stack pop */
+    ChannelWaiterNode* node = waiter_pop(channel);
+    if (node) {
+        SchedulerTask* task = node->task;
+        free(node);
+        return task;
+    }
+    return NULL;
 }
 
 int64_t coex_channel_buffer_count(TaskChannel* channel) {
-    ChannelBuffer* buffer = (ChannelBuffer*)(intptr_t)channel->buffer_ptr;
-    return buffer->count;
+    /* Approximate: check if MPSC queue has any data */
+    ChannelNode* head = atomic_load_explicit(&channel->mpsc_head, memory_order_acquire);
+    ChannelNode* next = atomic_load_explicit(&head->next, memory_order_acquire);
+    return (next != NULL) ? 1 : 0;  /* Approximate — only indicates non-empty */
 }

@@ -1,14 +1,14 @@
 /**
  * Coex TaskChannel - Lightweight channels for task-to-task communication
  *
- * TaskChannels use scheduler-managed wait queues with no mutex overhead.
- * They are designed for task-to-task communication within the work-stealing scheduler.
+ * Lock-free MPSC (Vyukov) queue for values, lock-free Treiber stack for
+ * task waiters. Mutex retained only for blocking receive (condvar API).
  *
  * Features:
  * - Unbounded buffer (send never blocks)
  * - FIFO order preserved
  * - Receive suspends task if buffer empty
- * - GC-managed memory
+ * - Lock-free send and try_receive
  */
 
 #ifndef COEX_CHANNEL_H
@@ -23,71 +23,55 @@
 struct SchedulerTask;
 
 /* ============================================================================
- * Channel Data Structures
+ * Lock-Free Channel Data Structures
  * ============================================================================ */
 
 /**
- * Wait node for tasks blocked on channel receive.
+ * Node for lock-free MPSC value queue (Vyukov pattern).
  */
-typedef struct ChannelWaitNode {
-    struct SchedulerTask* task;         /* Waiting task */
-    struct ChannelWaitNode* next;       /* Next in queue */
-} ChannelWaitNode;
+typedef struct ChannelNode {
+    int64_t value;
+    struct ChannelNode* _Atomic next;
+} ChannelNode;
 
 /**
- * Wait queue for blocked receivers.
+ * Lock-free waiter node (Treiber stack).
  */
-typedef struct {
-    ChannelWaitNode* head;              /* First waiter */
-    ChannelWaitNode* tail;              /* Last waiter */
-    int64_t count;                      /* Number of waiters */
-} ChannelWaitQueue;
-
-/**
- * Ring buffer for channel values.
- * Grows dynamically as needed.
- */
-typedef struct {
-    int64_t* data;                      /* Circular buffer of i64 values */
-    int64_t capacity;                   /* Current capacity */
-    int64_t head;                       /* Read position */
-    int64_t tail;                       /* Write position */
-    int64_t count;                      /* Current item count */
-} ChannelBuffer;
-
-/**
- * Channel synchronization for thread/func callers.
- * Uses mutex + condition variable for proper blocking.
- */
-typedef struct {
-    pthread_mutex_t mutex;              /* Protects buffer and count */
-    pthread_cond_t cond;                /* Signals when data available */
-    atomic_int_fast64_t buffer_count;   /* Atomic count for non-blocking check */
-} ChannelSync;
+typedef struct ChannelWaiterNode {
+    struct SchedulerTask* task;
+    struct ChannelWaiterNode* _Atomic next;
+} ChannelWaiterNode;
 
 /**
  * TaskChannel structure.
  *
- * Layout (48 bytes, 6 i64 fields for GC compatibility):
- *   [0] buffer_ptr    - Pointer to ChannelBuffer (stored as i64)
- *   [1] head          - Cached read position for fast access
- *   [2] tail          - Cached write position for fast access
- *   [3] count         - Cached item count for fast access
- *   [4] waiters_ptr   - Pointer to ChannelWaitQueue (traced by GC)
- *   [5] elem_size     - Size of each element (currently always 8 for i64)
+ * Layout: first 6 i64 fields for GC/codegen compatibility (opaque access).
+ * The MPSC queue, waiter stack, and blocking condvar follow.
  *
- * NOTE: ChannelSync is stored immediately after the 6-field struct
- * for thread/func synchronization. The GC only sees the first 6 fields.
+ * Codegen treats channels as opaque pointers — all access goes through
+ * C runtime functions (coex_channel_send, etc.). No GEP into fields.
  */
 typedef struct {
-    int64_t buffer_ptr;                 /* Pointer stored as i64 */
-    int64_t head;                       /* Cached head position */
-    int64_t tail;                       /* Cached tail position */
-    int64_t count;                      /* Cached item count */
-    int64_t waiters_ptr;                /* Wait queue pointer as i64 */
+    /* --- 6 i64 fields for codegen struct compatibility --- */
+    int64_t _reserved0;                 /* Unused (legacy buffer_ptr) */
+    int64_t _reserved1;                 /* Unused (legacy head) */
+    int64_t _reserved2;                 /* Unused (legacy tail) */
+    int64_t _reserved3;                 /* Unused (legacy count) */
+    int64_t _reserved4;                 /* Unused (legacy waiters_ptr) */
     int64_t elem_size;                  /* Element size (8 for all types via handles) */
-    /* Extended fields for thread synchronization (not seen by GC) */
-    ChannelSync sync;                   /* Mutex/condvar for func/thread callers */
+
+    /* --- Lock-free MPSC value queue (Vyukov) --- */
+    ChannelNode stub;                   /* Sentinel node (never dequeued) */
+    ChannelNode* _Atomic mpsc_head;     /* Consumer reads here */
+    ChannelNode* _Atomic mpsc_tail;     /* Producers append here */
+
+    /* --- Lock-free task waiter stack (Treiber) --- */
+    ChannelWaiterNode* _Atomic waiter_head;
+
+    /* --- Blocking receive support (condvar requires mutex) --- */
+    atomic_int_fast64_t blocking_count; /* Number of threads blocked in receive */
+    pthread_mutex_t block_mutex;        /* Only for condvar API compliance */
+    pthread_cond_t block_cond;          /* Only for blocking receive */
 } TaskChannel;
 
 /* ============================================================================
@@ -103,9 +87,10 @@ typedef struct {
 TaskChannel* coex_channel_new(int64_t elem_size);
 
 /**
- * Send a value to the channel.
+ * Send a value to the channel (lock-free).
  * Never blocks - unbounded buffer grows as needed.
- * If receivers are waiting, wakes exactly one.
+ * If task receivers are waiting, wakes exactly one via Treiber stack.
+ * If blocking receivers exist, signals condvar.
  *
  * @param channel    Channel to send to
  * @param value      Value to send (as i64)
@@ -113,7 +98,7 @@ TaskChannel* coex_channel_new(int64_t elem_size);
 void coex_channel_send(TaskChannel* channel, int64_t value);
 
 /**
- * Try to receive a value from the channel.
+ * Try to receive a value from the channel (lock-free).
  * If buffer has data, returns immediately.
  * If buffer empty, returns -1 to indicate task should suspend.
  *
@@ -126,6 +111,7 @@ int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value);
 /**
  * Receive a value from the channel (blocking).
  * For use from func/thread context only.
+ * Uses condvar for blocking; fast path is lock-free.
  *
  * @param channel    Channel to receive from
  * @return           Received value
@@ -133,7 +119,7 @@ int64_t coex_channel_try_receive(TaskChannel* channel, int64_t* out_value);
 int64_t coex_channel_receive(TaskChannel* channel);
 
 /**
- * Add a task to the wait queue.
+ * Add a task to the wait queue (lock-free Treiber stack push).
  * Called by scheduler when task suspends on receive.
  *
  * @param channel    Channel with wait queue
@@ -142,7 +128,7 @@ int64_t coex_channel_receive(TaskChannel* channel);
 void coex_channel_add_waiter(TaskChannel* channel, struct SchedulerTask* task);
 
 /**
- * Try to wake a waiting receiver.
+ * Try to wake a waiting receiver (lock-free Treiber stack pop).
  * Called after send adds value to buffer.
  *
  * @param channel    Channel with wait queue
@@ -151,54 +137,12 @@ void coex_channel_add_waiter(TaskChannel* channel, struct SchedulerTask* task);
 struct SchedulerTask* coex_channel_wake_waiter(TaskChannel* channel);
 
 /**
- * Get buffer count (for checking if data available).
+ * Get approximate buffer count.
+ * Not exact due to lock-free access; sufficient for heuristics.
  *
  * @param channel    Channel to check
- * @return           Number of items in buffer
+ * @return           Approximate number of items in buffer
  */
 int64_t coex_channel_buffer_count(TaskChannel* channel);
-
-/* ============================================================================
- * Buffer Operations (internal)
- * ============================================================================ */
-
-/**
- * Initialize channel buffer with given capacity.
- */
-ChannelBuffer* channel_buffer_new(int64_t initial_capacity);
-
-/**
- * Push value to buffer, growing if needed.
- */
-void channel_buffer_push(ChannelBuffer* buffer, int64_t value);
-
-/**
- * Pop value from buffer (assumes count > 0).
- */
-int64_t channel_buffer_pop(ChannelBuffer* buffer);
-
-/**
- * Grow buffer to double capacity.
- */
-void channel_buffer_grow(ChannelBuffer* buffer);
-
-/* ============================================================================
- * Wait Queue Operations (internal)
- * ============================================================================ */
-
-/**
- * Initialize wait queue.
- */
-ChannelWaitQueue* channel_waitqueue_new(void);
-
-/**
- * Add task to wait queue.
- */
-void channel_waitqueue_push(ChannelWaitQueue* queue, struct SchedulerTask* task);
-
-/**
- * Remove and return first task from queue.
- */
-struct SchedulerTask* channel_waitqueue_pop(ChannelWaitQueue* queue);
 
 #endif /* COEX_CHANNEL_H */

@@ -23,7 +23,7 @@ extern void coex_gc_unregister_thread(void);
 
 static atomic_bool scheduler_initialized = false;
 static atomic_bool scheduler_shutdown_flag = false;
-static pthread_mutex_t scheduler_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t scheduler_init_once = PTHREAD_ONCE_INIT;
 
 static int worker_count = 0;
 static pthread_t workers[SCHEDULER_MAX_WORKERS];
@@ -34,13 +34,39 @@ static pthread_mutex_t parking_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t parking_cond = PTHREAD_COND_INITIALIZER;
 static atomic_int parked_workers = 0;
 
-/* Global queue for tasks from main thread */
-static Deque global_queue;
-static pthread_mutex_t global_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Global queue for tasks from main thread (lock-free Treiber stack) */
+static SchedulerTask* _Atomic global_stack_head = NULL;
 
 /* Statistics */
 static atomic_uint_fast64_t tasks_executed = 0;
 static atomic_uint_fast64_t tasks_stolen = 0;
+
+/* ============================================================================
+ * Lock-Free Treiber Stack (Global Queue)
+ * ============================================================================ */
+
+static void global_stack_push(SchedulerTask* task) {
+    SchedulerTask* old_head = atomic_load_explicit(&global_stack_head, memory_order_relaxed);
+    do {
+        atomic_store_explicit(&task->next, old_head, memory_order_relaxed);
+    } while (!atomic_compare_exchange_weak_explicit(
+        &global_stack_head, &old_head, task,
+        memory_order_release, memory_order_relaxed));
+}
+
+static SchedulerTask* global_stack_pop(void) {
+    SchedulerTask* old_head = atomic_load_explicit(&global_stack_head, memory_order_acquire);
+    while (old_head != NULL) {
+        SchedulerTask* next = atomic_load_explicit(&old_head->next, memory_order_relaxed);
+        if (atomic_compare_exchange_weak_explicit(
+                &global_stack_head, &old_head, next,
+                memory_order_acquire, memory_order_relaxed)) {
+            atomic_store_explicit(&old_head->next, NULL, memory_order_relaxed);
+            return old_head;
+        }
+    }
+    return NULL;
+}
 
 /* ============================================================================
  * Chase-Lev Deque Implementation
@@ -67,13 +93,11 @@ void deque_init(Deque* dq) {
     DequeBuffer* buf = deque_buffer_alloc(DEQUE_INITIAL_CAPACITY);
     atomic_store(&dq->buffer, (uintptr_t)buf);
     dq->capacity = DEQUE_INITIAL_CAPACITY;
-    pthread_mutex_init(&dq->resize_lock, NULL);
 }
 
 void deque_destroy(Deque* dq) {
     DequeBuffer* buf = (DequeBuffer*)atomic_load(&dq->buffer);
     if (buf) free(buf);
-    pthread_mutex_destroy(&dq->resize_lock);
 }
 
 /* Grow the deque buffer (called under resize_lock) */
@@ -103,12 +127,10 @@ void deque_push_bottom(Deque* dq, SchedulerTask* task) {
     int64_t t = atomic_load_explicit(&dq->top, memory_order_acquire);
     DequeBuffer* buf = (DequeBuffer*)atomic_load_explicit(&dq->buffer, memory_order_relaxed);
 
-    /* Check if we need to grow */
+    /* Check if we need to grow (only owner calls push_bottom, no lock needed) */
     if (b - t >= buf->capacity - 1) {
-        pthread_mutex_lock(&dq->resize_lock);
         deque_grow(dq);
-        buf = (DequeBuffer*)atomic_load(&dq->buffer);
-        pthread_mutex_unlock(&dq->resize_lock);
+        buf = (DequeBuffer*)atomic_load_explicit(&dq->buffer, memory_order_acquire);
     }
 
     buf->tasks[b % buf->capacity] = task;
@@ -205,10 +227,8 @@ static void park_worker(int worker_id) {
 
 /* Try to steal from other workers */
 static SchedulerTask* try_steal(int worker_id) {
-    /* Try global queue first */
-    pthread_mutex_lock(&global_queue_mutex);
-    SchedulerTask* task = deque_steal(&global_queue);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Try global queue first (lock-free Treiber stack) */
+    SchedulerTask* task = global_stack_pop();
     if (task) {
         atomic_fetch_add(&tasks_stolen, 1);
         return task;
@@ -471,42 +491,40 @@ static void handle_most_completion(SchedulerTask* task, int64_t value) {
  * Scheduler Lifecycle
  * ============================================================================ */
 
+static void scheduler_do_init(void) {
+    /* Determine worker count: match physical cores */
+    int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+    worker_count = cores;
+    if (worker_count > SCHEDULER_MAX_WORKERS) {
+        worker_count = SCHEDULER_MAX_WORKERS;
+    }
+
+    /* Global queue is a lock-free Treiber stack (initialized statically) */
+
+    /* Initialize worker deques */
+    for (int i = 0; i < worker_count; i++) {
+        deque_init(&worker_deques[i]);
+    }
+
+    /* Spawn worker threads */
+    for (int i = 0; i < worker_count; i++) {
+        int rc = pthread_create(&workers[i], NULL,
+                                coex_scheduler_worker_loop,
+                                (void*)(intptr_t)i);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to create worker %d: %s\n", i, strerror(rc));
+        }
+    }
+
+    atomic_store_explicit(&scheduler_initialized, true, memory_order_release);
+}
+
 void coex_scheduler_ensure_init(void) {
-    if (atomic_load(&scheduler_initialized)) {
+    if (atomic_load_explicit(&scheduler_initialized, memory_order_acquire)) {
         return;
     }
-
-    pthread_mutex_lock(&scheduler_init_mutex);
-    if (!atomic_load(&scheduler_initialized)) {
-        /* Determine worker count: match physical cores */
-        int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
-        if (cores < 1) cores = 1;
-        worker_count = cores;
-        if (worker_count > SCHEDULER_MAX_WORKERS) {
-            worker_count = SCHEDULER_MAX_WORKERS;
-        }
-
-        /* Initialize global queue */
-        deque_init(&global_queue);
-
-        /* Initialize worker deques */
-        for (int i = 0; i < worker_count; i++) {
-            deque_init(&worker_deques[i]);
-        }
-
-        /* Spawn worker threads */
-        for (int i = 0; i < worker_count; i++) {
-            int rc = pthread_create(&workers[i], NULL,
-                                    coex_scheduler_worker_loop,
-                                    (void*)(intptr_t)i);
-            if (rc != 0) {
-                fprintf(stderr, "Failed to create worker %d: %s\n", i, strerror(rc));
-            }
-        }
-
-        atomic_store(&scheduler_initialized, true);
-    }
-    pthread_mutex_unlock(&scheduler_init_mutex);
+    pthread_once(&scheduler_init_once, scheduler_do_init);
 }
 
 bool coex_scheduler_is_initialized(void) {
@@ -531,8 +549,7 @@ void coex_scheduler_shutdown(void) {
         pthread_join(workers[i], NULL);
     }
 
-    /* Cleanup deques */
-    deque_destroy(&global_queue);
+    /* Cleanup worker deques (global queue is a Treiber stack, no cleanup needed) */
     for (int i = 0; i < worker_count; i++) {
         deque_destroy(&worker_deques[i]);
     }
@@ -566,10 +583,8 @@ int64_t coex_scheduler_spawn_and_wait(void* frame, StepFunction step_fn) {
     task->main_result = &result;
     task->main_done = &done;
 
-    /* Submit to global queue */
-    pthread_mutex_lock(&global_queue_mutex);
-    deque_push_bottom(&global_queue, task);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Submit to global queue (lock-free) */
+    global_stack_push(task);
 
     /* Wake a worker */
     wake_one_worker();
@@ -603,10 +618,8 @@ SchedulerTask* coex_scheduler_spawn_child(void* frame, StepFunction step_fn,
 }
 
 void coex_scheduler_ready_task(SchedulerTask* task) {
-    /* Add task to global queue and wake a worker */
-    pthread_mutex_lock(&global_queue_mutex);
-    deque_push_bottom(&global_queue, task);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Add task to global queue (lock-free) and wake a worker */
+    global_stack_push(task);
     wake_one_worker();
 }
 
@@ -634,10 +647,8 @@ SchedulerTask* coex_scheduler_spawn_async(void* frame, StepFunction step_fn) {
     *task->main_result = 0;
     atomic_store(task->main_done, false);
 
-    /* Submit to global queue */
-    pthread_mutex_lock(&global_queue_mutex);
-    deque_push_bottom(&global_queue, task);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Submit to global queue (lock-free) */
+    global_stack_push(task);
 
     /* Wake a worker */
     wake_one_worker();
@@ -719,10 +730,8 @@ void coex_scheduler_first_spawn_task(FirstContext* ctx, int64_t index,
     /* Store in context for cancellation */
     ctx->tasks[index] = task;
 
-    /* Submit to global queue (don't wake yet - batch wake in first_wait) */
-    pthread_mutex_lock(&global_queue_mutex);
-    deque_push_bottom(&global_queue, task);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Submit to global queue (lock-free, don't wake yet - batch wake in first_wait) */
+    global_stack_push(task);
 }
 
 int64_t coex_scheduler_first_wait(FirstContext* ctx) {
@@ -791,10 +800,8 @@ void coex_scheduler_most_spawn_task(MostContext* ctx,
     task->completion_type = COMPLETION_MOST;
     task->completion_index = 0;  /* Not used for most */
 
-    /* Submit to global queue (don't wake yet - batch wake in most_wait) */
-    pthread_mutex_lock(&global_queue_mutex);
-    deque_push_bottom(&global_queue, task);
-    pthread_mutex_unlock(&global_queue_mutex);
+    /* Submit to global queue (lock-free, don't wake yet - batch wake in most_wait) */
+    global_stack_push(task);
 }
 
 void coex_scheduler_most_wait(MostContext* ctx,

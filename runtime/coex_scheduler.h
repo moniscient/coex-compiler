@@ -58,6 +58,7 @@ typedef struct SchedulerTask {
     struct SchedulerTask* waiter;     /* Parent task to wake on completion */
     _Atomic int64_t resolved_value;   /* Value from completed subtask (atomic for visibility) */
     atomic_bool cancelled;            /* Cancellation flag */
+    struct SchedulerTask* _Atomic next; /* Treiber stack link for global queue */
 
     /* For main thread waiting */
     pthread_mutex_t* main_mutex;      /* Non-null if main is waiting */
@@ -77,7 +78,6 @@ typedef struct {
     atomic_int_fast64_t bottom;       /* Push/pop here (owner) */
     atomic_uintptr_t buffer;          /* Pointer to circular buffer */
     int64_t capacity;                 /* Current capacity */
-    pthread_mutex_t resize_lock;      /* Lock for buffer resize */
 } Deque;
 
 /**

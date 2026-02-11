@@ -4,6 +4,16 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-093: Replace compile-time type inference with runtime TYPE_ID lookup where appropriate
+- **Discovered**: 2026-02-04, during Channel fix discussion
+- **Category**: Codegen
+- **Severity**: Medium
+- **Fix**: Added shared `get_runtime_type_id()` helper to `GarbageCollector` class in `coex_gc.py`. Refactored `json_type.py:_get_json_type_id()` to delegate to shared helper. Extracted `_resolve_heap_target_struct()` in `statements.py` with type annotation fallback when compile-time inference fails. Added `_get_struct_for_type_id_const()` mapping in `core.py` for future runtime dispatch.
+- **Files**: `coex_gc.py`, `codegen/json_type.py`, `codegen/statements.py`, `codegen/core.py`
+- **Status**: Fixed (2026-02-10)
+
+---
+
 ### BUG-115: JSON codegen stale-pointer-across-allocation bugs (9 sites)
 - **Discovered**: 2026-02-10, during json_type.py audit
 - **Category**: Codegen/GC
@@ -1971,4 +1981,44 @@ func main() -> int
 - **Root Cause**: `string_new` takes a raw `data` pointer (i8*), then does two GC allocations (string struct + data buffer). Either allocation can trigger GC+compaction, moving data's TLAB. The raw pointer becomes invalid. Additionally, `string_new` can be called with null data (empty string), so gc_ptr_to_handle needs a null guard.
 - **Fix**: (1) string_new: branch on null check, save data handle via gc_ptr_to_handle for non-null, phi merge, re-derive after allocations. (2) string_from_literal: save string struct handle, re-derive after data buffer allocation. (3) string_setrange: re-derive orig_data and source_data handles after allocation.
 - **Files**: `codegen/strings.py` (string_new, string_from_literal, string_setrange)
+- **Status**: Fixed (2026-02-11)
+
+### BUG-033: Scheduler initialization uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Reproduction**: Scheduler lazy initialization via `coex_scheduler_ensure_init()`
+- **Observed**: Uses `scheduler_init_mutex` (pthread_mutex) at `coex_scheduler.c:26`
+- **Fix**: Replaced double-checked locking with `pthread_once`. Extracted init body into `scheduler_do_init()`, replaced mutex with `pthread_once_t scheduler_init_once`. Fast path: acquire load of `scheduler_initialized` returns immediately.
+- **Files**: `runtime/coex_scheduler.c`
+- **Status**: Fixed (2026-02-11)
+
+### BUG-035: Global work queue uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Medium
+- **Reproduction**: Tasks submitted from main thread use global queue
+- **Observed**: Uses `global_queue_mutex` at `coex_scheduler.c:39`
+- **Fix**: Replaced global Chase-Lev deque + mutex with lock-free Treiber stack. Added `next` field to `SchedulerTask` struct. `global_stack_push()` uses CAS loop; `global_stack_pop()` uses CAS loop. Updated all 6 call sites: spawn_and_wait, ready_task, spawn_async, first_spawn_task, most_spawn_task, try_steal.
+- **Files**: `runtime/coex_scheduler.h`, `runtime/coex_scheduler.c`
+- **Status**: Fixed (2026-02-11)
+
+### BUG-036: Deque resize uses lock
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Low
+- **Reproduction**: Chase-Lev deque grows when full
+- **Observed**: Uses `resize_lock` in Deque struct at `coex_scheduler.h:80`
+- **Fix**: Removed `resize_lock` from Deque struct and all init/destroy/usage. Only the owner thread calls `deque_push_bottom`, so no lock needed. Stealers load buffer pointer atomically; old buffers are intentionally leaked (safe for concurrent stealers). Post-grow buffer reload uses `memory_order_acquire`.
+- **Files**: `runtime/coex_scheduler.h`, `runtime/coex_scheduler.c`
+- **Status**: Fixed (2026-02-11)
+
+### BUG-042: Channel synchronization uses mutex
+- **Discovered**: 2026-01-18, during lock audit
+- **Category**: Runtime
+- **Severity**: Medium
+- **Reproduction**: Channels used from func/thread context
+- **Observed**: Uses `mutex` + `cond` in ChannelSync for all operations including send and try_receive
+- **Fix**: Replaced ring buffer + mutex with Vyukov MPSC queue (lock-free FIFO) for values and Treiber stack for task waiters. Send is fully lock-free: mpsc_push + Treiber pop for waiter wakeup. Try_receive is fully lock-free: mpsc_try_pop. Blocking receive uses condvar only in slow path (when queue empty). Mutex retained solely for POSIX condvar API compliance.
+- **Files**: `runtime/coex_channel.h`, `runtime/coex_channel.c`
 - **Status**: Fixed (2026-02-11)
