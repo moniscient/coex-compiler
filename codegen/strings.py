@@ -319,11 +319,16 @@ class StringGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
+        # Save data handle before allocations (data is a GC-allocated buffer)
+        # BUG-118b: data pointer goes stale if allocations below trigger GC+compaction
+        data_handle = builder.call(cg.gc.gc_ptr_to_handle, [data])
+
         # Allocate String struct (32 bytes) via GC
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         string_raw = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        string_ptr = builder.bitcast(string_raw, cg.string_struct.as_pointer())
+        # Save string handle for re-derivation after second allocation
+        string_handle = builder.call(cg.gc.gc_ptr_to_handle, [string_raw])
 
         # Allocate data buffer via GC
         # BUG-019: Allocate size+1 for C interop null terminator
@@ -331,11 +336,18 @@ class StringGenerator:
         alloc_size = builder.add(byte_len, ir.Constant(i64, 1))
         data_raw = cg.gc.alloc_arena_or_gc(builder, alloc_size, data_type_id)
 
+        # Re-derive source data pointer (may have moved during allocations)
+        data_fresh = builder.call(cg.gc.gc_handle_deref, [data_handle])
+
         # Copy data to new buffer
-        builder.call(cg.memcpy, [data_raw, data, byte_len])
+        builder.call(cg.memcpy, [data_raw, data_fresh, byte_len])
         # BUG-019: Write null at data[size] for C interop
         null_ptr = builder.gep(data_raw, [byte_len])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
+
+        # Re-derive string_ptr via handle (may have moved during data buffer allocation)
+        string_raw2 = builder.call(cg.gc.gc_handle_deref, [string_handle])
+        string_ptr = builder.bitcast(string_raw2, cg.string_struct.as_pointer())
 
         # Store owner_handle - GC handle to data buffer
         owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [data_raw])
@@ -1317,13 +1329,19 @@ class StringGenerator:
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         new_data = cg.gc.alloc_arena_or_gc(builder, new_size, type_id)
 
-        builder.call(cg.memcpy, [new_data, orig_data, start_clamped])
+        # Re-derive orig_data and source_data after allocation (stale pointer fix)
+        orig_owner_fresh = builder.call(cg.gc.gc_handle_deref, [orig_owner_handle])
+        orig_data_fresh = builder.gep(orig_owner_fresh, [orig_offset])
+        source_owner_fresh = builder.call(cg.gc.gc_handle_deref, [source_owner_handle])
+        source_data_fresh = builder.gep(source_owner_fresh, [source_offset])
+
+        builder.call(cg.memcpy, [new_data, orig_data_fresh, start_clamped])
 
         dest_after_prefix = builder.gep(new_data, [start_clamped])
-        builder.call(cg.memcpy, [dest_after_prefix, source_data, source_size])
+        builder.call(cg.memcpy, [dest_after_prefix, source_data_fresh, source_size])
 
         dest_after_source = builder.gep(new_data, [builder.add(start_clamped, source_size)])
-        source_suffix = builder.gep(orig_data, [end_clamped])
+        source_suffix = builder.gep(orig_data_fresh, [end_clamped])
         builder.call(cg.memcpy, [dest_after_source, source_suffix, suffix_len])
 
         count_loop = func.append_basic_block("count_loop")
