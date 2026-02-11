@@ -310,6 +310,12 @@ class StringGenerator:
         func.args[2].name = "char_count"
 
         entry = func.append_basic_block("entry")
+        valid_data = func.append_basic_block("valid_data")
+        null_data = func.append_basic_block("null_data")
+        alloc_start = func.append_basic_block("alloc_start")
+        do_copy = func.append_basic_block("do_copy")
+        after_copy = func.append_basic_block("after_copy")
+
         builder = ir.IRBuilder(entry)
 
         data = func.args[0]
@@ -319,15 +325,29 @@ class StringGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
+        # Guard: data can be null (empty string case) — gc_ptr_to_handle crashes on null
+        data_int = builder.ptrtoint(data, i64)
+        data_is_null = builder.icmp_unsigned("==", data_int, ir.Constant(i64, 0))
+        builder.cbranch(data_is_null, null_data, valid_data)
+
         # Save data handle before allocations (data is a GC-allocated buffer)
-        # BUG-118b: data pointer goes stale if allocations below trigger GC+compaction
-        data_handle = builder.call(cg.gc.gc_ptr_to_handle, [data])
+        builder.position_at_end(valid_data)
+        data_handle_val = builder.call(cg.gc.gc_ptr_to_handle, [data])
+        builder.branch(alloc_start)
+
+        builder.position_at_end(null_data)
+        builder.branch(alloc_start)
+
+        # Merge: data_handle is 0 if null, real handle otherwise
+        builder.position_at_end(alloc_start)
+        data_handle = builder.phi(i64, "data_handle")
+        data_handle.add_incoming(data_handle_val, valid_data)
+        data_handle.add_incoming(ir.Constant(i64, 0), null_data)
 
         # Allocate String struct (32 bytes) via GC
         struct_size = ir.Constant(i64, 32)
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         string_raw = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        # Save string handle for re-derivation after second allocation
         string_handle = builder.call(cg.gc.gc_ptr_to_handle, [string_raw])
 
         # Allocate data buffer via GC
@@ -336,11 +356,16 @@ class StringGenerator:
         alloc_size = builder.add(byte_len, ir.Constant(i64, 1))
         data_raw = cg.gc.alloc_arena_or_gc(builder, alloc_size, data_type_id)
 
-        # Re-derive source data pointer (may have moved during allocations)
-        data_fresh = builder.call(cg.gc.gc_handle_deref, [data_handle])
+        # Copy data if non-null (byte_len > 0 implies data was GC-allocated)
+        handle_is_zero = builder.icmp_unsigned("==", data_handle, ir.Constant(i64, 0))
+        builder.cbranch(handle_is_zero, after_copy, do_copy)
 
-        # Copy data to new buffer
+        builder.position_at_end(do_copy)
+        data_fresh = builder.call(cg.gc.gc_handle_deref, [data_handle])
         builder.call(cg.memcpy, [data_raw, data_fresh, byte_len])
+        builder.branch(after_copy)
+
+        builder.position_at_end(after_copy)
         # BUG-019: Write null at data[size] for C interop
         null_ptr = builder.gep(data_raw, [byte_len])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
@@ -425,7 +450,8 @@ class StringGenerator:
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
-        string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
+        # Save handle — string_ptr goes stale after data buffer allocation
+        string_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer and copy literal data
         # BUG-019: Allocate size+1 for C interop null terminator
@@ -433,10 +459,15 @@ class StringGenerator:
         alloc_size = builder.add(final_byte_len, ir.Constant(ir.IntType(64), 1))
         data_buf = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
         # Copy size+1 bytes to include null terminator from C literal (for C interop only)
+        # cstr is a C string literal in .rodata — always valid, never moved by GC
         builder.call(cg.memcpy, [data_buf, cstr, alloc_size])
 
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
+
+        # Re-derive string_ptr via handle (may have moved during data buffer allocation)
+        string_raw2 = builder.call(cg.gc.gc_handle_deref, [string_handle])
+        string_ptr = builder.bitcast(string_raw2, cg.string_struct.as_pointer())
 
         # Store owner_handle at field 0 - GC handle to data buffer
         owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [data_buf])
