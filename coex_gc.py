@@ -2024,7 +2024,7 @@ class GarbageCollector:
         # This ensures dereferencing an uninitialized slot returns NULL
         builder.call(self.codegen.memset, [
             table_ptr,
-            ir.Constant(self.i8, 0),
+            ir.Constant(ir.IntType(32), 0),
             table_bytes
         ])
 
@@ -2848,7 +2848,7 @@ class GarbageCollector:
         # The GC marks buffer elements based on capacity (header size / elem_size),
         # not actual element count, so all slots must be zeroed.
         builder.call(self.codegen.memset, [
-            user_ptr, ir.Constant(ir.IntType(8), 0), user_size
+            user_ptr, ir.Constant(ir.IntType(32), 0), user_size
         ])
 
         # Allocate stack slot to store handle across blocks
@@ -6413,7 +6413,7 @@ class GarbageCollector:
         # Zero the user data area to prevent the GC from tracing
         # uninitialized memory
         builder.call(self.codegen.memset, [
-            user_ptr, ir.Constant(ir.IntType(8), 0), size
+            user_ptr, ir.Constant(ir.IntType(32), 0), size
         ])
 
         builder.ret(user_ptr)
@@ -8904,7 +8904,7 @@ class GarbageCollector:
         # Initialize new table to NULL
         builder.call(self.codegen.memset, [
             new_table_raw,
-            ir.Constant(self.i8, 0),
+            ir.Constant(ir.IntType(32), 0),
             new_bytes
         ])
 

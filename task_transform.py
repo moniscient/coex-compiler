@@ -2242,7 +2242,7 @@ class TaskTransformer:
         malloc_fn = self._get_or_declare_malloc()
         child_frame_mem = builder.call(malloc_fn, [frame_size], name="child_frame_mem")
         # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
-        builder.call(self.cg.memset, [child_frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
+        builder.call(self.cg.memset, [child_frame_mem, ir.Constant(ir.IntType(32), 0), frame_size])
         child_frame_ptr = builder.bitcast(
             child_frame_mem,
             child_frame_info.llvm_frame_type.as_pointer(),
@@ -2571,7 +2571,7 @@ class TaskTransformer:
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
         # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
-        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
+        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(32), 0), frame_size])
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
 
         # Initialize state to 0
@@ -2739,7 +2739,7 @@ class TaskTransformer:
         malloc_fn = self._get_or_declare_malloc()
         frame_mem = builder.call(malloc_fn, [frame_size], name="frame_mem")
         # Zero-initialize frame so unset pointer fields are null (safe for GC root scanning)
-        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(8), 0), frame_size])
+        builder.call(self.cg.memset, [frame_mem, ir.Constant(ir.IntType(32), 0), frame_size])
         frame_ptr = builder.bitcast(frame_mem, frame_info.llvm_frame_type.as_pointer(), name="frame")
 
         # Initialize state to 0

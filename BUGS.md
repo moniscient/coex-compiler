@@ -191,6 +191,22 @@ TYPE_JSON_OBJECT = 23
 
 ---
 
+### BUG-117: LLVM 20 (llvmlite >=0.45.0) causes heap corruption and silent crashes
+- **Discovered**: 2026-02-10, during Linux CI investigation
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**: Run `test_gc_auto_trigger_multiple_cycles` or `test_list_set_38_elements_tail_and_tree` on Linux with llvmlite >=0.45.0 (which uses LLVM 20 with the new PipelineTuningOptions pass manager)
+- **Observed**: On Linux CI (Python 3.11, llvmlite 0.46.0/LLVM 20): `test_gc_auto_trigger_multiple_cycles` silently crashes (empty output); `test_list_set_38_elements_tail_and_tree` gets `malloc(): unaligned tcache chunk detected` (glibc heap corruption). Both pass on macOS (llvmlite 0.43.0/LLVM 14).
+- **Expected**: Tests should pass with any supported llvmlite version
+- **Hypothesis**: LLVM 20's new optimization pipeline is more aggressive and may exploit undefined behavior in our IR, particularly: (1) ptrtoint→arithmetic→inttoptr roundtrips that lose pointer provenance, (2) plain (non-atomic) initial loads on atomically-modified alloc_list pointers (data race UB in C11 memory model), (3) possible other UB patterns that LLVM 14 doesn't exploit.
+- **Root causes to investigate**:
+  - All `ptrtoint → sub → inttoptr` patterns for header access (widespread in coex_gc.py). Should use `gep` with negative offset to preserve provenance.
+  - Plain loads at gc_alloc_to_thread_list:6525, gc_sweep:6668, prepend_survivors:6953 racing with atomic CAS operations on same memory. Should be `load_atomic(..., ordering='monotonic')`.
+  - Any other UB patterns exposed by LLVM 20's stricter optimization.
+- **Workaround**: Pin llvmlite to <0.45.0 in requirements.txt
+- **Files**: coex_gc.py (ptrtoint/inttoptr patterns, atomic ordering), codegen/core.py (compile_to_object LLVM 20 path), requirements.txt
+- **Status**: Open (workaround in place: llvmlite pinned to <0.45.0)
+
 ---
 
-**Next valid BUG ID: BUG-117**
+**Next valid BUG ID: BUG-118**

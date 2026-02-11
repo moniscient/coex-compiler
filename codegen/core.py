@@ -307,10 +307,11 @@ class CodeGenerator:
                                       ir.IntType(64)])
         self.memcpy = ir.Function(self.module, memcpy_ty, name="memcpy")
 
-        # memset
+        # memset - C signature: void *memset(void *s, int c, size_t n)
+        # Second parameter is int (i32), not i8
         memset_ty = ir.FunctionType(ir.IntType(8).as_pointer(),
                                      [ir.IntType(8).as_pointer(),
-                                      ir.IntType(8),
+                                      ir.IntType(32),
                                       ir.IntType(64)])
         self.memset = ir.Function(self.module, memset_ty, name="memset")
 

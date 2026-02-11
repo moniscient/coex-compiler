@@ -162,7 +162,7 @@ class ListGenerator:
 
         # Always zero-initialize tail buffer since GC iterates through all
         # TaggedValues and we don't want uninitialized type_id values
-        builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(8), 0), tail_size])
+        builder.call(cg.memset, [tail_ptr, ir.Constant(ir.IntType(32), 0), tail_size])
 
         # Store as GC handle (stable across compaction)
         tail_field_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -345,7 +345,7 @@ class ListGenerator:
         # stale TLAB data that the GC's mark_pv_node would interpret as live pointers.
         create_children_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         create_children_i8 = builder.bitcast(create_children_ptr, ir.IntType(8).as_pointer())
-        builder.call(cg.memset, [create_children_i8, ir.Constant(ir.IntType(8), 0), ir.Constant(i64, 32 * 8)])
+        builder.call(cg.memset, [create_children_i8, ir.Constant(ir.IntType(32), 0), ir.Constant(i64, 32 * 8)])
 
         # Store leaf_data handle in children[0] (field 0 is now children of i64 handles)
         create_child0_ptr = builder.gep(new_root_create, [ir.Constant(i32, 0), ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -388,7 +388,7 @@ class ListGenerator:
         uber_children_ptr = builder.gep(new_uber_root, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         uber_children_i8 = builder.bitcast(uber_children_ptr, ir.IntType(8).as_pointer())
         children_array_size = ir.Constant(i64, 32 * 8)
-        builder.call(cg.memset, [uber_children_i8, ir.Constant(ir.IntType(8), 0), children_array_size])
+        builder.call(cg.memset, [uber_children_i8, ir.Constant(ir.IntType(32), 0), children_array_size])
 
         # Put old root handle at children[0] (field 0 is children of i64 handles)
         # No need to re-derive raw pointer — we store the handle directly
@@ -522,7 +522,7 @@ class ListGenerator:
         # Zero out children (field 0 is children)
         create_child_children = builder.gep(new_child_create, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         create_child_children_i8 = builder.bitcast(create_child_children, ir.IntType(8).as_pointer())
-        builder.call(cg.memset, [create_child_children_i8, ir.Constant(ir.IntType(8), 0), children_array_size])
+        builder.call(cg.memset, [create_child_children_i8, ir.Constant(ir.IntType(32), 0), children_array_size])
         builder.branch(child_done_block)
 
         # Copy existing child node (no refcount - GC handles it)
