@@ -4,6 +4,23 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-121: llvmlite `.ordering` attribute silently ignored on plain loads + mixed atomic/non-atomic UB
+- **Discovered**: 2026-02-11, during Linux CI crash investigation of `test_gc_auto_trigger_multiple_cycles`
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run `test_gc_auto_trigger_multiple_cycles` on Linux x86-64 CI — crashes silently with empty output
+- **Observed**: Three instances of `load.ordering = 'acquire'` on plain `builder.load()` results produced plain (non-atomic) loads in the emitted IR. TLAB live_count re-checks before munmap were non-atomic → LLVM could optimize away re-checks → munmap of in-use TLABs → SIGSEGV. Additionally, `gc_compacting` and `gc_alloc_count` were read with plain loads from mutator threads while written atomically from the GC thread — mixed atomic/non-atomic access is UB under C11.
+- **Expected**: Atomic ordering attributes should produce atomic load instructions in generated IR
+- **Fix**: 6 instances fixed:
+  - 3x `recheck_live.ordering = 'acquire'` → `builder.load_atomic(ptr, ordering='acquire', align=8)` (TLAB live_count in gc_sweep, gc_compact_deferred_cleanup, gc_compact_impl)
+  - 1x `builder.load(gc_compacting)` → `builder.load_atomic(gc_compacting, ordering='acquire', align=8)` (safepoint)
+  - 1x `builder.load(gc_alloc_count)` → `builder.load_atomic(gc_alloc_count, ordering='monotonic', align=8)` (safepoint)
+  - 1x `builder.load(gc_compacting)` → `builder.load_atomic(gc_compacting, ordering='acquire', align=8)` (handle table grow)
+- **Files**: coex_gc.py
+- **Status**: Fixed (2026-02-11)
+
+---
+
 ### BUG-093: Replace compile-time type inference with runtime TYPE_ID lookup where appropriate
 - **Discovered**: 2026-02-04, during Channel fix discussion
 - **Category**: Codegen

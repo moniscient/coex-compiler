@@ -20,7 +20,8 @@ class CompilerResult:
 
     def __init__(self, compile_success: bool, compile_output: str,
                  run_success: bool = None, run_output: str = None,
-                 ir: str = None, stdout: str = None, stderr: str = None):
+                 ir: str = None, stdout: str = None, stderr: str = None,
+                 returncode: int = None):
         self.compile_success = compile_success
         self.compile_output = compile_output
         self.run_success = run_success
@@ -28,6 +29,7 @@ class CompilerResult:
         self.ir = ir
         self.stdout = stdout if stdout is not None else (run_output or "")
         self.stderr = stderr if stderr is not None else ""
+        self.returncode = returncode
 
 
 @pytest.fixture
@@ -90,7 +92,8 @@ def compile_coex(compiler_root):
                 run_success=run_result.returncode == 0,
                 run_output=run_result.stdout,
                 stdout=run_result.stdout,
-                stderr=run_result.stderr
+                stderr=run_result.stderr,
+                returncode=run_result.returncode
             )
     
     return _compile
@@ -108,7 +111,10 @@ def expect_output(compile_coex):
     def _expect(source: str, expected: str, partial: bool = False):
         result = compile_coex(source)
         assert result.compile_success, f"Compilation failed:\n{result.compile_output}"
-        assert result.run_success, f"Execution failed:\n{result.run_output}"
+        assert result.run_success, (
+            f"Execution failed (returncode={result.returncode}, "
+            f"stdout={result.run_output!r}, stderr={result.stderr!r})"
+        )
         if partial:
             assert expected in result.run_output, \
                 f"Output does not contain expected substring:\nExpected to find: {expected!r}\nIn output: {result.run_output!r}"

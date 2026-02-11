@@ -4549,7 +4549,8 @@ class GarbageCollector:
         builder.position_at_end(enabled_check)
 
         # Skip GC trigger if compaction is in progress
-        compacting_val = builder.load(self.gc_compacting)
+        # Must use atomic load — gc_compacting is written by the GC thread
+        compacting_val = builder.load_atomic(self.gc_compacting, ordering='acquire', align=8)
         is_compacting_now = builder.icmp_unsigned('!=', compacting_val, ir.Constant(self.i64, 0))
         not_compacting = func.append_basic_block("not_compacting")
         builder.cbranch(is_compacting_now, done, not_compacting)
@@ -4563,10 +4564,10 @@ class GarbageCollector:
 
         builder.position_at_end(threshold_check)
 
-        # First, check if count is high enough (non-atomic read is fine for check)
+        # First, check if count is high enough (monotonic read to avoid UB with atomic_rmw)
         # Only if high, do we attempt the atomic exchange to claim the trigger
         threshold = ir.Constant(self.i64, self.GC_THRESHOLD)
-        current_count = builder.load(self.gc_alloc_count)
+        current_count = builder.load_atomic(self.gc_alloc_count, ordering='monotonic', align=8)
         maybe_gc = builder.icmp_unsigned(">=", current_count, threshold)
 
         try_claim = func.append_basic_block("try_claim")
@@ -7078,11 +7079,11 @@ class GarbageCollector:
 
         # Re-check live_count: if the mutator allocated into this TLAB
         # between decrement-to-zero and now, skip it entirely.
+        # MUST use load_atomic — llvmlite silently ignores .ordering on plain loads.
         recheck_live_ptr = builder.gep(dead_header, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)  # live_count field
         ], inbounds=True)
-        recheck_live = builder.load(recheck_live_ptr)
-        recheck_live.ordering = 'acquire'
+        recheck_live = builder.load_atomic(recheck_live_ptr, ordering='acquire', align=8)
         tlab_still_dead = builder.icmp_unsigned("==", recheck_live, ir.Constant(self.i64, 0))
 
         defer_tlab = func.append_basic_block("defer_tlab")
@@ -8896,7 +8897,8 @@ class GarbageCollector:
         builder = ir.IRBuilder(entry)
 
         # Check once: if compacting, return without growing. Caller retries.
-        compacting = builder.load(self.gc_compacting)
+        # Must use atomic load — gc_compacting is written by the GC thread
+        compacting = builder.load_atomic(self.gc_compacting, ordering='acquire', align=8)
         is_compacting = builder.icmp_unsigned('!=', compacting, ir.Constant(self.i64, 0))
         builder.cbranch(is_compacting, skip_if_compacting, do_grow)
 
@@ -9095,15 +9097,24 @@ class GarbageCollector:
         in_bounds = builder.icmp_unsigned('<', handle, table_size)
         builder.cbranch(in_bounds, bounds_ok, bounds_fail)
 
-        # Out-of-bounds: print diagnostic and abort
+        # Out-of-bounds: print diagnostic to stderr and abort
         builder.position_at_end(bounds_fail)
 
-        # Get or declare printf
-        printf_ty = ir.FunctionType(self.i32, [self.i8_ptr], var_arg=True)
-        if "printf" in self.module.globals:
-            printf = self.module.globals["printf"]
+        # Get or declare fprintf
+        fprintf_ty = ir.FunctionType(self.i32, [self.i8_ptr, self.i8_ptr], var_arg=True)
+        if "fprintf" in self.module.globals:
+            fprintf = self.module.globals["fprintf"]
         else:
-            printf = ir.Function(self.module, printf_ty, name="printf")
+            fprintf = ir.Function(self.module, fprintf_ty, name="fprintf")
+
+        # Get or declare fdopen/stderr - use __stderrp on macOS, stderr on Linux
+        # Instead, use a portable approach: open fd 2 as FILE*
+        # Actually, just get the stderr FILE* via fdopen(2, "w")
+        fdopen_ty = ir.FunctionType(self.i8_ptr, [self.i32, self.i8_ptr])
+        if "fdopen" in self.module.globals:
+            fdopen_fn = self.module.globals["fdopen"]
+        else:
+            fdopen_fn = ir.Function(self.module, fdopen_ty, name="fdopen")
 
         # Get or declare abort
         abort_ty = ir.FunctionType(self.void, [])
@@ -9113,6 +9124,16 @@ class GarbageCollector:
             abort_fn = ir.Function(self.module, abort_ty, name="abort")
             abort_fn.attributes.add('noreturn')
 
+        # Get stderr via fdopen(2, "w")
+        w_str = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, 2),
+                                   name=".gc_deref_w_mode")
+        w_str.global_constant = True
+        w_str.linkage = 'private'
+        w_str.initializer = ir.Constant(ir.ArrayType(self.i8, 2),
+                                        bytearray(b'w\0'))
+        w_ptr = builder.bitcast(w_str, self.i8_ptr)
+        stderr_file = builder.call(fdopen_fn, [ir.Constant(self.i32, 2), w_ptr])
+
         fmt_str = "FATAL: gc_handle_deref: handle %lld >= table_size %lld (raw pointer passed as handle?)\n"
         fmt_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(fmt_str) + 1),
                                        name=".gc_handle_deref_bounds_fmt")
@@ -9121,7 +9142,7 @@ class GarbageCollector:
         fmt_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(fmt_str) + 1),
                                              bytearray(fmt_str.encode('utf-8')) + bytearray([0]))
         fmt_ptr = builder.bitcast(fmt_global, self.i8_ptr)
-        builder.call(printf, [fmt_ptr, handle, table_size])
+        builder.call(fprintf, [stderr_file, fmt_ptr, handle, table_size])
         builder.call(abort_fn, [])
         builder.unreachable()
 
@@ -9712,12 +9733,13 @@ class GarbageCollector:
 
         # Re-check live_count: if the mutator allocated into this TLAB
         # between decrement-to-zero and now, skip the munmap.
+        # MUST use load_atomic with acquire ordering — llvmlite silently
+        # ignores setting .ordering on a plain load (BUG-121).
         recheck_hdr = builder.bitcast(tlab_ptr, self.tlab_header_type.as_pointer())
         recheck_live_ptr = builder.gep(recheck_hdr, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)  # live_count field
         ], inbounds=True)
-        recheck_live = builder.load(recheck_live_ptr)
-        recheck_live.ordering = 'acquire'
+        recheck_live = builder.load_atomic(recheck_live_ptr, ordering='acquire', align=8)
         tlab_still_dead = builder.icmp_unsigned('==', recheck_live, ir.Constant(self.i64, 0))
 
         do_munmap = func.append_basic_block("do_munmap")
@@ -10274,12 +10296,12 @@ class GarbageCollector:
 
         # Re-check live_count with acquire ordering: a mutator may have
         # allocated into this TLAB between the decrement-to-zero above and now.
+        # MUST use load_atomic — llvmlite silently ignores .ordering on plain loads.
         old_tlab_hdr_recheck = builder.bitcast(old_tlab_base, self.tlab_header_type.as_pointer())
         recheck_live_ptr_c = builder.gep(old_tlab_hdr_recheck, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)
         ], inbounds=True)
-        recheck_live_c = builder.load(recheck_live_ptr_c)
-        recheck_live_c.ordering = 'acquire'
+        recheck_live_c = builder.load_atomic(recheck_live_ptr_c, ordering='acquire', align=8)
         tlab_still_dead_c = builder.icmp_unsigned("==", recheck_live_c, ir.Constant(self.i64, 0))
 
         compact_defer_tlab = func.append_basic_block("compact_defer_tlab")
