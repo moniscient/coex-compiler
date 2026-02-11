@@ -1961,3 +1961,14 @@ func main() -> int
 - **Fix**: Added `sys.platform` check to both `gc_tlab_init` and `gc_tlab_refill`, matching the existing pattern in `gc_segment_alloc` and `gc_compact_impl`: macOS uses 0x1002, Linux uses 0x0022.
 - **Files**: `coex_gc.py` (lines 6070-6077, 6311-6325)
 - **Status**: Fixed (2026-02-10)
+
+### BUG-119: Stale pointer in string_new and string_from_literal after GC compaction
+- **Discovered**: 2026-02-11, during Linux CI investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run `test_gc_no_explicit_gc_heavy_alloc` on Linux (150K string allocations with auto-triggered GC)
+- **Observed**: Silent crash (segfault). `string_new` passes stale `data` pointer to memcpy after internal allocations trigger GC+compaction that munmaps the TLAB containing data. `string_from_literal` has same pattern: `string_ptr` stale after data buffer allocation.
+- **Root Cause**: `string_new` takes a raw `data` pointer (i8*), then does two GC allocations (string struct + data buffer). Either allocation can trigger GC+compaction, moving data's TLAB. The raw pointer becomes invalid. Additionally, `string_new` can be called with null data (empty string), so gc_ptr_to_handle needs a null guard.
+- **Fix**: (1) string_new: branch on null check, save data handle via gc_ptr_to_handle for non-null, phi merge, re-derive after allocations. (2) string_from_literal: save string struct handle, re-derive after data buffer allocation. (3) string_setrange: re-derive orig_data and source_data handles after allocation.
+- **Files**: `codegen/strings.py` (string_new, string_from_literal, string_setrange)
+- **Status**: Fixed (2026-02-11)
