@@ -279,7 +279,7 @@ class GenericsHandler:
                 return cg.var_coex_types[name]
             # Fall back to LLVM type lookup
             if name in cg.locals:
-                llvm_type = cg.locals[name].type.pointee
+                llvm_type = cg._get_var_original_type(name)
                 return self.llvm_type_to_coex(llvm_type)
         elif isinstance(expr, ListExpr):
             if expr.elements:

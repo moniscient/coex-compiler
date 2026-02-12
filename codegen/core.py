@@ -207,6 +207,11 @@ class CodeGenerator:
         # Coex AST type tracking for deep copy and nested collections
         self.var_coex_types: Dict[str, Type] = {}  # var_name -> Coex AST Type
 
+        # Handle-storing alloca tracking: maps var_name -> original LLVM pointer type
+        # Presence means the alloca stores an i64 handle instead of a raw pointer.
+        # Only populated when GC is enabled, for variables tracked in gc_root_indices.
+        self.var_ptr_types: Dict[str, ir.Type] = {}
+
         # Move tracking for use-after-move detection
         self.moved_vars: set = set()  # Set of variable names that have been moved
 
@@ -299,7 +304,23 @@ class CodeGenerator:
         
         free_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()])
         self.free = ir.Function(self.module, free_ty, name="free")
-        
+
+        # ObjC autorelease pool functions (macOS only)
+        # Extern calls can trigger ObjC/Metal allocations (e.g., terminal rendering,
+        # GPU command buffers). Without periodic pool drains, autoreleased objects
+        # accumulate indefinitely, causing steady RSS growth (~136 objects/sec).
+        import sys
+        if sys.platform == 'darwin':
+            pool_push_ty = ir.FunctionType(ir.IntType(8).as_pointer(), [])
+            self.objc_autorelease_push = ir.Function(
+                self.module, pool_push_ty, name="objc_autoreleasePoolPush")
+            pool_pop_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()])
+            self.objc_autorelease_pop = ir.Function(
+                self.module, pool_pop_ty, name="objc_autoreleasePoolPop")
+        else:
+            self.objc_autorelease_push = None
+            self.objc_autorelease_pop = None
+
         # memcpy
         memcpy_ty = ir.FunctionType(ir.IntType(8).as_pointer(),
                                      [ir.IntType(8).as_pointer(),
@@ -314,6 +335,7 @@ class CodeGenerator:
                                       ir.IntType(32),
                                       ir.IntType(64)])
         self.memset = ir.Function(self.module, memset_ty, name="memset")
+
 
         # strtoll for string to int conversion
         strtoll_ty = ir.FunctionType(ir.IntType(64),
@@ -1334,16 +1356,17 @@ class CodeGenerator:
     def _marshal_string_for_extern(self, string_ptr: ir.Value) -> ir.Value:
         """Marshal a Coex string for passing to extern C function (BUG-019).
 
-        Creates a stack-allocated null-terminated copy of the string data.
-        This is safe for all strings including slice views.
+        Creates a heap-allocated null-terminated copy of the string data.
+        The caller (generate_extern_call) is responsible for freeing the
+        returned buffer after the extern call completes.
 
-        For performance: uses stack allocation for strings up to 4KB,
-        falls back to heap for larger strings.
+        Uses malloc instead of alloca to prevent stack leaks in loops —
+        dynamic allocas inside long-running loops (e.g., main() game loops
+        that never return) would grow the stack without bound.
         """
         i8 = ir.IntType(8)
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        i8_ptr = i8.as_pointer()
 
         # Get string's data pointer
         data_ptr = self.builder.call(self.string_data, [string_ptr])
@@ -1357,10 +1380,8 @@ class CodeGenerator:
         # Calculate allocation size (size + 1 for null terminator)
         alloc_size = self.builder.add(byte_size, ir.Constant(i64, 1))
 
-        # For simplicity, always use stack allocation up to a reasonable limit.
-        # LLVM will handle very large allocas appropriately.
-        # In a production system, we'd check size and use heap for large strings.
-        temp_buf = self.builder.alloca(i8, size=alloc_size, name="cstr_temp")
+        # Allocate on heap — freed by generate_extern_call after the C call
+        temp_buf = self.builder.call(self.malloc, [alloc_size], name="cstr_temp")
 
         # Copy string data to temporary buffer
         self.builder.call(self.memcpy, [temp_buf, data_ptr, byte_size])
@@ -1582,46 +1603,50 @@ class CodeGenerator:
             init_value = self._generate_expression(stmt.initializer)
             llvm_type = init_value.type
 
+            # Determine if this variable should use handle-storing alloca
+            use_handle_alloca = (stmt.name in self.gc_root_indices and self.gc is not None)
+
             # Check if variable was pre-allocated (e.g., by loop optimization)
             # If so, reuse the existing alloca if types are compatible
             if stmt.name in self.locals:
                 existing_alloca = self.locals[stmt.name]
                 existing_type = existing_alloca.type.pointee
 
-                # If types match, reuse the existing alloca
-                if existing_type == llvm_type:
+                if use_handle_alloca and isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                    # Pre-allocated i64 is already correct for handle storage
+                    alloca = existing_alloca
+                elif existing_type == llvm_type:
                     alloca = existing_alloca
                 elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
-                    # Pre-allocated as i64 placeholder but needs different type
-                    # Create proper alloca ONCE at function entry (not in loop)
-                    # Use entry block for alloca to avoid stack growth in loops
-                    func = self.builder.function
-                    entry_block = func.entry_basic_block
-                    current_block = self.builder.block
-
-                    # Save current position
-                    saved_block = self.builder.block
-                    saved_pos = self.builder._anchor
-
-                    # Insert at end of entry block (before terminator if any)
-                    if entry_block.is_terminated:
-                        # Position before the terminator
-                        self.builder.position_before(entry_block.terminator)
+                    if use_handle_alloca:
+                        alloca = existing_alloca
                     else:
-                        self.builder.position_at_end(entry_block)
+                        func = self.builder.function
+                        entry_block = func.entry_basic_block
+                        saved_block = self.builder.block
 
-                    alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                        if entry_block.is_terminated:
+                            self.builder.position_before(entry_block.terminator)
+                        else:
+                            self.builder.position_at_end(entry_block)
 
-                    # Restore position
-                    self.builder.position_at_end(saved_block)
-
-                    # Update locals to use new alloca
-                    self.locals[stmt.name] = alloca
+                        alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                        self.builder.position_at_end(saved_block)
+                        self.locals[stmt.name] = alloca
                 else:
-                    # Different non-placeholder type - create new alloca
-                    alloca = self.builder.alloca(llvm_type, name=stmt.name)
+                    if use_handle_alloca:
+                        alloca = self.builder.alloca(ir.IntType(64), name=stmt.name)
+                    else:
+                        alloca = self.builder.alloca(llvm_type, name=stmt.name)
             else:
-                alloca = self.builder.alloca(llvm_type, name=stmt.name)
+                if use_handle_alloca:
+                    alloca = self.builder.alloca(ir.IntType(64), name=stmt.name)
+                else:
+                    alloca = self.builder.alloca(llvm_type, name=stmt.name)
+
+            # Record original pointer type for handle-storing allocas
+            if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+                self.var_ptr_types[stmt.name] = llvm_type
 
             # Value semantics: deep copy collections on assignment to prevent aliasing
             # Try to get Coex type from initializer for proper deep copy
@@ -1698,17 +1723,13 @@ class CodeGenerator:
                         else:
                             init_value = self.builder.call(self.array_copy, [init_value])
 
-            self.builder.store(init_value, alloca)
+            # Store value and update shadow stack
+            self._store_var_handle(stmt.name, init_value, alloca)
             self.locals[stmt.name] = alloca
 
             # Register new variable in current scope for proper scoping
             if is_new_var:
                 self._register_var_in_scope(stmt.name)
-
-            # Register as GC root if this is a heap type
-            if stmt.name in self.gc_root_indices and self.gc is not None:
-                root_idx = self.gc_root_indices[stmt.name]
-                self.gc.set_root(self.builder, self.gc_frame, root_idx, init_value)
 
             # Try to infer tuple info from initializer
             tuple_info = self._infer_tuple_info(stmt.initializer)
@@ -1720,32 +1741,48 @@ class CodeGenerator:
                 self.moved_vars.add(move_source_name)
             return
 
+        # Determine if this variable should use handle-storing alloca
+        use_handle_alloca = (stmt.name in self.gc_root_indices and self.gc is not None)
+
         # Check if variable was pre-allocated (e.g., by loop optimization)
         if stmt.name in self.locals:
             existing_alloca = self.locals[stmt.name]
             existing_type = existing_alloca.type.pointee
 
-            if existing_type == llvm_type:
+            if use_handle_alloca and isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                alloca = existing_alloca
+            elif existing_type == llvm_type:
                 alloca = existing_alloca
             elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
-                # Pre-allocated as i64 placeholder but needs different type
-                # Create proper alloca at function entry
-                func = self.builder.function
-                entry_block = func.entry_basic_block
-                saved_block = self.builder.block
-
-                if entry_block.is_terminated:
-                    self.builder.position_before(entry_block.terminator)
+                if use_handle_alloca:
+                    alloca = existing_alloca
                 else:
-                    self.builder.position_at_end(entry_block)
+                    func = self.builder.function
+                    entry_block = func.entry_basic_block
+                    saved_block = self.builder.block
 
-                alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
-                self.builder.position_at_end(saved_block)
-                self.locals[stmt.name] = alloca
+                    if entry_block.is_terminated:
+                        self.builder.position_before(entry_block.terminator)
+                    else:
+                        self.builder.position_at_end(entry_block)
+
+                    alloca = self.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                    self.builder.position_at_end(saved_block)
+                    self.locals[stmt.name] = alloca
+            else:
+                if use_handle_alloca:
+                    alloca = self.builder.alloca(ir.IntType(64), name=stmt.name)
+                else:
+                    alloca = self.builder.alloca(llvm_type, name=stmt.name)
+        else:
+            if use_handle_alloca:
+                alloca = self.builder.alloca(ir.IntType(64), name=stmt.name)
             else:
                 alloca = self.builder.alloca(llvm_type, name=stmt.name)
-        else:
-            alloca = self.builder.alloca(llvm_type, name=stmt.name)
+
+        # Record original pointer type for handle-storing allocas
+        if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+            self.var_ptr_types[stmt.name] = llvm_type
 
         # Generate initializer
         # Handle nil assignment to optional type
@@ -1863,7 +1900,8 @@ class CodeGenerator:
                 else:
                     init_value = self._generate_move_or_eager_copy(init_value, stmt.type_annotation)
 
-        self.builder.store(init_value, alloca)
+        # Store value and update shadow stack
+        self._store_var_handle(stmt.name, init_value, alloca)
         self.locals[stmt.name] = alloca
 
         # Register new variable in current scope for proper scoping
@@ -1872,11 +1910,6 @@ class CodeGenerator:
 
         # Variable is now properly typed, remove from placeholders
         self.placeholder_vars.discard(stmt.name)
-
-        # Register as GC root if this is a heap type
-        if stmt.name in self.gc_root_indices and self.gc is not None:
-            root_idx = self.gc_root_indices[stmt.name]
-            self.gc.set_root(self.builder, self.gc_frame, root_idx, init_value)
 
         # Mark source as moved AFTER we've read its value
         if move_source_name:
@@ -1893,8 +1926,8 @@ class CodeGenerator:
         # Generate the value
         value = self._generate_expression(stmt.initializer)
 
-        # Get expected type from alloca
-        expected_type = alloca.type.pointee
+        # Get expected type (use original pointer type for handle-storing vars)
+        expected_type = self._get_var_original_type(stmt.name)
 
         # Cast if needed
         value = self._cast_value(value, expected_type)
@@ -1930,13 +1963,8 @@ class CodeGenerator:
                     if stmt.is_copy:
                         value = self.builder.call(self.array_deep_copy, [value])
 
-        # Store the value
-        self.builder.store(value, alloca)
-
-        # Update GC root if needed
-        if stmt.name in self.gc_root_indices and self.gc is not None:
-            root_idx = self.gc_root_indices[stmt.name]
-            self.gc.set_root(self.builder, self.gc_frame, root_idx, value)
+        # Store value and update shadow stack
+        self._store_var_handle(stmt.name, value, alloca)
 
         # Mark source as moved
         if move_source_name:
@@ -1945,6 +1973,73 @@ class CodeGenerator:
         # Clear moved status for target (variable is now valid again)
         if stmt.name in self.moved_vars:
             self.moved_vars.discard(stmt.name)
+
+    # ========================================================================
+    # Handle-Storing Alloca Helpers
+    # ========================================================================
+
+    def _store_var_handle(self, name: str, value: ir.Value, alloca: ir.Value):
+        """Store a value to a variable's alloca, using handle storage if tracked.
+
+        If name is in var_ptr_types (handle-storing alloca), converts the pointer
+        to a handle via gc_ptr_to_handle, stores i64 to alloca, and updates the
+        shadow stack. Otherwise stores the raw value and calls set_root as before.
+        """
+        if name in self.var_ptr_types and self.gc is not None:
+            root_idx = self.gc_root_indices[name]
+            # Convert pointer to handle
+            if isinstance(value.type, ir.PointerType):
+                ptr_as_i8 = self.builder.bitcast(value, ir.IntType(8).as_pointer())
+                handle = self.builder.call(self.gc.gc_ptr_to_handle, [ptr_as_i8])
+            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
+                # Already an i64 (could be a handle from channel receive etc.)
+                handle = value
+            else:
+                handle = self._cast_value(value, ir.IntType(64))
+            # Store handle to alloca
+            self.builder.store(handle, alloca)
+            # Update shadow stack with handle directly
+            self.gc.set_root_handle(self.builder, self.gc_frame, root_idx, handle)
+        else:
+            self.builder.store(value, alloca)
+            # Update shadow stack if tracked (non-handle path)
+            if name in self.gc_root_indices and self.gc is not None:
+                root_idx = self.gc_root_indices[name]
+                self.gc.set_root(self.builder, self.gc_frame, root_idx, value)
+
+    def _load_var_ptr(self, name: str) -> ir.Value:
+        """Load a variable's current pointer value.
+
+        If name is in var_ptr_types (handle-storing alloca), loads the i64 handle,
+        calls gc_handle_deref, and bitcasts to the original pointer type.
+        Otherwise loads the raw value from the alloca.
+        """
+        alloca = self.locals[name]
+        if name in self.var_ptr_types:
+            handle = self.builder.load(alloca, name=f"{name}.handle")
+            raw_ptr = self.builder.call(self.gc.gc_handle_deref, [handle])
+            return self.builder.bitcast(raw_ptr, self.var_ptr_types[name])
+        else:
+            return self.builder.load(alloca, name=name)
+
+    def _load_var_handle(self, name: str) -> ir.Value:
+        """Load the raw i64 handle from a handle-storing alloca.
+
+        Used by in-place optimization which needs the handle directly.
+        Only valid for variables in var_ptr_types.
+        """
+        alloca = self.locals[name]
+        return self.builder.load(alloca, name=f"{name}.handle")
+
+    def _get_var_original_type(self, name: str) -> ir.Type:
+        """Get the original LLVM pointer type for a variable.
+
+        If the variable uses handle storage, returns the original pointer type
+        from var_ptr_types. Otherwise returns alloca.type.pointee.
+        """
+        if name in self.var_ptr_types:
+            return self.var_ptr_types[name]
+        return self.locals[name].type.pointee
 
     def _infer_tuple_info(self, expr: Expr) -> Optional[PyList[tuple]]:
         """Infer tuple field info from an expression"""
@@ -2277,14 +2372,12 @@ class CodeGenerator:
                     value = self.builder.call(self.array_deep_copy, [value])
 
         if ptr:
-            self.builder.store(value, ptr)
-
-            # Update GC root if this is a tracked heap variable being reassigned
+            # Store value and update shadow stack
             if isinstance(stmt.target, Identifier):
                 target_name = stmt.target.name
-                if target_name in self.gc_root_indices and self.gc is not None:
-                    root_idx = self.gc_root_indices[target_name]
-                    self.gc.set_root(self.builder, self.gc_frame, root_idx, value)
+                self._store_var_handle(target_name, value, ptr)
+            else:
+                self.builder.store(value, ptr)
 
         # Mark source as moved AFTER we've read its value
         if move_source_name:
@@ -2391,12 +2484,7 @@ class CodeGenerator:
         if isinstance(target.object, Identifier):
             var_name = target.object.name
             if var_name in self.locals:
-                self.builder.store(new_struct, self.locals[var_name])
-
-                # Update GC root if this is a tracked heap variable
-                if var_name in self.gc_root_indices and self.gc is not None:
-                    root_idx = self.gc_root_indices[var_name]
-                    self.gc.set_root(self.builder, self.gc_frame, root_idx, new_struct)
+                self._store_var_handle(var_name, new_struct, self.locals[var_name])
         elif isinstance(target.object, MemberExpr):
             # Nested field assignment: a.b.x = value
             # Recursively create new structs up the chain
@@ -2460,12 +2548,7 @@ class CodeGenerator:
         if isinstance(stmt.target, Identifier):
             var_name = stmt.target.name
             if var_name in self.locals:
-                self.builder.store(new_collection, self.locals[var_name])
-
-                # Update GC root if this is a tracked heap variable
-                if var_name in self.gc_root_indices and self.gc is not None:
-                    root_idx = self.gc_root_indices[var_name]
-                    self.gc.set_root(self.builder, self.gc_frame, root_idx, new_collection)
+                self._store_var_handle(var_name, new_collection, self.locals[var_name])
 
     def _get_lvalue(self, expr: Expr) -> Optional[ir.Value]:
         """Get pointer to an lvalue expression"""

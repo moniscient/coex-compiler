@@ -279,6 +279,7 @@ class FunctionGenerator:
         # Clear locals for this function
         cg.locals = {}
         cg.var_coex_types = {}
+        cg.var_ptr_types = {}
         cg.moved_vars = set()
         cg.const_bindings = set()
 
@@ -483,12 +484,37 @@ class FunctionGenerator:
                 c_arg = arg_val
             c_args.append(c_arg)
 
+        # Push autorelease pool before extern call (macOS only).
+        # Extern calls can trigger ObjC/Metal allocations (GPU command buffers,
+        # terminal rendering) that accumulate without a pool drain.
+        pool_token = None
+        if cg.objc_autorelease_push is not None:
+            pool_token = cg.builder.call(cg.objc_autorelease_push, [])
+
         # Call the extern function
         if isinstance(llvm_func.return_value.type, ir.VoidType):
             cg.builder.call(llvm_func, c_args)
+            # Free any malloc'd string marshaling buffers
+            for i, arg in enumerate(c_args):
+                if i < len(func_decl.params):
+                    p = func_decl.params[i]
+                    if isinstance(p.type_annotation, PrimitiveType) and p.type_annotation.name == "string":
+                        cg.builder.call(cg.free, [arg])
+            # Drain autorelease pool
+            if pool_token is not None:
+                cg.builder.call(cg.objc_autorelease_pop, [pool_token])
             return ir.Constant(ir.IntType(64), 0)
         else:
             c_result = cg.builder.call(llvm_func, c_args)
+            # Free any malloc'd string marshaling buffers
+            for i, arg in enumerate(c_args):
+                if i < len(func_decl.params):
+                    p = func_decl.params[i]
+                    if isinstance(p.type_annotation, PrimitiveType) and p.type_annotation.name == "string":
+                        cg.builder.call(cg.free, [arg])
+            # Drain autorelease pool
+            if pool_token is not None:
+                cg.builder.call(cg.objc_autorelease_pop, [pool_token])
             # Convert C result back to Coex type
             if func_decl.return_type:
                 return cg._convert_from_c_type(c_result, func_decl.return_type)
@@ -810,6 +836,7 @@ class FunctionGenerator:
         # Phase 5: gc_frame is now the start_slot index (i64), gc_roots is no longer needed
         cg.gc_frame = None
         cg.gc_root_indices = {}
+        cg.var_ptr_types = {}
 
         if heap_var_names and cg.gc is not None:
             num_roots = len(heap_var_names)
@@ -855,9 +882,15 @@ class FunctionGenerator:
                 param_value = cg._generate_deep_copy(llvm_param, param.type_annotation)
 
             # Allocate on stack and store the value
-            alloca = cg.builder.alloca(llvm_param.type, name=param.name)
-            cg.builder.store(param_value, alloca)
+            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
+                          and isinstance(llvm_param.type, ir.PointerType))
+            if use_handle:
+                alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
+                cg.var_ptr_types[param.name] = llvm_param.type
+            else:
+                alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
+            cg._store_var_handle(param.name, param_value, alloca)
 
             # Handle unique parameters - add to unique_bindings for in-place optimization
             if getattr(param, 'is_unique', False):
@@ -868,11 +901,6 @@ class FunctionGenerator:
             # Unique parameters are NOT aliased - they have sole ownership.
             elif cg._is_collection_coex_type(param.type_annotation):
                 cg.aliased_vars.add(param.name)
-
-            # Register parameter as GC root if it's a heap type
-            if param.name in cg.gc_root_indices and cg.gc is not None:
-                root_idx = cg.gc_root_indices[param.name]
-                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, param_value)
 
         # Generate body
         for stmt in func.body:
@@ -901,6 +929,7 @@ class FunctionGenerator:
         # Clear GC state for this function
         cg.gc_frame = None
         cg.gc_root_indices = {}
+        cg.var_ptr_types = {}
         cg.arena_start = None
         cg.use_arena_allocation = False
         cg.current_function = None
@@ -979,9 +1008,11 @@ class FunctionGenerator:
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
         old_gc_frame = getattr(cg, 'gc_frame', None)
         old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
+        old_var_ptr_types = getattr(cg, 'var_ptr_types', {})
 
         cg.gc_frame = None
         cg.gc_root_indices = {}
+        cg.var_ptr_types = {}
 
         # Collect heap variables for GC root tracking
         heap_var_names = []
@@ -1016,17 +1047,19 @@ class FunctionGenerator:
             if cg._needs_parameter_copy(param_type):
                 param_value = cg._generate_deep_copy(llvm_param, param_type)
 
-            alloca = cg.builder.alloca(llvm_param.type, name=param.name)
-            cg.builder.store(param_value, alloca)
+            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
+                          and isinstance(llvm_param.type, ir.PointerType))
+            if use_handle:
+                alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
+                cg.var_ptr_types[param.name] = llvm_param.type
+            else:
+                alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
+            cg._store_var_handle(param.name, param_value, alloca)
 
             # Mark collection parameters as aliased for in-place optimization safety
             if cg._is_collection_coex_type(param_type):
                 cg.aliased_vars.add(param.name)
-
-            # Register parameter as GC root if it's a heap type
-            if param.name in cg.gc_root_indices and cg.gc is not None:
-                cg.gc.set_root(cg.builder, cg.gc_frame, cg.gc_root_indices[param.name], param_value)
 
         # Generate body
         for stmt in func_decl.body:
@@ -1052,6 +1085,7 @@ class FunctionGenerator:
         cg.type_substitutions = old_subs
         cg.gc_frame = old_gc_frame
         cg.gc_root_indices = old_gc_root_indices
+        cg.var_ptr_types = old_var_ptr_types
 
         return mangled_name
 
@@ -1329,6 +1363,7 @@ class FunctionGenerator:
         old_current_type = cg.current_type
         old_gc_frame = getattr(cg, 'gc_frame', None)
         old_gc_root_indices = getattr(cg, 'gc_root_indices', {})
+        old_var_ptr_types = getattr(cg, 'var_ptr_types', {})
 
         entry = llvm_func.append_basic_block(name="entry")
         cg.builder = ir.IRBuilder(entry)
@@ -1348,6 +1383,7 @@ class FunctionGenerator:
         # Phase 5: gc_frame is now start_slot index (i64), gc_roots is no longer needed
         cg.gc_frame = None
         cg.gc_root_indices = {}
+        cg.var_ptr_types = {}
 
         # Collect heap variables for GC root tracking
         heap_var_names = []
@@ -1381,17 +1417,19 @@ class FunctionGenerator:
             llvm_param = llvm_func.args[i + 1]
             llvm_param.name = param.name
 
-            alloca = cg.builder.alloca(llvm_param.type, name=param.name)
-            cg.builder.store(llvm_param, alloca)
+            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
+                          and isinstance(llvm_param.type, ir.PointerType))
+            if use_handle:
+                alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
+                cg.var_ptr_types[param.name] = llvm_param.type
+            else:
+                alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
+            cg._store_var_handle(param.name, llvm_param, alloca)
 
             # Mark collection parameters as aliased for in-place optimization safety
             if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
                 cg.aliased_vars.add(param.name)
-
-            # Register parameter as GC root if it's a heap type
-            if param.name in cg.gc_root_indices and cg.gc is not None:
-                cg.gc.set_root(cg.builder, cg.gc_frame, cg.gc_root_indices[param.name], llvm_param)
 
         # Generate body
         for stmt in method.body:
@@ -1417,6 +1455,7 @@ class FunctionGenerator:
         cg.current_type = old_current_type
         cg.gc_frame = old_gc_frame
         cg.gc_root_indices = old_gc_root_indices
+        cg.var_ptr_types = old_var_ptr_types
 
     # ========================================================================
     # Lambda Expression Generation

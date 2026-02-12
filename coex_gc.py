@@ -437,6 +437,12 @@ class GarbageCollector:
         # Per-thread handle pool functions (lock-free allocation)
         self._implement_gc_handle_pool_alloc()
         self._implement_gc_handle_pool_refill()
+        # alloc_node pool
+        self._implement_gc_alloc_node_pop()
+        self._implement_gc_alloc_node_push()
+        # shadow stack frame pool
+        self._implement_gc_frame_pool_pop()
+        self._implement_gc_frame_pool_push()
         # Heap compaction
         self._implement_gc_compact_deferred_cleanup()
         self._implement_gc_compact_impl()
@@ -1011,6 +1017,35 @@ class GarbageCollector:
         self.gc_dead_tlab_list.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_dead_tlab_list.linkage = 'internal'
 
+        # alloc_node pool - lock-free free list to avoid malloc/free churn
+        # Each gc_alloc mallocs a 32-byte alloc_node; at ~600K allocs/sec
+        # macOS libmalloc retains freed pages causing steady RSS growth.
+        # Pool recycles nodes via CAS-based free list.
+        self.gc_alloc_node_free_list = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_alloc_node_free_list")
+        self.gc_alloc_node_free_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_alloc_node_free_list.linkage = 'internal'
+
+        self.gc_debug_node_pool_reuse = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_node_pool_reuse")
+        self.gc_debug_node_pool_reuse.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_node_pool_reuse.linkage = 'internal'
+
+        # Shadow stack frame pool - lock-free free list to avoid malloc/free churn
+        # Each gc_push_frame mallocs a 24-byte frame struct; at ~600K calls/sec
+        # macOS libmalloc retains freed pages causing steady RSS growth.
+        # Pool recycles frames via CAS-based free list (same pattern as alloc_node pool).
+        # Frame field 0 (parent pointer) doubles as free-list next pointer.
+        self.gc_frame_free_list = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_frame_free_list")
+        self.gc_frame_free_list.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_frame_free_list.linkage = 'internal'
+
+        self.gc_debug_frame_pool_reuse = ir.GlobalVariable(
+            self.module, self.i64, name="gc_debug_frame_pool_reuse")
+        self.gc_debug_frame_pool_reuse.initializer = ir.Constant(self.i64, 0)
+        self.gc_debug_frame_pool_reuse.linkage = 'internal'
+
         # ============================================================
         # Phase 5: Mark Worklist for Concurrent Marking
         # ============================================================
@@ -1361,6 +1396,20 @@ class GarbageCollector:
         # Frees old memory from previous compaction (called at start of gc_collect)
         gc_compact_cleanup_ty = ir.FunctionType(self.void, [])
         self.gc_compact_deferred_cleanup = ir.Function(self.module, gc_compact_cleanup_ty, name="coex_gc_compact_deferred_cleanup")
+
+        # alloc_node pool functions (lock-free)
+        pop_ty = ir.FunctionType(self.i8_ptr, [])
+        self.gc_alloc_node_pop = ir.Function(self.module, pop_ty, name="coex_gc_alloc_node_pop")
+
+        push_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_alloc_node_push = ir.Function(self.module, push_ty, name="coex_gc_alloc_node_push")
+
+        # Shadow stack frame pool functions (lock-free)
+        frame_pop_ty = ir.FunctionType(self.i8_ptr, [])
+        self.gc_frame_pool_pop = ir.Function(self.module, frame_pop_ty, name="coex_gc_frame_pool_pop")
+
+        frame_push_ty = ir.FunctionType(self.void, [self.i8_ptr])
+        self.gc_frame_pool_push = ir.Function(self.module, frame_push_ty, name="coex_gc_frame_pool_push")
 
         # ============================================================
         # Pthread function declarations (external)
@@ -2352,13 +2401,16 @@ class GarbageCollector:
         # Atomically decrement thread count
         builder.atomic_rmw('sub', self.gc_thread_count, ir.Constant(self.i64, 1), 'acq_rel')
 
-        # CAS-append to gc_dead_threads list (using the entry's next field)
-        # We reuse field 11 (next) for the dead list linkage
+        # CAS-append to gc_dead_threads list.
+        # BUG-122 FIX: Use field 15 (reserved) for dead-list linkage instead of
+        # field 11 (registry next). Overwriting field 11 severs the registry
+        # linked list, orphaning threads registered after this one — their roots
+        # are never scanned and their alloc_lists are never swept.
         dead_cas_loop = func.append_basic_block("dead_cas_loop")
         dead_cas_done = func.append_basic_block("dead_cas_done")
 
-        my_next_ptr = builder.gep(my_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+        my_dead_next_ptr = builder.gep(my_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 15)  # reserved field for dead-list linkage
         ], inbounds=True)
         my_entry_i8 = builder.bitcast(my_entry, self.i8_ptr)
 
@@ -2366,8 +2418,8 @@ class GarbageCollector:
 
         builder.position_at_end(dead_cas_loop)
         old_dead_head = builder.load(self.gc_dead_threads)
-        # Set our next to current dead list head
-        builder.store(old_dead_head, my_next_ptr)
+        # Set our dead-list next to current dead list head (field 15, NOT field 11)
+        builder.store(old_dead_head, my_dead_next_ptr)
         # CAS: gc_dead_threads = my_entry (if still == old_dead_head)
         dead_cas = builder.cmpxchg(
             self.gc_dead_threads, old_dead_head, my_entry_i8,
@@ -2531,12 +2583,15 @@ class GarbageCollector:
 
         Phase 3: Takes i64* handle_slots instead of i8** roots.
         Uses thread-local storage for the frame chain.
+        Uses frame pool to avoid malloc/free churn.
         """
         func = self.gc_push_frame
         func.args[0].name = "num_roots"
         func.args[1].name = "handle_slots"
 
         entry = func.append_basic_block("entry")
+        pool_miss = func.append_basic_block("pool_miss")
+        have_frame = func.append_basic_block("have_frame")
         update_entry = func.append_basic_block("update_entry")
         done = func.append_basic_block("done")
         builder = ir.IRBuilder(entry)
@@ -2544,9 +2599,23 @@ class GarbageCollector:
         num_roots = func.args[0]
         handle_slots = func.args[1]
 
-        # Allocate frame struct (24 bytes: parent + num_roots + handle_slots_ptr)
+        # Try to get a frame from the pool first (avoids malloc)
+        pooled = builder.call(self.gc_frame_pool_pop, [])
+        pooled_int = builder.ptrtoint(pooled, self.i64)
+        got_pooled = builder.icmp_unsigned('!=', pooled_int, ir.Constant(self.i64, 0))
+        builder.cbranch(got_pooled, have_frame, pool_miss)
+
+        # Pool empty - fall back to malloc
+        builder.position_at_end(pool_miss)
         frame_size = ir.Constant(self.i64, 24)
-        raw_frame = builder.call(self.codegen.malloc, [frame_size])
+        malloced = builder.call(self.codegen.malloc, [frame_size])
+        builder.branch(have_frame)
+
+        # Merge: raw_frame = pooled or malloced
+        builder.position_at_end(have_frame)
+        raw_frame = builder.phi(self.i8_ptr, 'raw_frame')
+        raw_frame.add_incoming(pooled, entry)
+        raw_frame.add_incoming(malloced, pool_miss)
         frame = builder.bitcast(raw_frame, self.gc_frame_type.as_pointer())
 
         # Set parent to current TLS top
@@ -2639,8 +2708,8 @@ class GarbageCollector:
         builder.branch(done)
 
         builder.position_at_end(done)
-        # Free the frame
-        builder.call(self.codegen.free, [frame_ptr])
+        # Return frame to pool instead of freeing (eliminates malloc/free churn)
+        builder.call(self.gc_frame_pool_push, [frame_ptr])
 
         builder.ret_void()
 
@@ -2896,11 +2965,19 @@ class GarbageCollector:
         # ============================================================
         builder.position_at_end(add_to_list)
 
-        # Allocate allocation node (ALWAYS use malloc for nodes, not TLAB)
-        # This ensures sweep can safely free nodes without tracking TLAB status
-        # malloc() is thread-safe on modern systems
-        node_size = ir.Constant(self.i64, 32)  # sizeof(alloc_node) - now includes tlab_base
-        raw_node = builder.call(self.codegen.malloc, [node_size])
+        # Allocate allocation node - try pool first, fall back to malloc
+        # Pool eliminates ~600K malloc/free cycles/sec that cause RSS growth on macOS
+        raw_node_try = builder.call(self.gc_alloc_node_pop, [])
+        is_pool_empty = builder.icmp_unsigned('==', raw_node_try, ir.Constant(self.i8_ptr, None))
+        node_alloca = builder.alloca(self.i8_ptr, name='node_alloca')
+        with builder.if_else(is_pool_empty) as (then_malloc, else_reuse):
+            with then_malloc:
+                node_size = ir.Constant(self.i64, 32)  # sizeof(alloc_node)
+                fresh = builder.call(self.codegen.malloc, [node_size])
+                builder.store(fresh, node_alloca)
+            with else_reuse:
+                builder.store(raw_node_try, node_alloca)
+        raw_node = builder.load(node_alloca)
 
         node = builder.bitcast(raw_node, self.alloc_node_type.as_pointer())
 
@@ -4184,11 +4261,49 @@ class GarbageCollector:
 
         builder.position_at_end(dead_cleanup_check)
         dead_entry = builder.bitcast(dead_curr_i8, self.thread_entry_type.as_pointer())
-        # Save next pointer before we modify the entry
+        # Save dead-list-next pointer (field 15) before we modify the entry
+        # BUG-122: Dead-list uses field 15 (reserved), NOT field 11 (registry next)
         dead_next_ptr = builder.gep(dead_entry, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 11)
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 15)  # dead-list next
         ], inbounds=True)
         dead_next_i8 = builder.load(dead_next_ptr)
+
+        # BUG-122 FIX: Check if alloc_list is empty before freeing.
+        # Sweep has already processed this thread's alloc_list (dead threads
+        # are no longer skipped). If survivors remain, re-add to dead list
+        # so the entry stays in the registry for next cycle's sweep.
+        dead_alloc_list_ptr = builder.gep(dead_entry, [
+            ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)  # alloc_list field
+        ], inbounds=True)
+        dead_alloc_list = builder.load(dead_alloc_list_ptr)
+        dead_alloc_int = builder.ptrtoint(dead_alloc_list, self.i64)
+        dead_alloc_empty = builder.icmp_unsigned('==', dead_alloc_int, ir.Constant(self.i64, 0))
+
+        dead_can_free = func.append_basic_block("dead_can_free")
+        dead_defer_free = func.append_basic_block("dead_defer_free")
+        builder.cbranch(dead_alloc_empty, dead_can_free, dead_defer_free)
+
+        # alloc_list not empty — re-add to gc_dead_threads for next cycle
+        builder.position_at_end(dead_defer_free)
+        dead_defer_cas_loop = func.append_basic_block("dead_defer_cas_loop")
+        dead_defer_cas_done = func.append_basic_block("dead_defer_cas_done")
+        builder.branch(dead_defer_cas_loop)
+
+        builder.position_at_end(dead_defer_cas_loop)
+        old_dead_for_defer = builder.load(self.gc_dead_threads)
+        # Set our next to current dead list head
+        builder.store(old_dead_for_defer, dead_next_ptr)
+        dead_defer_cas = builder.cmpxchg(
+            self.gc_dead_threads, old_dead_for_defer, dead_curr_i8,
+            'acq_rel', 'acquire')
+        dead_defer_ok = builder.extract_value(dead_defer_cas, 1)
+        builder.cbranch(dead_defer_ok, dead_defer_cas_done, dead_defer_cas_loop)
+
+        builder.position_at_end(dead_defer_cas_done)
+        builder.branch(dead_next_dead)
+
+        # alloc_list empty — safe to unlink from registry and free
+        builder.position_at_end(dead_can_free)
         builder.branch(dead_remove_entry)
 
         # Remove dead entry from main registry (GC thread is sole remover)
@@ -4735,45 +4850,15 @@ class GarbageCollector:
         absolute_slot = builder.add(start_slot, index_val)
         builder.call(self.gc_segment_set_root, [absolute_slot, handle])
 
-    def reload_roots_after_compact(self, builder: ir.IRBuilder, gc_frame: ir.Value,
-                                     gc_root_indices: dict, locals_dict: dict):
-        """Reload heap variable pointers after gc_compact moves objects.
+    def set_root_handle(self, builder: ir.IRBuilder, start_slot: ir.Value, index: int, handle: ir.Value):
+        """Set a root slot to a handle value directly (no ptr_to_handle conversion).
 
-        After gc_compact(), objects have been copied to a new buffer and handles
-        updated, but the raw pointers stored in stack allocas are stale.
-        This method reads the handle from the shadow stack, dereferences it to
-        get the current pointer, and updates each variable's stack alloca.
-
-        Args:
-            builder: LLVM IR builder
-            gc_frame: Start slot of the current GC frame (i64)
-            gc_root_indices: Dict mapping var_name -> shadow stack slot index
-            locals_dict: Dict mapping var_name -> LLVM alloca instruction
+        Like set_root but skips the gc_ptr_to_handle conversion since the caller
+        already has the i64 handle. Used by handle-storing allocas.
         """
-        for var_name, slot_index in gc_root_indices.items():
-            if var_name not in locals_dict:
-                continue
-            alloca = locals_dict[var_name]
-            # Get the element type of the alloca
-            if not isinstance(alloca.type, ir.PointerType):
-                continue
-            elem_type = alloca.type.pointee
-            # Only reload pointer types (heap objects)
-            if not isinstance(elem_type, ir.PointerType):
-                continue
-
-            # Read handle from shadow stack
-            absolute_slot = builder.add(gc_frame, ir.Constant(self.i64, slot_index))
-            handle = builder.call(self.gc_segment_get_root, [absolute_slot])
-
-            # Only deref and update if handle is non-null
-            is_nonnull = builder.icmp_unsigned("!=", handle, ir.Constant(self.i64, 0))
-            with builder.if_then(is_nonnull):
-                # Deref handle to get current pointer
-                new_ptr = builder.call(self.gc_handle_deref, [handle])
-                # Bitcast to the expected pointer type
-                typed_ptr = builder.bitcast(new_ptr, elem_type)
-                builder.store(typed_ptr, alloca)
+        index_val = ir.Constant(self.i64, index)
+        absolute_slot = builder.add(start_slot, index_val)
+        builder.call(self.gc_segment_set_root, [absolute_slot, handle])
 
     def alloc_with_deref(self, builder: ir.IRBuilder, size: ir.Value, type_id: ir.Value) -> ir.Value:
         """Allocate memory and return the pointer (backward compatibility helper).
@@ -6651,20 +6736,13 @@ class GarbageCollector:
         # Process this thread's allocation list
         builder.position_at_end(process_thread)
 
-        # Skip dead entries (watermark_active == 0xDEAD)
-        sweep_skip_dead = func.append_basic_block("sweep_skip_dead")
-        sweep_live_thread = func.append_basic_block("sweep_live_thread")
-        wm_active_sweep_ptr = builder.gep(curr_thread, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        wm_active_sweep = builder.load(wm_active_sweep_ptr)
-        is_dead_sweep = builder.icmp_unsigned('==', wm_active_sweep, ir.Constant(self.i64, 0xDEAD))
-        builder.cbranch(is_dead_sweep, sweep_skip_dead, sweep_live_thread)
-
-        builder.position_at_end(sweep_skip_dead)
-        builder.branch(next_thread)
-
-        builder.position_at_end(sweep_live_thread)
+        # BUG-122 FIX: Do NOT skip dead threads during sweep.
+        # Dead threads' alloc_lists contain objects that need sweeping.
+        # Without sweeping: alloc_nodes leak, handles are never retired,
+        # TLAB live_counts never reach 0, TLABs are never munmapped.
+        # Dead threads are swept like live threads — survivors are prepended
+        # back to the alloc_list. The ThreadEntry is only freed in gc_collect's
+        # dead-thread cleanup when the alloc_list is finally empty.
 
         # DEBUG: Increment thread counter
         builder.atomic_rmw('add', self.gc_debug_sweep_threads, ir.Constant(self.i64, 1), 'monotonic')
@@ -6903,8 +6981,8 @@ class GarbageCollector:
                 builder.atomic_rmw('add', self.gc_debug_nontlab_freed, ir.Constant(self.i64, 1), 'monotonic')
                 builder.call(self.codegen.free, [header_ptr])
 
-        # Always free the allocation node (nodes are always from malloc)
-        builder.call(self.codegen.free, [curr_node])
+        # Return allocation node to pool instead of freeing (eliminates malloc/free churn)
+        builder.call(self.gc_alloc_node_push, [curr_node])
 
         # Retire the handle using MI-6 deferred reclamation
         freed_handle = builder.load(handle_alloca)
@@ -7508,7 +7586,7 @@ class GarbageCollector:
         builder.call(printf, [timing_ptr, last_gc_ns])
 
         # DEBUG: List add stats
-        debug_fmt = "[GC:DEBUG] adds: %lld, tlab_freed: %lld, tlabs_reclaimed: %lld\n"
+        debug_fmt = "[GC:DEBUG] adds: %lld, tlab_freed: %lld, nontlab_freed: %lld, tlabs_reclaimed: %lld\n"
         debug_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(debug_fmt) + 1), name=".gc_stats_debug")
         debug_global.global_constant = True
         debug_global.linkage = 'private'
@@ -7518,8 +7596,9 @@ class GarbageCollector:
 
         list_adds = builder.load(self.gc_debug_list_adds)
         tlab_freed = builder.load(self.gc_debug_tlab_freed)
+        nontlab_freed = builder.load(self.gc_debug_nontlab_freed)
         tlabs_reclaimed = builder.load(self.gc_debug_tlabs_reclaimed)
-        builder.call(printf, [debug_ptr, list_adds, tlab_freed, tlabs_reclaimed])
+        builder.call(printf, [debug_ptr, list_adds, tlab_freed, nontlab_freed, tlabs_reclaimed])
 
         # DEBUG: Handle table stats - check if handles are being reused
         handle_fmt = "[GC:DEBUG] next_handle: %lld, table_size: %lld\n"
@@ -7533,6 +7612,19 @@ class GarbageCollector:
         next_handle = builder.load(self.gc_next_handle)
         table_size = builder.load(self.gc_handle_table_size)
         builder.call(printf, [handle_ptr, next_handle, table_size])
+
+        # DEBUG: pool reuse stats
+        pool_fmt = "[GC:DEBUG] node_pool_reuse: %lld, frame_pool_reuse: %lld\n"
+        pool_global = ir.GlobalVariable(self.module, ir.ArrayType(self.i8, len(pool_fmt) + 1), name=".gc_stats_pool")
+        pool_global.global_constant = True
+        pool_global.linkage = 'private'
+        pool_global.initializer = ir.Constant(ir.ArrayType(self.i8, len(pool_fmt) + 1),
+                                               bytearray(pool_fmt.encode('utf-8')) + bytearray([0]))
+        pool_ptr = builder.bitcast(pool_global, self.i8_ptr)
+
+        pool_reuse = builder.load(self.gc_debug_node_pool_reuse)
+        frame_reuse = builder.load(self.gc_debug_frame_pool_reuse)
+        builder.call(printf, [pool_ptr, pool_reuse, frame_reuse])
 
         # Flush stdout to ensure output appears immediately
         fflush_ty = ir.FunctionType(self.i32, [self.i8_ptr])
@@ -9632,6 +9724,204 @@ class GarbageCollector:
 
     # ========================================================================
     # Heap Compaction Implementation
+    # ========================================================================
+
+    def _implement_gc_alloc_node_pop(self):
+        """CAS-based pop from alloc_node free list pool.
+
+        Returns a recycled alloc_node (i8*) or NULL if pool is empty.
+        Uses the node's field 0 (next pointer, offset 0) for free list linkage.
+        """
+        func = self.gc_alloc_node_pop
+        func.attributes.add('nounwind')
+        entry = func.append_basic_block('entry')
+        cas_loop = func.append_basic_block('cas_loop')
+        cas_ok = func.append_basic_block('cas_ok')
+        cas_fail = func.append_basic_block('cas_fail')
+        ret_null = func.append_basic_block('ret_null')
+
+        builder = ir.IRBuilder(entry)
+        # Load head of free list
+        head = builder.load(self.gc_alloc_node_free_list)
+        is_null = builder.icmp_unsigned('==', head, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, ret_null, cas_loop)
+
+        # CAS loop
+        builder = ir.IRBuilder(cas_loop)
+        head_phi = builder.phi(self.i8_ptr, 'head')
+        head_phi.add_incoming(head, entry)
+        # Read next from head->field_0 (offset 0, i8* type)
+        head_as_pp = builder.bitcast(head_phi, self.i8_ptr.as_pointer())
+        next_val = builder.load(head_as_pp)
+        # CAS: free_list head -> next
+        free_list_as_i64p = builder.bitcast(self.gc_alloc_node_free_list, self.i64.as_pointer())
+        head_i64 = builder.ptrtoint(head_phi, self.i64)
+        next_i64 = builder.ptrtoint(next_val, self.i64)
+        cas_result = builder.cmpxchg(free_list_as_i64p, head_i64, next_i64, 'acq_rel', 'acquire')
+        old_val = builder.extract_value(cas_result, 0)
+        success = builder.extract_value(cas_result, 1)
+        builder.cbranch(success, cas_ok, cas_fail)
+
+        # CAS succeeded - return the node
+        builder = ir.IRBuilder(cas_ok)
+        builder.atomic_rmw('add', self.gc_debug_node_pool_reuse, ir.Constant(self.i64, 1), 'monotonic')
+        builder.ret(head_phi)
+
+        # CAS failed - retry with actual value
+        builder = ir.IRBuilder(cas_fail)
+        actual_ptr = builder.inttoptr(old_val, self.i8_ptr)
+        actual_is_null = builder.icmp_unsigned('==', actual_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(actual_is_null, ret_null, cas_loop)
+        head_phi.add_incoming(actual_ptr, cas_fail)
+
+        # Pool empty
+        builder = ir.IRBuilder(ret_null)
+        builder.ret(ir.Constant(self.i8_ptr, None))
+
+    def _implement_gc_alloc_node_push(self):
+        """CAS-based push to alloc_node free list pool.
+
+        Takes an alloc_node (i8*) and pushes it onto the pool free list.
+        Uses the node's field 0 (next pointer, offset 0) for free list linkage.
+        """
+        func = self.gc_alloc_node_push
+        func.attributes.add('nounwind')
+        node = func.args[0]
+        node.name = 'node'
+
+        entry = func.append_basic_block('entry')
+        cas_loop = func.append_basic_block('cas_loop')
+        cas_fail = func.append_basic_block('cas_fail')
+        cas_ok = func.append_basic_block('cas_ok')
+
+        builder = ir.IRBuilder(entry)
+        old_head = builder.load(self.gc_alloc_node_free_list)
+        builder.branch(cas_loop)
+
+        # CAS loop
+        builder = ir.IRBuilder(cas_loop)
+        head_phi = builder.phi(self.i8_ptr, 'old_head')
+        head_phi.add_incoming(old_head, entry)
+        # node->field_0 = old_head (store next pointer)
+        node_as_pp = builder.bitcast(node, self.i8_ptr.as_pointer())
+        builder.store(head_phi, node_as_pp)
+        # CAS: free_list old_head -> node
+        free_list_as_i64p = builder.bitcast(self.gc_alloc_node_free_list, self.i64.as_pointer())
+        head_i64 = builder.ptrtoint(head_phi, self.i64)
+        node_i64 = builder.ptrtoint(node, self.i64)
+        cas_result = builder.cmpxchg(free_list_as_i64p, head_i64, node_i64, 'acq_rel', 'acquire')
+        old_val = builder.extract_value(cas_result, 0)
+        success = builder.extract_value(cas_result, 1)
+        builder.cbranch(success, cas_ok, cas_fail)
+
+        # CAS failed - retry with actual head value
+        builder = ir.IRBuilder(cas_fail)
+        actual_ptr = builder.inttoptr(old_val, self.i8_ptr)
+        builder.branch(cas_loop)
+        head_phi.add_incoming(actual_ptr, cas_fail)
+
+        # CAS succeeded
+        builder = ir.IRBuilder(cas_ok)
+        builder.ret_void()
+
+    def _implement_gc_frame_pool_pop(self):
+        """CAS-based pop from shadow stack frame free list pool.
+
+        Returns a recycled frame (i8*) or NULL if pool is empty.
+        Uses the frame's field 0 (parent pointer, offset 0) for free list linkage.
+        """
+        func = self.gc_frame_pool_pop
+        func.attributes.add('nounwind')
+        entry = func.append_basic_block('entry')
+        cas_loop = func.append_basic_block('cas_loop')
+        cas_ok = func.append_basic_block('cas_ok')
+        cas_fail = func.append_basic_block('cas_fail')
+        ret_null = func.append_basic_block('ret_null')
+
+        builder = ir.IRBuilder(entry)
+        # Load head of free list
+        head = builder.load(self.gc_frame_free_list)
+        is_null = builder.icmp_unsigned('==', head, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(is_null, ret_null, cas_loop)
+
+        # CAS loop
+        builder = ir.IRBuilder(cas_loop)
+        head_phi = builder.phi(self.i8_ptr, 'head')
+        head_phi.add_incoming(head, entry)
+        # Read next from head->field_0 (offset 0, i8* type)
+        head_as_pp = builder.bitcast(head_phi, self.i8_ptr.as_pointer())
+        next_val = builder.load(head_as_pp)
+        # CAS: free_list head -> next
+        free_list_as_i64p = builder.bitcast(self.gc_frame_free_list, self.i64.as_pointer())
+        head_i64 = builder.ptrtoint(head_phi, self.i64)
+        next_i64 = builder.ptrtoint(next_val, self.i64)
+        cas_result = builder.cmpxchg(free_list_as_i64p, head_i64, next_i64, 'acq_rel', 'acquire')
+        old_val = builder.extract_value(cas_result, 0)
+        success = builder.extract_value(cas_result, 1)
+        builder.cbranch(success, cas_ok, cas_fail)
+
+        # CAS succeeded - return the frame
+        builder = ir.IRBuilder(cas_ok)
+        builder.atomic_rmw('add', self.gc_debug_frame_pool_reuse, ir.Constant(self.i64, 1), 'monotonic')
+        builder.ret(head_phi)
+
+        # CAS failed - retry with actual value
+        builder = ir.IRBuilder(cas_fail)
+        actual_ptr = builder.inttoptr(old_val, self.i8_ptr)
+        actual_is_null = builder.icmp_unsigned('==', actual_ptr, ir.Constant(self.i8_ptr, None))
+        builder.cbranch(actual_is_null, ret_null, cas_loop)
+        head_phi.add_incoming(actual_ptr, cas_fail)
+
+        # Pool empty
+        builder = ir.IRBuilder(ret_null)
+        builder.ret(ir.Constant(self.i8_ptr, None))
+
+    def _implement_gc_frame_pool_push(self):
+        """CAS-based push to shadow stack frame free list pool.
+
+        Takes a frame (i8*) and pushes it onto the pool free list.
+        Uses the frame's field 0 (parent pointer, offset 0) for free list linkage.
+        """
+        func = self.gc_frame_pool_push
+        func.attributes.add('nounwind')
+        node = func.args[0]
+        node.name = 'frame'
+
+        entry = func.append_basic_block('entry')
+        cas_loop = func.append_basic_block('cas_loop')
+        cas_fail = func.append_basic_block('cas_fail')
+        cas_ok = func.append_basic_block('cas_ok')
+
+        builder = ir.IRBuilder(entry)
+        old_head = builder.load(self.gc_frame_free_list)
+        builder.branch(cas_loop)
+
+        # CAS loop
+        builder = ir.IRBuilder(cas_loop)
+        head_phi = builder.phi(self.i8_ptr, 'old_head')
+        head_phi.add_incoming(old_head, entry)
+        # frame->field_0 = old_head (store next pointer)
+        node_as_pp = builder.bitcast(node, self.i8_ptr.as_pointer())
+        builder.store(head_phi, node_as_pp)
+        # CAS: free_list old_head -> frame
+        free_list_as_i64p = builder.bitcast(self.gc_frame_free_list, self.i64.as_pointer())
+        head_i64 = builder.ptrtoint(head_phi, self.i64)
+        node_i64 = builder.ptrtoint(node, self.i64)
+        cas_result = builder.cmpxchg(free_list_as_i64p, head_i64, node_i64, 'acq_rel', 'acquire')
+        old_val = builder.extract_value(cas_result, 0)
+        success = builder.extract_value(cas_result, 1)
+        builder.cbranch(success, cas_ok, cas_fail)
+
+        # CAS failed - retry with actual head value
+        builder = ir.IRBuilder(cas_fail)
+        actual_ptr = builder.inttoptr(old_val, self.i8_ptr)
+        builder.branch(cas_loop)
+        head_phi.add_incoming(actual_ptr, cas_fail)
+
+        # CAS succeeded
+        builder = ir.IRBuilder(cas_ok)
+        builder.ret_void()
+
     # ========================================================================
 
     def _implement_gc_compact_deferred_cleanup(self):

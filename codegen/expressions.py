@@ -165,39 +165,10 @@ class ExpressionGenerator:
             return cg.builder.load(read_buf, name=name)
 
         if name in cg.locals:
+            # Handle-storing allocas: deref handle to get current pointer
+            if name in getattr(cg, 'var_ptr_types', {}):
+                return cg._load_var_ptr(name)
             raw_value = cg.builder.load(cg.locals[name], name=name)
-
-            # BUG-111 FIX: For heap-allocated reference types with shadow stack
-            # slots, re-derive the pointer from the shadow stack handle.
-            # GC compaction can move objects, making the raw pointer in the
-            # alloca stale. The shadow stack always has the correct handle,
-            # and gc_handle_deref returns the current pointer.
-            if (isinstance(raw_value.type, ir.PointerType) and
-                    hasattr(cg, 'gc_root_indices') and
-                    name in cg.gc_root_indices and
-                    cg.gc is not None and
-                    hasattr(cg, 'gc_frame') and cg.gc_frame is not None):
-                pointee = raw_value.type.pointee
-                if hasattr(pointee, 'name') and pointee.name in (
-                        "struct.List", "struct.String", "struct.Map",
-                        "struct.Set", "struct.Array", "struct.Json"):
-                    root_idx = cg.gc_root_indices[name]
-                    absolute_slot = cg.builder.add(
-                        cg.gc_frame,
-                        ir.Constant(ir.IntType(64), root_idx)
-                    )
-                    handle = cg.builder.call(
-                        cg.gc.gc_segment_get_root, [absolute_slot]
-                    )
-                    # Deref handle to get current pointer (safe even after compaction)
-                    fresh_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                    typed_ptr = cg.builder.bitcast(fresh_ptr, raw_value.type)
-                    # Use fresh pointer if handle is non-null, else use alloca value
-                    is_nonnull = cg.builder.icmp_unsigned(
-                        "!=", handle, ir.Constant(ir.IntType(64), 0)
-                    )
-                    return cg.builder.select(is_nonnull, typed_ptr, raw_value)
-
             return raw_value
         elif name in cg.functions:
             return cg.functions[name]

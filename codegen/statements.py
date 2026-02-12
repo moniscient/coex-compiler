@@ -101,14 +101,6 @@ class StatementGenerator:
         """
         cg = self.cg
 
-        # BUG-113: In-place optimization is incompatible with the always-compact GC.
-        # It mutates through raw pointers loaded from allocas, but GC compaction
-        # moves objects and updates the handle table. The raw pointer becomes stale,
-        # so writes go to the old (non-canonical) location and mutations are lost.
-        # The normal reassignment path is safe (BUG-111 re-derives from handles).
-        if cg.gc is not None:
-            return False
-
         # Check if this is an update pattern
         if not can_optimize_statement(stmt):
             return False
@@ -135,12 +127,11 @@ class StatementGenerator:
         # Get the variable's type to determine which in-place function to use
         coex_type = cg.var_coex_types.get(var_name)
         if coex_type is None:
-            # Try to infer from LLVM type
-            alloca = cg.locals[var_name]
-            pointee = alloca.type.pointee
-            if not hasattr(pointee, 'name'):
+            # Try to infer from LLVM type (use var_ptr_types for handle-storing vars)
+            orig_type = cg._get_var_original_type(var_name)
+            if not hasattr(orig_type, 'name'):
                 return False
-            struct_name = pointee.name
+            struct_name = orig_type.name
             if struct_name == "struct.Set":
                 coex_type = SetType(PrimitiveType("int"))  # Default assumption
             elif struct_name == "struct.Map":
@@ -230,9 +221,14 @@ class StatementGenerator:
         """Generate the actual in-place function call."""
         cg = self.cg
 
-        # Load the wrapper pointer
-        alloca = cg.locals[var_name]
-        wrapper_ptr = cg.builder.load(alloca)
+        # Load the wrapper pointer - handle-storing allocas need deref
+        if var_name in getattr(cg, 'var_ptr_types', {}) and cg.gc is not None:
+            handle = cg._load_var_handle(var_name)
+            raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+            wrapper_ptr = cg.builder.bitcast(raw_ptr, cg.var_ptr_types[var_name])
+        else:
+            alloca = cg.locals[var_name]
+            wrapper_ptr = cg.builder.load(alloca)
 
         # Generate arguments - Array.set needs special handling
         llvm_args = [wrapper_ptr]
@@ -274,13 +270,8 @@ class StatementGenerator:
         # Call the in-place function (returns void)
         cg.builder.call(inplace_func, llvm_args)
 
-        # No need to store result - wrapper was mutated in place
-        # The handle in the variable slot is still valid
-
-        # Update GC root if needed (handle unchanged, but for consistency)
-        if var_name in cg.gc_root_indices and cg.gc is not None:
-            root_idx = cg.gc_root_indices[var_name]
-            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, wrapper_ptr)
+        # In-place mutation doesn't change the handle - same object, same wrapper.
+        # No alloca or shadow stack update needed.
 
         return True
 
@@ -493,48 +484,71 @@ class StatementGenerator:
             init_value = cg._generate_expression(stmt.initializer)
             llvm_type = init_value.type
 
+            # Determine if this variable should use handle-storing alloca
+            use_handle_alloca = (stmt.name in cg.gc_root_indices and cg.gc is not None)
+
             # Check if variable was pre-allocated
             if stmt.name in cg.locals:
                 existing_alloca = cg.locals[stmt.name]
                 existing_type = existing_alloca.type.pointee
 
-                if existing_type == llvm_type:
+                if use_handle_alloca and isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                    # Pre-allocated i64 alloca is already the correct type for handle storage
+                    alloca = existing_alloca
+                elif existing_type == llvm_type:
                     alloca = existing_alloca
                 elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
-                    func = cg.builder.function
-                    entry_block = func.entry_basic_block
-                    saved_block = cg.builder.block
-
-                    if entry_block.is_terminated:
-                        cg.builder.position_before(entry_block.terminator)
+                    if use_handle_alloca:
+                        alloca = existing_alloca
                     else:
-                        cg.builder.position_at_end(entry_block)
+                        func = cg.builder.function
+                        entry_block = func.entry_basic_block
+                        saved_block = cg.builder.block
 
-                    alloca = cg.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
-                    cg.builder.position_at_end(saved_block)
-                    cg.locals[stmt.name] = alloca
+                        if entry_block.is_terminated:
+                            cg.builder.position_before(entry_block.terminator)
+                        else:
+                            cg.builder.position_at_end(entry_block)
+
+                        alloca = cg.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                        cg.builder.position_at_end(saved_block)
+                        cg.locals[stmt.name] = alloca
+                else:
+                    if use_handle_alloca:
+                        alloca = cg.builder.alloca(ir.IntType(64), name=stmt.name)
+                    else:
+                        alloca = cg.builder.alloca(llvm_type, name=stmt.name)
+            else:
+                if use_handle_alloca:
+                    alloca = cg.builder.alloca(ir.IntType(64), name=stmt.name)
                 else:
                     alloca = cg.builder.alloca(llvm_type, name=stmt.name)
-            else:
-                alloca = cg.builder.alloca(llvm_type, name=stmt.name)
+
+            # Record original pointer type for handle-storing allocas
+            if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+                cg.var_ptr_types[stmt.name] = llvm_type
 
             # Value semantics: deep copy collections
             inferred_coex_type = self._infer_coex_type_from_initializer(stmt)
 
             # Handle i64 values that are actually handles to heap types
             # This happens with Channel.receive() which returns handles (i64).
-            # Use the inferred Coex type (or type annotation fallback) to determine
-            # the correct pointer type, then dereference the handle via gc_handle_deref.
             if isinstance(init_value.type, ir.IntType) and init_value.type.width == 64:
                 target_struct = self._resolve_heap_target_struct(inferred_coex_type, stmt)
 
                 if target_struct is not None:
-                    # Convert handle (i64) to typed pointer via gc_handle_deref
-                    raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [init_value])
-                    init_value = cg.builder.bitcast(raw_ptr, target_struct.as_pointer())
-                    # Re-allocate local with correct pointer type
-                    alloca = cg.builder.alloca(init_value.type, name=stmt.name)
-                    cg.locals[stmt.name] = alloca
+                    if use_handle_alloca:
+                        # With handle-storing allocas, keep the i64 handle directly
+                        # Record the pointer type for later deref
+                        cg.var_ptr_types[stmt.name] = target_struct.as_pointer()
+                        # init_value stays as i64 handle
+                    else:
+                        # Convert handle (i64) to typed pointer via gc_handle_deref
+                        raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [init_value])
+                        init_value = cg.builder.bitcast(raw_ptr, target_struct.as_pointer())
+                        # Re-allocate local with correct pointer type
+                        alloca = cg.builder.alloca(init_value.type, name=stmt.name)
+                        cg.locals[stmt.name] = alloca
 
             # Track aliasing for in-place optimization safety:
             # When copying a collection from another variable (e.g., s2 = s1),
@@ -600,15 +614,12 @@ class StatementGenerator:
                             cg.aliased_vars.add(source_var_name)
                             cg.aliased_vars.add(stmt.name)
 
-            cg.builder.store(init_value, alloca)
+            # Store value and update shadow stack
+            cg._store_var_handle(stmt.name, init_value, alloca)
             cg.locals[stmt.name] = alloca
 
             if is_new_var:
                 cg._register_var_in_scope(stmt.name)
-
-            if stmt.name in cg.gc_root_indices and cg.gc is not None:
-                root_idx = cg.gc_root_indices[stmt.name]
-                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, init_value)
 
             tuple_info = cg._infer_tuple_info(stmt.initializer)
             if tuple_info:
@@ -618,30 +629,49 @@ class StatementGenerator:
                 cg.moved_vars.add(move_source_name)
             return
 
+        # Determine if this variable should use handle-storing alloca
+        use_handle_alloca = (stmt.name in cg.gc_root_indices and cg.gc is not None)
+
         # Type-annotated path
         if stmt.name in cg.locals:
             existing_alloca = cg.locals[stmt.name]
             existing_type = existing_alloca.type.pointee
 
-            if existing_type == llvm_type:
+            if use_handle_alloca and isinstance(existing_type, ir.IntType) and existing_type.width == 64:
+                # Pre-allocated i64 alloca is already the correct type for handle storage
+                alloca = existing_alloca
+            elif existing_type == llvm_type:
                 alloca = existing_alloca
             elif isinstance(existing_type, ir.IntType) and existing_type.width == 64:
-                func = cg.builder.function
-                entry_block = func.entry_basic_block
-                saved_block = cg.builder.block
-
-                if entry_block.is_terminated:
-                    cg.builder.position_before(entry_block.terminator)
+                if use_handle_alloca:
+                    alloca = existing_alloca
                 else:
-                    cg.builder.position_at_end(entry_block)
+                    func = cg.builder.function
+                    entry_block = func.entry_basic_block
+                    saved_block = cg.builder.block
 
-                alloca = cg.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
-                cg.builder.position_at_end(saved_block)
-                cg.locals[stmt.name] = alloca
+                    if entry_block.is_terminated:
+                        cg.builder.position_before(entry_block.terminator)
+                    else:
+                        cg.builder.position_at_end(entry_block)
+
+                    alloca = cg.builder.alloca(llvm_type, name=f"{stmt.name}.typed")
+                    cg.builder.position_at_end(saved_block)
+                    cg.locals[stmt.name] = alloca
+            else:
+                if use_handle_alloca:
+                    alloca = cg.builder.alloca(ir.IntType(64), name=stmt.name)
+                else:
+                    alloca = cg.builder.alloca(llvm_type, name=stmt.name)
+        else:
+            if use_handle_alloca:
+                alloca = cg.builder.alloca(ir.IntType(64), name=stmt.name)
             else:
                 alloca = cg.builder.alloca(llvm_type, name=stmt.name)
-        else:
-            alloca = cg.builder.alloca(llvm_type, name=stmt.name)
+
+        # Record original pointer type for handle-storing allocas
+        if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+            cg.var_ptr_types[stmt.name] = llvm_type
 
         # Generate initializer with special cases
         if isinstance(stmt.initializer, NilLiteral) and isinstance(stmt.type_annotation, OptionalType):
@@ -795,17 +825,14 @@ class StatementGenerator:
                         cg.aliased_vars.add(typed_source_var_name)
                         cg.aliased_vars.add(stmt.name)  # Target is also aliased
 
-        cg.builder.store(init_value, alloca)
+        # Store value and update shadow stack
+        cg._store_var_handle(stmt.name, init_value, alloca)
         cg.locals[stmt.name] = alloca
 
         if is_new_var:
             cg._register_var_in_scope(stmt.name)
 
         cg.placeholder_vars.discard(stmt.name)
-
-        if stmt.name in cg.gc_root_indices and cg.gc is not None:
-            root_idx = cg.gc_root_indices[stmt.name]
-            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, init_value)
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
@@ -981,7 +1008,7 @@ class StatementGenerator:
             reassign_source_var_name = stmt.initializer.name
 
         value = cg._generate_expression(stmt.initializer)
-        expected_type = alloca.type.pointee
+        expected_type = cg._get_var_original_type(stmt.name)
         value = cg._cast_value(value, expected_type)
 
         # Check for unique bindings - they are never aliased
@@ -1038,16 +1065,13 @@ class StatementGenerator:
                         cg.aliased_vars.add(reassign_source_var_name)
                         cg.aliased_vars.add(stmt.name)
 
-        cg.builder.store(value, alloca)
+        # Store value and update shadow stack
+        cg._store_var_handle(stmt.name, value, alloca)
 
         # Apply deferred type update for method calls (BUG-075 fix)
         # This updates var_coex_types AFTER expression generation and store
         if deferred_type_update is not None:
             cg.var_coex_types[stmt.name] = deferred_type_update
-
-        if stmt.name in cg.gc_root_indices and cg.gc is not None:
-            root_idx = cg.gc_root_indices[stmt.name]
-            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, value)
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
@@ -1068,17 +1092,20 @@ class StatementGenerator:
 
                     if name in cg.locals:
                         alloca = cg.locals[name]
-                        if alloca.type.pointee != elem_type:
-                            elem_val = cg._cast_value(elem_val, alloca.type.pointee)
-                        cg.builder.store(elem_val, alloca)
+                        orig_type = cg._get_var_original_type(name)
+                        if orig_type != elem_type:
+                            elem_val = cg._cast_value(elem_val, orig_type)
                     else:
-                        alloca = cg.builder.alloca(elem_type, name=name)
-                        cg.builder.store(elem_val, alloca)
+                        use_handle = (name in cg.gc_root_indices and cg.gc is not None
+                                      and isinstance(elem_type, ir.PointerType))
+                        if use_handle:
+                            alloca = cg.builder.alloca(ir.IntType(64), name=name)
+                            cg.var_ptr_types[name] = elem_type
+                        else:
+                            alloca = cg.builder.alloca(elem_type, name=name)
                         cg.locals[name] = alloca
 
-                    if name in cg.gc_root_indices and cg.gc is not None:
-                        root_idx = cg.gc_root_indices[name]
-                        cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, elem_val)
+                    cg._store_var_handle(name, elem_val, cg.locals[name])
         else:
             for name in stmt.names:
                 if name in cg.locals:
@@ -1151,10 +1178,14 @@ class StatementGenerator:
                 alloca = cg.locals[name]
 
                 if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
-                    old_val = cg.builder.load(alloca)
+                    # Compound assignment: load current value (deref handle if needed)
+                    if name in getattr(cg, 'var_ptr_types', {}):
+                        old_val = cg._load_var_ptr(name)
+                    else:
+                        old_val = cg.builder.load(alloca)
                     value = self._apply_compound_op(stmt.op, old_val, value)
 
-                expected_type = alloca.type.pointee
+                expected_type = cg._get_var_original_type(name)
                 value = cg._cast_value(value, expected_type)
 
                 # Value semantics for collections
@@ -1178,11 +1209,8 @@ class StatementGenerator:
                         elif pointee.name == "struct.Array" and stmt.op != AssignOp.COPY_ASSIGN:
                             value = cg.builder.call(cg.array_copy, [value])
 
-                cg.builder.store(value, alloca)
-
-                if name in cg.gc_root_indices and cg.gc is not None:
-                    root_idx = cg.gc_root_indices[name]
-                    cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, value)
+                # Store value and update shadow stack
+                cg._store_var_handle(name, value, alloca)
             else:
                 # Variable doesn't exist - compound assignment is an error
                 if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
@@ -1223,8 +1251,9 @@ class StatementGenerator:
                         name = elem_expr.name
                         if name in cg.locals:
                             alloca = cg.locals[name]
-                            elem_val = cg._cast_value(elem_val, alloca.type.pointee)
-                            cg.builder.store(elem_val, alloca)
+                            orig_type = cg._get_var_original_type(name)
+                            elem_val = cg._cast_value(elem_val, orig_type)
+                            cg._store_var_handle(name, elem_val, alloca)
 
     def generate_member_assignment(self, stmt: Assignment):
         """Generate assignment to member expression"""
@@ -1276,10 +1305,7 @@ class StatementGenerator:
                     if isinstance(target.object, Identifier):
                         var_name = target.object.name
                         if var_name in cg.locals:
-                            cg.builder.store(new_list, cg.locals[var_name])
-                            if var_name in cg.gc_root_indices and cg.gc is not None:
-                                root_idx = cg.gc_root_indices[var_name]
-                                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_list)
+                            cg._store_var_handle(var_name, new_list, cg.locals[var_name])
                     return
 
                 if pointee.name == "struct.Array":
@@ -1308,10 +1334,7 @@ class StatementGenerator:
                     if isinstance(target.object, Identifier):
                         var_name = target.object.name
                         if var_name in cg.locals:
-                            cg.builder.store(new_array, cg.locals[var_name])
-                            if var_name in cg.gc_root_indices and cg.gc is not None:
-                                root_idx = cg.gc_root_indices[var_name]
-                                cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_array)
+                            cg._store_var_handle(var_name, new_array, cg.locals[var_name])
                     return
 
     def generate_slice_assignment(self, stmt: SliceAssignment):
@@ -1348,10 +1371,7 @@ class StatementGenerator:
                 if isinstance(stmt.target, Identifier):
                     var_name = stmt.target.name
                     if var_name in cg.locals:
-                        cg.builder.store(new_obj, cg.locals[var_name])
-                        if var_name in cg.gc_root_indices and cg.gc is not None:
-                            root_idx = cg.gc_root_indices[var_name]
-                            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_obj)
+                        cg._store_var_handle(var_name, new_obj, cg.locals[var_name])
                 return
 
         if isinstance(obj.type, ir.PointerType):
@@ -1361,10 +1381,7 @@ class StatementGenerator:
                 if isinstance(stmt.target, Identifier):
                     var_name = stmt.target.name
                     if var_name in cg.locals:
-                        cg.builder.store(new_list, cg.locals[var_name])
-                        if var_name in cg.gc_root_indices and cg.gc is not None:
-                            root_idx = cg.gc_root_indices[var_name]
-                            cg.gc.set_root(cg.builder, cg.gc_frame, root_idx, new_list)
+                        cg._store_var_handle(var_name, new_list, cg.locals[var_name])
 
     def generate_return(self, stmt: ReturnStmt):
         """Generate return statement"""

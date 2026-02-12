@@ -4,6 +4,20 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-123: Galaxian ~3MB/min memory leak from alloc_node malloc/free churn
+- **Discovered**: 2026-02-11, during Galaxian memory leak investigation
+- **Category**: GC
+- **Severity**: Medium
+- **Reproduction**: Run Galaxian game, monitor RSS. Memory grows ~3MB/min during gameplay.
+- **Observed**: RSS increases steadily. GC reclamation works correctly (live_objects stable), but ~600K malloc(32)/free() calls/sec for alloc_nodes cause macOS libmalloc to retain freed heap pages.
+- **Expected**: Steady-state memory usage after initial warmup period
+- **Root cause**: Every `gc_alloc` mallocs a 32-byte alloc_node struct, and every sweep frees it. macOS libmalloc retains freed heap pages in its arena (RSS doesn't decrease).
+- **Fix**: Added lock-free alloc_node pool using CAS-based free list. `gc_alloc_node_pop` tries pool before malloc; `gc_alloc_node_push` returns swept nodes to pool instead of freeing. Eliminates ~600K malloc/free cycles/sec.
+- **Files**: coex_gc.py (globals, pop/push functions, gc_alloc, gc_sweep, gc_dump_stats)
+- **Status**: Fixed (2026-02-11)
+
+---
+
 ### BUG-121: llvmlite `.ordering` attribute silently ignored on plain loads + mixed atomic/non-atomic UB
 - **Discovered**: 2026-02-11, during Linux CI crash investigation of `test_gc_auto_trigger_multiple_cycles`
 - **Category**: GC
@@ -1902,7 +1916,7 @@ func main() -> int
 - **Fix**: Modified `generate_identifier` to re-derive reference-type pointers from the shadow stack handle on every variable read. For variables with shadow stack slots (`gc_root_indices`), the fix reads the handle via `gc_segment_get_root`, dereferences it via `gc_handle_deref` to get the current pointer, and returns the fresh pointer. This adds ~3 instructions per reference-type variable access but ensures correctness after compaction.
 - **Files**: codegen/expressions.py (generate_identifier, lines 167-196)
 - **Tests**: tests/test_stale_var_pointer.py (4 new tests)
-- **Status**: Fixed (2026-02-09)
+- **Status**: Fixed (2026-02-09). Workaround (per-read shadow stack re-derive) properly resolved by handle-storing allocas refactor (2026-02-11): allocas now store i64 handles instead of raw pointers, so variable reads naturally produce fresh pointers via `_load_var_ptr` → `gc_handle_deref`. The 30-line BUG-111 hack in `generate_identifier` was replaced with a 3-line `_load_var_ptr` call.
 
 ---
 
@@ -1947,9 +1961,9 @@ func main() -> int
 - **Reproduction**: `m = m.set(key, val)` after GC compaction (2 gc() cycles with garbage between them)
 - **Observed**: `try_generate_inplace_update` calls `map_put_inplace` with a raw pointer loaded from the variable's alloca. After compaction, this is stale.
 - **Root Cause**: In-place optimization mutates through raw pointers, but compaction changes the canonical object location. Writes go to old location; reads via handle deref see unmodified copy at new location.
-- **Fix**: Disabled in-place optimization when GC is active (`cg.gc is not None` → return False). The normal reassignment path is correct and performance difference is negligible.
+- **Fix**: Initially disabled in-place optimization when GC is active (`cg.gc is not None` → return False). The normal reassignment path is correct and performance difference is negligible.
 - **Files**: `codegen/statements.py` (try_generate_inplace_update)
-- **Status**: Fixed (2026-02-09)
+- **Status**: Fixed (2026-02-09). In-place optimization re-enabled by handle-storing allocas refactor (2026-02-11): `_generate_inplace_call` now loads the wrapper pointer via `_load_var_handle` → `gc_handle_deref`, getting a fresh pointer that is valid after compaction. The GC guard (`if cg.gc is not None: return False`) was removed.
 
 ---
 
@@ -2051,4 +2065,24 @@ func main() -> int
 - **Root cause**: runtime/coex_string.c was written when arena allocation existed and owner_handle stored raw pointers via ptrtoint. After arena removal (Feb 2026), all codegen switched to treating owner_handle as a GC handle, but the C runtime was never updated.
 - **Fix**: (1) Added extern declarations for coex_gc_ptr_to_handle and coex_gc_handle_deref to coex_string.c. (2) string_create_internal now stores gc_ptr_to_handle(data_buf) in owner_handle and includes stale-pointer-across-allocation protection (saves string handle before second alloc, re-derives after). (3) coex_string_get_data now uses gc_handle_deref(owner_handle) instead of raw cast.
 - **Files**: `runtime/coex_string.c`, `runtime/coex_string.h`
+- **Status**: Fixed (2026-02-11)
+
+---
+
+### BUG-122: Dead task thread TLABs never freed — memory leak
+- **Discovered**: 2026-02-11, during investigation of ~10MB/minute memory leak in Galaxian
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run Galaxian or any program that spawns many short-lived task threads. Memory grows linearly over time as dead thread TLABs (256KB each) and alloc_nodes are never reclaimed.
+- **Observed**: Three interrelated bugs causing permanent memory leak:
+  1. **Registry corruption**: `gc_unregister_thread` reused field 11 (registry `next` pointer) for dead-list linkage via `gc_dead_threads`. This severed the registry linked list, orphaning threads registered after the dead thread — their roots were never scanned and alloc_lists were never swept.
+  2. **Sweep skip**: `gc_sweep_thread_lists` skipped dead threads entirely (`watermark_active == 0xDEAD`). Dead threads' alloc_nodes were never processed, handles were never retired, TLAB live_counts never reached 0, TLABs were never munmapped.
+  3. **Premature ThreadEntry free**: `gc_collect` dead cleanup freed ThreadEntry even when its alloc_list still contained unswept objects.
+- **Expected**: After task threads complete and their objects become unreachable, GC should sweep dead thread allocations, retire handles, and eventually munmap TLABs.
+- **Fix**: Three coordinated changes in `coex_gc.py`:
+  1. Changed dead-list linkage from field 11 (registry next) to field 15 (reserved) in `_implement_gc_unregister_thread` — preserves registry linked list integrity.
+  2. Removed dead-thread skip in `_implement_gc_sweep_thread_lists` — dead threads' alloc_lists are now swept normally, retiring handles and decrementing TLAB live_counts.
+  3. Added alloc_list emptiness check in `_implement_gc_collect` dead cleanup — if alloc_list not empty, CAS-append back to `gc_dead_threads` for next cycle; if empty, proceed to unlink from registry and free ThreadEntry.
+- **Tests**: `tests/test_dead_thread_tlab_leak.py` — 8 tests covering dead thread sweep (3), TLAB reclamation (2), stress (1), and registry integrity (2)
+- **Files**: `coex_gc.py` (`_implement_gc_unregister_thread`, `_implement_gc_sweep_thread_lists`, `_implement_gc_collect`)
 - **Status**: Fixed (2026-02-11)
