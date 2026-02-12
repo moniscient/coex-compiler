@@ -93,17 +93,6 @@
 
 ---
 
-### BUG-126: Bare field access in UDT methods broken when variable uses handle-storing alloca
-- **Discovered**: 2026-02-12, during BUG-125 test development
-- **Category**: Codegen
-- **Severity**: Medium
-- **Reproduction**: `type Accum: total: int; func add_and_get(n: int) -> int; return total + n ~; ~` — compile error: `Type of #1 arg mismatch: i64 != %"struct.Accum"*`
-- **Observed**: Compile-time type error when calling a method that uses bare field name (implicit `self`) on a variable stored as a handle-storing alloca
-- **Expected**: Bare field names in method bodies should work identically to `self.field`
-- **Hypothesis**: Pre-existing issue unrelated to BUG-125. When the caller's variable is stored as i64 handle, the method call site passes an i64 to a function expecting a struct pointer. The implicit field access path in `generate_identifier` loads `self` correctly, but the method call dispatch doesn't properly convert the caller's handle-stored variable to a pointer before passing as self.
-- **Files**: codegen/expressions.py (generate_method_call, generate_identifier implicit field path)
-- **Status**: Open
-
 ---
 
 **Next valid BUG ID: BUG-127**

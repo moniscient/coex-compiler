@@ -174,7 +174,6 @@ func main() -> int
 class TestUdtImplicitFieldAccess:
     """Tests: implicit field access (bare field name, not self.field)."""
 
-    @pytest.mark.xfail(reason="BUG-126: bare field access in UDT methods broken when var_ptr_types active")
     def test_implicit_field_after_alloc(self, expect_output):
         """Access field by bare name in method, after allocating."""
         expect_output('''

@@ -1093,17 +1093,24 @@ class FunctionGenerator:
     # Type Method Generation
     # ========================================================================
 
-    def method_uses_self(self, method) -> bool:
+    def method_uses_self(self, method, field_names: set = None) -> bool:
         """Check if a method body references 'self' or implicit field access.
 
         Methods that don't use self are static methods and don't get a self parameter.
+        BUG-126 FIX: Also checks for bare field name access (e.g., 'total' instead
+        of 'self.total'), which resolves to implicit self field access at codegen time.
         """
         def check_expr(expr) -> bool:
             """Recursively check if expression uses self"""
             if expr is None:
                 return False
             if isinstance(expr, Identifier):
-                return expr.name == "self"
+                if expr.name == "self":
+                    return True
+                # BUG-126: Check if identifier is a field name (implicit self access)
+                if field_names and expr.name in field_names:
+                    return True
+                return False
             if isinstance(expr, SelfExpr):
                 return True
             if isinstance(expr, MemberExpr):
@@ -1207,7 +1214,9 @@ class FunctionGenerator:
             mangled_name = f"{type_decl.name}_{method.name}"
 
             # Check if this is a static method (doesn't use self)
-            is_static = not self.method_uses_self(method)
+            # BUG-126 FIX: Pass field names so bare field access is detected
+            field_names = {name for name, _ in cg.type_fields.get(type_decl.name, [])}
+            is_static = not self.method_uses_self(method, field_names)
             cg.static_methods[mangled_name] = is_static
 
             # Build parameter types

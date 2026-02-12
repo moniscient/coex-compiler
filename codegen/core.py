@@ -1288,9 +1288,9 @@ class CodeGenerator:
         """Register enum type - delegated to EnumGenerator"""
         return self._enums.register_enum_type(type_decl)
 
-    def _method_uses_self(self, method) -> bool:
+    def _method_uses_self(self, method, field_names: set = None) -> bool:
         """Check if a method body references 'self' or implicit field access."""
-        return self._functions.method_uses_self(method)
+        return self._functions.method_uses_self(method, field_names)
 
     def _declare_type_methods(self, type_decl: TypeDecl):
         """Declare all methods for a type"""

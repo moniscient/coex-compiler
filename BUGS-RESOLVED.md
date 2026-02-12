@@ -4,6 +4,18 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-126: Bare field access in UDT methods broken when variable uses handle-storing alloca
+- **Discovered**: 2026-02-12, during BUG-125 test development
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: `type Accum: total: int; func add_and_get(n: int) -> int; return total + n ~; ~` — compile error: `Type of #1 arg mismatch: i64 != %"struct.Accum"*`
+- **Root cause**: `method_uses_self()` only checked for explicit `self` or `SelfExpr` references. Bare field names like `total` (which resolve to implicit `self.total` at codegen time) were not detected, causing the method to be incorrectly declared as static (no `self` parameter). At the call site, the caller passed the UDT object as first arg to a function that didn't expect it → type mismatch.
+- **Fix**: Added `field_names` parameter to `method_uses_self()`. When an `Identifier` matches a field name of the enclosing type, the method is treated as instance (non-static). Conservative — a local variable shadowing a field name causes a false positive (unused self param) rather than a false negative (crash).
+- **Files**: codegen/functions.py (method_uses_self, declare_type_methods), codegen/core.py (_method_uses_self)
+- **Status**: Fixed (2026-02-12)
+
+---
+
 ### BUG-125: UDT method `self` pointer not GC-tracked — stale pointer after compaction
 - **Discovered**: 2026-02-12, during UDT implementation audit
 - **Category**: GC
