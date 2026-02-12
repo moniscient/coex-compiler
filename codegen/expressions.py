@@ -123,7 +123,10 @@ class ExpressionGenerator:
 
         elif isinstance(expr, SelfExpr):
             # Return self pointer if available
+            # BUG-125 FIX: Re-derive from handle if self is handle-stored
             if "self" in cg.locals:
+                if "self" in getattr(cg, 'var_ptr_types', {}):
+                    return cg._load_var_ptr("self")
                 return cg.builder.load(cg.locals["self"])
             return ir.Constant(ir.IntType(64), 0)
 
@@ -177,7 +180,11 @@ class ExpressionGenerator:
             if cg.current_type and "self" in cg.locals:
                 field_idx = cg._get_field_index(cg.current_type, name)
                 if field_idx is not None:
-                    self_ptr = cg.builder.load(cg.locals["self"])
+                    # BUG-125 FIX: Re-derive self from handle
+                    if "self" in getattr(cg, 'var_ptr_types', {}):
+                        self_ptr = cg._load_var_ptr("self")
+                    else:
+                        self_ptr = cg.builder.load(cg.locals["self"])
                     field_ptr = cg.builder.gep(self_ptr, [
                         ir.Constant(ir.IntType(32), 0),
                         ir.Constant(ir.IntType(32), field_idx)

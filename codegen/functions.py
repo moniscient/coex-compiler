@@ -1261,26 +1261,75 @@ class FunctionGenerator:
             cg.current_function = method
             cg.current_type = type_decl.name if not is_static else None
 
+            # BUG-125 FIX: Set up GC shadow stack frame for methods
+            # Previously this path had NO GC frame — self and params were
+            # raw pointers that went stale after compaction.
+            cg.gc_frame = None
+            cg.gc_root_indices = {}
+            cg.var_ptr_types = {}
+
             if is_static:
                 # Static method - no self parameter
-                # Allocate parameters directly (no offset for self)
+                # Collect heap vars for GC tracking
+                heap_var_names = []
+                for param in method.params:
+                    if param.type_annotation and cg._is_heap_type(param.type_annotation):
+                        heap_var_names.append(param.name)
+                body_heap_vars = self.collect_heap_vars_from_body(method.body)
+                heap_var_names.extend(body_heap_vars)
+
+                if heap_var_names and cg.gc is not None:
+                    num_roots = len(heap_var_names)
+                    cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
+                    cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+
+                # GC safepoint
+                if cg.gc is not None:
+                    cg.gc.inject_safepoint(cg.builder)
+
+                # Allocate parameters
                 for i, param in enumerate(method.params):
                     llvm_param = llvm_func.args[i]
                     llvm_param.name = param.name
 
-                    alloca = cg.builder.alloca(llvm_param.type, name=param.name)
-                    cg.builder.store(llvm_param, alloca)
+                    use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
+                                  and isinstance(llvm_param.type, ir.PointerType))
+                    if use_handle:
+                        alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
+                        cg.var_ptr_types[param.name] = llvm_param.type
+                    else:
+                        alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.locals[param.name] = alloca
+                    cg._store_var_handle(param.name, llvm_param, alloca)
 
                     # Mark collection parameters as aliased for in-place optimization safety
                     if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
                         cg.aliased_vars.add(param.name)
             else:
                 # Instance method - has self as first parameter
-                # Store self pointer
-                self_alloca = cg.builder.alloca(llvm_func.args[0].type, name="self")
-                cg.builder.store(llvm_func.args[0], self_alloca)
+                # Collect heap vars: self + params + body locals
+                heap_var_names = ["self"]  # self is always a heap type (UDT)
+                for param in method.params:
+                    if param.type_annotation and cg._is_heap_type(param.type_annotation):
+                        heap_var_names.append(param.name)
+                body_heap_vars = self.collect_heap_vars_from_body(method.body)
+                heap_var_names.extend(body_heap_vars)
+
+                if heap_var_names and cg.gc is not None:
+                    num_roots = len(heap_var_names)
+                    cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
+                    cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
+
+                # GC safepoint
+                if cg.gc is not None:
+                    cg.gc.inject_safepoint(cg.builder)
+
+                # Store self as handle-storing alloca
+                self_ptr_type = llvm_func.args[0].type
+                self_alloca = cg.builder.alloca(ir.IntType(64), name="self")
+                cg.var_ptr_types["self"] = self_ptr_type
                 cg.locals["self"] = self_alloca
+                cg._store_var_handle("self", llvm_func.args[0], self_alloca)
 
                 # Also make fields accessible directly by name
                 cg._setup_field_aliases(type_decl.name, self_alloca)
@@ -1290,9 +1339,15 @@ class FunctionGenerator:
                     llvm_param = llvm_func.args[i + 1]  # +1 for self
                     llvm_param.name = param.name
 
-                    alloca = cg.builder.alloca(llvm_param.type, name=param.name)
-                    cg.builder.store(llvm_param, alloca)
+                    use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
+                                  and isinstance(llvm_param.type, ir.PointerType))
+                    if use_handle:
+                        alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
+                        cg.var_ptr_types[param.name] = llvm_param.type
+                    else:
+                        alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.locals[param.name] = alloca
+                    cg._store_var_handle(param.name, llvm_param, alloca)
 
                     # Mark collection parameters as aliased for in-place optimization safety
                     if param.type_annotation and cg._is_collection_coex_type(param.type_annotation):
@@ -1306,11 +1361,18 @@ class FunctionGenerator:
 
             # Add implicit return if needed
             if not cg.builder.block.is_terminated:
+                # Pop GC frame before implicit return
+                if cg.gc_frame is not None and cg.gc is not None:
+                    cg.gc.pop_frame(cg.builder, cg.gc_frame)
+
                 if isinstance(llvm_func.return_value.type, ir.VoidType):
                     cg.builder.ret_void()
                 else:
                     cg.builder.ret(ir.Constant(llvm_func.return_value.type, 0))
 
+            cg.gc_frame = None
+            cg.gc_root_indices = {}
+            cg.var_ptr_types = {}
             cg.current_type = None
             cg.current_function = None
 
@@ -1385,10 +1447,11 @@ class FunctionGenerator:
         cg.gc_root_indices = {}
         cg.var_ptr_types = {}
 
-        # Collect heap variables for GC root tracking
-        heap_var_names = []
+        # BUG-125 FIX: Collect heap variables for GC root tracking
+        # Include 'self' — it's a heap type (UDT pointer) that must be tracked
+        heap_var_names = ["self"]
 
-        # Check parameters for heap types (skip 'self')
+        # Check parameters for heap types
         for param in method.params:
             if param.type_annotation and cg._is_heap_type(param.type_annotation):
                 heap_var_names.append(param.name)
@@ -1397,8 +1460,8 @@ class FunctionGenerator:
         body_heap_vars = self.collect_heap_vars_from_body(method.body)
         heap_var_names.extend(body_heap_vars)
 
-        # Create shadow stack frame if we have heap variables
-        if heap_var_names and cg.gc is not None:
+        # Create shadow stack frame — always needed since self is included
+        if cg.gc is not None:
             num_roots = len(heap_var_names)
             cg.gc_frame = cg.gc.push_frame(cg.builder, num_roots)
             cg.gc_root_indices = {name: i for i, name in enumerate(heap_var_names)}
@@ -1407,10 +1470,12 @@ class FunctionGenerator:
         if cg.gc is not None:
             cg.gc.inject_safepoint(cg.builder)
 
-        # Store self pointer
-        self_alloca = cg.builder.alloca(llvm_func.args[0].type, name="self")
-        cg.builder.store(llvm_func.args[0], self_alloca)
+        # Store self as handle-storing alloca (BUG-125 FIX)
+        self_ptr_type = llvm_func.args[0].type
+        self_alloca = cg.builder.alloca(ir.IntType(64), name="self")
+        cg.var_ptr_types["self"] = self_ptr_type
         cg.locals["self"] = self_alloca
+        cg._store_var_handle("self", llvm_func.args[0], self_alloca)
 
         # Allocate other parameters
         for i, param in enumerate(method.params):

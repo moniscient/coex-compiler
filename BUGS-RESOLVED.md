@@ -4,6 +4,24 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-125: UDT method `self` pointer not GC-tracked — stale pointer after compaction
+- **Discovered**: 2026-02-12, during UDT implementation audit
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Any UDT method that accesses `self.field` after an allocation that triggers GC compaction. E.g., a method that creates a new list/string then reads `self.name`.
+- **Observed**: `self` is stored as a raw pointer in an alloca. After GC compaction moves the UDT object and deferred TLAB munmap frees the old memory, accessing `self.field` dereferences a stale pointer → SIGSEGV.
+- **Expected**: `self` should be tracked as a GC handle in the shadow stack and re-derived via `gc_handle_deref` on every access, like all other reference-type variables.
+- **Root cause**: Two separate but related issues:
+  1. **Non-generic method path** (`generate_type_methods`, functions.py): Had NO GC frame at all — no `push_frame`, no `gc_root_indices`, no `var_ptr_types`. Neither `self` nor any heap-type parameters were protected.
+  2. **Monomorphized method path** (`generate_method_body`, functions.py): Had a GC frame but explicitly skipped `self`. Parameters got handle storage but `self` did not.
+  3. **SelfExpr** (expressions.py): `cg.builder.load(cg.locals["self"])` loaded the raw stale pointer without re-derivation.
+  4. **Implicit field access** (expressions.py): `self_ptr = cg.builder.load(cg.locals["self"])` then GEPs — same stale pointer issue.
+- **Fix**: Added full GC shadow stack frame to both method codegen paths. `self` is now stored as a handle-storing i64 alloca in `var_ptr_types`, with `_store_var_handle`/`_load_var_ptr` for handle↔pointer conversion. SelfExpr and implicit field access check `var_ptr_types` and re-derive via `gc_handle_deref`. Also discovered pre-existing BUG-126 (bare field access broken with handle allocas).
+- **Files**: codegen/functions.py, codegen/expressions.py
+- **Status**: Fixed (2026-02-12)
+
+---
+
 ### BUG-123: Galaxian ~3MB/min memory leak from alloc_node malloc/free churn
 - **Discovered**: 2026-02-11, during Galaxian memory leak investigation
 - **Category**: GC
