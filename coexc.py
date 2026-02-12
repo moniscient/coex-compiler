@@ -252,6 +252,11 @@ def compile_coex(source_path: str, output_path: str = None,
         # Build link command
         link_cmd = ["clang", obj_path, "-o", exe_path, "-lpthread", "-lm"]
 
+        # Link ObjC runtime on macOS for autorelease pool drain in extern calls.
+        # objc_autoreleasePoolPush/Pop prevent Metal/GPU command buffer accumulation.
+        if sys.platform == "darwin":
+            link_cmd.append("-lobjc")
+
         # Add task runtime library (always linked for concurrent task support)
         runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
         task_runtime = os.path.join(runtime_dir, "libcoex_task.a")
