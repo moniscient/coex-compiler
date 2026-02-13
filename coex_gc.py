@@ -6862,9 +6862,27 @@ class GarbageCollector:
         obj_gen = builder.load(gen_ptr)
         current_mark = builder.load(self.gc_current_mark_value)
 
-        # If generation >= current, object is live (born-marked gen==current
-        # or explicitly traced gen==current+1 both survive)
-        is_marked = builder.icmp_unsigned(">=", obj_gen, current_mark)
+        # BUG-124 FIX: One-generation grace period for birth-marking race.
+        #
+        # When a safepoint triggers gc_async() and the GC thread hasn't yet
+        # incremented gc_current_mark_value, gc_alloc reads the OLD value (M)
+        # instead of the new value (M+1). Objects allocated with generation M
+        # fail the birth-mark check (M < M+1) and are swept if unrooted.
+        #
+        # This race manifests when functions return heap objects: between the
+        # callee's gc_segment_pop and the caller's gc_segment_set_root, the
+        # returned object is in no shadow stack. If the GC marks during this
+        # window, the object is neither rooted nor birth-marked → swept.
+        #
+        # Fix: check gen >= current_mark - 1 instead of gen >= current_mark.
+        # This gives objects a one-generation grace period:
+        #  - Traced objects (gen = M+1): M+1 >= M → survives ✓
+        #  - Birth-marked (gen = M): M >= M → survives ✓
+        #  - Race victims (gen = M-1): M-1 >= M-1 → survives ✓
+        #  - Old garbage (gen < M-1): swept ✓
+        # Cost: objects may survive one extra cycle (minor floating garbage).
+        grace_mark = builder.sub(current_mark, ir.Constant(self.i64, 1))
+        is_marked = builder.icmp_unsigned(">=", obj_gen, grace_mark)
         builder.cbranch(is_marked, marked_node, unmarked_node)
 
         # Object is marked - add to survivors list

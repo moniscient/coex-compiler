@@ -4,6 +4,23 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-124: List append through helper function segfaults at high iteration count
+- **Discovered**: 2026-02-11, during frame pool verification testing
+- **Category**: GC
+- **Severity**: High
+- **Reproduction**: `func helper(x: [int]) -> [int]; return x.append(1) ~` called 200K times in a loop: `x = helper(x)`. Works at 1K iterations, segfaults at 200K.
+- **Observed**: Segmentation fault (signal 11) after ~33K-90K iterations (non-deterministic, varies with GC timing)
+- **Root cause**: Birth-marking race condition + unrooted return value window.
+  1. **Birth-marking race**: `gc_alloc` reads `gc_current_mark_value` with seq_cst, and the GC thread increments it with seq_cst. In the total order, the mutator's read CAN happen before the GC increment, giving the object generation value M-1 instead of M. Sweep checked `gen >= current_mark (M)`, so M-1 < M → object swept as garbage.
+  2. **Unrooted window**: Between callee's `gc_segment_pop` and caller's `gc_segment_set_root`, the returned list handle is in NO shadow stack. Combined with the race, the object is neither rooted nor birth-marked → swept.
+  3. **Handle retirement**: `gc_handle_retire` immediately overwrites the handle table entry. When caller later calls `gc_ptr_to_handle` on the returned pointer, the forward field reads from freed/zeroed memory → returns 0 → segfault.
+- **Fix**: Changed sweep check from `gen >= current_mark` to `gen >= current_mark - 1` (one-generation grace period). Race victims with generation M-1 survive current cycle (M-1 >= M-1). Cost: objects may survive one extra cycle (minor floating garbage). Also fixed stale pointer bugs in `list_new` (handle save/re-derive between two allocations) and `list_append` merge block (re-derive from handle after list_new call).
+- **Files**: coex_gc.py (sweep check at line ~6884), codegen/list.py (list_new, list_append)
+- **Tests**: tests/test_bug124_list_helper.py (6 tests)
+- **Status**: Fixed (2026-02-12)
+
+---
+
 ### BUG-126: Bare field access in UDT methods broken when variable uses handle-storing alloca
 - **Discovered**: 2026-02-12, during BUG-125 test development
 - **Category**: Codegen

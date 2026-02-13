@@ -78,19 +78,6 @@
 
 ---
 
-### BUG-124: List append through helper function segfaults at high iteration count
-- **Discovered**: 2026-02-11, during frame pool verification testing
-- **Category**: GC
-- **Severity**: High
-- **Reproduction**: `func helper(x: [int]) -> [int]; return x.append(1) ~` called 200K times in a loop: `x = helper(x)`. Works at 1K iterations, segfaults at 200K.
-- **Observed**: Segmentation fault (signal 11) after ~100K iterations when GC cycles trigger during list operations
-- **Expected**: Should complete without crash
-- **Hypothesis**: Stale pointer across GC compaction — similar to BUG-110/111 pattern. When `helper` returns a list handle, the caller's variable alloca may hold a stale raw pointer that becomes invalid after GC compaction + deferred TLAB munmap. The pass-through-function-return path may not re-derive from handle.
-- **Files**: codegen/functions.py, codegen/list.py, codegen/expressions.py
-- **Status**: Open
-
----
-
 ---
 
 ---
