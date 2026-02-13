@@ -43,49 +43,45 @@ class ListGenerator:
         """Create helper functions for list operations."""
         cg = self.cg
 
-        list_ptr = cg.list_struct.as_pointer()
+        # Handles-everywhere: all List params and returns use i64 handles
+        list_ptr = cg.list_struct.as_pointer()  # Keep for internal deref only
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # list_new(elem_size: i64, flags: i64) -> List*
-        # flags bit 0: elements are reference types (need GC tracing)
-        list_new_ty = ir.FunctionType(list_ptr, [i64, i64])
+        # list_new(elem_size: i64, flags: i64) -> i64 handle
+        list_new_ty = ir.FunctionType(i64, [i64, i64])
         cg.list_new = ir.Function(cg.module, list_new_ty, name="coex_list_new")
 
-        # list_append(list: List*, elem: i8*, elem_size: i64) -> List*
-        # Returns a NEW list with the element appended (value semantics)
-        list_append_ty = ir.FunctionType(list_ptr, [list_ptr, i8_ptr, i64])
+        # list_append(list: i64 handle, elem: i8*, elem_size: i64) -> i64 handle
+        list_append_ty = ir.FunctionType(i64, [i64, i8_ptr, i64])
         cg.list_append = ir.Function(cg.module, list_append_ty, name="coex_list_append")
 
-        # list_get(list: List*, index: i64) -> i8*
-        list_get_ty = ir.FunctionType(i8_ptr, [list_ptr, i64])
+        # list_get(list: i64 handle, index: i64) -> i8*
+        list_get_ty = ir.FunctionType(i8_ptr, [i64, i64])
         cg.list_get = ir.Function(cg.module, list_get_ty, name="coex_list_get")
 
-        # list_len(list: List*) -> i64
-        list_len_ty = ir.FunctionType(i64, [list_ptr])
+        # list_len(list: i64 handle) -> i64
+        list_len_ty = ir.FunctionType(i64, [i64])
         cg.list_len = ir.Function(cg.module, list_len_ty, name="coex_list_len")
 
-        # list_size(list: List*) -> i64 (total memory footprint in bytes)
-        list_size_ty = ir.FunctionType(i64, [list_ptr])
+        # list_size(list: i64 handle) -> i64
+        list_size_ty = ir.FunctionType(i64, [i64])
         cg.list_size = ir.Function(cg.module, list_size_ty, name="coex_list_size")
 
-        # list_copy(list: List*) -> List* (deep copy for value semantics)
-        list_copy_ty = ir.FunctionType(list_ptr, [list_ptr])
+        # list_copy(list: i64 handle) -> i64 handle
+        list_copy_ty = ir.FunctionType(i64, [i64])
         cg.list_copy = ir.Function(cg.module, list_copy_ty, name="coex_list_copy")
 
-        # list_set(list: List*, index: i64, value: i8*, elem_size: i64) -> List*
-        # Returns a NEW list with element at index replaced (value semantics, path copying)
-        list_set_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i8_ptr, i64])
+        # list_set(list: i64 handle, index: i64, value: i8*, elem_size: i64) -> i64 handle
+        list_set_ty = ir.FunctionType(i64, [i64, i64, i8_ptr, i64])
         cg.list_set = ir.Function(cg.module, list_set_ty, name="coex_list_set")
 
-        # list_getrange(list: List*, start: i64, end: i64) -> List*
-        # Returns a NEW list with elements [start, end)
-        list_getrange_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i64])
+        # list_getrange(list: i64 handle, start: i64, end: i64) -> i64 handle
+        list_getrange_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.list_getrange = ir.Function(cg.module, list_getrange_ty, name="coex_list_getrange")
 
-        # list_setrange(list: List*, start: i64, end: i64, source: List*) -> List*
-        # Returns a NEW list with elements [start, end) replaced by elements from source
-        list_setrange_ty = ir.FunctionType(list_ptr, [list_ptr, i64, i64, list_ptr])
+        # list_setrange(list: i64 handle, start: i64, end: i64, source: i64 handle) -> i64 handle
+        list_setrange_ty = ir.FunctionType(i64, [i64, i64, i64, i64])
         cg.list_setrange = ir.Function(cg.module, list_setrange_ty, name="coex_list_setrange")
 
         # NOTE: list_to_array is declared after Array type exists (in _create_conversion_helpers)
@@ -190,7 +186,8 @@ class ListGenerator:
         flags_ptr = builder.gep(list_ptr_fresh, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         builder.store(flags_arg, flags_ptr)
 
-        builder.ret(list_ptr_fresh)
+        # Return i64 handle (not struct pointer)
+        builder.ret(list_handle)
 
     def _implement_list_append(self):
         """Implement list_append: return a NEW list with element appended.
@@ -215,9 +212,13 @@ class ListGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        old_list = func.args[0]
+        old_list_handle = func.args[0]  # i64 handle
         elem_ptr = func.args[1]
         elem_size = func.args[2]
+
+        # Deref handle to get List*
+        old_list_raw = builder.call(cg.gc.gc_handle_deref, [old_list_handle])
+        old_list = builder.bitcast(old_list_raw, cg.list_struct.as_pointer())
 
         # Load old list fields (Phase 4: all fields are i64)
         # len (field 1)
@@ -251,13 +252,12 @@ class ListGenerator:
         old_root_i8 = builder.call(cg.gc.gc_handle_deref, [old_root_handle])
         old_root = builder.bitcast(old_root_i8, cg.pv_node_struct.as_pointer())
 
-        # Create new list with same flags
-        new_list = builder.call(cg.list_new, [old_elem_size, old_flags])
+        # Create new list with same flags — list_new now returns i64 handle
+        new_list_handle = builder.call(cg.list_new, [old_elem_size, old_flags])
 
-        # Save new_list handle for re-derivation after allocations in tail_full path
-        # (BUG-124: new_list becomes stale after gc_alloc calls in tail_full/merge)
-        new_list_i8 = builder.bitcast(new_list, ir.IntType(8).as_pointer())
-        new_list_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_list_i8])
+        # Deref handle to get List* for field access
+        new_list_raw = builder.call(cg.gc.gc_handle_deref, [new_list_handle])
+        new_list = builder.bitcast(new_list_raw, cg.list_struct.as_pointer())
 
         # Set new len = old_len + 1
         new_len = builder.add(old_len, ir.Constant(i64, 1))
@@ -304,7 +304,8 @@ class ListGenerator:
         builder.store(new_tail_len, new_tail_len_ptr)
 
         # Structural sharing: no refcount needed - GC keeps shared nodes alive
-        builder.ret(new_list)
+        # Return i64 handle (not struct pointer)
+        builder.ret(new_list_handle)
 
         # --- CASE 2: Tail is full, need to push into tree ---
         builder.position_at_end(tail_full_block)
@@ -647,7 +648,8 @@ class ListGenerator:
         new_list_tail_len_ptr = builder.gep(new_list_fresh, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(ir.Constant(i64, 1), new_list_tail_len_ptr)
 
-        builder.ret(new_list_fresh)
+        # Return i64 handle (not struct pointer)
+        builder.ret(new_list_handle)
 
     def _implement_list_get(self):
         """Implement list_get: return pointer to element at index.
@@ -673,8 +675,12 @@ class ListGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        list_ptr = func.args[0]
+        list_handle = func.args[0]  # i64 handle
         index = func.args[1]
+
+        # Deref handle to get List*
+        list_raw = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        list_ptr = builder.bitcast(list_raw, cg.list_struct.as_pointer())
 
         # Load list fields (Phase 4: all fields are i64)
         # len (field 1)
@@ -831,10 +837,14 @@ class ListGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        old_list = func.args[0]
+        old_list_handle = func.args[0]  # i64 handle
         index = func.args[1]
         value_ptr = func.args[2]
         elem_size = func.args[3]
+
+        # Deref handle to get List*
+        old_list_raw = builder.call(cg.gc.gc_handle_deref, [old_list_handle])
+        old_list = builder.bitcast(old_list_raw, cg.list_struct.as_pointer())
 
         # Load old list fields (Phase 4: all fields are i64)
         # len (field 1)
@@ -880,8 +890,12 @@ class ListGenerator:
         # --- CASE 1: Index is in tail ---
         builder.position_at_end(tail_set_block)
 
-        # Create new list with same flags
-        new_list_tail = builder.call(cg.list_new, [stored_elem_size, old_flags])
+        # Create new list with same flags — list_new returns i64 handle
+        new_list_tail_handle = builder.call(cg.list_new, [stored_elem_size, old_flags])
+
+        # Deref handle to get List* for field access
+        new_list_tail_raw = builder.call(cg.gc.gc_handle_deref, [new_list_tail_handle])
+        new_list_tail = builder.bitcast(new_list_tail_raw, cg.list_struct.as_pointer())
 
         # Share the root (Phase 4: store i64 handle)
         new_root_ptr_t = builder.gep(new_list_tail, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -915,13 +929,18 @@ class ListGenerator:
         elem_dest_t = builder.gep(new_tail_t, [elem_offset_t])
         builder.call(cg.memcpy, [elem_dest_t, value_ptr, elem_size])
 
-        builder.ret(new_list_tail)
+        # Return i64 handle (not struct pointer)
+        builder.ret(new_list_tail_handle)
 
         # --- CASE 2: Index is in tree - path copy ---
         builder.position_at_end(tree_set_block)
 
-        # Create new list with same flags
-        new_list_tree = builder.call(cg.list_new, [stored_elem_size, old_flags])
+        # Create new list with same flags — list_new returns i64 handle
+        new_list_tree_handle = builder.call(cg.list_new, [stored_elem_size, old_flags])
+
+        # Deref handle to get List* for field access
+        new_list_tree_raw = builder.call(cg.gc.gc_handle_deref, [new_list_tree_handle])
+        new_list_tree = builder.bitcast(new_list_tree_raw, cg.list_struct.as_pointer())
 
         # Copy len and depth - Phase 4: depth is i64
         new_len_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -960,7 +979,7 @@ class ListGenerator:
         builder.cbranch(root_null_check, ret_empty, root_exists)
 
         builder.position_at_end(ret_empty)
-        builder.ret(new_list_tree)  # Return list with copied tail but no tree
+        builder.ret(new_list_tree_handle)  # Return list with copied tail but no tree
 
         builder.position_at_end(root_exists)
 
@@ -979,6 +998,10 @@ class ListGenerator:
         old_root_children_i8 = builder.bitcast(old_root_children, ir.IntType(8).as_pointer())
         new_root_children_i8 = builder.bitcast(new_root_children, ir.IntType(8).as_pointer())
         builder.call(cg.memcpy, [new_root_children_i8, old_root_children_i8, children_size])
+
+        # Re-derive new_list_tree after alloc (stale-pointer-across-allocation)
+        new_list_tree_raw2 = builder.call(cg.gc.gc_handle_deref, [new_list_tree_handle])
+        new_list_tree = builder.bitcast(new_list_tree_raw2, cg.list_struct.as_pointer())
 
         # Store new root in new list - store as GC handle (stable across compaction)
         new_root_ptr_tr = builder.gep(new_list_tree, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -1031,7 +1054,7 @@ class ListGenerator:
         new_leaf_handle_d1 = builder.call(cg.gc.gc_ptr_to_handle, [new_leaf_d1])
         builder.store(new_leaf_handle_d1, new_leaf_slot_d1)
 
-        builder.ret(new_list_tree)
+        builder.ret(new_list_tree_handle)
 
         # --- Depth > 1 case (path copy through multiple levels) ---
         builder.position_at_end(depth_multi_block)
@@ -1154,7 +1177,7 @@ class ListGenerator:
         new_leaf_handle_m = builder.call(cg.gc.gc_ptr_to_handle, [new_leaf_m])
         builder.store(new_leaf_handle_m, new_leaf_slot_m)
 
-        builder.ret(new_list_tree)
+        builder.ret(new_list_tree_handle)
 
     def _implement_list_len(self):
         """Implement list_len: return list length.
@@ -1170,7 +1193,11 @@ class ListGenerator:
         builder = ir.IRBuilder(entry)
         i32 = ir.IntType(32)
 
-        list_ptr = func.args[0]
+        list_handle = func.args[0]  # i64 handle
+
+        # Deref handle to get List*
+        list_raw = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        list_ptr = builder.bitcast(list_raw, cg.list_struct.as_pointer())
 
         # Get len field (field 1 in PV structure)
         len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -1194,7 +1221,11 @@ class ListGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        list_ptr = func.args[0]
+        list_handle = func.args[0]  # i64 handle
+
+        # Deref handle to get List*
+        list_raw = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        list_ptr = builder.bitcast(list_raw, cg.list_struct.as_pointer())
 
         # Get tail_len field (field 4)
         tail_len_ptr = builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
@@ -1205,7 +1236,6 @@ class ListGenerator:
         elem_size = builder.load(elem_size_ptr)
 
         # Size = 56 (header with 7 fields) + 32 * elem_size (tail capacity)
-        tail_len_64 = builder.zext(tail_len, i64)
         tail_size = builder.mul(ir.Constant(i64, 32), elem_size)
         total_size = builder.add(ir.Constant(i64, 56), tail_size)
 
@@ -1247,17 +1277,20 @@ class ListGenerator:
         i32 = ir.IntType(32)
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
-        list_ptr_type = cg.list_struct.as_pointer()
 
-        src_list = func.args[0]
+        src_list_handle = func.args[0]  # i64 handle
         start = func.args[1]
         end = func.args[2]
 
+        # Deref handle to get List* for field access
+        src_list_raw = builder.call(cg.gc.gc_handle_deref, [src_list_handle])
+        src_list_ptr = builder.bitcast(src_list_raw, cg.list_struct.as_pointer())
+
         # Get source list length, element size, and flags
-        src_len = builder.call(cg.list_len, [src_list])
-        elem_size_ptr = builder.gep(src_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        src_len = builder.call(cg.list_len, [src_list_handle])
+        elem_size_ptr = builder.gep(src_list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
-        flags_ptr = builder.gep(src_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        flags_ptr = builder.gep(src_list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         flags = builder.load(flags_ptr)
 
         # Clamp start to [0, len]
@@ -1273,8 +1306,8 @@ class ListGenerator:
         # Calculate result length
         result_len = builder.sub(end_clamped, start_clamped)
 
-        # Create new empty list with same flags
-        new_list = builder.call(cg.list_new, [elem_size, flags])
+        # Create new empty list with same flags — list_new returns i64 handle
+        new_list_handle = builder.call(cg.list_new, [elem_size, flags])
 
         # Loop: copy elements from start to end
         loop_header = func.append_basic_block("loop_header")
@@ -1283,8 +1316,9 @@ class ListGenerator:
 
         i_ptr = builder.alloca(i64, name="i")
         builder.store(zero, i_ptr)
-        result_ptr = builder.alloca(list_ptr_type, name="result")
-        builder.store(new_list, result_ptr)
+        # Store i64 handles (not struct pointers)
+        result_handle_ptr = builder.alloca(i64, name="result_handle")
+        builder.store(new_list_handle, result_handle_ptr)
         builder.branch(loop_header)
 
         builder.position_at_end(loop_header)
@@ -1294,17 +1328,18 @@ class ListGenerator:
 
         builder.position_at_end(loop_body)
         src_idx = builder.add(start_clamped, i)
-        elem_ptr = builder.call(cg.list_get, [src_list, src_idx])
-        current_result = builder.load(result_ptr)
-        new_result = builder.call(cg.list_append, [current_result, elem_ptr, elem_size])
-        builder.store(new_result, result_ptr)
+        # list_get and list_append now take i64 handles
+        elem_ptr = builder.call(cg.list_get, [src_list_handle, src_idx])
+        current_result_handle = builder.load(result_handle_ptr)
+        new_result_handle = builder.call(cg.list_append, [current_result_handle, elem_ptr, elem_size])
+        builder.store(new_result_handle, result_handle_ptr)
         next_i = builder.add(i, one)
         builder.store(next_i, i_ptr)
         builder.branch(loop_header)
 
         builder.position_at_end(loop_exit)
-        final_result = builder.load(result_ptr)
-        builder.ret(final_result)
+        final_result_handle = builder.load(result_handle_ptr)
+        builder.ret(final_result_handle)
 
     def _implement_list_setrange(self):
         """Implement list_setrange: return new list with [start, end) replaced by source."""
@@ -1323,19 +1358,22 @@ class ListGenerator:
         i32 = ir.IntType(32)
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
-        list_ptr_type = cg.list_struct.as_pointer()
 
-        orig_list = func.args[0]
+        orig_list_handle = func.args[0]  # i64 handle
         start = func.args[1]
         end = func.args[2]
-        source = func.args[3]
+        source_handle = func.args[3]  # i64 handle
+
+        # Deref handle to get List* for field access
+        orig_list_raw = builder.call(cg.gc.gc_handle_deref, [orig_list_handle])
+        orig_list_ptr = builder.bitcast(orig_list_raw, cg.list_struct.as_pointer())
 
         # Get lengths, element size, and flags
-        orig_len = builder.call(cg.list_len, [orig_list])
-        source_len = builder.call(cg.list_len, [source])
-        elem_size_ptr = builder.gep(orig_list, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        orig_len = builder.call(cg.list_len, [orig_list_handle])
+        source_len = builder.call(cg.list_len, [source_handle])
+        elem_size_ptr = builder.gep(orig_list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = builder.load(elem_size_ptr)
-        flags_ptr = builder.gep(orig_list, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
+        flags_ptr = builder.gep(orig_list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 6)], inbounds=True)
         flags = builder.load(flags_ptr)
 
         # Clamp bounds
@@ -1355,10 +1393,11 @@ class ListGenerator:
             range_len
         )
 
-        # Create result list with same flags
-        result = builder.call(cg.list_new, [elem_size, flags])
-        result_ptr = builder.alloca(list_ptr_type, name="result")
-        builder.store(result, result_ptr)
+        # Create result list with same flags — list_new returns i64 handle
+        result_handle = builder.call(cg.list_new, [elem_size, flags])
+        # Store i64 handles (not struct pointers)
+        result_handle_ptr = builder.alloca(i64, name="result_handle")
+        builder.store(result_handle, result_handle_ptr)
 
         # Phase 1: Copy elements [0, start) from original
         phase1_header = func.append_basic_block("phase1_header")
@@ -1375,10 +1414,11 @@ class ListGenerator:
         builder.cbranch(cond, phase1_body, phase1_exit)
 
         builder.position_at_end(phase1_body)
-        elem_ptr = builder.call(cg.list_get, [orig_list, i])
-        current = builder.load(result_ptr)
+        # list_get and list_append now take i64 handles
+        elem_ptr = builder.call(cg.list_get, [orig_list_handle, i])
+        current = builder.load(result_handle_ptr)
         updated = builder.call(cg.list_append, [current, elem_ptr, elem_size])
-        builder.store(updated, result_ptr)
+        builder.store(updated, result_handle_ptr)
         builder.store(builder.add(i, one), i_ptr)
         builder.branch(phase1_header)
 
@@ -1397,10 +1437,10 @@ class ListGenerator:
         builder.cbranch(cond, phase2_body, phase2_exit)
 
         builder.position_at_end(phase2_body)
-        elem_ptr = builder.call(cg.list_get, [source, i])
-        current = builder.load(result_ptr)
+        elem_ptr = builder.call(cg.list_get, [source_handle, i])
+        current = builder.load(result_handle_ptr)
         updated = builder.call(cg.list_append, [current, elem_ptr, elem_size])
-        builder.store(updated, result_ptr)
+        builder.store(updated, result_handle_ptr)
         builder.store(builder.add(i, one), i_ptr)
         builder.branch(phase2_header)
 
@@ -1419,16 +1459,16 @@ class ListGenerator:
         builder.cbranch(cond, phase3_body, phase3_exit)
 
         builder.position_at_end(phase3_body)
-        elem_ptr = builder.call(cg.list_get, [orig_list, i])
-        current = builder.load(result_ptr)
+        elem_ptr = builder.call(cg.list_get, [orig_list_handle, i])
+        current = builder.load(result_handle_ptr)
         updated = builder.call(cg.list_append, [current, elem_ptr, elem_size])
-        builder.store(updated, result_ptr)
+        builder.store(updated, result_handle_ptr)
         builder.store(builder.add(i, one), i_ptr)
         builder.branch(phase3_header)
 
         builder.position_at_end(phase3_exit)
-        final_result = builder.load(result_ptr)
-        builder.ret(final_result)
+        final_result_handle = builder.load(result_handle_ptr)
+        builder.ret(final_result_handle)
 
     def _register_list_methods(self):
         """Register List as a type with methods."""

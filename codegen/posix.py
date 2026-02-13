@@ -141,11 +141,9 @@ class PosixGenerator:
     def _create_posix_open(self, posix_ptr: ir.Type, i8_ptr: ir.Type, i32: ir.Type, i64: ir.Type):
         """Create posix.open(path, mode) static method."""
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
-        string_ptr = cg.string_struct.as_pointer()
 
-        # posix.open(path: String*, mode: String*) -> Result*
-        func_type = ir.FunctionType(result_ptr, [string_ptr, string_ptr])
+        # posix.open(path: i64 string handle, mode: i64 string handle) -> i64 handle
+        func_type = ir.FunctionType(i64, [i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_open")
         cg.posix_open_method = func
         cg.functions["coex_posix_open"] = func
@@ -161,10 +159,10 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        path = func.args[0]
-        mode = func.args[1]
+        path = func.args[0]   # i64 string handle
+        mode = func.args[1]   # i64 string handle
 
-        # Get path as C string
+        # Get path as C string (string_data takes i64 handle)
         path_cstr = builder.call(cg.string_data, [path])
 
         # Parse mode string to get flags
@@ -214,22 +212,18 @@ class PosixGenerator:
         # Open failed - return Err(message)
         builder.position_at_end(open_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to open file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        # string_from_literal returns i64 handle directly
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_read_all(self, posix_ptr: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
         """Create posix.read_all() method."""
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
-        string_ptr = cg.string_struct.as_pointer()
         i32 = ir.IntType(32)
 
-        # posix.read_all() -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr])
+        # posix.read_all() -> i64 handle
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_read_all")
         cg.posix_read_all = func
         cg.functions["coex_posix_read_all"] = func
@@ -243,7 +237,10 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        p = func.args[0]
+        # Deref posix handle to get struct pointer
+        posix_handle = func.args[0]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        p = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
 
         # Get fd from posix
         fd_field = builder.gep(p, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -278,33 +275,26 @@ class PosixGenerator:
         null_pos = builder.gep(buffer, [bytes_read])
         builder.store(ir.Constant(ir.IntType(8), 0), null_pos)
 
-        # Create string from buffer (bytes_read = byte_len, assume ASCII for char_count)
-        result_string = builder.call(cg.string_new, [buffer, bytes_read, bytes_read])
-        str_i8 = builder.bitcast(result_string, ir.IntType(8).as_pointer())
-        str_promoted = builder.call(cg.gc.gc_promote_to_heap, [str_i8])
-        str_handle = builder.call(cg.gc.gc_ptr_to_handle, [str_promoted])
+        # Create string from buffer (string_new returns i64 handle)
+        str_handle = builder.call(cg.string_new, [buffer, bytes_read, bytes_read])
         ok_result = builder.call(cg.result_ok, [str_handle])
         builder.ret(ok_result)
 
         # Read failed
         builder.position_at_end(read_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        # string_from_literal returns i64 handle directly
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_writeln(self, posix_ptr: ir.Type, i64: ir.Type):
         """Create posix.writeln(text) method."""
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
-        string_ptr = cg.string_struct.as_pointer()
         i32 = ir.IntType(32)
 
-        # posix.writeln(text: String*) -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr, string_ptr])
+        # posix.writeln(text: i64 string handle) -> i64 handle
+        func_type = ir.FunctionType(i64, [i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_writeln")
         cg.posix_writeln = func
         cg.functions["coex_posix_writeln"] = func
@@ -319,14 +309,18 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        p = func.args[0]
-        text = func.args[1]
+        # Deref posix handle to get struct pointer
+        posix_handle = func.args[0]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        p = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
+
+        text = func.args[1]  # i64 string handle
 
         # Get fd from posix
         fd_field = builder.gep(p, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
-        # Get text data and byte size (not total memory footprint)
+        # Get text data and byte size (string_data and string_byte_size take i64 handles)
         text_data = builder.call(cg.string_data, [text])
         text_size = builder.call(cg.string_byte_size, [text])
 
@@ -350,21 +344,17 @@ class PosixGenerator:
         # Write failed
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
     def _create_posix_close(self, posix_ptr: ir.Type, i32: ir.Type):
         """Create posix.close() method."""
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
         i64 = ir.IntType(64)
 
-        # posix.close() -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr])
+        # posix.close() -> i64 handle
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_close")
         cg.posix_close_func = func
         cg.functions["coex_posix_close"] = func
@@ -378,10 +368,13 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
+        # Deref posix handle to get struct pointer
         posix_handle = func.args[0]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        posix_val = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
 
         # Get fd from posix struct
-        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd_field = builder.gep(posix_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Close the file descriptor
@@ -400,10 +393,7 @@ class PosixGenerator:
         # Close failed
         builder.position_at_end(close_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to close file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
@@ -413,11 +403,10 @@ class PosixGenerator:
         Returns Result<[byte], string> - Ok with byte list or Err with message.
         """
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
         list_ptr = cg.list_struct.as_pointer()
 
-        # posix.read(count: int) -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr, i64])
+        # posix.read(count: int) -> i64 handle
+        func_type = ir.FunctionType(i64, [i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_read")
         cg.posix_read_func = func
         cg.functions["coex_posix_read"] = func
@@ -432,11 +421,15 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
+        # Deref posix handle to get struct pointer
         posix_handle = func.args[0]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        posix_val = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
+
         count = func.args[1]
 
         # Get fd from posix struct
-        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd_field = builder.gep(posix_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Allocate buffer for reading
@@ -454,8 +447,11 @@ class PosixGenerator:
         builder.position_at_end(read_ok)
 
         # Create new list with elem_size = 1 (byte)
+        # list_new returns i64 handle - deref to get pointer for GEP
         elem_size = ir.Constant(i64, 1)
-        byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        list_handle = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        list_i8 = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        byte_list = builder.bitcast(list_i8, cg.list_struct.as_pointer())
 
         # Get the tail pointer from the new list via handle deref (tail field is a GC handle)
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -464,6 +460,10 @@ class PosixGenerator:
 
         # Copy bytes_read bytes from buf to tail
         builder.call(cg.memcpy, [tail, buf, bytes_read])
+
+        # Re-derive byte_list pointer after memcpy (may have triggered GC)
+        list_i8_fresh = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        byte_list = builder.bitcast(list_i8_fresh, cg.list_struct.as_pointer())
 
         # Update list length and tail_len
         len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -476,10 +476,7 @@ class PosixGenerator:
         # Free the temporary buffer
         builder.call(cg.free, [buf])
 
-        # Return Ok(byte_list) - store as GC handle
-        list_i8 = builder.bitcast(byte_list, ir.IntType(8).as_pointer())
-        list_promoted = builder.call(cg.gc.gc_promote_to_heap, [list_i8])
-        list_handle = builder.call(cg.gc.gc_ptr_to_handle, [list_promoted])
+        # Return Ok(byte_list) - list_handle is already an i64 handle
         ok_result = builder.call(cg.result_ok, [list_handle])
         builder.ret(ok_result)
 
@@ -487,10 +484,7 @@ class PosixGenerator:
         builder.position_at_end(read_err)
         builder.call(cg.free, [buf])
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to read from file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
@@ -500,11 +494,10 @@ class PosixGenerator:
         Takes [byte] list and returns Result<int, string> with bytes written.
         """
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
         list_ptr = cg.list_struct.as_pointer()
 
-        # posix.write(data: [byte]) -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr, list_ptr])
+        # posix.write(data: [byte]) -> i64 handle
+        func_type = ir.FunctionType(i64, [i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_write")
         cg.posix_write_func = func
         cg.functions["coex_posix_write"] = func
@@ -519,11 +512,18 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
+        # Deref posix handle to get struct pointer
         posix_handle = func.args[0]
-        data = func.args[1]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        posix_val = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
+
+        # Deref list handle to get list struct pointer
+        list_handle = func.args[1]
+        raw_list = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        data = builder.bitcast(raw_list, cg.list_struct.as_pointer())
 
         # Get fd from posix struct
-        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd_field = builder.gep(posix_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Get length from list
@@ -551,10 +551,7 @@ class PosixGenerator:
         # Write failed
         builder.position_at_end(write_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to write to file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
@@ -565,10 +562,9 @@ class PosixGenerator:
         Returns Result<int, string> with new position or error.
         """
         cg = self.cg
-        result_ptr = cg.result_struct.as_pointer()
 
-        # posix.seek(offset: int, whence: int) -> Result*
-        func_type = ir.FunctionType(result_ptr, [posix_ptr, i64, i64])
+        # posix.seek(offset: int, whence: int) -> i64 handle
+        func_type = ir.FunctionType(i64, [i64, i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_seek")
         cg.posix_seek_func = func
         cg.functions["coex_posix_seek"] = func
@@ -584,12 +580,16 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
+        # Deref posix handle to get struct pointer
         posix_handle = func.args[0]
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [posix_handle])
+        posix_val = builder.bitcast(raw_ptr, cg.posix_struct.as_pointer())
+
         offset = func.args[1]
         whence = func.args[2]
 
         # Get fd from posix struct
-        fd_field = builder.gep(posix_handle, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        fd_field = builder.gep(posix_val, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         fd = builder.load(fd_field)
 
         # Convert whence from i64 to i32 for lseek
@@ -611,10 +611,7 @@ class PosixGenerator:
         # Seek failed
         builder.position_at_end(seek_err)
         err_msg = self._get_raw_string_ptr_with_builder(builder, "Failed to seek in file")
-        err_string = builder.call(cg.string_from_literal, [err_msg])
-        err_i8 = builder.bitcast(err_string, ir.IntType(8).as_pointer())
-        err_promoted = builder.call(cg.gc.gc_promote_to_heap, [err_i8])
-        err_handle = builder.call(cg.gc.gc_ptr_to_handle, [err_promoted])
+        err_handle = builder.call(cg.string_from_literal, [err_msg])
         err_result = builder.call(cg.result_err, [err_handle])
         builder.ret(err_result)
 
@@ -715,12 +712,10 @@ class PosixGenerator:
         Returns string? (optional string) - nil if not found.
         """
         cg = self.cg
-        string_ptr = cg.string_struct.as_pointer()
         i32 = ir.IntType(32)
 
-        # posix.getenv(name: string) -> string?
-        # Returns nullable string pointer
-        func_type = ir.FunctionType(string_ptr, [string_ptr])
+        # posix.getenv(name: i64 string handle) -> i64 (string handle or 0 for nil)
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_getenv")
         cg.posix_getenv_func = func
         cg.functions["coex_posix_getenv"] = func
@@ -735,11 +730,9 @@ class PosixGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        name = func.args[0]
+        name = func.args[0]  # i64 string handle
 
-        # Get string data pointer (Phase 4: owner is i64 handle)
-        # Note: getenv expects null-terminated string, so we just use string_data
-        # which returns owner + offset (must ensure null-terminated at call site)
+        # Get string data pointer (string_data takes i64 handle)
         c_str = builder.call(cg.string_data, [name])
 
         # Call getenv(name)
@@ -750,15 +743,14 @@ class PosixGenerator:
         is_null = builder.icmp_unsigned("==", result, null_ptr)
         builder.cbranch(is_null, not_found, found)
 
-        # Found - wrap in Coex string
+        # Found - wrap in Coex string (string_from_literal returns i64 handle)
         builder.position_at_end(found)
-        coex_string = builder.call(cg.string_from_literal, [result])
-        builder.ret(coex_string)
+        coex_string_handle = builder.call(cg.string_from_literal, [result])
+        builder.ret(coex_string_handle)
 
-        # Not found - return nil (null pointer)
+        # Not found - return 0 (nil handle)
         builder.position_at_end(not_found)
-        null_string = ir.Constant(string_ptr, None)
-        builder.ret(null_string)
+        builder.ret(ir.Constant(i64, 0))
 
     def _create_posix_random_seed(self, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
         """Create posix.random_seed() static method - returns random seed from /dev/urandom."""
@@ -797,10 +789,9 @@ class PosixGenerator:
     def _create_posix_urandom(self, i32: ir.Type, i64: ir.Type, i8_ptr: ir.Type):
         """Create posix.urandom(count) static method - returns random bytes."""
         cg = self.cg
-        list_ptr = cg.list_struct.as_pointer()
 
-        # posix.urandom(count: int) -> [byte]
-        func_type = ir.FunctionType(list_ptr, [i64])
+        # posix.urandom(count: int) -> i64 (list handle)
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_posix_urandom")
         cg.posix_urandom_func = func
         cg.functions["coex_posix_urandom"] = func
@@ -819,9 +810,13 @@ class PosixGenerator:
         O_RDONLY = ir.Constant(i32, 0)
         fd = builder.call(cg.posix_open_syscall, [urandom_path, O_RDONLY, ir.Constant(i32, 0)])
 
-        # Create new list with elem_size = 1 (byte)
+        # Create new list with elem_size = 1 (byte) - list_new returns i64 handle
         elem_size = ir.Constant(i64, 1)
-        byte_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        list_handle = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+
+        # Deref handle to get list pointer for GEP
+        list_i8 = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        byte_list = builder.bitcast(list_i8, cg.list_struct.as_pointer())
 
         # Get the tail pointer via handle deref (tail field is a GC handle)
         tail_handle_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
@@ -834,6 +829,10 @@ class PosixGenerator:
         # Close fd
         builder.call(cg.posix_close_syscall, [fd])
 
+        # Re-derive byte_list pointer after I/O operations
+        list_i8_fresh = builder.call(cg.gc.gc_handle_deref, [list_handle])
+        byte_list = builder.bitcast(list_i8_fresh, cg.list_struct.as_pointer())
+
         # Update list length and tail_len
         len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(count, len_ptr)
@@ -842,4 +841,5 @@ class PosixGenerator:
         tail_len_ptr = builder.gep(byte_list, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         builder.store(count, tail_len_ptr)
 
-        builder.ret(byte_list)
+        # Return i64 list handle
+        builder.ret(list_handle)

@@ -4,6 +4,48 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-129: Unrooted intermediate string concat results crash under GC compaction
+- **Discovered**: 2026-02-12, during BREP torus octree demo
+- **Category**: Codegen
+- **Severity**: Critical
+- **Reproduction**: Compile and run a program with deep recursive string concatenation + UDT field access that creates enough allocation pressure for 2+ GC cycles during expression evaluation. Minimal reproducer: depth-4 octree with `bbox_center` + `bbox_size` calls producing 4096 leaves with string concat chains.
+- **Observed**: Segfault in `coex_string_concat + 32` (ldp from stale pointer to unmapped TLAB memory). Crash is at FIRST access to argument `a` inside `coex_string_concat` — the pointer is already stale when entering the function.
+- **Expected**: String concatenation chains should work under arbitrary GC pressure.
+- **Root cause**: In `generate_binary()`, `left = generate_expression(expr.left)` produces a raw `struct.String*`. Then `right = generate_expression(expr.right)` may allocate (e.g., `String.from()`, string literals), triggering GC+compaction. Compaction copies left's object to compact buffer and frees the old TLAB. The raw pointer in the LLVM register still points to the old (now unmapped) TLAB location. For chained concats `a + b + c`, the intermediate `a + b` result is a raw pointer not in any shadow stack slot.
+- **Fix**: Two-part fix: (1) In `codegen/expressions.py:generate_binary()`, save left's handle via `gc_ptr_to_handle` before evaluating right, then re-derive via `gc_handle_deref` after. (2) In `coex_gc.py`, widen sweep grace period from -1 to -2 so unrooted intermediates survive 2 GC cycles (enough for any realistic expression chain).
+- **Files**: codegen/expressions.py, coex_gc.py
+- **Status**: Fixed (2026-02-12)
+
+---
+
+### BUG-130: Multiple stale pointer paths in UDT constructor and method calls under GC pressure
+- **Discovered**: 2026-02-12, during BREP torus progressive demo (generation 4+ crash)
+- **Category**: Codegen / GC
+- **Severity**: Critical
+- **Reproduction**: Run `examples/brep_torus.coex` — crashes at generation 4-5 during `subdivide_one_level` or `evaporate` with deep recursive UDT trees under GC compaction pressure.
+- **Observed**: Three interrelated issues found:
+  1. **Constructor stale pointer**: `_generate_type_constructor` evaluates ALL field expressions before allocating. Evaluating a LATER arg (e.g., `[]` which calls list_new) can trigger GC+compaction, making an EARLIER arg's raw pointer (e.g., BBox*) stale.
+  2. **List.append stale obj**: In `generate_method_call` for `.append()`, the list object pointer `obj` is evaluated BEFORE the element expression. If the element triggers GC, `obj` becomes stale.
+  3. **Missing function return type inference**: `_infer_coex_type_from_initializer` didn't look up `func_decls` for function call return types.
+- **Fix**: Handles-everywhere refactoring (2026-02-13) — All non-primitive types are now i64 GC handles everywhere. Constructor args, method objects, and function results are all i64 handles that remain stable across GC cycles. No raw pointers exist to become stale. The original band-aid fixes (save-handle-before-next-arg-eval) are subsumed by the uniform i64 representation.
+- **Files**: `codegen/core.py`, `codegen/expressions.py`, `codegen/statements.py`
+- **Status**: Fixed (2026-02-13) — resolved by handles-everywhere refactoring
+
+---
+
+### BUG-127: Task returning float/double crashes with invalid ptrtoint cast
+- **Discovered**: 2026-02-12, during math builtins implementation
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: `task compute(x: float) -> float: return sin(x) ~` — any task returning float
+- **Observed**: LLVM IR error: `invalid cast opcode for cast from 'double' to 'i64'` via `ptrtoint`
+- **Expected**: Float return values should be bitcast (not ptrtoint) to i64 for task result storage
+- **Fix**: Added `DoubleType`/`FloatType` handling (fpext+bitcast) in `task_transform.py` (3 sites) and `codegen/thread.py` (1 site). The receive side already had the correct bitcast-from-i64 at entry function line 2624.
+- **Files**: task_transform.py, codegen/thread.py
+- **Status**: Fixed (2026-02-12)
+
+---
+
 ### BUG-124: List append through helper function segfaults at high iteration count
 - **Discovered**: 2026-02-11, during frame pool verification testing
 - **Category**: GC

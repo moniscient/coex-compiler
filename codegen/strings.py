@@ -76,7 +76,8 @@ class StringGenerator:
             ir.IntType(64),  # size - byte count (field 3)
         )
 
-        string_ptr = cg.string_struct.as_pointer()
+        # Handles-everywhere: all String/List params and returns use i64 handles
+        string_ptr = cg.string_struct.as_pointer()  # Keep for internal deref only
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
         i1 = ir.IntType(1)
@@ -85,155 +86,148 @@ class StringGenerator:
         write_ty = ir.FunctionType(i64, [ir.IntType(32), i8_ptr, i64])
         cg.write_syscall = ir.Function(cg.module, write_ty, name="write")
 
-        # string_new(data: i8*, byte_len: i64, char_count: i64) -> String*
-        string_new_ty = ir.FunctionType(string_ptr, [i8_ptr, i64, i64])
+        # string_new(data: i8*, byte_len: i64, char_count: i64) -> i64 handle
+        string_new_ty = ir.FunctionType(i64, [i8_ptr, i64, i64])
         cg.string_new = ir.Function(cg.module, string_new_ty, name="coex_string_new")
 
-        # string_from_literal(data: i8*) -> String* (for null-terminated C strings)
-        string_from_lit_ty = ir.FunctionType(string_ptr, [i8_ptr])
+        # string_from_literal(data: i8*) -> i64 handle
+        string_from_lit_ty = ir.FunctionType(i64, [i8_ptr])
         cg.string_from_literal = ir.Function(cg.module, string_from_lit_ty, name="coex_string_from_literal")
 
-        # string_len(s: String*) -> i64
-        string_len_ty = ir.FunctionType(i64, [string_ptr])
+        # string_len(s: i64 handle) -> i64
+        string_len_ty = ir.FunctionType(i64, [i64])
         cg.string_len = ir.Function(cg.module, string_len_ty, name="coex_string_len")
 
-        # string_get(s: String*, index: i64) -> i64
-        string_get_ty = ir.FunctionType(i64, [string_ptr, i64])
+        # string_get(s: i64 handle, index: i64) -> i64
+        string_get_ty = ir.FunctionType(i64, [i64, i64])
         cg.string_get = ir.Function(cg.module, string_get_ty, name="coex_string_get")
 
-        # string_slice(s: String*, start: i64, end: i64) -> String*
-        string_slice_ty = ir.FunctionType(string_ptr, [string_ptr, i64, i64])
+        # string_slice(s: i64, start: i64, end: i64) -> i64 handle
+        string_slice_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.string_slice = ir.Function(cg.module, string_slice_ty, name="coex_string_slice")
 
         # string_getrange is an alias for string_slice
         cg.string_getrange = cg.string_slice
 
-        # string_setrange(s: String*, start: i64, end: i64, source: String*) -> String*
-        string_setrange_ty = ir.FunctionType(string_ptr, [string_ptr, i64, i64, string_ptr])
+        # string_setrange(s: i64, start: i64, end: i64, source: i64) -> i64 handle
+        string_setrange_ty = ir.FunctionType(i64, [i64, i64, i64, i64])
         cg.string_setrange = ir.Function(cg.module, string_setrange_ty, name="coex_string_setrange")
 
-        # string_concat(a: String*, b: String*) -> String*
-        string_concat_ty = ir.FunctionType(string_ptr, [string_ptr, string_ptr])
+        # string_concat(a: i64, b: i64) -> i64 handle
+        string_concat_ty = ir.FunctionType(i64, [i64, i64])
         cg.string_concat = ir.Function(cg.module, string_concat_ty, name="coex_string_concat")
 
-        # string_join_list(strings: List*, separator: String*) -> String*
-        string_join_list_ty = ir.FunctionType(string_ptr, [cg.list_struct.as_pointer(), string_ptr])
+        # string_join_list(strings: i64 list handle, separator: i64 string handle) -> i64
+        string_join_list_ty = ir.FunctionType(i64, [i64, i64])
         cg.string_join_list = ir.Function(cg.module, string_join_list_ty, name="coex_string_join_list")
 
-        # string_eq(a: String*, b: String*) -> bool
-        string_eq_ty = ir.FunctionType(i1, [string_ptr, string_ptr])
+        # string_eq(a: i64, b: i64) -> bool
+        string_eq_ty = ir.FunctionType(i1, [i64, i64])
         cg.string_eq = ir.Function(cg.module, string_eq_ty, name="coex_string_eq")
 
-        # string_contains(s: String*, needle: String*) -> bool
-        string_contains_ty = ir.FunctionType(i1, [string_ptr, string_ptr])
+        # string_contains(s: i64, needle: i64) -> bool
+        string_contains_ty = ir.FunctionType(i1, [i64, i64])
         cg.string_contains = ir.Function(cg.module, string_contains_ty, name="coex_string_contains")
 
-        # string_print(s: String*) -> void
-        string_print_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
+        # string_print(s: i64) -> void
+        string_print_ty = ir.FunctionType(ir.VoidType(), [i64])
         cg.string_print = ir.Function(cg.module, string_print_ty, name="coex_string_print")
 
-        # string_debug(s: String*) -> void (prints to stderr)
-        string_debug_ty = ir.FunctionType(ir.VoidType(), [string_ptr])
+        # string_debug(s: i64) -> void (prints to stderr)
+        string_debug_ty = ir.FunctionType(ir.VoidType(), [i64])
         cg.string_debug = ir.Function(cg.module, string_debug_ty, name="coex_string_debug")
 
-        # string_data(s: String*) -> i8*
-        string_data_ty = ir.FunctionType(i8_ptr, [string_ptr])
+        # string_data(s: i64) -> i8* (raw data pointer for immediate use)
+        string_data_ty = ir.FunctionType(i8_ptr, [i64])
         cg.string_data = ir.Function(cg.module, string_data_ty, name="coex_string_data")
 
-        # string_size(s: String*) -> i64
-        string_size_ty = ir.FunctionType(i64, [string_ptr])
+        # string_size(s: i64) -> i64
+        string_size_ty = ir.FunctionType(i64, [i64])
         cg.string_size = ir.Function(cg.module, string_size_ty, name="coex_string_size")
 
-        # string_copy(s: String*) -> String*
-        string_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
+        # string_copy(s: i64) -> i64 handle
+        string_copy_ty = ir.FunctionType(i64, [i64])
         cg.string_copy = ir.Function(cg.module, string_copy_ty, name="coex_string_copy")
 
-        # string_deep_copy(s: String*) -> String*
-        string_deep_copy_ty = ir.FunctionType(string_ptr, [string_ptr])
+        # string_deep_copy(s: i64) -> i64 handle
+        string_deep_copy_ty = ir.FunctionType(i64, [i64])
         cg.string_deep_copy = ir.Function(cg.module, string_deep_copy_ty, name="coex_string_deep_copy")
 
-        # string_byte_size(s: String*) -> i64
-        string_byte_size_ty = ir.FunctionType(i64, [string_ptr])
+        # string_byte_size(s: i64) -> i64
+        string_byte_size_ty = ir.FunctionType(i64, [i64])
         cg.string_byte_size = ir.Function(cg.module, string_byte_size_ty, name="coex_string_byte_size")
 
-        # string_hash(s: String*) -> i64
-        string_hash_ty = ir.FunctionType(i64, [string_ptr])
+        # string_hash(s: i64) -> i64
+        string_hash_ty = ir.FunctionType(i64, [i64])
         cg.string_hash = ir.Function(cg.module, string_hash_ty, name="coex_string_hash")
 
-        # string_split(s: String*, delimiter: String*) -> List<String>*
-        list_ptr = cg.list_struct.as_pointer()
-        string_split_ty = ir.FunctionType(list_ptr, [string_ptr, string_ptr])
+        # string_split(s: i64, delimiter: i64) -> i64 list handle
+        string_split_ty = ir.FunctionType(i64, [i64, i64])
         cg.string_split = ir.Function(cg.module, string_split_ty, name="coex_string_split")
 
         # Optional types for parsing results
         int_optional = ir.LiteralStructType([ir.IntType(1), i64])
         float_optional = ir.LiteralStructType([ir.IntType(1), ir.DoubleType()])
 
-        # string_to_int(s: String*) -> int?
-        string_to_int_ty = ir.FunctionType(int_optional, [string_ptr])
+        # string_to_int(s: i64) -> int?
+        string_to_int_ty = ir.FunctionType(int_optional, [i64])
         cg.string_to_int = ir.Function(cg.module, string_to_int_ty, name="coex_string_to_int")
 
-        # string_to_float(s: String*) -> float?
-        string_to_float_ty = ir.FunctionType(float_optional, [string_ptr])
+        # string_to_float(s: i64) -> float?
+        string_to_float_ty = ir.FunctionType(float_optional, [i64])
         cg.string_to_float = ir.Function(cg.module, string_to_float_ty, name="coex_string_to_float")
 
-        # string_to_int_hex(s: String*) -> int?
-        string_to_int_hex_ty = ir.FunctionType(int_optional, [string_ptr])
+        # string_to_int_hex(s: i64) -> int?
+        string_to_int_hex_ty = ir.FunctionType(int_optional, [i64])
         cg.string_to_int_hex = ir.Function(cg.module, string_to_int_hex_ty, name="coex_string_to_int_hex")
 
-        # string_from_int(n: i64) -> String*
-        string_from_int_ty = ir.FunctionType(string_ptr, [i64])
+        # string_from_int(n: i64) -> i64 handle
+        string_from_int_ty = ir.FunctionType(i64, [i64])
         cg.string_from_int = ir.Function(cg.module, string_from_int_ty, name="coex_string_from_int")
 
-        # string_from_float(f: double) -> String*
-        string_from_float_ty = ir.FunctionType(string_ptr, [ir.DoubleType()])
+        # string_from_float(f: double) -> i64 handle
+        string_from_float_ty = ir.FunctionType(i64, [ir.DoubleType()])
         cg.string_from_float = ir.Function(cg.module, string_from_float_ty, name="coex_string_from_float")
 
-        # string_from_bool(b: i1) -> String*
-        string_from_bool_ty = ir.FunctionType(string_ptr, [ir.IntType(1)])
+        # string_from_bool(b: i1) -> i64 handle
+        string_from_bool_ty = ir.FunctionType(i64, [ir.IntType(1)])
         cg.string_from_bool = ir.Function(cg.module, string_from_bool_ty, name="coex_string_from_bool")
 
-        # string_from_hex(n: i64) -> String*
-        string_from_hex_ty = ir.FunctionType(string_ptr, [i64])
+        # string_from_hex(n: i64) -> i64 handle
+        string_from_hex_ty = ir.FunctionType(i64, [i64])
         cg.string_from_hex = ir.Function(cg.module, string_from_hex_ty, name="coex_string_from_hex")
 
-        # string_validjson(s: String*) -> bool
-        string_validjson_ty = ir.FunctionType(ir.IntType(1), [string_ptr])
+        # string_validjson(s: i64) -> bool
+        string_validjson_ty = ir.FunctionType(ir.IntType(1), [i64])
         cg.string_validjson = ir.Function(cg.module, string_validjson_ty, name="coex_string_validjson")
 
-        # string_from_bytes(bytes: List*) -> String*
-        list_ptr = cg.list_struct.as_pointer()
-        string_from_bytes_ty = ir.FunctionType(string_ptr, [list_ptr])
+        # string_from_bytes(bytes: i64 list handle) -> i64 string handle
+        string_from_bytes_ty = ir.FunctionType(i64, [i64])
         cg.string_from_bytes = ir.Function(cg.module, string_from_bytes_ty, name="coex_string_from_bytes")
 
-        # string_to_bytes(s: String*) -> List*
-        string_to_bytes_ty = ir.FunctionType(list_ptr, [string_ptr])
+        # string_to_bytes(s: i64) -> i64 list handle
+        string_to_bytes_ty = ir.FunctionType(i64, [i64])
         cg.string_to_bytes = ir.Function(cg.module, string_to_bytes_ty, name="coex_string_to_bytes")
 
-        # string_cstring(s: String*) -> List* (byte array with null terminator)
-        # BUG-019: Produces a null-terminated byte array for C interop
-        string_cstring_ty = ir.FunctionType(list_ptr, [string_ptr])
+        # string_cstring(s: i64) -> i64 list handle
+        string_cstring_ty = ir.FunctionType(i64, [i64])
         cg.string_cstring = ir.Function(cg.module, string_cstring_ty, name="coex_string_cstring")
 
         # C Runtime FFI functions for string conversion (BUG-094)
-        # These are implemented in runtime/coex_string.c and linked from libcoex_string.a
         i32 = ir.IntType(32)
 
-        # coex_string_from_cstring_take(c_str: i8*) -> String*
-        # Takes ownership of malloc'd C string, frees it after copying
-        string_from_cstring_take_ty = ir.FunctionType(string_ptr, [i8_ptr])
+        # coex_string_from_cstring_take(c_str: i8*) -> i64 handle
+        string_from_cstring_take_ty = ir.FunctionType(i64, [i8_ptr])
         cg.string_from_cstring_take = ir.Function(cg.module, string_from_cstring_take_ty,
                                                    name="coex_string_from_cstring_take")
 
-        # coex_string_from_cstring_copy(c_str: i8*) -> String*
-        # Copies C string without freeing (caller retains ownership)
-        string_from_cstring_copy_ty = ir.FunctionType(string_ptr, [i8_ptr])
+        # coex_string_from_cstring_copy(c_str: i8*) -> i64 handle
+        string_from_cstring_copy_ty = ir.FunctionType(i64, [i8_ptr])
         cg.string_from_cstring_copy = ir.Function(cg.module, string_from_cstring_copy_ty,
                                                    name="coex_string_from_cstring_copy")
 
-        # coex_string_from_raw_bytes(data: i8*, byte_len: i64) -> String*
-        # Creates string from raw byte buffer with known length (for C interop)
-        string_from_raw_bytes_ty = ir.FunctionType(string_ptr, [i8_ptr, i64])
+        # coex_string_from_raw_bytes(data: i8*, byte_len: i64) -> i64 handle
+        string_from_raw_bytes_ty = ir.FunctionType(i64, [i8_ptr, i64])
         cg.string_from_raw_bytes = ir.Function(cg.module, string_from_raw_bytes_ty,
                                                 name="coex_string_from_raw_bytes")
 
@@ -273,24 +267,27 @@ class StringGenerator:
         self._register_string_methods()
 
     def _implement_string_data(self):
-        """Get pointer to actual data (owner + offset)."""
+        """Get pointer to actual data (owner + offset). Takes i64 handle, returns i8*."""
         cg = self.cg
         func = cg.string_data
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
         i32 = ir.IntType(32)
-        i8_ptr = ir.IntType(8).as_pointer()
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         # Load owner_handle from field 0
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
 
         # Dereference handle to get pointer
-        owner_ptr = builder.call(self.cg.gc.gc_handle_deref, [owner_handle])
+        owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
 
         # Load offset from field 1
         offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -391,7 +388,7 @@ class StringGenerator:
         size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(byte_len, size_ptr)
 
-        builder.ret(string_ptr)
+        builder.ret(string_handle)
 
     def _implement_string_from_literal(self):
         """Create String from null-terminated C string literal."""
@@ -486,18 +483,22 @@ class StringGenerator:
         size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(final_byte_len, size_ptr)
 
-        builder.ret(string_ptr)
+        builder.ret(string_handle)
 
     def _implement_string_len(self):
         """Return string length (codepoint count at field 2)."""
         cg = self.cg
         func = cg.string_len
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+
         len_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
         length = builder.load(len_ptr)
         builder.ret(length)
@@ -506,12 +507,16 @@ class StringGenerator:
         """Return string total memory footprint in bytes."""
         cg = self.cg
         func = cg.string_size
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
         total_size = builder.add(ir.Constant(ir.IntType(64), 32), byte_size)
@@ -521,12 +526,16 @@ class StringGenerator:
         """Return string byte size (field 3)."""
         cg = self.cg
         func = cg.string_byte_size
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
         builder.ret(byte_size)
@@ -535,7 +544,7 @@ class StringGenerator:
         """Get byte at index with bounds checking."""
         cg = self.cg
         func = cg.string_get
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
         func.args[1].name = "index"
 
         entry = func.append_basic_block("entry")
@@ -544,8 +553,12 @@ class StringGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
         index = func.args[1]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -575,7 +588,7 @@ class StringGenerator:
         """Create a slice VIEW that shares the parent's data buffer."""
         cg = self.cg
         func = cg.string_slice
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
         func.args[1].name = "start"
         func.args[2].name = "end"
 
@@ -588,9 +601,13 @@ class StringGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
         start = func.args[1]
         end = func.args[2]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         byte_size = builder.load(size_ptr)
@@ -652,6 +669,7 @@ class StringGenerator:
         struct_size = ir.Constant(ir.IntType(64), 32)
         type_id = ir.Constant(ir.IntType(32), cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
+        string_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -666,36 +684,48 @@ class StringGenerator:
         new_size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(new_byte_len, new_size_ptr)
 
-        builder.ret(string_ptr)
+        builder.ret(string_handle)
 
     def _implement_string_concat(self):
         """Concatenate two strings."""
         cg = self.cg
         func = cg.string_concat
-        func.args[0].name = "a"
-        func.args[1].name = "b"
+        func.args[0].name = "a_handle"
+        func.args[1].name = "b_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        a = func.args[0]
-        b = func.args[1]
+        a_handle = func.args[0]
+        b_handle = func.args[1]
 
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
         i8_ptr = ir.IntType(8).as_pointer()
 
+        # Deref handles to get String*
+        a_raw = builder.call(cg.gc.gc_handle_deref, [a_handle])
+        a = builder.bitcast(a_raw, cg.string_struct.as_pointer())
+        b_raw = builder.call(cg.gc.gc_handle_deref, [b_handle])
+        b = builder.bitcast(b_raw, cg.string_struct.as_pointer())
+
+        # Load all fields BEFORE allocations (pointers go stale after alloc)
         a_size_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         a_size = builder.load(a_size_ptr)
-
         b_size_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         b_size = builder.load(b_size_ptr)
-
         a_len_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         a_len = builder.load(a_len_ptr)
-
         b_len_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         b_len = builder.load(b_len_ptr)
+        a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        a_owner_handle = builder.load(a_owner_handle_ptr)
+        a_offset_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        a_offset = builder.load(a_offset_ptr)
+        b_owner_handle_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        b_owner_handle = builder.load(b_owner_handle_ptr)
+        b_offset_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        b_offset = builder.load(b_offset_ptr)
 
         total_size = builder.add(a_size, b_size)
         total_len = builder.add(a_len, b_len)
@@ -712,20 +742,13 @@ class StringGenerator:
         alloc_size = builder.add(total_size, ir.Constant(i64, 1))
         dest_data = cg.gc.alloc_arena_or_gc(builder, alloc_size, string_data_type_id)
 
-        a_owner_handle_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        a_owner_handle = builder.load(a_owner_handle_ptr)
+        # Re-derive data pointers via handles (stale after allocations)
         a_owner = builder.call(cg.gc.gc_handle_deref, [a_owner_handle])
-        a_offset_ptr = builder.gep(a, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        a_offset = builder.load(a_offset_ptr)
         a_data = builder.gep(a_owner, [a_offset])
         builder.call(cg.memcpy, [dest_data, a_data, a_size])
 
         b_dest = builder.gep(dest_data, [a_size])
-        b_owner_handle_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        b_owner_handle = builder.load(b_owner_handle_ptr)
         b_owner = builder.call(cg.gc.gc_handle_deref, [b_owner_handle])
-        b_offset_ptr = builder.gep(b, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        b_offset = builder.load(b_offset_ptr)
         b_data = builder.gep(b_owner, [b_offset])
         builder.call(cg.memcpy, [b_dest, b_data, b_size])
 
@@ -750,14 +773,14 @@ class StringGenerator:
         size_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(total_size, size_ptr)
 
-        builder.ret(string_ptr2)
+        builder.ret(string_handle)
 
     def _implement_string_join_list(self):
         """Efficiently join a list of strings with a separator."""
         cg = self.cg
         func = cg.string_join_list
-        func.args[0].name = "strings"
-        func.args[1].name = "separator"
+        func.args[0].name = "strings_handle"
+        func.args[1].name = "separator_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
@@ -767,8 +790,8 @@ class StringGenerator:
         i8_ptr = ir.IntType(8).as_pointer()
         string_ptr_ty = cg.string_struct.as_pointer()
 
-        strings_list = func.args[0]
-        separator = func.args[1]
+        strings_list = func.args[0]  # i64 handle - pass directly to list_len/list_get
+        separator_handle = func.args[1]  # i64 handle
 
         list_len = builder.call(cg.list_len, [strings_list])
 
@@ -788,10 +811,19 @@ class StringGenerator:
 
         builder.position_at_end(calc_size)
 
+        # Deref separator handle to get String*
+        sep_raw = builder.call(cg.gc.gc_handle_deref, [separator_handle])
+        separator = builder.bitcast(sep_raw, string_ptr_ty)
+
         sep_size_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         sep_size = builder.load(sep_size_ptr)
         sep_len_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         sep_len = builder.load(sep_len_ptr)
+        # Also load separator owner_handle and offset now (before allocations)
+        sep_owner_handle_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        sep_owner_handle = builder.load(sep_owner_handle_ptr)
+        sep_offset_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        sep_offset = builder.load(sep_offset_ptr)
 
         total_size_ptr = builder.alloca(i64, name="total_size")
         total_len_ptr = builder.alloca(i64, name="total_len")
@@ -897,11 +929,8 @@ class StringGenerator:
 
         builder.position_at_end(add_sep_block)
         sep_dest = builder.gep(dest_data, [write_pos])
-        sep_owner_handle_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        sep_owner_handle = builder.load(sep_owner_handle_ptr)
+        # Use pre-loaded sep_owner_handle and sep_offset (loaded before allocations)
         sep_owner = builder.call(cg.gc.gc_handle_deref, [sep_owner_handle])
-        sep_offset_ptr = builder.gep(separator, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        sep_offset = builder.load(sep_offset_ptr)
         sep_data = builder.gep(sep_owner, [sep_offset])
         builder.call(cg.memcpy, [sep_dest, sep_data, sep_size])
         new_write_pos = builder.add(write_pos, sep_size)
@@ -946,14 +975,14 @@ class StringGenerator:
         final_write_pos = builder.load(write_pos_ptr)
         null_ptr = builder.gep(dest_data, [final_write_pos])
         builder.store(ir.Constant(ir.IntType(8), 0), null_ptr)
-        builder.ret(result_str)
+        builder.ret(result_str_handle)
 
     def _implement_string_eq(self):
         """Compare two strings for equality."""
         cg = self.cg
         func = cg.string_eq
-        func.args[0].name = "a"
-        func.args[1].name = "b"
+        func.args[0].name = "a_handle"
+        func.args[1].name = "b_handle"
 
         entry = func.append_basic_block("entry")
         check_data = func.append_basic_block("check_data")
@@ -964,8 +993,14 @@ class StringGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        a = func.args[0]
-        b = func.args[1]
+        a_handle = func.args[0]
+        b_handle = func.args[1]
+
+        # Deref handles to get String*
+        a_raw = builder.call(cg.gc.gc_handle_deref, [a_handle])
+        a = builder.bitcast(a_raw, cg.string_struct.as_pointer())
+        b_raw = builder.call(cg.gc.gc_handle_deref, [b_handle])
+        b = builder.bitcast(b_raw, cg.string_struct.as_pointer())
 
         a_size_ptr = builder.gep(a, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         a_size = builder.load(a_size_ptr)
@@ -1021,8 +1056,8 @@ class StringGenerator:
         """Check if string contains substring."""
         cg = self.cg
         func = cg.string_contains
-        func.args[0].name = "s"
-        func.args[1].name = "needle"
+        func.args[0].name = "s_handle"
+        func.args[1].name = "needle_handle"
 
         entry = func.append_basic_block("entry")
         outer_loop = func.append_basic_block("outer_loop")
@@ -1035,8 +1070,14 @@ class StringGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
-        needle = func.args[1]
+        s_handle = func.args[0]
+        needle_handle = func.args[1]
+
+        # Deref handles to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+        needle_raw = builder.call(cg.gc.gc_handle_deref, [needle_handle])
+        needle = builder.bitcast(needle_raw, cg.string_struct.as_pointer())
 
         s_size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         s_size = builder.load(s_size_ptr)
@@ -1115,12 +1156,16 @@ class StringGenerator:
         """Print string to stdout."""
         cg = self.cg
         func = cg.string_print
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -1144,12 +1189,16 @@ class StringGenerator:
         """Print string to stderr."""
         cg = self.cg
         func = cg.string_debug
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -1183,19 +1232,23 @@ class StringGenerator:
         """Create an independent copy of a string with its own data buffer."""
         cg = self.cg
         func = cg.string_deep_copy
-        func.args[0].name = "src"
+        func.args[0].name = "src_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        src = func.args[0]
+        src_handle = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
+        # Deref handle to get String*
+        src_raw = builder.call(cg.gc.gc_handle_deref, [src_handle])
+        src = builder.bitcast(src_raw, cg.string_struct.as_pointer())
+
+        # Load all fields BEFORE allocations (pointers go stale after alloc)
         src_owner_handle_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         src_owner_handle = builder.load(src_owner_handle_ptr)
-        src_owner = builder.call(cg.gc.gc_handle_deref, [src_owner_handle])
 
         src_offset_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
@@ -1206,21 +1259,26 @@ class StringGenerator:
         src_size_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         src_size = builder.load(src_size_ptr)
 
-        src_data = builder.gep(src_owner, [src_offset])
-
         type_id = ir.Constant(i32, cg.gc.TYPE_STRING_DATA)
         new_data = cg.gc.alloc_arena_or_gc(builder, src_size, type_id)
 
+        # Re-derive src_data via handle after allocation (stale pointer fix)
+        src_owner = builder.call(cg.gc.gc_handle_deref, [src_owner_handle])
+        src_data = builder.gep(src_owner, [src_offset])
+
         builder.call(cg.memcpy, [new_data, src_data, src_size])
+
+        # Save new_data handle before second allocation
+        new_data_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_data])
 
         struct_size = ir.Constant(i64, 32)
         string_type_id = ir.Constant(i32, cg.gc.TYPE_STRING)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, string_type_id)
+        string_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
         string_ptr = builder.bitcast(raw_ptr, cg.string_struct.as_pointer())
 
         new_owner_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-        new_owner_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_data])
-        builder.store(new_owner_handle, new_owner_ptr)
+        builder.store(new_data_handle, new_owner_ptr)
 
         new_offset_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         builder.store(ir.Constant(i64, 0), new_offset_ptr)
@@ -1231,13 +1289,13 @@ class StringGenerator:
         new_size_ptr = builder.gep(string_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(src_size, new_size_ptr)
 
-        builder.ret(string_ptr)
+        builder.ret(string_handle)
 
     def _implement_string_hash(self):
         """Compute hash of string content using FNV-1a algorithm."""
         cg = self.cg
         func = cg.string_hash
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         null_case = func.append_basic_block("null_case")
@@ -1248,18 +1306,22 @@ class StringGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        s = func.args[0]
+        s_handle = func.args[0]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        string_ptr_type = cg.string_struct.as_pointer()
 
-        is_null = builder.icmp_unsigned("==", s, ir.Constant(string_ptr_type, None))
+        # Check for null handle (0)
+        is_null = builder.icmp_unsigned("==", s_handle, ir.Constant(i64, 0))
         builder.cbranch(is_null, null_case, init_loop)
 
         builder.position_at_end(null_case)
         builder.ret(ir.Constant(i64, 0))
 
         builder.position_at_end(init_loop)
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+
         owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         owner_handle = builder.load(owner_handle_ptr)
         owner_ptr = builder.call(cg.gc.gc_handle_deref, [owner_handle])
@@ -1308,10 +1370,10 @@ class StringGenerator:
         """Return new string with [start, end) replaced by source."""
         cg = self.cg
         func = cg.string_setrange
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
         func.args[1].name = "start"
         func.args[2].name = "end"
-        func.args[3].name = "source"
+        func.args[3].name = "source_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
@@ -1322,28 +1384,31 @@ class StringGenerator:
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
 
-        s = func.args[0]
+        s_handle = func.args[0]
         start = func.args[1]
         end = func.args[2]
-        source = func.args[3]
+        source_handle = func.args[3]
 
+        # Deref handles to get String*
+        source_raw = builder.call(cg.gc.gc_handle_deref, [source_handle])
+        source = builder.bitcast(source_raw, cg.string_struct.as_pointer())
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
+
+        # Load all fields BEFORE allocations (pointers go stale after alloc)
         source_size_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         source_size = builder.load(source_size_ptr)
         source_owner_handle_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         source_owner_handle = builder.load(source_owner_handle_ptr)
-        source_owner = builder.call(cg.gc.gc_handle_deref, [source_owner_handle])
         source_offset_ptr = builder.gep(source, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         source_offset = builder.load(source_offset_ptr)
-        source_data = builder.gep(source_owner, [source_offset])
 
         orig_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         orig_size = builder.load(orig_size_ptr)
         orig_owner_handle_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         orig_owner_handle = builder.load(orig_owner_handle_ptr)
-        orig_owner = builder.call(cg.gc.gc_handle_deref, [orig_owner_handle])
         orig_offset_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         orig_offset = builder.load(orig_offset_ptr)
-        orig_data = builder.gep(orig_owner, [orig_offset])
 
         start_neg = builder.icmp_signed("<", start, zero)
         start_over = builder.icmp_signed(">", start, orig_size)
@@ -1420,7 +1485,7 @@ class StringGenerator:
         """Parse string as integer using strtoll."""
         cg = self.cg
         func = cg.string_to_int
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         success_block = func.append_basic_block("success")
@@ -1435,7 +1500,11 @@ class StringGenerator:
         i8_ptr = i8.as_pointer()
         int_optional = ir.LiteralStructType([i1, i64])
 
-        s = func.args[0]
+        s_handle = func.args[0]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -1483,7 +1552,7 @@ class StringGenerator:
         """Parse string as float using strtod."""
         cg = self.cg
         func = cg.string_to_float
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         success_block = func.append_basic_block("success")
@@ -1498,7 +1567,11 @@ class StringGenerator:
         double = ir.DoubleType()
         float_optional = ir.LiteralStructType([i1, double])
 
-        s = func.args[0]
+        s_handle = func.args[0]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -1536,7 +1609,7 @@ class StringGenerator:
         """Parse hex string as integer using strtoll with base 16."""
         cg = self.cg
         func = cg.string_to_int_hex
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         success_block = func.append_basic_block("success")
@@ -1551,7 +1624,11 @@ class StringGenerator:
 
         int_optional = ir.LiteralStructType([i1, i64])
 
-        s = func.args[0]
+        s_handle = func.args[0]
+
+        # Deref handle to get String*
+        s_raw = builder.call(cg.gc.gc_handle_deref, [s_handle])
+        s = builder.bitcast(s_raw, cg.string_struct.as_pointer())
 
         size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         size = builder.load(size_ptr)
@@ -1669,7 +1746,7 @@ class StringGenerator:
         builder.branch(merge_block)
 
         builder.position_at_end(merge_block)
-        phi = builder.phi(cg.string_struct.as_pointer())
+        phi = builder.phi(ir.IntType(64))
         phi.add_incoming(true_result, true_block)
         phi.add_incoming(false_result, false_block)
         builder.ret(phi)
@@ -1705,7 +1782,7 @@ class StringGenerator:
         """Convert byte array (List*) to String."""
         cg = self.cg
         func = cg.string_from_bytes
-        func.args[0].name = "bytes"
+        func.args[0].name = "bytes_handle"
 
         entry = func.append_basic_block("entry")
         check_empty = func.append_basic_block("check_empty")
@@ -1719,10 +1796,9 @@ class StringGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        bytes_list = func.args[0]
+        bytes_list = func.args[0]  # i64 handle - pass directly to list_get/list_len
 
-        len_ptr = builder.gep(bytes_list, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        byte_len = builder.load(len_ptr)
+        byte_len = builder.call(cg.list_len, [bytes_list])
 
         builder.branch(check_empty)
 
@@ -1792,7 +1868,7 @@ class StringGenerator:
         """Convert String to byte array (List*)."""
         cg = self.cg
         func = cg.string_to_bytes
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         check_empty = func.append_basic_block("check_empty")
@@ -1803,12 +1879,9 @@ class StringGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        s = func.args[0]
+        s_handle = func.args[0]  # i64 handle
 
-        data_ptr = builder.call(cg.string_data, [s])
-
-        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        byte_size = builder.load(size_ptr)
+        byte_size = builder.call(cg.string_byte_size, [s_handle])
 
         builder.branch(check_empty)
 
@@ -1821,7 +1894,7 @@ class StringGenerator:
         byte_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, 0)])
 
         idx_ptr = builder.alloca(i64, name="idx")
-        list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="list")
+        list_ptr = builder.alloca(i64, name="list")
         builder.store(ir.Constant(i64, 0), idx_ptr)
         builder.store(byte_list, list_ptr)
 
@@ -1837,6 +1910,8 @@ class StringGenerator:
         builder.cbranch(in_bounds, loop_body, loop_end)
 
         builder.position_at_end(loop_body)
+        # Re-derive data_ptr each iteration (list_append may trigger GC compaction)
+        data_ptr = builder.call(cg.string_data, [s_handle])
         src_byte_ptr = builder.gep(data_ptr, [idx])
         byte_val = builder.load(src_byte_ptr)
         byte_as_i64 = builder.zext(byte_val, i64)
@@ -1865,8 +1940,8 @@ class StringGenerator:
         """Split string by delimiter, returning List of zero-copy slice views."""
         cg = self.cg
         func = cg.string_split
-        func.args[0].name = "s"
-        func.args[1].name = "delim"
+        func.args[0].name = "s_handle"
+        func.args[1].name = "delim_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
@@ -1877,20 +1952,18 @@ class StringGenerator:
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
 
-        s = func.args[0]
-        delim = func.args[1]
+        s_handle = func.args[0]  # i64 handle
+        delim_handle = func.args[1]  # i64 handle
 
-        src_data = builder.call(cg.string_data, [s])
-        src_size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        src_size = builder.load(src_size_ptr)
+        src_data = builder.call(cg.string_data, [s_handle])
+        src_size = builder.call(cg.string_byte_size, [s_handle])
 
-        delim_data = builder.call(cg.string_data, [delim])
-        delim_size_ptr = builder.gep(delim, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        delim_size = builder.load(delim_size_ptr)
+        delim_data = builder.call(cg.string_data, [delim_handle])
+        delim_size = builder.call(cg.string_byte_size, [delim_handle])
 
         # List of strings - using TaggedValue (16 bytes per element)
         result_list = builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
-        list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
+        list_ptr = builder.alloca(i64, name="result")
         builder.store(result_list, list_ptr)
 
         idx_ptr = builder.alloca(i64, name="idx")
@@ -1904,10 +1977,7 @@ class StringGenerator:
         builder.cbranch(delim_empty, empty_delim_block, scan_loop)
 
         builder.position_at_end(empty_delim_block)
-        # Convert string pointer to handle for TaggedValue storage
-        s_i8 = builder.bitcast(s, i8.as_pointer())
-        s_handle = builder.call(cg.gc.gc_ptr_to_handle, [s_i8])
-        # Create TaggedValue with TV_TYPE_STRING (64)
+        # s_handle is already a handle - use it directly for TaggedValue storage
         tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, s_handle)
         tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
@@ -1949,9 +2019,12 @@ class StringGenerator:
         idx = builder.load(idx_ptr)
         m_idx = builder.load(match_idx_ptr)
         src_off = builder.add(idx, m_idx)
-        src_byte_ptr = builder.gep(src_data, [src_off])
+        # Re-derive data pointers (may be stale after list_append triggered GC)
+        src_data_fresh = builder.call(cg.string_data, [s_handle])
+        delim_data_fresh = builder.call(cg.string_data, [delim_handle])
+        src_byte_ptr = builder.gep(src_data_fresh, [src_off])
         src_byte = builder.load(src_byte_ptr)
-        delim_byte_ptr = builder.gep(delim_data, [m_idx])
+        delim_byte_ptr = builder.gep(delim_data_fresh, [m_idx])
         delim_byte = builder.load(delim_byte_ptr)
         eq = builder.icmp_unsigned("==", src_byte, delim_byte)
         builder.cbranch(eq, match_next, match_fail)
@@ -1966,11 +2039,8 @@ class StringGenerator:
         idx = builder.load(idx_ptr)
         start = builder.load(start_ptr)
 
-        slice_val = builder.call(cg.string_slice, [s, start, idx])
-        # Convert string pointer to handle for TaggedValue storage
-        slice_i8_ptr = builder.bitcast(slice_val, i8.as_pointer())
-        slice_handle = builder.call(cg.gc.gc_ptr_to_handle, [slice_i8_ptr])
-        # Create TaggedValue with TV_TYPE_STRING (64)
+        slice_handle = builder.call(cg.string_slice, [s_handle, start, idx])
+        # slice_handle is already an i64 handle - use directly for TaggedValue storage
         tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, slice_handle)
         tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
@@ -1990,11 +2060,8 @@ class StringGenerator:
 
         builder.position_at_end(add_final)
         start = builder.load(start_ptr)
-        final_slice = builder.call(cg.string_slice, [s, start, src_size])
-        # Convert string pointer to handle for TaggedValue storage
-        final_i8_ptr = builder.bitcast(final_slice, i8.as_pointer())
-        final_handle = builder.call(cg.gc.gc_ptr_to_handle, [final_i8_ptr])
-        # Create TaggedValue with TV_TYPE_STRING (64)
+        final_handle = builder.call(cg.string_slice, [s_handle, start, src_size])
+        # final_handle is already an i64 handle - use directly for TaggedValue storage
         tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, final_handle)
         tv_i8 = builder.bitcast(tv_ptr, i8.as_pointer())
         curr = builder.load(list_ptr)
@@ -2017,7 +2084,7 @@ class StringGenerator:
         """
         cg = self.cg
         func = cg.string_cstring
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
@@ -2028,12 +2095,11 @@ class StringGenerator:
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
 
-        s = func.args[0]
+        s_handle = func.args[0]  # i64 handle
 
         # Get string data pointer and size
-        data_ptr = builder.call(cg.string_data, [s])
-        size_ptr = builder.gep(s, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
-        byte_size = builder.load(size_ptr)
+        data_ptr = builder.call(cg.string_data, [s_handle])
+        byte_size = builder.call(cg.string_byte_size, [s_handle])
 
         # Calculate new size (size + 1 for null terminator)
         new_size = builder.add(byte_size, one)
@@ -2043,8 +2109,8 @@ class StringGenerator:
         byte_list = builder.call(cg.list_new, [tv_size, zero])
 
         # We need to append all bytes one at a time, then append null
-        # Store list pointer for updates
-        list_ptr = builder.alloca(cg.list_struct.as_pointer(), name="list")
+        # Store list handle for updates
+        list_ptr = builder.alloca(i64, name="list")
         builder.store(byte_list, list_ptr)
 
         # Loop through all bytes in the string
@@ -2063,8 +2129,10 @@ class StringGenerator:
         builder.cbranch(in_bounds, loop_body, loop_end)
 
         builder.position_at_end(loop_body)
+        # Re-derive data_ptr each iteration (list_append may trigger GC compaction)
+        data_ptr_fresh = builder.call(cg.string_data, [s_handle])
         # Get source byte and wrap in TaggedValue
-        src_byte_ptr = builder.gep(data_ptr, [idx])
+        src_byte_ptr = builder.gep(data_ptr_fresh, [idx])
         byte_val = builder.load(src_byte_ptr)
         byte_as_i64 = builder.zext(byte_val, i64)
         tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, byte_as_i64)
@@ -2091,15 +2159,15 @@ class StringGenerator:
         """Implement string_validjson - called after JSON type is created."""
         cg = self.cg
         func = cg.string_validjson
-        func.args[0].name = "s"
+        func.args[0].name = "s_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
         json_result = builder.call(cg.json_parse, [func.args[0]])
 
-        null_ptr = ir.Constant(cg.json_struct.as_pointer(), None)
-        is_valid = builder.icmp_unsigned("!=", json_result, null_ptr)
+        # json_parse returns i64 handle; 0 = null/failure
+        is_valid = builder.icmp_unsigned("!=", json_result, ir.Constant(ir.IntType(64), 0))
 
         builder.ret(is_valid)
 

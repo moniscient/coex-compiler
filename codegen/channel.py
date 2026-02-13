@@ -155,28 +155,16 @@ class ChannelGenerator:
         self.declare_channel_functions()
         cg = self.cg
 
-        # Ensure channel is the right type
+        # Ensure channel is the right type (channel arrives as i64 handle via ptrtoint)
         channel_ptr_type = self.get_channel_struct().as_pointer()
         if channel.type != channel_ptr_type:
-            channel = builder.bitcast(channel, channel_ptr_type)
-
-        # Convert value to i64 - use handle for heap types, raw value for primitives
-        if isinstance(value.type, ir.PointerType):
-            # Check if it's a heap-allocated struct type
-            pointee = value.type.pointee
-            is_heap_type = (hasattr(pointee, 'name') and
-                           pointee.name in ("struct.List", "struct.Map", "struct.Set",
-                                           "struct.Array", "struct.String", "struct.Json"))
-            if is_heap_type:
-                # Convert pointer to handle for GC safety
-                value_i8 = builder.bitcast(value, ir.IntType(8).as_pointer())
-                value_i64 = builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
+            if isinstance(channel.type, ir.IntType):
+                channel = builder.inttoptr(channel, channel_ptr_type)
             else:
-                # Non-heap pointer (shouldn't happen often) - use ptrtoint
-                value_i64 = builder.ptrtoint(value, ir.IntType(64))
-        else:
-            # Primitive type - cast directly to i64
-            value_i64 = cg._cast_value(value, ir.IntType(64))
+                channel = builder.bitcast(channel, channel_ptr_type)
+
+        # Convert value to i64 - with handles-everywhere, ref types are already i64 handles
+        value_i64 = cg._cast_value(value, ir.IntType(64))
 
         # Call coex_channel_send
         builder.call(self._channel_send_fn, [channel, value_i64])
@@ -200,10 +188,59 @@ class ChannelGenerator:
         # Ensure channel is the right type
         channel_ptr_type = self.get_channel_struct().as_pointer()
         if channel.type != channel_ptr_type:
-            channel = builder.bitcast(channel, channel_ptr_type)
+            if isinstance(channel.type, ir.IntType):
+                channel = builder.inttoptr(channel, channel_ptr_type)
+            else:
+                channel = builder.bitcast(channel, channel_ptr_type)
 
         # Call coex_channel_receive (blocking)
         result = builder.call(self._channel_receive_fn, [channel], name="received")
+
+        return result
+
+    def generate_channel_try_receive(self, channel: ir.Value,
+                                       builder: ir.IRBuilder) -> ir.Value:
+        """
+        Generate code for ch.try_receive().
+
+        Non-blocking receive: returns the value if available, or 0 (nil) if empty.
+        Uses coex_channel_try_receive(channel, &out) which returns 0 on success, -1 on empty.
+
+        Args:
+            channel: Channel pointer
+            builder: LLVM IR builder
+
+        Returns:
+            Received value (i64) or 0 (nil) if channel is empty
+        """
+        self.declare_channel_functions()
+
+        i64 = ir.IntType(64)
+
+        # Ensure channel is the right type
+        channel_ptr_type = self.get_channel_struct().as_pointer()
+        if channel.type != channel_ptr_type:
+            if isinstance(channel.type, ir.IntType):
+                channel = builder.inttoptr(channel, channel_ptr_type)
+            else:
+                channel = builder.bitcast(channel, channel_ptr_type)
+
+        # Alloca for output value
+        out_alloca = builder.alloca(i64, name="try_recv_out")
+        builder.store(ir.Constant(i64, 0), out_alloca)
+
+        # Call coex_channel_try_receive(channel, &out) -> status (0=ok, -1=empty)
+        status = builder.call(self._channel_try_receive_fn, [channel, out_alloca],
+                              name="try_recv_status")
+
+        # Check if successful
+        is_ok = builder.icmp_signed("==", status, ir.Constant(i64, 0), name="try_recv_ok")
+
+        # Load the value (valid only if is_ok)
+        out_val = builder.load(out_alloca, name="try_recv_val")
+
+        # Return value if ok, else 0 (nil)
+        result = builder.select(is_ok, out_val, ir.Constant(i64, 0), name="try_recv_result")
 
         return result
 

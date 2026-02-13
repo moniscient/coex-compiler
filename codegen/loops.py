@@ -251,36 +251,34 @@ class LoopGenerator:
         We need to load the pointer, copy the collection, and store the new pointer back.
         """
         cg = self.cg
-        # Load the collection pointer from the alloca
-        if isinstance(var_ptr.type, ir.PointerType):
-            loaded = cg.builder.load(var_ptr)
+        # Load the collection handle from the alloca
+        loaded = cg.builder.load(var_ptr)
 
-            # Check if the loaded value is a collection pointer
-            if isinstance(loaded.type, ir.PointerType):
-                pointee = loaded.type.pointee
-                if hasattr(pointee, 'name'):
-                    if 'List' in pointee.name:
-                        # Copy the list to main heap using runtime function
-                        copied = cg.builder.call(cg.list_copy, [loaded])
-                        cg.builder.store(copied, var_ptr)
-                        return copied
-                    elif 'Array' in pointee.name:
-                        # Copy the array to main heap using runtime function
-                        copied = cg.builder.call(cg.array_copy, [loaded])
-                        cg.builder.store(copied, var_ptr)
-                        return copied
-                    elif 'Map' in pointee.name:
-                        # Copy the map to main heap using runtime function
-                        copied = cg.builder.call(cg.map_copy, [loaded])
-                        cg.builder.store(copied, var_ptr)
-                        return copied
-                    elif 'Set' in pointee.name:
-                        # Copy the set to main heap using runtime function
-                        copied = cg.builder.call(cg.set_copy, [loaded])
-                        cg.builder.store(copied, var_ptr)
-                        return copied
+        # Determine the Coex type name for this variable to dispatch copy
+        type_name = cg.var_coex_types.get(var_name)
+        if type_name is not None:
+            resolved = cg._coex_type_to_type_name(type_name)
+        else:
+            resolved = None
 
-        return cg.builder.load(var_ptr)
+        if resolved == "List":
+            copied = cg.builder.call(cg.list_copy, [loaded])
+            cg.builder.store(copied, var_ptr)
+            return copied
+        elif resolved == "Array":
+            copied = cg.builder.call(cg.array_copy, [loaded])
+            cg.builder.store(copied, var_ptr)
+            return copied
+        elif resolved == "Map":
+            copied = cg.builder.call(cg.map_copy, [loaded])
+            cg.builder.store(copied, var_ptr)
+            return copied
+        elif resolved == "Set":
+            copied = cg.builder.call(cg.set_copy, [loaded])
+            cg.builder.store(copied, var_ptr)
+            return copied
+
+        return loaded
 
     # ========================================================================
     # For Loop Generation
@@ -307,25 +305,26 @@ class LoopGenerator:
 
         # Check if iterable is a list, array, or map
         if isinstance(stmt.iterable, (Identifier, ListExpr, CallExpr, IndexExpr, MethodCallExpr, MapExpr, MemberExpr)):
+            # Resolve the Coex type name to dispatch iteration strategy
+            type_name = cg._resolve_expr_type_name(stmt.iterable)
             # Generate the iterable expression
             iterable = cg._generate_expression(stmt.iterable)
-            if isinstance(iterable.type, ir.PointerType):
-                pointee = iterable.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                    self.generate_list_for(stmt, iterable)
-                    return
-                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                    self.generate_array_for(stmt, iterable)
-                    return
-                if hasattr(pointee, 'name') and pointee.name == "struct.Map":
-                    self.generate_map_for(stmt, iterable)
-                    return
-                if hasattr(pointee, 'name') and pointee.name == "struct.Set":
-                    self.generate_set_for(stmt, iterable)
-                    return
-                if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                    self.generate_string_for(stmt, iterable)
-                    return
+
+            if type_name == "List":
+                self.generate_list_for(stmt, iterable)
+                return
+            elif type_name == "Array":
+                self.generate_array_for(stmt, iterable)
+                return
+            elif type_name == "Map":
+                self.generate_map_for(stmt, iterable)
+                return
+            elif type_name == "Set":
+                self.generate_set_for(stmt, iterable)
+                return
+            elif type_name == "String":
+                self.generate_string_for(stmt, iterable)
+                return
 
         # For other iterables, we need iterator protocol
         # For now, just execute body once as fallback
@@ -690,14 +689,17 @@ class LoopGenerator:
 
             cg.builder.cbranch(is_heap, heap_bb, value_bb)
 
-            # Heap path: raw_value is a handle, dereference it
+            # Heap path: raw_value is a handle
             cg.builder.position_at_end(heap_bb)
-            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-            # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
-            if isinstance(elem_type, ir.PointerType):
+            if isinstance(elem_type, ir.IntType) and elem_type.width == 64:
+                # Handles-everywhere: raw_value IS the handle (i64), return directly
+                heap_result = raw_value
+            elif isinstance(elem_type, ir.PointerType):
+                ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
                 heap_result = cg.builder.bitcast(ptr_i8, elem_type)
             else:
-                # This branch won't be taken for primitives, but IR must be valid
+                # Fallback: dereference and convert (shouldn't happen with handles-everywhere)
+                ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
                 heap_result = cg.builder.ptrtoint(ptr_i8, elem_type)
             cg.builder.branch(merge_bb)
             heap_bb_final = cg.builder.block
@@ -705,7 +707,8 @@ class LoopGenerator:
             # Value path: raw_value is the actual value
             cg.builder.position_at_end(value_bb)
             # Convert raw_value (i64) to target type
-            if elem_type == ir.IntType(64):
+            if isinstance(elem_type, ir.IntType) and elem_type.width == 64:
+                # raw_value is already i64 (handle or int) - use directly
                 value_result = raw_value
             elif isinstance(elem_type, ir.IntType):
                 if elem_type.width < 64:
@@ -717,7 +720,7 @@ class LoopGenerator:
             elif isinstance(elem_type, ir.PointerType):
                 value_result = cg.builder.inttoptr(raw_value, elem_type)
             else:
-                value_result = cg.builder.inttoptr(raw_value, elem_type)
+                value_result = raw_value
             cg.builder.branch(merge_bb)
             value_bb_final = cg.builder.block
 
@@ -728,12 +731,11 @@ class LoopGenerator:
             phi.add_incoming(value_result, value_bb_final)
             elem_val = phi
         else:
-            # Legacy mode: Reference types are stored as handles - need to load handle and dereference
+            # Reference types are stored as i64 handles in the list
             if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                # Handles-everywhere: element is an i64 handle, load it directly
                 handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-                handle = cg.builder.load(handle_ptr)
-                ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+                elem_val = cg.builder.load(handle_ptr)
             else:
                 # Non-reference types: load directly - lists store values inline
                 typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
@@ -828,14 +830,12 @@ class LoopGenerator:
         elem_coex_type = self.get_array_element_coex_type(stmt)
         elem_type = self.get_array_element_type_for_pattern(stmt)
 
-        # Reference types are stored as handles - need to load handle and dereference
+        # Reference types are stored as i64 handles in the array
         if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
-            # Derive correct LLVM type from Coex type for reference types
-            elem_type = cg._get_llvm_type(elem_coex_type)
+            # Handles-everywhere: element is an i64 handle, load it directly
             handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-            handle = cg.builder.load(handle_ptr)
-            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-            elem_val = cg.builder.bitcast(ptr_i8, elem_type)
+            elem_val = cg.builder.load(handle_ptr)
+            elem_type = ir.IntType(64)
         else:
             # Non-reference types: load directly - arrays store values inline
             typed_ptr = cg.builder.bitcast(elem_ptr, elem_type.as_pointer())
@@ -1189,6 +1189,18 @@ class LoopGenerator:
             var_ptr = cg.builder.alloca(result.type, name=stmt.target)
             cg.locals[stmt.target] = var_ptr
             cg.builder.store(result, var_ptr)
+
+        # Track result type as List for method dispatch
+        # Determine element type from the body expression's return type
+        if isinstance(stmt.body_expr, CallExpr) and isinstance(stmt.body_expr.callee, Identifier):
+            call_name = stmt.body_expr.callee.name
+            if call_name in cg.func_decls and cg.func_decls[call_name].return_type is not None:
+                elem_type = cg.func_decls[call_name].return_type
+            else:
+                elem_type = PrimitiveType("int")
+        else:
+            elem_type = PrimitiveType("int")
+        cg.var_coex_types[stmt.target] = ListType(elem_type)
 
     def _is_thread_call(self, expr: Expr) -> bool:
         """Check if expression is a call to a thread function."""
@@ -1713,14 +1725,14 @@ class LoopGenerator:
         if stmt.results_target in cg.locals:
             cg.builder.store(results_list, cg.locals[stmt.results_target])
         else:
-            results_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.results_target)
+            results_ptr = cg.builder.alloca(ir.IntType(64), name=stmt.results_target)
             cg.locals[stmt.results_target] = results_ptr
             cg.builder.store(results_list, results_ptr)
 
         if stmt.errors_target in cg.locals:
             cg.builder.store(errors_list, cg.locals[stmt.errors_target])
         else:
-            errors_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.errors_target)
+            errors_ptr = cg.builder.alloca(ir.IntType(64), name=stmt.errors_target)
             cg.locals[stmt.errors_target] = errors_ptr
             cg.builder.store(errors_list, errors_ptr)
 
@@ -1887,14 +1899,14 @@ class LoopGenerator:
         if stmt.results_target in cg.locals:
             cg.builder.store(result_list, cg.locals[stmt.results_target])
         else:
-            results_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.results_target)
+            results_ptr = cg.builder.alloca(ir.IntType(64), name=stmt.results_target)
             cg.locals[stmt.results_target] = results_ptr
             cg.builder.store(result_list, results_ptr)
 
         if stmt.errors_target in cg.locals:
             cg.builder.store(errors_list, cg.locals[stmt.errors_target])
         else:
-            errors_ptr = cg.builder.alloca(cg.list_struct.as_pointer(), name=stmt.errors_target)
+            errors_ptr = cg.builder.alloca(ir.IntType(64), name=stmt.errors_target)
             cg.locals[stmt.errors_target] = errors_ptr
             cg.builder.store(errors_list, errors_ptr)
 
@@ -1907,7 +1919,7 @@ class LoopGenerator:
         # Create result list with TaggedValue elements
         elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
-        result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
+        result_alloca = cg.builder.alloca(ir.IntType(64), name="result_list")
         cg.builder.store(result_list, result_alloca)
 
         # Get iterable length and iterator
@@ -2154,7 +2166,7 @@ class LoopGenerator:
         # =====================================================================
         elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         result_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
-        result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name="result_list")
+        result_alloca = cg.builder.alloca(ir.IntType(64), name="result_list")
         cg.builder.store(result_list, result_alloca)
 
         collect_header = func.append_basic_block("collect_header")
@@ -2571,8 +2583,6 @@ class LoopGenerator:
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
         elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
-        list_ptr_type = cg.list_struct.as_pointer()
-
         # Extract body expression from block
         body_expr = self._extract_body_expr(stmt.body)
         if body_expr is None:
@@ -2611,13 +2621,13 @@ class LoopGenerator:
             if stmt.results_target in cg.locals:
                 cg.builder.store(result_list, cg.locals[stmt.results_target])
             else:
-                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
+                var_ptr = cg.builder.alloca(i64, name=stmt.results_target)
                 cg.locals[stmt.results_target] = var_ptr
                 cg.builder.store(result_list, var_ptr)
             if stmt.errors_target in cg.locals:
                 cg.builder.store(errors_list, cg.locals[stmt.errors_target])
             else:
-                var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
+                var_ptr = cg.builder.alloca(i64, name=stmt.errors_target)
                 cg.locals[stmt.errors_target] = var_ptr
                 cg.builder.store(errors_list, var_ptr)
 
@@ -2741,16 +2751,13 @@ class LoopGenerator:
         # =====================================================================
         # Phase 2: Join all threads and collect results
         # =====================================================================
-        # Create results list and errors list
-        # Use list struct pointer type so method calls work
-        list_ptr_type = cg.list_struct.as_pointer()
-
+        # Create results list and errors list (handles are i64)
         results_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="most_results")
-        results_alloca = cg.builder.alloca(list_ptr_type, name="most_results_ptr")
+        results_alloca = cg.builder.alloca(i64, name="most_results_ptr")
         cg.builder.store(results_list, results_alloca)
 
         errors_list = cg.builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)], name="most_errors")
-        errors_alloca = cg.builder.alloca(list_ptr_type, name="most_errors_ptr")
+        errors_alloca = cg.builder.alloca(i64, name="most_errors_ptr")
         cg.builder.store(errors_list, errors_alloca)
 
         # Join and collect loop
@@ -2854,11 +2861,11 @@ class LoopGenerator:
 
         # Merge with phi nodes - using list pointer type
         cg.builder.position_at_end(after_wait)
-        final_results = cg.builder.phi(list_ptr_type, name="most_final_results")
+        final_results = cg.builder.phi(i64, name="most_final_results")
         final_results.add_incoming(final_results_from_join, join_done)
         final_results.add_incoming(empty_results_list, empty_block)
 
-        final_errors = cg.builder.phi(list_ptr_type, name="most_final_errors")
+        final_errors = cg.builder.phi(i64, name="most_final_errors")
         final_errors.add_incoming(final_errors_from_join, join_done)
         final_errors.add_incoming(empty_errors_list, empty_block)
 
@@ -2866,7 +2873,7 @@ class LoopGenerator:
         if stmt.results_target in cg.locals:
             cg.builder.store(final_results, cg.locals[stmt.results_target])
         else:
-            var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.results_target)
+            var_ptr = cg.builder.alloca(i64, name=stmt.results_target)
             cg.locals[stmt.results_target] = var_ptr
             cg.builder.store(final_results, var_ptr)
 
@@ -2874,7 +2881,7 @@ class LoopGenerator:
         if stmt.errors_target in cg.locals:
             cg.builder.store(final_errors, cg.locals[stmt.errors_target])
         else:
-            var_ptr = cg.builder.alloca(list_ptr_type, name=stmt.errors_target)
+            var_ptr = cg.builder.alloca(i64, name=stmt.errors_target)
             cg.locals[stmt.errors_target] = var_ptr
             cg.builder.store(final_errors, var_ptr)
 
@@ -2944,13 +2951,13 @@ class LoopGenerator:
         # Handle method call iterables (e.g., text.split("\n"))
         if isinstance(stmt.iterable, MethodCallExpr):
             if stmt.iterable.method == "split":
-                # split() returns List<String>
-                return cg.string_struct.as_pointer()
+                # split() returns List<String> — elements are i64 handles
+                return ir.IntType(64)
         elif isinstance(stmt.iterable, CallExpr):
             # CallExpr with MemberExpr callee (e.g., text.split("\n"))
             if isinstance(stmt.iterable.callee, MemberExpr):
                 if stmt.iterable.callee.member == "split":
-                    return cg.string_struct.as_pointer()
+                    return ir.IntType(64)
 
         # Infer from pattern structure
         pattern = stmt.pattern

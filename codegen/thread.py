@@ -518,19 +518,24 @@ class ThreadGenerator:
         # Convert result to i8* for storage in closure
         # BUG-099: For heap-type pointer results, convert to GC handle first
         # so the stored i64 is a stable handle, not a raw pointer that goes stale
+        # With handles-everywhere, all reference type results are already i64 handles
         result_handle = None
         if result.type == i64:
+            result_handle = result  # May be a GC handle for ref types
             result_ptr = builder.inttoptr(result, i8_ptr)
         elif result.type == ir.VoidType():
             result_ptr = ir.Constant(i8_ptr, None)
-        elif result.type.is_pointer and returns_heap_type and cg.gc is not None:
-            # Heap-type pointer result: convert to handle
-            result_i8 = builder.bitcast(result, i8_ptr) if result.type != i8_ptr else result
-            result_handle = builder.call(cg.gc.gc_ptr_to_handle, [result_i8], name="result_handle")
-            result_ptr = builder.inttoptr(result_handle, i8_ptr)
+        elif isinstance(result.type, (ir.DoubleType, ir.FloatType)):
+            if isinstance(result.type, ir.FloatType):
+                result = builder.fpext(result, ir.DoubleType())
+            result_i64 = builder.bitcast(result, i64)
+            result_ptr = builder.inttoptr(result_i64, i8_ptr)
+        elif hasattr(result.type, 'is_pointer') and result.type.is_pointer:
+            # Legacy path for actual pointer types (e.g., channels)
+            result_i64 = builder.ptrtoint(result, i64)
+            result_ptr = builder.inttoptr(result_i64, i8_ptr)
         else:
-            # Non-heap pointer or primitive: bit-preserving cast through i64
-            result_i64 = builder.ptrtoint(result, i64) if result.type.is_pointer else builder.zext(result, i64)
+            result_i64 = builder.zext(result, i64)
             result_ptr = builder.inttoptr(result_i64, i8_ptr)
         builder.store(result_ptr, result_field)
 

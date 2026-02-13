@@ -706,6 +706,10 @@ class TaskTransformer:
         if result_val.type != ir.IntType(64):
             if isinstance(result_val.type, ir.IntType):
                 result_val = builder.sext(result_val, ir.IntType(64))
+            elif isinstance(result_val.type, (ir.DoubleType, ir.FloatType)):
+                if isinstance(result_val.type, ir.FloatType):
+                    result_val = builder.fpext(result_val, ir.DoubleType())
+                result_val = builder.bitcast(result_val, ir.IntType(64))
             else:
                 result_val = builder.ptrtoint(result_val, ir.IntType(64))
 
@@ -2011,6 +2015,10 @@ class TaskTransformer:
                     if return_val.type != ir.IntType(64):
                         if isinstance(return_val.type, ir.IntType):
                             return_val = builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, (ir.DoubleType, ir.FloatType)):
+                            if isinstance(return_val.type, ir.FloatType):
+                                return_val = builder.fpext(return_val, ir.DoubleType())
+                            return_val = builder.bitcast(return_val, ir.IntType(64))
                         elif isinstance(return_val.type, ir.PointerType):
                             return_val = builder.ptrtoint(return_val, ir.IntType(64))
                 else:
@@ -2155,6 +2163,10 @@ class TaskTransformer:
                     if return_val.type != ir.IntType(64):
                         if isinstance(return_val.type, ir.IntType):
                             return_val = builder.sext(return_val, ir.IntType(64))
+                        elif isinstance(return_val.type, (ir.DoubleType, ir.FloatType)):
+                            if isinstance(return_val.type, ir.FloatType):
+                                return_val = builder.fpext(return_val, ir.DoubleType())
+                            return_val = builder.bitcast(return_val, ir.IntType(64))
                         elif isinstance(return_val.type, ir.PointerType):
                             return_val = builder.ptrtoint(return_val, ir.IntType(64))
                 else:

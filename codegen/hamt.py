@@ -103,7 +103,8 @@ class HamtGenerator:
             ir.IntType(8)    # state (not used in HAMT)
         )
 
-        map_ptr = cg.map_struct.as_pointer()
+        # Handles-everywhere: all Map/Set/List/String params and returns use i64 handles
+        map_ptr = cg.map_struct.as_pointer()  # Keep for internal deref only
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
         i1 = ir.IntType(1)
@@ -111,40 +112,40 @@ class HamtGenerator:
         hamt_node_ptr = cg.hamt_node_struct.as_pointer()
         hamt_leaf_ptr = cg.hamt_leaf_struct.as_pointer()
 
-        # map_new(flags: i64) -> Map*
-        map_new_ty = ir.FunctionType(map_ptr, [i64])
+        # map_new(flags: i64) -> i64 handle
+        map_new_ty = ir.FunctionType(i64, [i64])
         cg.map_new = ir.Function(cg.module, map_new_ty, name="coex_map_new")
 
-        # map_set(map: Map*, key: i64, value: i64) -> Map*
-        map_set_ty = ir.FunctionType(map_ptr, [map_ptr, i64, i64])
+        # map_set(map: i64 handle, key: i64, value: i64) -> i64 handle
+        map_set_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.map_set = ir.Function(cg.module, map_set_ty, name="coex_map_set")
 
-        # map_get(map: Map*, key: i64) -> i64
-        map_get_ty = ir.FunctionType(i64, [map_ptr, i64])
+        # map_get(map: i64 handle, key: i64) -> i64
+        map_get_ty = ir.FunctionType(i64, [i64, i64])
         cg.map_get = ir.Function(cg.module, map_get_ty, name="coex_map_get")
 
-        # map_has(map: Map*, key: i64) -> bool
-        map_has_ty = ir.FunctionType(i1, [map_ptr, i64])
+        # map_has(map: i64 handle, key: i64) -> bool
+        map_has_ty = ir.FunctionType(i1, [i64, i64])
         cg.map_has = ir.Function(cg.module, map_has_ty, name="coex_map_has")
 
-        # map_remove(map: Map*, key: i64) -> Map*
-        map_remove_ty = ir.FunctionType(map_ptr, [map_ptr, i64])
+        # map_remove(map: i64 handle, key: i64) -> i64 handle
+        map_remove_ty = ir.FunctionType(i64, [i64, i64])
         cg.map_remove = ir.Function(cg.module, map_remove_ty, name="coex_map_remove")
 
-        # map_len(map: Map*) -> i64
-        map_len_ty = ir.FunctionType(i64, [map_ptr])
+        # map_len(map: i64 handle) -> i64
+        map_len_ty = ir.FunctionType(i64, [i64])
         cg.map_len = ir.Function(cg.module, map_len_ty, name="coex_map_len")
 
-        # map_size(map: Map*) -> i64
-        map_size_ty = ir.FunctionType(i64, [map_ptr])
+        # map_size(map: i64 handle) -> i64
+        map_size_ty = ir.FunctionType(i64, [i64])
         cg.map_size = ir.Function(cg.module, map_size_ty, name="coex_map_size")
 
         # map_hash(key: i64) -> i64
         map_hash_ty = ir.FunctionType(i64, [i64])
         cg.map_hash = ir.Function(cg.module, map_hash_ty, name="coex_map_hash")
 
-        # map_copy(map: Map*) -> Map*
-        map_copy_ty = ir.FunctionType(map_ptr, [map_ptr])
+        # map_copy(map: i64 handle) -> i64 handle
+        map_copy_ty = ir.FunctionType(i64, [i64])
         cg.map_copy = ir.Function(cg.module, map_copy_ty, name="coex_map_copy")
 
         # HAMT internal: popcount(i32) -> i32
@@ -175,53 +176,49 @@ class HamtGenerator:
         hamt_remove_ty = ir.FunctionType(i64, [i64, i64, i64, i32, i32.as_pointer()])
         cg.hamt_remove = ir.Function(cg.module, hamt_remove_ty, name="coex_hamt_remove")
 
-        # HAMT internal: hamt_collect_keys(node: i64, list: List*) -> List*
-        list_ptr_type = cg.list_struct.as_pointer()
-        hamt_collect_ty = ir.FunctionType(list_ptr_type, [i64, list_ptr_type])
+        # HAMT internal: hamt_collect_keys(node: i64, list: i64 handle) -> i64 handle
+        hamt_collect_ty = ir.FunctionType(i64, [i64, i64])
         cg.hamt_collect_keys = ir.Function(cg.module, hamt_collect_ty, name="coex_hamt_collect_keys")
 
         # Collect all values into a list
-        hamt_collect_values_ty = ir.FunctionType(list_ptr_type, [i64, list_ptr_type])
+        hamt_collect_values_ty = ir.FunctionType(i64, [i64, i64])
         cg.hamt_collect_values = ir.Function(cg.module, hamt_collect_values_ty, name="coex_hamt_collect_values")
 
-        # HAMT string variants
-        string_ptr = cg.string_struct.as_pointer()
-
-        # hamt_insert_string(node: i64, hash: i64, key: String*, value: i64, shift: i32, added: i32*) -> i64
-        hamt_insert_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i64, i32, i32.as_pointer()])
+        # HAMT string variants — String* params become i64 handles
+        # hamt_insert_string(node: i64, hash: i64, key: i64, value: i64, shift: i32, added: i32*) -> i64
+        hamt_insert_string_ty = ir.FunctionType(i64, [i64, i64, i64, i64, i32, i32.as_pointer()])
         cg.hamt_insert_string = ir.Function(cg.module, hamt_insert_string_ty, name="coex_hamt_insert_string")
 
-        # hamt_lookup_string(node: i64, hash: i64, key: String*, shift: i32) -> i64
-        hamt_lookup_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i32])
+        # hamt_lookup_string(node: i64, hash: i64, key: i64, shift: i32) -> i64
+        hamt_lookup_string_ty = ir.FunctionType(i64, [i64, i64, i64, i32])
         cg.hamt_lookup_string = ir.Function(cg.module, hamt_lookup_string_ty, name="coex_hamt_lookup_string")
 
-        # hamt_contains_string(node: i64, hash: i64, key: String*, shift: i32) -> bool
-        hamt_contains_string_ty = ir.FunctionType(i1, [i64, i64, string_ptr, i32])
+        # hamt_contains_string(node: i64, hash: i64, key: i64, shift: i32) -> bool
+        hamt_contains_string_ty = ir.FunctionType(i1, [i64, i64, i64, i32])
         cg.hamt_contains_string = ir.Function(cg.module, hamt_contains_string_ty, name="coex_hamt_contains_string")
 
-        # hamt_remove_string(node: i64, hash: i64, key: String*, shift: i32, removed: i32*) -> i64
-        hamt_remove_string_ty = ir.FunctionType(i64, [i64, i64, string_ptr, i32, i32.as_pointer()])
+        # hamt_remove_string(node: i64, hash: i64, key: i64, shift: i32, removed: i32*) -> i64
+        hamt_remove_string_ty = ir.FunctionType(i64, [i64, i64, i64, i32, i32.as_pointer()])
         cg.hamt_remove_string = ir.Function(cg.module, hamt_remove_string_ty, name="coex_hamt_remove_string")
 
-        # String-key map variants
-        map_set_string_ty = ir.FunctionType(map_ptr, [map_ptr, string_ptr, i64])
+        # String-key map variants — Map* and String* become i64 handles
+        map_set_string_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.map_set_string = ir.Function(cg.module, map_set_string_ty, name="coex_map_set_string")
 
-        map_get_string_ty = ir.FunctionType(i64, [map_ptr, string_ptr])
+        map_get_string_ty = ir.FunctionType(i64, [i64, i64])
         cg.map_get_string = ir.Function(cg.module, map_get_string_ty, name="coex_map_get_string")
 
-        map_has_string_ty = ir.FunctionType(i1, [map_ptr, string_ptr])
+        map_has_string_ty = ir.FunctionType(i1, [i64, i64])
         cg.map_has_string = ir.Function(cg.module, map_has_string_ty, name="coex_map_has_string")
 
-        map_remove_string_ty = ir.FunctionType(map_ptr, [map_ptr, string_ptr])
+        map_remove_string_ty = ir.FunctionType(i64, [i64, i64])
         cg.map_remove_string = ir.Function(cg.module, map_remove_string_ty, name="coex_map_remove_string")
 
-        # map_keys and map_values
-        list_ptr = cg.list_struct.as_pointer()
-        map_keys_ty = ir.FunctionType(list_ptr, [map_ptr])
+        # map_keys and map_values — return i64 list handles
+        map_keys_ty = ir.FunctionType(i64, [i64])
         cg.map_keys = ir.Function(cg.module, map_keys_ty, name="coex_map_keys")
 
-        map_values_ty = ir.FunctionType(list_ptr, [map_ptr])
+        map_values_ty = ir.FunctionType(i64, [i64])
         cg.map_values = ir.Function(cg.module, map_values_ty, name="coex_map_values")
 
         # Implement all HAMT and Map functions
@@ -1138,7 +1135,7 @@ class HamtGenerator:
         builder = ir.IRBuilder(entry)
 
         node = func.args[0]  # i64 tagged handle
-        list_ptr = func.args[1]
+        list_handle = func.args[1]  # i64 list handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
@@ -1149,7 +1146,7 @@ class HamtGenerator:
         builder.cbranch(is_null, return_unchanged, check_tag)
 
         builder.position_at_end(return_unchanged)
-        builder.ret(list_ptr)
+        builder.ret(list_handle)
 
         builder.position_at_end(check_tag)
         low_bit = builder.and_(node, ir.Constant(i64, 1))
@@ -1173,13 +1170,13 @@ class HamtGenerator:
             tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, key)
             tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
-            new_list = builder.call(cg.list_append, [list_ptr, tv_i8, elem_size])
+            new_list = builder.call(cg.list_append, [list_handle, tv_i8, elem_size])
         else:
             temp = builder.alloca(i64, name="temp_key")
             builder.store(key, temp)
             temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, 8)
-            new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+            new_list = builder.call(cg.list_append, [list_handle, temp_i8, elem_size])
 
         builder.ret(new_list)
 
@@ -1196,8 +1193,9 @@ class HamtGenerator:
         children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_handle = builder.load(children_handle_ptr)
 
-        result_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
-        builder.store(list_ptr, result_ptr)
+        # Store list handle (i64) not list pointer
+        result_ptr = builder.alloca(i64, name="result")
+        builder.store(list_handle, result_ptr)
 
         idx_ptr = builder.alloca(i32, name="idx")
         builder.store(ir.Constant(i32, 0), idx_ptr)
@@ -1244,7 +1242,7 @@ class HamtGenerator:
         builder = ir.IRBuilder(entry)
 
         node = func.args[0]  # i64 tagged handle
-        list_ptr = func.args[1]
+        list_handle = func.args[1]  # i64 list handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
@@ -1255,7 +1253,7 @@ class HamtGenerator:
         builder.cbranch(is_null, return_unchanged, check_tag)
 
         builder.position_at_end(return_unchanged)
-        builder.ret(list_ptr)
+        builder.ret(list_handle)
 
         builder.position_at_end(check_tag)
         low_bit = builder.and_(node, ir.Constant(i64, 1))
@@ -1279,13 +1277,13 @@ class HamtGenerator:
             tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_INT, value)
             tv_i8 = builder.bitcast(tv_ptr, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
-            new_list = builder.call(cg.list_append, [list_ptr, tv_i8, elem_size])
+            new_list = builder.call(cg.list_append, [list_handle, tv_i8, elem_size])
         else:
             temp = builder.alloca(i64, name="temp_value")
             builder.store(value, temp)
             temp_i8 = builder.bitcast(temp, ir.IntType(8).as_pointer())
             elem_size = ir.Constant(i64, 8)
-            new_list = builder.call(cg.list_append, [list_ptr, temp_i8, elem_size])
+            new_list = builder.call(cg.list_append, [list_handle, temp_i8, elem_size])
 
         builder.ret(new_list)
 
@@ -1301,8 +1299,9 @@ class HamtGenerator:
         children_handle_ptr = builder.gep(as_node, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
         children_handle = builder.load(children_handle_ptr)
 
-        result_ptr = builder.alloca(cg.list_struct.as_pointer(), name="result")
-        builder.store(list_ptr, result_ptr)
+        # Store list handle (i64) not list pointer
+        result_ptr = builder.alloca(i64, name="result")
+        builder.store(list_handle, result_ptr)
 
         idx_ptr = builder.alloca(i32, name="idx")
         builder.store(ir.Constant(i32, 0), idx_ptr)
@@ -1352,11 +1351,10 @@ class HamtGenerator:
 
         node = func.args[0]  # i64 tagged handle
         hash_val = func.args[1]
-        key = func.args[2]
+        key = func.args[2]  # i64 string handle
         shift = func.args[3]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        string_ptr_type = cg.string_struct.as_pointer()
 
         is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
 
@@ -1382,11 +1380,10 @@ class HamtGenerator:
         leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
 
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_handle = builder.load(stored_key_ptr)  # Now a GC handle, not raw ptr
-        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
-        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)  # GC handle stored in leaf
 
-        keys_match = builder.call(cg.string_eq, [stored_key, key])
+        # string_eq now takes i64 handles directly
+        keys_match = builder.call(cg.string_eq, [stored_key_handle, key])
 
         return_value = func.append_basic_block("return_value")
         return_not_found = func.append_basic_block("return_not_found")
@@ -1459,12 +1456,11 @@ class HamtGenerator:
 
         node = func.args[0]
         hash_val = func.args[1]
-        key = func.args[2]
+        key = func.args[2]  # i64 string handle
         shift = func.args[3]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i1 = ir.IntType(1)
-        string_ptr_type = cg.string_struct.as_pointer()
 
         # Null check: tagged handle 0 means empty
         is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
@@ -1491,10 +1487,9 @@ class HamtGenerator:
         leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
         leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_handle = builder.load(stored_key_ptr)
-        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
-        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
-        keys_match = builder.call(cg.string_eq, [stored_key, key])
+        stored_key_handle = builder.load(stored_key_ptr)  # GC handle stored in leaf
+        # string_eq now takes i64 handles directly
+        keys_match = builder.call(cg.string_eq, [stored_key_handle, key])
         builder.ret(keys_match)
 
         # Node - decode handle, deref, descend
@@ -1559,18 +1554,16 @@ class HamtGenerator:
 
         node = func.args[0]
         hash_val = func.args[1]
-        key = func.args[2]
+        key = func.args[2]  # i64 string handle
         value = func.args[3]
         shift = func.args[4]
         added_ptr = func.args[5]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
-        string_ptr_type = cg.string_struct.as_pointer()
 
-        # Convert string key pointer to GC handle for storage in leaves
-        key_as_i8 = builder.bitcast(key, i8_ptr)
-        key_handle = builder.call(cg.gc.gc_ptr_to_handle, [key_as_i8])
+        # key is already a GC handle (i64) — use directly for storage in leaves
+        key_handle = key
 
         # Null check: tagged handle 0 means empty
         is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
@@ -1603,11 +1596,10 @@ class HamtGenerator:
         stored_hash_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         stored_hash = builder.load(stored_hash_ptr)
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_handle = builder.load(stored_key_ptr)
-        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
-        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)  # GC handle stored in leaf
 
-        keys_match = builder.call(cg.string_eq, [stored_key, key])
+        # string_eq now takes i64 handles directly
+        keys_match = builder.call(cg.string_eq, [stored_key_handle, key])
 
         update_leaf = func.append_basic_block("update_leaf")
         split_leaf = func.append_basic_block("split_leaf")
@@ -1869,12 +1861,11 @@ class HamtGenerator:
 
         node = func.args[0]
         hash_val = func.args[1]
-        key = func.args[2]
+        key = func.args[2]  # i64 string handle
         shift = func.args[3]
         removed_ptr = func.args[4]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
-        string_ptr_type = cg.string_struct.as_pointer()
 
         # Null check: tagged handle 0 means empty
         is_null = builder.icmp_unsigned("==", node, ir.Constant(i64, 0))
@@ -1902,11 +1893,10 @@ class HamtGenerator:
         leaf_raw = builder.call(cg.gc.gc_handle_deref, [leaf_handle])
         leaf_ptr = builder.bitcast(leaf_raw, cg.hamt_leaf_struct.as_pointer())
         stored_key_ptr = builder.gep(leaf_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        stored_key_handle = builder.load(stored_key_ptr)
-        stored_key_raw = builder.call(cg.gc.gc_handle_deref, [stored_key_handle])
-        stored_key = builder.bitcast(stored_key_raw, string_ptr_type)
+        stored_key_handle = builder.load(stored_key_ptr)  # GC handle stored in leaf
 
-        keys_match = builder.call(cg.string_eq, [stored_key, key])
+        # string_eq now takes i64 handles directly
+        keys_match = builder.call(cg.string_eq, [stored_key_handle, key])
 
         remove_leaf = func.append_basic_block("remove_leaf")
         keep_leaf = func.append_basic_block("keep_leaf")
@@ -2157,7 +2147,10 @@ class HamtGenerator:
         flags_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(flags, flags_field)
 
-        builder.ret(map_ptr)
+        # Return i64 handle
+        map_i8 = builder.bitcast(map_ptr, ir.IntType(8).as_pointer())
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [map_i8])
+        builder.ret(handle)
 
     def _implement_map_set(self):
         """Return a NEW map with key-value pair set using HAMT.
@@ -2173,12 +2166,16 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_map = func.args[0]
+        old_map_handle = func.args[0]  # i64 handle
         key = func.args[1]
         value = func.args[2]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref old map handle to get struct pointer
+        old_map_raw = builder.call(cg.gc.gc_handle_deref, [old_map_handle])
+        old_map = builder.bitcast(old_map_raw, cg.map_struct.as_pointer())
 
         # Compute hash of key
         hash_val = builder.call(cg.map_hash, [key])
@@ -2225,7 +2222,10 @@ class HamtGenerator:
         new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_field)
 
-        builder.ret(new_map)
+        # Return i64 handle
+        new_map_i8 = builder.bitcast(new_map, ir.IntType(8).as_pointer())
+        new_map_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_map_i8])
+        builder.ret(new_map_handle)
 
     def _implement_map_get(self):
         """Get value for key using HAMT lookup (returns 0 if not found)."""
@@ -2237,11 +2237,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
 
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
@@ -2264,11 +2268,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
 
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
@@ -2294,11 +2302,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_map = func.args[0]
+        old_map_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref old map handle
+        old_map_raw = builder.call(cg.gc.gc_handle_deref, [old_map_handle])
+        old_map = builder.bitcast(old_map_raw, cg.map_struct.as_pointer())
 
         # Compute hash
         hash_val = builder.call(cg.map_hash, [key])
@@ -2345,7 +2357,10 @@ class HamtGenerator:
         new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_field)
 
-        builder.ret(new_map)
+        # Return i64 handle
+        new_map_i8 = builder.bitcast(new_map, ir.IntType(8).as_pointer())
+        new_map_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_map_i8])
+        builder.ret(new_map_handle)
 
     def _implement_map_len(self):
         """Return number of entries in map."""
@@ -2356,8 +2371,12 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
+
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
 
         # len is field 1
         len_field = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2377,9 +2396,13 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
 
         # Get len field (field 1)
         len_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -2421,15 +2444,19 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_map = func.args[0]
-        key = func.args[1]  # String pointer
+        old_map_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         value = func.args[2]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
         map_ptr_type = cg.map_struct.as_pointer()
 
-        # Compute string hash
+        # Deref old map handle
+        old_map_raw = builder.call(cg.gc.gc_handle_deref, [old_map_handle])
+        old_map = builder.bitcast(old_map_raw, map_ptr_type)
+
+        # Compute string hash (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Get old root (tagged handle i64), len, and flags
@@ -2466,7 +2493,10 @@ class HamtGenerator:
         new_flags_ptr = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_ptr)
 
-        builder.ret(new_map)
+        # Return i64 handle
+        new_map_i8 = builder.bitcast(new_map, ir.IntType(8).as_pointer())
+        new_map_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_map_i8])
+        builder.ret(new_map_handle)
 
     def _implement_map_get_string(self):
         """Get value for string key using HAMT (returns 0 if not found)."""
@@ -2478,13 +2508,17 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
-        key = func.args[1]  # String pointer
+        map_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Compute string hash
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
+
+        # Compute string hash (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Get root (tagged handle i64)
@@ -2505,13 +2539,17 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
-        key = func.args[1]  # String pointer
+        map_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Compute string hash
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
+
+        # Compute string hash (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Get root (tagged handle i64)
@@ -2532,13 +2570,17 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_map = func.args[0]
-        key = func.args[1]  # String pointer
+        old_map_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
-        # Compute string hash
+        # Deref old map handle
+        old_map_raw = builder.call(cg.gc.gc_handle_deref, [old_map_handle])
+        old_map = builder.bitcast(old_map_raw, cg.map_struct.as_pointer())
+
+        # Compute string hash (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Get old root (tagged handle i64)
@@ -2581,7 +2623,10 @@ class HamtGenerator:
         new_flags_field = builder.gep(new_map, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_field)
 
-        builder.ret(new_map)
+        # Return i64 handle
+        new_map_i8 = builder.bitcast(new_map, ir.IntType(8).as_pointer())
+        new_map_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_map_i8])
+        builder.ret(new_map_handle)
 
     def _implement_map_keys(self):
         """Return a List of all keys in the map (as i64 values) using HAMT."""
@@ -2592,25 +2637,34 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
+
         # Create empty result list - use TaggedValue size if enabled
+        # list_new returns i64 handle
         use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
         if use_tagged:
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         else:
             elem_size = ir.Constant(i64, 8)
-        empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        empty_list_handle = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+
+        # Re-deref map after list_new allocation (may have moved)
+        map_raw2 = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr2 = builder.bitcast(map_raw2, cg.map_struct.as_pointer())
 
         # Get HAMT root (tagged handle i64)
-        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root_ptr = builder.gep(map_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         root = builder.load(root_ptr)
 
-        # Collect all keys from HAMT into list
-        result = builder.call(cg.hamt_collect_keys, [root, empty_list])
+        # Collect all keys from HAMT into list (takes and returns i64 handle)
+        result = builder.call(cg.hamt_collect_keys, [root, empty_list_handle])
         builder.ret(result)
 
     def _implement_map_values(self):
@@ -2622,25 +2676,34 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        map_ptr = func.args[0]
+        map_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
+        # Deref map handle
+        map_raw = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr = builder.bitcast(map_raw, cg.map_struct.as_pointer())
+
         # Create empty result list - use TaggedValue size if enabled
+        # list_new returns i64 handle
         use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
         if use_tagged:
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         else:
             elem_size = ir.Constant(i64, 8)
-        empty_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        empty_list_handle = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+
+        # Re-deref map after list_new allocation (may have moved)
+        map_raw2 = builder.call(cg.gc.gc_handle_deref, [map_handle])
+        map_ptr2 = builder.bitcast(map_raw2, cg.map_struct.as_pointer())
 
         # Get HAMT root (tagged handle i64)
-        root_ptr = builder.gep(map_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root_ptr = builder.gep(map_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         root = builder.load(root_ptr)
 
-        # Collect all values from HAMT into list
-        result = builder.call(cg.hamt_collect_values, [root, empty_list])
+        # Collect all values from HAMT into list (takes and returns i64 handle)
+        result = builder.call(cg.hamt_collect_values, [root, empty_list_handle])
         builder.ret(result)
 
     def _register_map_methods(self):
@@ -2712,68 +2775,63 @@ class HamtGenerator:
             ir.IntType(64)               # flags (type info for GC)
         )
 
-        set_ptr = cg.set_struct.as_pointer()
+        # Handles-everywhere: all Set/List/String params and returns use i64 handles
+        set_ptr = cg.set_struct.as_pointer()  # Keep for internal deref only
         i64 = ir.IntType(64)
         i32 = ir.IntType(32)
         i1 = ir.IntType(1)
 
-        # set_new(flags: i64) -> Set*
-        # flags: bit 0 = element is ptr
-        set_new_ty = ir.FunctionType(set_ptr, [i64])
+        # set_new(flags: i64) -> i64 handle
+        set_new_ty = ir.FunctionType(i64, [i64])
         cg.set_new = ir.Function(cg.module, set_new_ty, name="coex_set_new")
 
-        # set_add(set: Set*, key: i64) -> Set*
-        # Returns a NEW set with the key added (value semantics)
-        set_add_ty = ir.FunctionType(set_ptr, [set_ptr, i64])
+        # set_add(set: i64 handle, key: i64) -> i64 handle
+        set_add_ty = ir.FunctionType(i64, [i64, i64])
         cg.set_add = ir.Function(cg.module, set_add_ty, name="coex_set_add")
 
-        # set_has(set: Set*, key: i64) -> bool
-        set_has_ty = ir.FunctionType(i1, [set_ptr, i64])
+        # set_has(set: i64 handle, key: i64) -> bool
+        set_has_ty = ir.FunctionType(i1, [i64, i64])
         cg.set_has = ir.Function(cg.module, set_has_ty, name="coex_set_has")
 
-        # set_remove(set: Set*, key: i64) -> Set*
-        # Returns a NEW set with element removed (value semantics)
-        set_remove_ty = ir.FunctionType(set_ptr, [set_ptr, i64])
+        # set_remove(set: i64 handle, key: i64) -> i64 handle
+        set_remove_ty = ir.FunctionType(i64, [i64, i64])
         cg.set_remove = ir.Function(cg.module, set_remove_ty, name="coex_set_remove")
 
-        # set_len(set: Set*) -> i64
-        set_len_ty = ir.FunctionType(i64, [set_ptr])
+        # set_len(set: i64 handle) -> i64
+        set_len_ty = ir.FunctionType(i64, [i64])
         cg.set_len = ir.Function(cg.module, set_len_ty, name="coex_set_len")
 
-        # set_size(set: Set*) -> i64 (total memory footprint in bytes)
-        set_size_ty = ir.FunctionType(i64, [set_ptr])
+        # set_size(set: i64 handle) -> i64
+        set_size_ty = ir.FunctionType(i64, [i64])
         cg.set_size = ir.Function(cg.module, set_size_ty, name="coex_set_size")
 
-        # set_grow(set: Set*)  (internal resize function)
-        set_grow_ty = ir.FunctionType(ir.VoidType(), [set_ptr])
+        # set_grow(set: i64 handle) (internal)
+        set_grow_ty = ir.FunctionType(ir.VoidType(), [i64])
         cg.set_grow = ir.Function(cg.module, set_grow_ty, name="coex_set_grow")
 
-        # set_find_slot(set: Set*, key: i64) -> i64  (internal: find slot for key)
-        set_find_slot_ty = ir.FunctionType(i64, [set_ptr, i64])
+        # set_find_slot(set: i64 handle, key: i64) -> i64
+        set_find_slot_ty = ir.FunctionType(i64, [i64, i64])
         cg.set_find_slot = ir.Function(cg.module, set_find_slot_ty, name="coex_set_find_slot")
 
-        # set_copy(set: Set*) -> Set*  (deep copy for value semantics)
-        set_copy_ty = ir.FunctionType(set_ptr, [set_ptr])
+        # set_copy(set: i64 handle) -> i64 handle
+        set_copy_ty = ir.FunctionType(i64, [i64])
         cg.set_copy = ir.Function(cg.module, set_copy_ty, name="coex_set_copy")
 
-        # set_to_list(set: Set*) -> List*  (for iteration - returns list of elements as i64)
-        list_ptr = cg.list_struct.as_pointer()
-        set_to_list_ty = ir.FunctionType(list_ptr, [set_ptr])
+        # set_to_list(set: i64 handle) -> i64 list handle
+        set_to_list_ty = ir.FunctionType(i64, [i64])
         cg.set_to_list = ir.Function(cg.module, set_to_list_ty, name="coex_set_to_list")
 
-        # String-specific Set operations
-        string_ptr = cg.string_struct.as_pointer()
-
-        # set_find_slot_string(set: Set*, key: String*) -> i64  (internal)
-        set_find_slot_string_ty = ir.FunctionType(i64, [set_ptr, string_ptr])
+        # String-specific Set operations — String* becomes i64 handle
+        # set_find_slot_string(set: i64, key: i64) -> i64
+        set_find_slot_string_ty = ir.FunctionType(i64, [i64, i64])
         cg.set_find_slot_string = ir.Function(cg.module, set_find_slot_string_ty, name="coex_set_find_slot_string")
 
-        # set_has_string(set: Set*, key: String*) -> bool
-        set_has_string_ty = ir.FunctionType(i1, [set_ptr, string_ptr])
+        # set_has_string(set: i64, key: i64) -> bool
+        set_has_string_ty = ir.FunctionType(i1, [i64, i64])
         cg.set_has_string = ir.Function(cg.module, set_has_string_ty, name="coex_set_has_string")
 
-        # set_add_string(set: Set*, key: String*) -> Set*
-        set_add_string_ty = ir.FunctionType(set_ptr, [set_ptr, string_ptr])
+        # set_add_string(set: i64, key: i64) -> i64 handle
+        set_add_string_ty = ir.FunctionType(i64, [i64, i64])
         cg.set_add_string = ir.Function(cg.module, set_add_string_ty, name="coex_set_add_string")
 
         # Implement all set functions
@@ -2824,7 +2882,10 @@ class HamtGenerator:
         flags_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(flags, flags_field)
 
-        builder.ret(set_ptr)
+        # Return i64 handle
+        set_i8 = builder.bitcast(set_ptr, ir.IntType(8).as_pointer())
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [set_i8])
+        builder.ret(handle)
 
     def _implement_set_find_slot(self):
         """Legacy stub - HAMT-based sets don't use linear probing slots.
@@ -2869,11 +2930,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_set = func.args[0]
+        old_set_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref old set handle
+        old_set_raw = builder.call(cg.gc.gc_handle_deref, [old_set_handle])
+        old_set = builder.bitcast(old_set_raw, cg.set_struct.as_pointer())
 
         # Get old root (tagged handle i64)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2917,7 +2982,10 @@ class HamtGenerator:
         new_flags_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_field)
 
-        builder.ret(new_set)
+        # Return i64 handle
+        new_set_i8 = builder.bitcast(new_set, ir.IntType(8).as_pointer())
+        new_set_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_set_i8])
+        builder.ret(new_set_handle)
 
     def _implement_set_has(self):
         """Implement set_has: check if key is in HAMT-based set."""
@@ -2929,11 +2997,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
+        set_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref set handle
+        set_raw = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr = builder.bitcast(set_raw, cg.set_struct.as_pointer())
 
         # Get root (tagged handle i64)
         root_field = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -2959,11 +3031,15 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_set = func.args[0]
+        old_set_handle = func.args[0]  # i64 handle
         key = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref old set handle
+        old_set_raw = builder.call(cg.gc.gc_handle_deref, [old_set_handle])
+        old_set = builder.bitcast(old_set_raw, cg.set_struct.as_pointer())
 
         # Get old root (tagged handle i64)
         root_field = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -3007,7 +3083,10 @@ class HamtGenerator:
         new_flags_field = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_field)
 
-        builder.ret(new_set)
+        # Return i64 handle
+        new_set_i8 = builder.bitcast(new_set, ir.IntType(8).as_pointer())
+        new_set_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_set_i8])
+        builder.ret(new_set_handle)
 
     def _implement_set_len(self):
         """Implement set_len: return number of elements in set."""
@@ -3018,7 +3097,11 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
+        set_handle = func.args[0]  # i64 handle
+
+        # Deref set handle
+        set_raw = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr = builder.bitcast(set_raw, cg.set_struct.as_pointer())
 
         len_field = builder.gep(set_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
         length = builder.load(len_field)
@@ -3039,9 +3122,13 @@ class HamtGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
+        set_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+
+        # Deref set handle
+        set_raw = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr = builder.bitcast(set_raw, cg.set_struct.as_pointer())
 
         # Get len field (field 1)
         len_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
@@ -3086,25 +3173,34 @@ class HamtGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
+        set_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
 
+        # Deref set handle
+        set_raw = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr = builder.bitcast(set_raw, cg.set_struct.as_pointer())
+
         # Create result list - use TaggedValue size if enabled
+        # list_new returns i64 handle
         use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
         if use_tagged:
             elem_size = ir.Constant(i64, cg.TAGGED_VALUE_SIZE)
         else:
             elem_size = ir.Constant(i64, 8)
-        result_list = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+        result_list_handle = builder.call(cg.list_new, [elem_size, ir.Constant(ir.IntType(64), 0)])
+
+        # Re-deref set after list_new allocation (may have moved)
+        set_raw2 = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr2 = builder.bitcast(set_raw2, cg.set_struct.as_pointer())
 
         # Get root from the set (tagged handle i64)
-        root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        root_ptr = builder.gep(set_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         root = builder.load(root_ptr)
 
-        # Use hamt_collect_keys to gather all keys into the list
-        final_list = builder.call(cg.hamt_collect_keys, [root, result_list])
+        # Use hamt_collect_keys to gather all keys into the list (takes and returns i64 handle)
+        final_list = builder.call(cg.hamt_collect_keys, [root, result_list_handle])
 
         builder.ret(final_list)
 
@@ -3134,17 +3230,21 @@ class HamtGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        set_ptr = func.args[0]
-        key = func.args[1]
+        set_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref set handle
+        set_raw = builder.call(cg.gc.gc_handle_deref, [set_handle])
+        set_ptr = builder.bitcast(set_raw, cg.set_struct.as_pointer())
 
         # Get root from set (tagged handle i64)
         root_ptr = builder.gep(set_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         root = builder.load(root_ptr)
 
-        # Hash the string key
+        # Hash the string key (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Check if key exists using hamt_contains_string
@@ -3162,11 +3262,15 @@ class HamtGenerator:
 
         builder = ir.IRBuilder(entry)
 
-        old_set = func.args[0]
-        key = func.args[1]
+        old_set_handle = func.args[0]  # i64 handle
+        key = func.args[1]  # i64 string handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         void_ptr = ir.IntType(8).as_pointer()
+
+        # Deref old set handle
+        old_set_raw = builder.call(cg.gc.gc_handle_deref, [old_set_handle])
+        old_set = builder.bitcast(old_set_raw, cg.set_struct.as_pointer())
 
         # Get old root (tagged handle i64)
         root_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
@@ -3178,7 +3282,7 @@ class HamtGenerator:
         flags_ptr = builder.gep(old_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         old_flags = builder.load(flags_ptr)
 
-        # Hash the string key
+        # Hash the string key (string_hash now takes i64 handle)
         hash_val = builder.call(cg.string_hash, [key])
 
         # Insert using hamt_insert_string (value = 1 for sets, returns tagged handle i64)
@@ -3206,7 +3310,10 @@ class HamtGenerator:
         new_flags_ptr = builder.gep(new_set, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
         builder.store(old_flags, new_flags_ptr)
 
-        builder.ret(new_set)
+        # Return i64 handle
+        new_set_i8 = builder.bitcast(new_set, ir.IntType(8).as_pointer())
+        new_set_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_set_i8])
+        builder.ret(new_set_handle)
 
     def _register_set_methods(self):
         """Register Set as a type with methods."""

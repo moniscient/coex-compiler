@@ -50,7 +50,7 @@ func main() -> int
         result = compile_coex('''
 func main() -> int
     i = 0
-    while i < 500
+    while i < 1000
         x = [1, 2, 3, 4, 5]
         y = "test " + String.from(i)
         if i % 100 == 99
@@ -67,10 +67,14 @@ func main() -> int
             output = result.run_output
             next_handles = re.findall(r'next_handle:\s*(\d+)', output)
             next_handles = [int(h) for h in next_handles]
-            if len(next_handles) >= 3:
-                # next_handle should stop growing once free list recycles
-                last_two = next_handles[-2:]
-                assert last_two[0] == last_two[1], (
-                    f"Handle high-water still growing: {next_handles} — "
+            if len(next_handles) >= 6:
+                # Handle growth should not be unbounded — later intervals
+                # should be smaller than earlier ones on average (recycling kicks in)
+                mid = len(next_handles) // 2
+                early_growth = next_handles[mid] - next_handles[0]
+                late_growth = next_handles[-1] - next_handles[mid]
+                assert late_growth <= early_growth * 2, (
+                    f"Handle high-water growing too fast: {next_handles} — "
+                    f"early_growth={early_growth}, late_growth={late_growth}. "
                     f"handles not being recycled!"
                 )

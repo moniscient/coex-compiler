@@ -124,6 +124,8 @@ class EnumGenerator:
 
         type_id = ir.Constant(ir.IntType(32), cg.gc.get_type_id(enum_name))
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, size_val, type_id)
+        # Save handle for later re-derive (expressions may trigger GC)
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
         ptr = builder.bitcast(raw_ptr, struct_type.as_pointer())
 
         # Store tag
@@ -134,6 +136,7 @@ class EnumGenerator:
         builder.store(ir.Constant(ir.IntType(64), tag), tag_ptr)
 
         # Process arguments - build field values dict
+        # Generate all expressions FIRST, then re-derive pointer before storing
         field_values = {}
         for name, value_expr in named_args.items():
             field_values[name] = cg._generate_expression(value_expr)
@@ -144,6 +147,11 @@ class EnumGenerator:
                 field_name = fields[i][0]
                 if field_name not in field_values:
                     field_values[field_name] = cg._generate_expression(arg)
+
+        # Re-derive pointer after expressions (may have triggered GC)
+        if field_values:
+            raw_ptr2 = builder.call(cg.gc.gc_handle_deref, [handle])
+            ptr = builder.bitcast(raw_ptr2, struct_type.as_pointer())
 
         # Store payload fields (starting at index 1, after tag)
         for i, (field_name, field_type) in enumerate(fields):
@@ -164,4 +172,5 @@ class EnumGenerator:
             else:
                 builder.store(ir.Constant(ir.IntType(64), 0), field_ptr)
 
-        return ptr
+        # Return i64 handle (not raw pointer)
+        return handle

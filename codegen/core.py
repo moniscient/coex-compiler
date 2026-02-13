@@ -697,7 +697,11 @@ class CodeGenerator:
     # ========================================================================
     
     def _get_llvm_type(self, coex_type: Type) -> ir.Type:
-        """Convert Coex type to LLVM type"""
+        """Convert Coex type to LLVM type.
+
+        All non-primitive heap types return i64 (GC handle). Pointers only exist
+        at point-of-use via _deref_handle().
+        """
         if isinstance(coex_type, PrimitiveType):
             type_map = {
                 "int": ir.IntType(64),
@@ -705,78 +709,76 @@ class CodeGenerator:
                 "float": ir.DoubleType(),
                 "float32": ir.FloatType(),
                 "bool": ir.IntType(1),
-                "string": self.string_struct.as_pointer(),
+                "string": ir.IntType(64),  # GC handle
                 "byte": ir.IntType(8),
                 "char": ir.IntType(32),
-                "json": self.json_struct.as_pointer(),
+                "json": ir.IntType(64),  # GC handle
             }
             return type_map.get(coex_type.name, ir.IntType(64))
-        
+
         elif isinstance(coex_type, AtomicType):
             # Atomic primitives always use i64 storage for proper alignment.
             # Float and bool values are bitcast to/from i64 during atomic operations.
             # This ensures atomic instructions work correctly on all platforms.
             return ir.IntType(64)
-        
+
         elif isinstance(coex_type, OptionalType):
             # Optional is a struct { i1 has_value, T value }
             inner = self._get_llvm_type(coex_type.inner)
             return ir.LiteralStructType([ir.IntType(1), inner])
 
         elif isinstance(coex_type, ResultType):
-            # Result<T, E> is a pointer to Result struct
-            return self.result_struct.as_pointer()
+            # Result<T, E> is i64 GC handle
+            return ir.IntType(64)
 
         elif isinstance(coex_type, ListType):
-            # Lists are pointers to List struct
-            return self.list_struct.as_pointer()
-        
+            # Lists are i64 GC handles
+            return ir.IntType(64)
+
         elif isinstance(coex_type, MapType):
-            # Maps are pointers to Map struct
-            return self.map_struct.as_pointer()
+            # Maps are i64 GC handles
+            return ir.IntType(64)
 
         elif isinstance(coex_type, SetType):
-            # Sets are pointers to Set struct
-            return self.set_struct.as_pointer()
+            # Sets are i64 GC handles
+            return ir.IntType(64)
 
         elif isinstance(coex_type, ArrayType):
-            # Arrays are pointers to Array struct
-            return self.array_struct.as_pointer()
+            # Arrays are i64 GC handles
+            return ir.IntType(64)
 
         elif isinstance(coex_type, ChannelType):
-            # Channels are pointers to Channel struct
-            return self._channel.get_channel_struct().as_pointer()
+            # Channels are i64 GC handles
+            return ir.IntType(64)
 
         elif isinstance(coex_type, TupleType):
             # Tuple is a struct of its elements
             elem_types = [self._get_llvm_type(t) for _, t in coex_type.elements]
             return ir.LiteralStructType(elem_types)
-        
+
         elif isinstance(coex_type, FunctionType):
-            # Function pointer
-            param_types = [self._get_llvm_type(t) for t in coex_type.param_types]
-            ret_type = self._get_llvm_type(coex_type.return_type) if coex_type.return_type else ir.VoidType()
-            return ir.FunctionType(ret_type, param_types).as_pointer()
-        
+            # Function types are i64 (code address stored as integer)
+            return ir.IntType(64)
+
         elif isinstance(coex_type, NamedType):
             # Check if it's a type parameter that needs substitution
             if coex_type.name in self.type_substitutions:
                 return self._get_llvm_type(self.type_substitutions[coex_type.name])
 
-            # Check if this is a generic type instantiation
+            # Check if this is a generic type instantiation - i64 handle
             if coex_type.type_args and coex_type.name in self.generic_types:
-                mangled_name = self._monomorphize_type(coex_type.name, coex_type.type_args)
-                return self.type_registry[mangled_name].as_pointer()
+                self._monomorphize_type(coex_type.name, coex_type.type_args)
+                return ir.IntType(64)
 
-            # User-defined type - return pointer to struct
+            # User-defined type - i64 GC handle
             if coex_type.name in self.type_registry:
-                return self.type_registry[coex_type.name].as_pointer()
+                return ir.IntType(64)
 
             # If in a module context, try the mangled name
             if self.current_module:
                 mangled_name = f"__{self.current_module}__{coex_type.name}"
                 if mangled_name in self.type_registry:
-                    return self.type_registry[mangled_name].as_pointer()
+                    return ir.IntType(64)
 
             # Check if it's a generic type without args - error or default
             if coex_type.name in self.generic_types:
@@ -785,25 +787,154 @@ class CodeGenerator:
 
             # Unknown type - default to i64
             return ir.IntType(64)
-        
+
         else:
             return ir.IntType(64)
 
     def _is_reference_type(self, coex_type: Type) -> bool:
-        """Check if a Coex type is a reference (pointer) type for GC tracking."""
+        """Check if a Coex type is a reference type for GC tracking.
+
+        Every non-primitive type that uses i64 GC handles is a reference type.
+        """
         if isinstance(coex_type, PrimitiveType):
             # string and json are references among primitives
             return coex_type.name in ("string", "json")
-        elif isinstance(coex_type, (ListType, MapType, SetType, ResultType)):
+        elif isinstance(coex_type, (ListType, MapType, SetType, ResultType, ArrayType, ChannelType)):
             return True
         elif isinstance(coex_type, NamedType):
-            # User-defined types are pointers
+            # User-defined types are GC-allocated
             return True
         elif isinstance(coex_type, OptionalType):
             # Optional of reference type needs tracking
             return self._is_reference_type(coex_type.inner)
         # TupleType, FunctionType, AtomicType, primitives (non-string) are not references
         return False
+
+    def _get_struct_ptr_type(self, coex_type) -> ir.Type:
+        """Get the concrete LLVM struct pointer type for a Coex reference type.
+
+        Used at point-of-use deref sites to bitcast from i8* to the concrete struct pointer.
+        coex_type can be a Type node or a string type name.
+        """
+        if isinstance(coex_type, str):
+            type_name = coex_type
+        elif isinstance(coex_type, PrimitiveType):
+            type_name = coex_type.name
+        elif isinstance(coex_type, NamedType):
+            type_name = coex_type.name
+            # Check for generic instantiation
+            if coex_type.type_args and coex_type.name in self.generic_types:
+                type_name = self._monomorphize_type(coex_type.name, coex_type.type_args)
+            # Check module context
+            if type_name not in self.type_registry and self.current_module:
+                mangled = f"__{self.current_module}__{type_name}"
+                if mangled in self.type_registry:
+                    type_name = mangled
+        elif isinstance(coex_type, ListType):
+            return self.list_struct.as_pointer()
+        elif isinstance(coex_type, MapType):
+            return self.map_struct.as_pointer()
+        elif isinstance(coex_type, SetType):
+            return self.set_struct.as_pointer()
+        elif isinstance(coex_type, ArrayType):
+            return self.array_struct.as_pointer()
+        elif isinstance(coex_type, ResultType):
+            return self.result_struct.as_pointer()
+        elif isinstance(coex_type, ChannelType):
+            return self._channel.get_channel_struct().as_pointer()
+        else:
+            return ir.IntType(8).as_pointer()
+
+        # String / json / user-defined type
+        if type_name == "string":
+            return self.string_struct.as_pointer()
+        elif type_name == "json":
+            return self.json_struct.as_pointer()
+        elif type_name in self.type_registry:
+            return self.type_registry[type_name].as_pointer()
+        return ir.IntType(8).as_pointer()
+
+    def _deref_handle(self, handle: ir.Value, coex_type) -> ir.Value:
+        """Dereference a GC handle to get a typed struct pointer.
+
+        This is the ONLY place where handles are converted to pointers.
+        The returned pointer must be used immediately and NEVER stored or
+        held across any operation that could allocate.
+        """
+        raw_ptr = self.builder.call(self.gc.gc_handle_deref, [handle])
+        ptr_type = self._get_struct_ptr_type(coex_type)
+        return self.builder.bitcast(raw_ptr, ptr_type)
+
+    def _coex_type_to_type_name(self, coex_type) -> Optional[str]:
+        """Convert a Coex type to the capitalized type name used in type_methods.
+
+        Returns capitalized names: "String", "Json", "List", "Map", etc.
+        For non-reference primitives: "int", "float", "bool", "byte", "char".
+        """
+        if coex_type is None:
+            return None
+        if isinstance(coex_type, PrimitiveType):
+            if coex_type.name == "string":
+                return "String"
+            elif coex_type.name == "json":
+                return "Json"
+            return coex_type.name  # "int", "float", "bool", etc.
+        elif isinstance(coex_type, NamedType):
+            # For generic types with type_args, return monomorphized name
+            if coex_type.type_args and coex_type.name in self.generic_types:
+                return self._monomorphize_type(coex_type.name, coex_type.type_args)
+            return coex_type.name
+        elif isinstance(coex_type, ListType):
+            return "List"
+        elif isinstance(coex_type, MapType):
+            return "Map"
+        elif isinstance(coex_type, SetType):
+            return "Set"
+        elif isinstance(coex_type, ArrayType):
+            return "Array"
+        elif isinstance(coex_type, ResultType):
+            return "Result"
+        elif isinstance(coex_type, ChannelType):
+            return "Channel"
+        elif isinstance(coex_type, FunctionType):
+            return "Function"
+        return None
+
+    def _resolve_expr_type_name(self, expr) -> Optional[str]:
+        """Resolve the Coex type name for an expression.
+
+        Used to determine what type an i64 handle represents so we can
+        look up fields, methods, etc.
+
+        Returns capitalized names: "String", "Json", "List", "Map", etc.
+        For non-reference primitives: "int", "float", "bool".
+        Returns None only if type cannot be determined.
+        """
+        # SelfExpr: current type in method context
+        from ast_nodes import SelfExpr
+        if isinstance(expr, SelfExpr):
+            if self.current_type:
+                return self.current_type
+            return None
+
+        # Fast path: Identifier lookup in var_coex_types (most common case)
+        if isinstance(expr, Identifier):
+            name = expr.name
+            if name in self.var_coex_types:
+                return self._coex_type_to_type_name(self.var_coex_types[name])
+            # Module-level constants: resolve type from constant's value expression
+            if name in self.module_constants:
+                return self._resolve_expr_type_name(self.module_constants[name])
+            # Fall back to LLVM type for legacy compatibility
+            if name in self.locals and name in self.var_ptr_types:
+                return self._get_type_name_from_ptr(self.var_ptr_types[name])
+
+        # Delegate to general type inference (handles MemberExpr, CallExpr,
+        # MethodCallExpr, IndexExpr, BinaryExpr, literals, etc.)
+        coex_type = self._infer_type_from_expr(expr)
+        if coex_type is not None:
+            return self._coex_type_to_type_name(coex_type)
+        return None
 
     def _get_default_value(self, coex_type: Type) -> ir.Constant:
         """Get default value for a type"""
@@ -1014,6 +1145,21 @@ class CodeGenerator:
                     'coex_ui_get_time', 'coex_ui_render_json', 'coex_ui_free_json',
                     'coex_ui_begin_frame', 'coex_ui_end_frame'}
         return any(fn in self.extern_function_decls for fn in ui_funcs)
+
+    def uses_metal3d(self) -> bool:
+        """Check if the compiled program uses the Metal 3D graphics library.
+
+        Returns True if any coex_metal3d_* functions are used, which requires linking
+        libcoex_metal3d.a (nested inside uses_ui since metal3d depends on the UI shell).
+        """
+        if not hasattr(self, 'extern_function_decls'):
+            return False
+        metal3d_funcs = {'coex_metal3d_init', 'coex_metal3d_shutdown',
+                         'coex_metal3d_begin_frame', 'coex_metal3d_end_frame',
+                         'coex_metal3d_set_camera', 'coex_metal3d_draw_cubes_json',
+                         'coex_metal3d_draw_lines_json', 'coex_metal3d_get_width',
+                         'coex_metal3d_get_height'}
+        return any(fn in self.extern_function_decls for fn in metal3d_funcs)
 
     def uses_bgfx(self) -> bool:
         """Check if the compiled program uses the bgfx 3D graphics library.
@@ -1368,11 +1514,15 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get string's data pointer
-        data_ptr = self.builder.call(self.string_data, [string_ptr])
+        # string_ptr is now an i64 handle — deref to get struct pointer
+        s_handle = string_ptr
+        # Get string's data pointer (string_data takes i64 handle)
+        data_ptr = self.builder.call(self.string_data, [s_handle])
 
-        # Get string's byte size (field 3)
-        size_ptr = self.builder.gep(string_ptr, [
+        # Get string's byte size (field 3) — deref handle for GEP
+        s_raw = self.builder.call(self.gc.gc_handle_deref, [s_handle])
+        s_struct = self.builder.bitcast(s_raw, self.string_struct.as_pointer())
+        size_ptr = self.builder.gep(s_struct, [
             ir.Constant(i32, 0), ir.Constant(i32, 3)
         ], inbounds=True)
         byte_size = self.builder.load(size_ptr)
@@ -1694,14 +1844,15 @@ class CodeGenerator:
                             inferred_coex_type = ListType(PrimitiveType("string"))
                             self.var_coex_types[stmt.name] = inferred_coex_type
 
-            if inferred_coex_type and self._is_collection_coex_type(inferred_coex_type):
-                # := operator creates independent deep copy, = shares pointer
-                if stmt.is_copy:
-                    init_value = self._generate_deep_copy(init_value, inferred_coex_type)
-                else:
-                    init_value = self._generate_move_or_eager_copy(init_value, inferred_coex_type)
-                # Track the inferred type for this variable too
+            if inferred_coex_type:
+                # Always track the inferred type for this variable
                 self.var_coex_types[stmt.name] = inferred_coex_type
+                if self._is_collection_coex_type(inferred_coex_type):
+                    # := operator creates independent deep copy, = shares pointer
+                    if stmt.is_copy:
+                        init_value = self._generate_deep_copy(init_value, inferred_coex_type)
+                    else:
+                        init_value = self._generate_move_or_eager_copy(init_value, inferred_coex_type)
             elif isinstance(init_value.type, ir.PointerType):
                 # Fallback for unknown collection types
                 pointee = init_value.type.pointee
@@ -1936,6 +2087,21 @@ class CodeGenerator:
         # := (is_copy=True) creates independent deep copy
         # = (is_copy=False) shares pointer (move semantics)
         coex_type = self.var_coex_types.get(stmt.name)
+        # If no type recorded yet, infer from initializer
+        if coex_type is None:
+            if isinstance(stmt.initializer, Identifier):
+                var_name = stmt.initializer.name
+                if var_name in self.var_coex_types:
+                    coex_type = self.var_coex_types[var_name]
+                    self.var_coex_types[stmt.name] = coex_type
+            elif isinstance(stmt.initializer, StringLiteral):
+                coex_type = PrimitiveType("string")
+                self.var_coex_types[stmt.name] = coex_type
+            else:
+                inferred = self._infer_type_from_expr(stmt.initializer)
+                if inferred:
+                    coex_type = inferred
+                    self.var_coex_types[stmt.name] = coex_type
         if coex_type and self._is_collection_coex_type(coex_type):
             if stmt.is_copy:
                 # := operator: create truly independent deep copy
@@ -1981,18 +2147,18 @@ class CodeGenerator:
     def _store_var_handle(self, name: str, value: ir.Value, alloca: ir.Value):
         """Store a value to a variable's alloca, using handle storage if tracked.
 
-        If name is in var_ptr_types (handle-storing alloca), converts the pointer
-        to a handle via gc_ptr_to_handle, stores i64 to alloca, and updates the
-        shadow stack. Otherwise stores the raw value and calls set_root as before.
+        With handles-everywhere, reference-type values arrive as i64 handles.
+        Legacy pointer path kept for rare edge cases during transition.
         """
         if name in self.var_ptr_types and self.gc is not None:
             root_idx = self.gc_root_indices[name]
-            # Convert pointer to handle
+            # Convert to handle if needed
             if isinstance(value.type, ir.PointerType):
+                # Legacy path: raw pointer → convert to handle
                 ptr_as_i8 = self.builder.bitcast(value, ir.IntType(8).as_pointer())
                 handle = self.builder.call(self.gc.gc_ptr_to_handle, [ptr_as_i8])
             elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-                # Already an i64 (could be a handle from channel receive etc.)
+                # Normal path: already an i64 handle
                 handle = value
             else:
                 handle = self._cast_value(value, ir.IntType(64))
@@ -2001,6 +2167,10 @@ class CodeGenerator:
             # Update shadow stack with handle directly
             self.gc.set_root_handle(self.builder, self.gc_frame, root_idx, handle)
         else:
+            # Non-reference type or no GC — store value directly
+            if isinstance(value.type, ir.IntType) and isinstance(alloca.type.pointee, ir.IntType):
+                if value.type.width != alloca.type.pointee.width:
+                    value = self._cast_value(value, alloca.type.pointee)
             self.builder.store(value, alloca)
             # Update shadow stack if tracked (non-handle path)
             if name in self.gc_root_indices and self.gc is not None:
@@ -2025,20 +2195,33 @@ class CodeGenerator:
     def _load_var_handle(self, name: str) -> ir.Value:
         """Load the raw i64 handle from a handle-storing alloca.
 
-        Used by in-place optimization which needs the handle directly.
-        Only valid for variables in var_ptr_types.
+        Works for any variable in var_ptr_types. With handles-everywhere,
+        this returns the i64 handle which IS the value for reference types.
         """
         alloca = self.locals[name]
         return self.builder.load(alloca, name=f"{name}.handle")
 
-    def _get_var_original_type(self, name: str) -> ir.Type:
-        """Get the original LLVM pointer type for a variable.
+    def _load_var_value(self, name: str) -> ir.Value:
+        """Load a variable's value. For reference types, returns i64 handle.
+        For non-reference types, returns the raw value.
 
-        If the variable uses handle storage, returns the original pointer type
-        from var_ptr_types. Otherwise returns alloca.type.pointee.
+        This is the primary way to read variables in handles-everywhere.
+        """
+        alloca = self.locals[name]
+        if name in self.var_ptr_types:
+            # Reference type → return i64 handle (the value representation)
+            return self.builder.load(alloca, name=f"{name}.handle")
+        else:
+            return self.builder.load(alloca, name=name)
+
+    def _get_var_original_type(self, name: str) -> ir.Type:
+        """Get the LLVM storage type for a variable.
+
+        With handles-everywhere, handle-stored variables use i64.
+        Otherwise returns alloca.type.pointee.
         """
         if name in self.var_ptr_types:
-            return self.var_ptr_types[name]
+            return ir.IntType(64)  # Handles-everywhere: storage is i64
         return self.locals[name].type.pointee
 
     def _infer_tuple_info(self, expr: Expr) -> Optional[PyList[tuple]]:
@@ -2401,9 +2584,9 @@ class CodeGenerator:
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get the old struct
-        old_struct = self._generate_expression(target.object)
-        type_name = self._get_type_name_from_ptr(old_struct.type)
+        # Get the old struct handle
+        old_handle = self._generate_expression(target.object)
+        type_name = self._resolve_expr_type_name(target.object)
 
         if type_name is None or type_name not in self.type_fields:
             # Fallback for unknown types - shouldn't happen
@@ -2416,6 +2599,13 @@ class CodeGenerator:
 
         fields = self.type_fields[type_name]
         struct_type = self.type_registry[type_name]
+
+        # Deref handle to get pointer for GEP
+        if isinstance(old_handle.type, ir.IntType) and old_handle.type.width == 64:
+            raw = self.builder.call(self.gc.gc_handle_deref, [old_handle])
+            old_struct = self.builder.bitcast(raw, struct_type.as_pointer())
+        else:
+            old_struct = old_handle
 
         # Handle compound assignment (+=, -=, etc.)
         if op not in (AssignOp.ASSIGN, AssignOp.COPY_ASSIGN):
@@ -2449,20 +2639,22 @@ class CodeGenerator:
         struct_size = ir.Constant(i64, struct_type.packed_size if hasattr(struct_type, 'packed_size') else 64)
         type_id = ir.Constant(i32, self.gc.get_type_id(type_name))
         raw_ptr = self.gc.alloc_arena_or_gc(self.builder, struct_size, type_id)
+        new_handle = self.builder.call(self.gc.gc_ptr_to_handle, [raw_ptr])
         new_struct = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
+
+        # Re-derive old_struct after allocation (may have triggered GC)
+        if isinstance(old_handle.type, ir.IntType) and old_handle.type.width == 64:
+            raw2 = self.builder.call(self.gc.gc_handle_deref, [old_handle])
+            old_struct = self.builder.bitcast(raw2, struct_type.as_pointer())
 
         # Copy all fields from old struct to new struct
         for i, (field_name, field_type) in enumerate(fields):
             if i == field_idx:
                 # This is the changed field - store new value
                 dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
-                # Phase 6: Reference type fields store as i64 handles
+                # Reference type fields are already i64 handles
                 if self._is_reference_type(field_type):
-                    if isinstance(new_value.type, ir.PointerType):
-                        # Get handle for the object (not raw ptrtoint!)
-                        value_i8 = self.builder.bitcast(new_value, ir.IntType(8).as_pointer())
-                        store_value = self.builder.call(self.gc.gc_ptr_to_handle, [value_i8])
-                    elif new_value.type != i64:
+                    if new_value.type != i64:
                         store_value = self._cast_value(new_value, i64)
                     else:
                         store_value = new_value
@@ -2479,16 +2671,16 @@ class CodeGenerator:
                 dst_field_ptr = self.builder.gep(new_struct, [ir.Constant(i32, 0), ir.Constant(i32, i)], inbounds=True)
                 self.builder.store(field_val, dst_field_ptr)
 
-        # Rebind the variable to point to the new struct
+        # Rebind the variable to the new struct handle
         # The object must be an Identifier for us to rebind it
         if isinstance(target.object, Identifier):
             var_name = target.object.name
             if var_name in self.locals:
-                self._store_var_handle(var_name, new_struct, self.locals[var_name])
+                self._store_var_handle(var_name, new_handle, self.locals[var_name])
         elif isinstance(target.object, MemberExpr):
             # Nested field assignment: a.b.x = value
             # Recursively create new structs up the chain
-            self._generate_immutable_field_assignment(target.object, new_struct, AssignOp.ASSIGN)
+            self._generate_immutable_field_assignment(target.object, new_handle, AssignOp.ASSIGN)
         else:
             raise RuntimeError(f"Cannot rebind field assignment target: {type(target.object)}")
 
@@ -2701,9 +2893,9 @@ class CodeGenerator:
         """Generate an if statement - delegated to FlowControlGenerator"""
         return self._flow_control.generate_if(stmt)
 
-    def _to_bool(self, value: ir.Value) -> ir.Value:
+    def _to_bool(self, value: ir.Value, expr=None) -> ir.Value:
         """Convert value to boolean (i1) - delegated to FlowControlGenerator"""
-        return self._flow_control.to_bool(value)
+        return self._flow_control.to_bool(value, expr)
 
     def _generate_while(self, stmt: WhileStmt):
         """Generate a while loop - delegated to FlowControlGenerator"""
@@ -2804,6 +2996,10 @@ class CodeGenerator:
         """Generate a continue statement - delegated to FlowControlGenerator"""
         return self._flow_control.generate_continue()
 
+    def _generate_select(self, stmt):
+        """Generate a select statement - delegated to FlowControlGenerator"""
+        return self._flow_control.generate_select(stmt)
+
     def _generate_match(self, stmt: MatchStmt):
         """Generate a match statement - delegated to FlowControlGenerator"""
         return self._flow_control.generate_match(stmt)
@@ -2890,48 +3086,36 @@ class CodeGenerator:
     def _generate_array_constructor(self, args: PyList['Expr']) -> ir.Value:
         """Generate code for Array(capacity, initial_value) constructor.
 
-        Creates an Array with the given capacity, initialized with the given value.
-
-        N-D Array struct layout:
-            Field 0: handle (i64) - GC handle for data buffer
-            Field 1: ndim (i64) - number of dimensions
-            Field 2: shape [4 x i64] - dimensions
-            Field 3: strides [4 x i64] - byte strides
-            Field 4: offset (i64) - byte offset for views
-            Field 5: elem_size (i64) - element size
-            Field 6: type_id (i64) - element type
+        Returns i64 GC handle for the array.
         """
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Parse arguments: Array(capacity, initial_value)
         if len(args) < 2:
-            # Need at least capacity and initial value
-            return ir.Constant(ir.IntType(8).as_pointer(), None)
+            return ir.Constant(i64, 0)
 
         capacity = self._generate_expression(args[0])
         initial_value = self._generate_expression(args[1])
 
-        # Determine element size (8 bytes for int/float, 1 for bool, etc.)
+        # Determine element size
         if isinstance(initial_value.type, ir.IntType):
             if initial_value.type.width == 1:
-                elem_size = ir.Constant(i64, 1)  # bool
+                elem_size = ir.Constant(i64, 1)
             else:
-                elem_size = ir.Constant(i64, 8)  # int
+                elem_size = ir.Constant(i64, 8)
         elif isinstance(initial_value.type, ir.DoubleType):
-            elem_size = ir.Constant(i64, 8)  # float
-        elif isinstance(initial_value.type, ir.PointerType):
-            elem_size = ir.Constant(i64, 8)  # pointer
+            elem_size = ir.Constant(i64, 8)
         else:
-            elem_size = ir.Constant(i64, 8)  # default
+            elem_size = ir.Constant(i64, 8)
 
-        # Call array_new to create the array
-        # array_new now sets shape[0] = capacity automatically
-        array_ptr = self.builder.call(self.array_new, [capacity, elem_size])
+        # array_new returns i64 handle (after Phase 2 changes)
+        array_handle = self.builder.call(self.array_new, [capacity, elem_size])
 
-        # Fill the array with the initial value
+        # Deref handle to get array struct pointer for field access
+        array_raw = self.builder.call(self.gc.gc_handle_deref, [array_handle])
+        array_ptr = self.builder.bitcast(array_raw, self.array_struct.as_pointer())
+
         # Get data pointer: deref handle + offset
-        # Field 0: handle (GC handle i64), Field 4: offset
         handle_ptr = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         handle_val = self.builder.load(handle_ptr)
         base_ptr = self.builder.call(self.gc.gc_handle_deref, [handle_val])
@@ -2945,24 +3129,20 @@ class CodeGenerator:
         init_body = current_func.append_basic_block("array_init_body")
         init_done = current_func.append_basic_block("array_init_done")
 
-        # Loop counter
         counter = self.builder.alloca(i64, name="init_counter")
         self.builder.store(ir.Constant(i64, 0), counter)
         self.builder.branch(init_header)
 
-        # Header: check if counter < capacity
         self.builder.position_at_end(init_header)
         i = self.builder.load(counter)
         done = self.builder.icmp_unsigned(">=", i, capacity)
         self.builder.cbranch(done, init_done, init_body)
 
-        # Body: store initial_value at data[i]
         self.builder.position_at_end(init_body)
         i_val = self.builder.load(counter)
         offset = self.builder.mul(i_val, elem_size)
         elem_ptr = self.builder.gep(data_ptr, [offset], inbounds=True)
 
-        # Cast and store based on element type
         if isinstance(initial_value.type, ir.IntType) and initial_value.type.width == 64:
             typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
             self.builder.store(initial_value, typed_ptr)
@@ -2974,40 +3154,39 @@ class CodeGenerator:
             val_i8 = self.builder.zext(initial_value, ir.IntType(8))
             self.builder.store(val_i8, typed_ptr)
         else:
-            # For pointers and other types, cast to i64
             typed_ptr = self.builder.bitcast(elem_ptr, i64.as_pointer())
-            if isinstance(initial_value.type, ir.PointerType):
-                val_i64 = self.builder.ptrtoint(initial_value, i64)
-            else:
-                val_i64 = self._cast_value(initial_value, i64)
+            val_i64 = self._cast_value(initial_value, i64)
             self.builder.store(val_i64, typed_ptr)
 
-        # Increment counter
         next_i = self.builder.add(i_val, ir.Constant(i64, 1))
         self.builder.store(next_i, counter)
         self.builder.branch(init_header)
 
-        # Done
         self.builder.position_at_end(init_done)
-        return array_ptr
+        return array_handle
 
     def _generate_type_constructor(self, type_name: str, args: PyList[Expr], named_args: Dict[str, Expr]) -> ir.Value:
-        """Generate code for type constructor: Point(x: 1, y: 2)"""
+        """Generate code for type constructor: Point(x: 1, y: 2)
+
+        Returns i64 GC handle.
+        """
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
 
         # Evaluate ALL field expressions BEFORE allocating the struct.
-        # Any expression evaluation could trigger GC/compaction, which would
-        # invalidate a raw pointer to the struct if we allocated it first.
+        # With handles-everywhere, reference-type values are already i64 handles.
+        i64 = ir.IntType(64)
         field_values = {}
         for name, value_expr in named_args.items():
-            field_values[name] = self._generate_expression(value_expr)
+            val = self._generate_expression(value_expr)
+            field_values[name] = val
 
         for i, arg in enumerate(args):
             if i < len(field_info):
                 field_name = field_info[i][0]
                 if field_name not in field_values:
-                    field_values[field_name] = self._generate_expression(arg)
+                    val = self._generate_expression(arg)
+                    field_values[field_name] = val
 
         # Calculate size - estimate 8 bytes per field (works for most types)
         size = len(field_info) * 8 if field_info else 8
@@ -3017,9 +3196,8 @@ class CodeGenerator:
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
         raw_ptr = self.gc.alloc_arena_or_gc(self.builder, size_val, type_id)
         ptr = self.builder.bitcast(raw_ptr, struct_type.as_pointer())
-        
+
         # Store each field
-        i64 = ir.IntType(64)
         for i, (field_name, field_type) in enumerate(field_info):
             field_ptr = self.builder.gep(ptr, [
                 ir.Constant(ir.IntType(32), 0),
@@ -3028,17 +3206,16 @@ class CodeGenerator:
 
             if field_name in field_values:
                 value = field_values[field_name]
-                # Phase 6: Reference type fields store as i64 handles
+                # Reference type fields: value is already i64 handle
                 if self._is_reference_type(field_type):
-                    # Get handle for the object (not raw ptrtoint!)
                     if isinstance(value.type, ir.PointerType):
-                        # Cast to i8* for gc_ptr_to_handle
+                        # Legacy path: raw pointer → convert to handle
                         value_i8 = self.builder.bitcast(value, ir.IntType(8).as_pointer())
                         value = self.builder.call(self.gc.gc_ptr_to_handle, [value_i8])
                     elif value.type != i64:
                         value = self._cast_value(value, i64)
                 else:
-                    # Cast if needed
+                    # Non-reference: cast to expected type
                     expected_type = self._get_llvm_type(field_type)
                     value = self._cast_value(value, expected_type)
                 self.builder.store(value, field_ptr)
@@ -3048,38 +3225,39 @@ class CodeGenerator:
                 default = self._get_default_value_for_llvm(expected_type)
                 self.builder.store(default, field_ptr)
 
-        return ptr
+        # Return i64 handle (not pointer)
+        handle = self.builder.call(self.gc.gc_ptr_to_handle, [raw_ptr])
+        return handle
     
     def _generate_type_new(self, type_name: str, args: PyList[Expr]) -> ir.Value:
-        """Generate code for Type.new() - allocate and zero-initialize"""
+        """Generate code for Type.new() - allocate and zero-initialize.
+
+        Returns i64 GC handle.
+        """
         i64 = ir.IntType(64)
-        # Special handling for built-in types
+        # Special handling for built-in types (already return i64 handles)
         if type_name == "Map":
-            # Default flags=0 (no heap pointers) - caller should use typed Map literal if needed
             return self.builder.call(self.map_new, [ir.Constant(i64, 0)])
 
         if type_name == "Set":
-            # Default flags=0 (no heap pointers)
             return self.builder.call(self.set_new, [ir.Constant(i64, 0)])
 
         if type_name == "Channel":
-            # Create new channel using runtime function
             return self._channel.generate_channel_new(None, self.builder)
 
         if type_name == "atomic_ref":
-            # atomic_ref.new(value) or atomic_ref.new() for nil
             if args:
                 initial = self._generate_expression(args[0])
                 initial = self._cast_value(initial, ir.IntType(64))
             else:
-                initial = ir.Constant(ir.IntType(64), 0)  # nil
+                initial = ir.Constant(ir.IntType(64), 0)
             return self.builder.call(self.atomic_ref_new, [initial])
 
         struct_type = self.type_registry[type_name]
         field_info = self.type_fields[type_name]
 
         # Allocate via GC
-        size = len(field_info) * 8 if field_info else 8  # Simplified size calculation
+        size = len(field_info) * 8 if field_info else 8
         size_val = ir.Constant(ir.IntType(64), size)
         type_id = ir.Constant(ir.IntType(32), self.gc.get_type_id(type_name))
 
@@ -3093,7 +3271,6 @@ class CodeGenerator:
                 ir.Constant(ir.IntType(32), i)
             ], inbounds=True)
 
-            # Phase 6: Reference type fields use i64 handles (0 = null)
             if self._is_reference_type(field_type):
                 default = ir.Constant(i64, 0)
             else:
@@ -3101,7 +3278,9 @@ class CodeGenerator:
                 default = self._get_default_value_for_llvm(expected_type)
             self.builder.store(default, field_ptr)
 
-        return ptr
+        # Return i64 handle
+        handle = self.builder.call(self.gc.gc_ptr_to_handle, [raw_ptr])
+        return handle
     
     def _find_enum_variant(self, variant_name: str) -> Optional[Tuple[str, str]]:
         """Find enum variant - delegated to EnumGenerator"""
@@ -3178,36 +3357,34 @@ class CodeGenerator:
                             ])
                             return self.builder.load(ptr)
         
-        # Try to determine the type from the pointer
-        type_name = self._get_type_name_from_ptr(obj.type)
+        # Try to determine the type from Coex type tracking (handles are i64)
+        type_name = self._resolve_expr_type_name(expr.object)
+        if not type_name:
+            # Fallback to LLVM pointer type detection (legacy)
+            type_name = self._get_type_name_from_ptr(obj.type)
 
         if type_name and type_name in self.type_fields:
+            # Deref handle to get struct pointer for field access
+            if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
+                obj_ptr = self._deref_handle(obj, type_name)
+            else:
+                obj_ptr = obj
+
             field_idx = self._get_field_index(type_name, expr.member)
             if field_idx is not None:
-                # GEP to get field pointer
-                field_ptr = self.builder.gep(obj, [
+                field_ptr = self.builder.gep(obj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), field_idx)
                 ], inbounds=True)
                 field_val = self.builder.load(field_ptr)
 
-                # Phase 6: Reference type fields store i64 handles - convert to pointer
-                field_info = self.type_fields[type_name]
-                if field_idx < len(field_info):
-                    _, field_type = field_info[field_idx]
-                    if self._is_reference_type(field_type):
-                        # Field contains a handle - dereference to get pointer
-                        ptr_i8 = self.builder.call(self.gc.gc_handle_deref, [field_val])
-                        ptr_type = self._get_llvm_type(field_type)
-                        return self.builder.bitcast(ptr_i8, ptr_type)
-
+                # Reference type fields store i64 handles — return as-is (i64)
+                # Non-reference fields return their native value
                 return field_val
-        
+
         # Handle JSON field access: j.field -> json_get_field(j, "field")
         if type_name == "Json":
-            # Create a string constant from the member name
             key_str = self._get_string_ptr(expr.member)
-            # Call json_get_field
             return self.builder.call(self.json_get_field, [obj, key_str])
 
         return ir.Constant(ir.IntType(64), 0)
@@ -3219,17 +3396,25 @@ class CodeGenerator:
     def _get_lvalue_member(self, expr: MemberExpr) -> Optional[ir.Value]:
         """Get pointer to a member for assignment"""
         obj = self._generate_expression(expr.object)
-        
-        type_name = self._get_type_name_from_ptr(obj.type)
-        
+
+        type_name = self._resolve_expr_type_name(expr.object)
+        if not type_name:
+            type_name = self._get_type_name_from_ptr(obj.type)
+
         if type_name and type_name in self.type_fields:
+            # Deref handle to struct pointer
+            if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
+                obj_ptr = self._deref_handle(obj, type_name)
+            else:
+                obj_ptr = obj
+
             field_idx = self._get_field_index(type_name, expr.member)
             if field_idx is not None:
-                return self.builder.gep(obj, [
+                return self.builder.gep(obj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), field_idx)
                 ], inbounds=True)
-        
+
         return None
     
     def _generate_index(self, expr: IndexExpr) -> ir.Value:
@@ -3238,39 +3423,41 @@ class CodeGenerator:
         For user-defined types, this calls the .get() method.
         """
         obj = self._generate_expression(expr.object)
-        
+
         if not expr.indices:
             return ir.Constant(ir.IntType(64), 0)
-        
+
+        # Determine the type using Coex type tracking
+        type_name = self._resolve_expr_type_name(expr.object)
+        if not type_name:
+            type_name = self._get_type_name_from_ptr(obj.type)
+
         # Check if this is a user-defined type with a get method
-        type_name = self._get_type_name_from_ptr(obj.type)
         if type_name and type_name in self.type_methods:
             method_map = self.type_methods[type_name]
             if "get" in method_map:
                 mangled = method_map["get"]
                 func = self.functions[mangled]
-                
+
                 # Build args: self first, then indices
                 args = [obj]
                 for i, idx_expr in enumerate(expr.indices):
                     idx_val = self._generate_expression(idx_expr)
-                    # Cast to expected type (args[i+1] because args[0] is self)
                     if i + 1 < len(func.args):
                         expected = func.args[i + 1].type
                         idx_val = self._cast_value(idx_val, expected)
                     args.append(idx_val)
-                
+
                 result = self.builder.call(func, args)
 
-                # Special handling for List.get and Array.get - returns i8* that needs dereferencing
+                # List.get and Array.get return i8* that needs dereferencing
                 if type_name == "List" or type_name == "Array":
-                    # Get element type from Coex type tracking
-                    elem_llvm_type = ir.IntType(64)  # default
+                    elem_llvm_type = ir.IntType(64)
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in self.var_coex_types:
                             coex_type = self.var_coex_types[var_name]
-                            if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
+                            if isinstance(coex_type, (ListType, ArrayType)):
                                 elem_llvm_type = self._get_llvm_type(coex_type.element_type)
                     typed_ptr = self.builder.bitcast(result, elem_llvm_type.as_pointer())
                     return self.builder.load(typed_ptr)
@@ -3279,65 +3466,45 @@ class CodeGenerator:
 
         index = self._generate_expression(expr.indices[0])
 
-        # Check if this is an Array
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                # Array indexing - call array_get and load the value
+        # Determine Coex type for the object
+        obj_coex_type = None
+        if isinstance(expr.object, Identifier) and expr.object.name in self.var_coex_types:
+            obj_coex_type = self.var_coex_types[expr.object.name]
+
+        # Array indexing
+        if isinstance(obj_coex_type, ArrayType) or type_name == "Array":
+            if index.type != ir.IntType(64):
+                index = self._cast_value(index, ir.IntType(64))
+            elem_ptr = self.builder.call(self.array_get, [obj, index])
+            elem_llvm_type = ir.IntType(64)
+            if isinstance(obj_coex_type, ArrayType):
+                elem_llvm_type = self._get_llvm_type(obj_coex_type.element_type)
+            typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+            return self.builder.load(typed_ptr)
+
+        # List indexing
+        if isinstance(obj_coex_type, ListType) or type_name == "List":
+            if index.type != ir.IntType(64):
+                index = self._cast_value(index, ir.IntType(64))
+            elem_ptr = self.builder.call(self.list_get, [obj, index])
+            elem_llvm_type = ir.IntType(64)
+            if isinstance(obj_coex_type, ListType):
+                elem_llvm_type = self._get_llvm_type(obj_coex_type.element_type)
+            typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
+            return self.builder.load(typed_ptr)
+
+        # JSON indexing
+        if isinstance(obj_coex_type, PrimitiveType) and obj_coex_type.name == "json" or type_name == "Json":
+            index_coex_type = self._infer_type_from_expr(expr.indices[0])
+            if isinstance(index_coex_type, PrimitiveType) and index_coex_type.name == "string":
+                return self.builder.call(self.json_get_field, [obj, index])
+            else:
                 if index.type != ir.IntType(64):
                     index = self._cast_value(index, ir.IntType(64))
+                return self.builder.call(self.json_get_index, [obj, index])
 
-                elem_ptr = self.builder.call(self.array_get, [obj, index])
-
-                # Get element type from Coex type tracking
-                elem_llvm_type = ir.IntType(64)  # default
-                if isinstance(expr.object, Identifier):
-                    var_name = expr.object.name
-                    if var_name in self.var_coex_types:
-                        coex_type = self.var_coex_types[var_name]
-                        if isinstance(coex_type, ArrayType):
-                            elem_llvm_type = self._get_llvm_type(coex_type.element_type)
-
-                typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
-                return self.builder.load(typed_ptr)
-
-        # Check if this is a List
+        # Legacy pointer-based indexing
         if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                # List indexing - call list_get and load the value
-                # Ensure index is i64
-                if index.type != ir.IntType(64):
-                    index = self._cast_value(index, ir.IntType(64))
-
-                elem_ptr = self.builder.call(self.list_get, [obj, index])
-
-                # Get element type from Coex type tracking
-                elem_llvm_type = ir.IntType(64)  # default
-                if isinstance(expr.object, Identifier):
-                    var_name = expr.object.name
-                    if var_name in self.var_coex_types:
-                        coex_type = self.var_coex_types[var_name]
-                        if isinstance(coex_type, ListType):
-                            elem_llvm_type = self._get_llvm_type(coex_type.element_type)
-
-                typed_ptr = self.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
-                return self.builder.load(typed_ptr)
-
-            # JSON indexing: j["key"] or j[0]
-            if hasattr(pointee, 'name') and pointee.name == "struct.Json":
-                # Determine index type
-                index_coex_type = self._infer_type_from_expr(expr.indices[0])
-                if isinstance(index_coex_type, PrimitiveType) and index_coex_type.name == "string":
-                    # String key: call json_get_field
-                    return self.builder.call(self.json_get_field, [obj, index])
-                else:
-                    # Integer index: call json_get_index
-                    if index.type != ir.IntType(64):
-                        index = self._cast_value(index, ir.IntType(64))
-                    return self.builder.call(self.json_get_index, [obj, index])
-
-            # String indexing
             ptr = self.builder.gep(obj, [index])
             return self.builder.load(ptr)
 
@@ -3438,7 +3605,7 @@ class CodeGenerator:
         else_block = func.append_basic_block("tern_else")
 
         cond = self._generate_expression(expr.condition)
-        cond = self._to_bool(cond)
+        cond = self._to_bool(cond, expr.condition)
 
         self.builder.cbranch(cond, then_block, else_block)
 

@@ -294,11 +294,9 @@ class FunctionGenerator:
         # Build the KindCall struct (returns i64 handle)
         kind_call_handle = self._build_kind_call(func, kind_decl)
 
-        # Call the handler function - dereference handle to get pointer
+        # Call the handler function with the KindCall handle (i64)
         handler_func = cg.functions[kind_decl.handler]
-        kind_call_i8 = cg.builder.call(cg.gc.gc_handle_deref, [kind_call_handle])
-        kind_call_ptr = cg.builder.bitcast(kind_call_i8, cg.type_registry['KindCall'].as_pointer())
-        result = cg.builder.call(handler_func, [kind_call_ptr])
+        result = cg.builder.call(handler_func, [kind_call_handle])
 
         # Pop GC frame and return
         cg.gc.pop_frame(cg.builder, cg.gc_frame)
@@ -330,98 +328,75 @@ class FunctionGenerator:
         raw_ptr = cg.gc.alloc_arena_or_gc(cg.builder, size_val, type_id)
         kind_call_struct_ptr = cg.builder.bitcast(raw_ptr, kind_call_type.as_pointer())
 
-        # Set field 0: name (string) - convert pointer to handle
-        name_str_ptr = cg._get_string_ptr(func.name)
-        name_i8 = cg.builder.bitcast(name_str_ptr, ir.IntType(8).as_pointer())
-        name_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [name_i8])
-        name_field_ptr = cg.builder.gep(
-            kind_call_struct_ptr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
-            inbounds=True
-        )
-        cg.builder.store(name_handle, name_field_ptr)
+        # Save handle for re-derive after potential GC from string/list creation
+        kind_call_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
-        # Set field 1: param_names ([string])
-        param_names_list_ptr = self._build_string_list([p.name for p in func.params])
-        param_names_i8 = cg.builder.bitcast(param_names_list_ptr, ir.IntType(8).as_pointer())
-        param_names_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [param_names_i8])
-        param_names_field_ptr = cg.builder.gep(
-            kind_call_struct_ptr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)],
-            inbounds=True
-        )
-        cg.builder.store(param_names_handle, param_names_field_ptr)
+        # Set field 0: name (string) - already returns i64 handle
+        name_handle = cg._get_string_ptr(func.name)
 
-        # Set field 2: param_values ([json])
-        param_values_list_ptr = self._build_json_list(func.params)
-        param_values_i8 = cg.builder.bitcast(param_values_list_ptr, ir.IntType(8).as_pointer())
-        param_values_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [param_values_i8])
-        param_values_field_ptr = cg.builder.gep(
-            kind_call_struct_ptr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)],
-            inbounds=True
-        )
-        cg.builder.store(param_values_handle, param_values_field_ptr)
+        # Set field 1: param_names ([string]) - returns i64 handle
+        param_names_handle = self._build_string_list([p.name for p in func.params])
 
-        # Set field 3: body (string) - convert pointer to handle
-        body_str_ptr = cg._get_string_ptr(func.body)
-        body_i8 = cg.builder.bitcast(body_str_ptr, ir.IntType(8).as_pointer())
-        body_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [body_i8])
-        body_field_ptr = cg.builder.gep(
-            kind_call_struct_ptr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 3)],
-            inbounds=True
-        )
-        cg.builder.store(body_handle, body_field_ptr)
+        # Set field 2: param_values ([json]) - returns i64 handle
+        param_values_handle = self._build_json_list(func.params)
 
-        # Convert pointer to handle for passing to handler function
-        ptr_i8 = cg.builder.bitcast(kind_call_struct_ptr, ir.IntType(8).as_pointer())
-        kind_call_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [ptr_i8])
+        # Set field 3: body (string) - already returns i64 handle
+        body_handle = cg._get_string_ptr(func.body)
+
+        # Re-derive struct pointer after all allocations
+        raw_ptr2 = cg.builder.call(cg.gc.gc_handle_deref, [kind_call_handle])
+        kind_call_struct_ptr = cg.builder.bitcast(raw_ptr2, kind_call_type.as_pointer())
+
+        # Store all fields
+        for field_idx, field_handle in enumerate([name_handle, param_names_handle,
+                                                   param_values_handle, body_handle]):
+            field_ptr = cg.builder.gep(
+                kind_call_struct_ptr,
+                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)],
+                inbounds=True
+            )
+            cg.builder.store(field_handle, field_ptr)
 
         return kind_call_handle
 
     def _build_string_list(self, strings: PyList[str]) -> ir.Value:
         """Build a [string] list from Python strings.
 
-        Returns a List* pointer containing string pointers (String*).
-        Consistent with split() and other list operations that store pointers.
+        Returns an i64 handle to a List containing string handles.
         """
         cg = self.cg
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
         # Create empty list with TaggedValue (16 bytes per element)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        list_handle = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Append each string as a TaggedValue
         for s in strings:
-            # Create string and get its handle
-            string_ptr = cg._get_string_ptr(s)
-            string_i8 = cg.builder.bitcast(string_ptr, i8_ptr)
-            string_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [string_i8])
+            # Create string — _get_string_ptr returns i64 handle
+            string_handle = cg._get_string_ptr(s)
 
             # Create TaggedValue with TV_TYPE_STRING (64)
             tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_STRING, string_handle)
             tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
-            # Append TaggedValue to list
-            list_ptr = cg.builder.call(cg.list_append, [list_ptr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
+            # Append TaggedValue to list (list_append takes/returns i64 handle)
+            list_handle = cg.builder.call(cg.list_append, [list_handle, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
-        return list_ptr
+        return list_handle
 
     def _build_json_list(self, params) -> ir.Value:
         """Build a [json] list from parameter values, wrapping each in json.
 
         Each parameter is accessed from locals and converted to a json value.
-        Returns a List* pointer containing json pointers (Json*).
-        Consistent with split() and other list operations that store pointers.
+        Returns an i64 handle to a List containing json handles.
         """
         cg = self.cg
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
         # Create empty list with TaggedValue (16 bytes per element)
-        list_ptr = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
+        list_handle = cg.builder.call(cg.list_new, [ir.Constant(i64, cg.TAGGED_VALUE_SIZE), ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
         # Wrap each parameter value in json and append as TaggedValue
         for param in params:
@@ -429,22 +404,17 @@ class FunctionGenerator:
             param_alloca = cg.locals[param.name]
             param_val = cg.builder.load(param_alloca)
 
-            # Convert to json based on type
-            json_ptr = cg._json.wrap_value_as_json(param_val, param.type_annotation)
+            # Convert to json based on type — returns i64 handle
+            json_handle = cg._json.wrap_value_as_json(param_val, param.type_annotation)
 
-            # Get handle for json pointer
-            json_i8 = cg.builder.bitcast(json_ptr, i8_ptr)
-            json_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [json_i8])
-
-            # Create TaggedValue with TV_TYPE_JSON_OBJECT (since wrap_value_as_json returns Json*)
-            # Note: The actual JSON type will vary, but TV_TYPE_LIST works for List<Json>
+            # Create TaggedValue with TV_TYPE_LIST (for List<Json>)
             tv_ptr = cg.gc.create_tagged_value(cg.builder, cg.gc.TV_TYPE_LIST, json_handle)
             tv_i8 = cg.builder.bitcast(tv_ptr, i8_ptr)
 
-            # Append TaggedValue to list
-            list_ptr = cg.builder.call(cg.list_append, [list_ptr, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
+            # Append TaggedValue to list (list_append takes/returns i64 handle)
+            list_handle = cg.builder.call(cg.list_append, [list_handle, tv_i8, ir.Constant(i64, cg.TAGGED_VALUE_SIZE)])
 
-        return list_ptr
+        return list_handle
 
     def generate_extern_call(self, name: str, args: list, func_decl: FunctionDecl) -> ir.Value:
         """Generate a call to an extern function with C ABI type conversion.
@@ -550,7 +520,7 @@ class FunctionGenerator:
         # Build parameter types for user's main (coex_main_impl)
         impl_param_types = []
         if has_args:
-            impl_param_types.append(cg.list_struct.as_pointer())  # [string] is a List*
+            impl_param_types.append(i64)  # [string] is an i64 handle
         if has_stdio:
             impl_param_types.append(cg.posix_struct.as_pointer())  # stdin: posix*
             impl_param_types.append(cg.posix_struct.as_pointer())  # stdout: posix*
@@ -594,7 +564,7 @@ class FunctionGenerator:
             args_list = builder.call(cg.list_new, [elem_size, ir.Constant(i64, cg.LIST_FLAG_ELEM_IS_REF)])
 
             # Store in alloca for list_append (which returns new list)
-            args_alloca = builder.alloca(cg.list_struct.as_pointer(), name="args_list")
+            args_alloca = builder.alloca(ir.IntType(64), name="args_list")
             builder.store(args_list, args_alloca)
 
             # Loop through argv and convert each to string
@@ -625,10 +595,8 @@ class FunctionGenerator:
             # Convert C string to Coex string using string_from_literal
             coex_string = builder.call(cg.string_from_literal, [c_str])
 
-            # Get handle for string and create TaggedValue
-            string_i8 = builder.bitcast(coex_string, i8_ptr)
-            string_handle = builder.call(cg.gc.gc_ptr_to_handle, [string_i8])
-            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, string_handle)
+            # coex_string is already an i64 handle - create TaggedValue
+            tv_ptr = cg.gc.create_tagged_value(builder, cg.gc.TV_TYPE_STRING, coex_string)
             tv_i8 = builder.bitcast(tv_ptr, i8_ptr)
 
             current_list = builder.load(args_alloca)
@@ -882,11 +850,10 @@ class FunctionGenerator:
                 param_value = cg._generate_deep_copy(llvm_param, param.type_annotation)
 
             # Allocate on stack and store the value
-            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
-                          and isinstance(llvm_param.type, ir.PointerType))
-            if use_handle:
+            is_ref = cg._is_reference_type(param.type_annotation)
+            if is_ref and param.name in cg.gc_root_indices and cg.gc is not None:
                 alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
-                cg.var_ptr_types[param.name] = llvm_param.type
+                cg.var_ptr_types[param.name] = cg._get_struct_ptr_type(param.type_annotation)
             else:
                 alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
@@ -1047,11 +1014,10 @@ class FunctionGenerator:
             if cg._needs_parameter_copy(param_type):
                 param_value = cg._generate_deep_copy(llvm_param, param_type)
 
-            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
-                          and isinstance(llvm_param.type, ir.PointerType))
-            if use_handle:
+            is_ref = cg._is_reference_type(param_type)
+            if is_ref and param.name in cg.gc_root_indices and cg.gc is not None:
                 alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
-                cg.var_ptr_types[param.name] = llvm_param.type
+                cg.var_ptr_types[param.name] = cg._get_struct_ptr_type(param_type)
             else:
                 alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
@@ -1207,7 +1173,6 @@ class FunctionGenerator:
             return
 
         struct_type = cg.type_registry[type_decl.name]
-        self_ptr_type = struct_type.as_pointer()
 
         for method in type_decl.methods:
             # Mangle name: TypeName_methodName
@@ -1222,7 +1187,7 @@ class FunctionGenerator:
             # Build parameter types
             param_types = []
             if not is_static:
-                param_types.append(self_ptr_type)  # self pointer for instance methods
+                param_types.append(ir.IntType(64))  # self as i64 handle (handles-everywhere)
             for param in method.params:
                 param_types.append(cg._get_llvm_type(param.type_annotation))
 
@@ -1242,6 +1207,8 @@ class FunctionGenerator:
 
             cg.functions[mangled_name] = llvm_func
             cg.type_methods[type_decl.name][method.name] = mangled_name
+            # Register in func_decls for return type inference
+            cg.func_decls[mangled_name] = method
 
     def generate_type_methods(self, type_decl: TypeDecl):
         """Generate method bodies for a type"""
@@ -1301,11 +1268,10 @@ class FunctionGenerator:
                     llvm_param = llvm_func.args[i]
                     llvm_param.name = param.name
 
-                    use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
-                                  and isinstance(llvm_param.type, ir.PointerType))
-                    if use_handle:
+                    is_ref = cg._is_reference_type(param.type_annotation) if param.type_annotation else False
+                    if is_ref and param.name in cg.gc_root_indices and cg.gc is not None:
                         alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
-                        cg.var_ptr_types[param.name] = llvm_param.type
+                        cg.var_ptr_types[param.name] = cg._get_struct_ptr_type(param.type_annotation)
                     else:
                         alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.locals[param.name] = alloca
@@ -1334,7 +1300,7 @@ class FunctionGenerator:
                     cg.gc.inject_safepoint(cg.builder)
 
                 # Store self as handle-storing alloca
-                self_ptr_type = llvm_func.args[0].type
+                self_ptr_type = cg._get_struct_ptr_type(type_decl.name)
                 self_alloca = cg.builder.alloca(ir.IntType(64), name="self")
                 cg.var_ptr_types["self"] = self_ptr_type
                 cg.locals["self"] = self_alloca
@@ -1348,11 +1314,10 @@ class FunctionGenerator:
                     llvm_param = llvm_func.args[i + 1]  # +1 for self
                     llvm_param.name = param.name
 
-                    use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
-                                  and isinstance(llvm_param.type, ir.PointerType))
-                    if use_handle:
+                    is_ref = cg._is_reference_type(param.type_annotation) if param.type_annotation else False
+                    if is_ref and param.name in cg.gc_root_indices and cg.gc is not None:
                         alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
-                        cg.var_ptr_types[param.name] = llvm_param.type
+                        cg.var_ptr_types[param.name] = cg._get_struct_ptr_type(param.type_annotation)
                     else:
                         alloca = cg.builder.alloca(llvm_param.type, name=param.name)
                     cg.locals[param.name] = alloca
@@ -1389,15 +1354,14 @@ class FunctionGenerator:
         """Declare methods for a monomorphized type"""
         cg = self.cg
         struct_type = cg.type_registry[mangled_type_name]
-        self_ptr_type = struct_type.as_pointer()
 
         # Save current substitutions (already set up by caller)
         for method in type_decl.methods:
             # Mangle method name with type name
             mangled_method = f"{mangled_type_name}_{method.name}"
 
-            # Build parameter types (self is implicit first parameter)
-            param_types = [self_ptr_type]
+            # Build parameter types (self is i64 handle for handles-everywhere)
+            param_types = [ir.IntType(64)]
             for param in method.params:
                 param_type = cg._substitute_type(param.type_annotation)
                 param_types.append(cg._get_llvm_type(param_type))
@@ -1480,7 +1444,7 @@ class FunctionGenerator:
             cg.gc.inject_safepoint(cg.builder)
 
         # Store self as handle-storing alloca (BUG-125 FIX)
-        self_ptr_type = llvm_func.args[0].type
+        self_ptr_type = cg._get_struct_ptr_type(type_name)
         self_alloca = cg.builder.alloca(ir.IntType(64), name="self")
         cg.var_ptr_types["self"] = self_ptr_type
         cg.locals["self"] = self_alloca
@@ -1491,11 +1455,10 @@ class FunctionGenerator:
             llvm_param = llvm_func.args[i + 1]
             llvm_param.name = param.name
 
-            use_handle = (param.name in cg.gc_root_indices and cg.gc is not None
-                          and isinstance(llvm_param.type, ir.PointerType))
-            if use_handle:
+            is_ref = cg._is_reference_type(param.type_annotation) if param.type_annotation else False
+            if is_ref and param.name in cg.gc_root_indices and cg.gc is not None:
                 alloca = cg.builder.alloca(ir.IntType(64), name=param.name)
-                cg.var_ptr_types[param.name] = llvm_param.type
+                cg.var_ptr_types[param.name] = cg._get_struct_ptr_type(param.type_annotation)
             else:
                 alloca = cg.builder.alloca(llvm_param.type, name=param.name)
             cg.locals[param.name] = alloca
@@ -1614,5 +1577,5 @@ class FunctionGenerator:
         cg.locals = saved_locals
         cg.current_function = saved_function
 
-        # Return pointer to the function
-        return func
+        # Return function as i64 (handles-everywhere: function pointers stored as i64)
+        return cg.builder.ptrtoint(func, ir.IntType(64))

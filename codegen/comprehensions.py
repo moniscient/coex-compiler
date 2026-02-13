@@ -62,7 +62,7 @@ class ComprehensionGenerator:
         # Store result list in a temporary
         result_var = f"__comp_result_{cg.lambda_counter}"
         cg.lambda_counter += 1
-        result_alloca = cg.builder.alloca(cg.list_struct.as_pointer(), name=result_var)
+        result_alloca = cg.builder.alloca(ir.IntType(64), name=result_var)
         cg.builder.store(list_ptr, result_alloca)
 
         # Pre-allocate temp storage OUTSIDE loop to avoid stack overflow
@@ -91,7 +91,7 @@ class ComprehensionGenerator:
 
         result_var = f"__comp_result_{cg.lambda_counter}"
         cg.lambda_counter += 1
-        result_alloca = cg.builder.alloca(cg.set_struct.as_pointer(), name=result_var)
+        result_alloca = cg.builder.alloca(ir.IntType(64), name=result_var)
         cg.builder.store(set_ptr, result_alloca)
 
         # Generate the nested loop structure
@@ -114,7 +114,7 @@ class ComprehensionGenerator:
 
         result_var = f"__comp_result_{cg.lambda_counter}"
         cg.lambda_counter += 1
-        result_alloca = cg.builder.alloca(cg.map_struct.as_pointer(), name=result_var)
+        result_alloca = cg.builder.alloca(ir.IntType(64), name=result_var)
         cg.builder.store(map_ptr, result_alloca)
 
         # Generate the nested loop structure with key-value pair
@@ -155,7 +155,8 @@ class ComprehensionGenerator:
         iterable = cg._generate_expression(clause.iterable)
 
         # Check if it's a List
-        if isinstance(iterable.type, ir.PointerType) and hasattr(iterable.type.pointee, 'name') and iterable.type.pointee.name == "struct.List":
+        type_name = cg._resolve_expr_type_name(clause.iterable)
+        if type_name == "List":
             # Generate list iteration
             length = cg.builder.call(cg.list_len, [iterable])
 
@@ -202,7 +203,7 @@ class ComprehensionGenerator:
             # Check condition if present
             if clause.condition:
                 cond_val = cg._generate_expression(clause.condition)
-                cond_bool = cg._to_bool(cond_val)
+                cond_bool = cg._to_bool(cond_val, clause.condition)
 
                 then_block = func.append_basic_block(f"comp_then_{clause_idx}")
                 after_block = func.append_basic_block(f"comp_after_{clause_idx}")
@@ -228,7 +229,7 @@ class ComprehensionGenerator:
             cg.builder.position_at_end(loop_end)
 
         # Check if it's an Array
-        elif isinstance(iterable.type, ir.PointerType) and hasattr(iterable.type.pointee, 'name') and iterable.type.pointee.name == "struct.Array":
+        elif type_name == "Array":
             # Generate array iteration
             length = cg.builder.call(cg.array_len, [iterable])
 
@@ -266,7 +267,7 @@ class ComprehensionGenerator:
             # Check condition if present
             if clause.condition:
                 cond_val = cg._generate_expression(clause.condition)
-                cond_bool = cg._to_bool(cond_val)
+                cond_bool = cg._to_bool(cond_val, clause.condition)
 
                 then_block = func.append_basic_block(f"comp_arr_then_{clause_idx}")
                 after_block = func.append_basic_block(f"comp_arr_after_{clause_idx}")
@@ -349,7 +350,7 @@ class ComprehensionGenerator:
         # Check condition if present
         if clause.condition:
             cond_val = cg._generate_expression(clause.condition)
-            cond_bool = cg._to_bool(cond_val)
+            cond_bool = cg._to_bool(cond_val, clause.condition)
 
             then_block = func.append_basic_block(f"comp_range_then_{clause_idx}")
             after_block = func.append_basic_block(f"comp_range_after_{clause_idx}")
@@ -421,7 +422,7 @@ class ComprehensionGenerator:
         # Check condition if present
         if clause.condition:
             cond_val = cg._generate_expression(clause.condition)
-            cond_bool = cg._to_bool(cond_val)
+            cond_bool = cg._to_bool(cond_val, clause.condition)
 
             then_block = func.append_basic_block(f"comp_rexpr_then_{clause_idx}")
             after_block = func.append_basic_block(f"comp_rexpr_after_{clause_idx}")

@@ -1700,7 +1700,7 @@ class GarbageCollector:
         self.type_descriptors['Set'] = self.TYPE_SET
         self.type_info[self.TYPE_SET_ENTRY] = {'size': 9, 'ref_offsets': []}
         self.type_descriptors['SetEntry'] = self.TYPE_SET_ENTRY
-        self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': [32]}
+        self.type_info[self.TYPE_CHANNEL] = {'size': 48, 'ref_offsets': []}  # Channels are malloc'd by C runtime, not GC-managed
         self.type_descriptors['Channel'] = self.TYPE_CHANNEL
         # Array N-D struct (104 bytes = 13 i64 fields):
         #   Field 0: handle (i64) - GC handle for data buffer
@@ -3559,14 +3559,9 @@ class GarbageCollector:
         builder.call(self.gc_mark_push, [owner_handle])  # Owner IS the handle, push directly
         builder.branch(done)
 
-        # Mark Channel: buffer pointer at offset 32 (4th i64 field)
+        # Mark Channel: channels are malloc'd by C runtime, not GC-managed.
+        # No GC references to trace — just branch to done.
         builder.position_at_end(mark_channel)
-        channel_ptr_type = ir.LiteralStructType([self.i64, self.i64, self.i64, self.i64, self.i8_ptr]).as_pointer()
-        channel_typed = builder.bitcast(ptr, channel_ptr_type)
-        buffer_ptr_ptr = builder.gep(channel_typed, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 4)], inbounds=True)
-        buffer_ptr = builder.load(buffer_ptr_ptr)
-        buffer_handle = builder.call(self.gc_ptr_to_handle, [buffer_ptr])
-        builder.call(self.gc_mark_push, [buffer_handle])  # Push to worklist
         builder.branch(done)
 
         # Mark PVNode: iterate through 32 children and mark each non-null one
@@ -6862,26 +6857,27 @@ class GarbageCollector:
         obj_gen = builder.load(gen_ptr)
         current_mark = builder.load(self.gc_current_mark_value)
 
-        # BUG-124 FIX: One-generation grace period for birth-marking race.
+        # BUG-124 + BUG-129 FIX: Two-generation grace period.
         #
-        # When a safepoint triggers gc_async() and the GC thread hasn't yet
-        # incremented gc_current_mark_value, gc_alloc reads the OLD value (M)
-        # instead of the new value (M+1). Objects allocated with generation M
-        # fail the birth-mark check (M < M+1) and are swept if unrooted.
+        # BUG-124: Birth-marking race — gc_alloc reads current_mark before
+        # GC increments it, so objects get generation M instead of M+1.
         #
-        # This race manifests when functions return heap objects: between the
-        # callee's gc_segment_pop and the caller's gc_segment_set_root, the
-        # returned object is in no shadow stack. If the GC marks during this
-        # window, the object is neither rooted nor birth-marked → swept.
+        # BUG-129: Unrooted intermediate expression results — chained string
+        # concatenation (a + b + c) produces intermediate raw pointers that
+        # are NOT in the shadow stack. GC correctly marks them as unreachable
+        # and sweeps them. With a 1-generation grace period, the intermediate
+        # survives one cycle (gen M >= M+1-1) but is swept by the second
+        # (gen M < M+1-1 = M, so M >= M survives). This protects objects
+        # that were allocated just before GC incremented the mark counter
+        # (BUG-124 birth-marking race).
         #
-        # Fix: check gen >= current_mark - 1 instead of gen >= current_mark.
-        # This gives objects a one-generation grace period:
-        #  - Traced objects (gen = M+1): M+1 >= M → survives ✓
-        #  - Birth-marked (gen = M): M >= M → survives ✓
-        #  - Race victims (gen = M-1): M-1 >= M-1 → survives ✓
-        #  - Old garbage (gen < M-1): swept ✓
-        # Cost: objects may survive one extra cycle (minor floating garbage).
-        grace_mark = builder.sub(current_mark, ir.Constant(self.i64, 1))
+        # BUG-129: Widen to -2 for intermediate string concat results.
+        # These unrooted temporaries need to survive 2 GC cycles (the max
+        # that can occur during a single expression chain, given 100K alloc
+        # threshold and ~20 allocs per concat). Combined with re-derivation
+        # via gc_handle_deref in codegen, this ensures correct pointers
+        # after compaction.
+        grace_mark = builder.sub(current_mark, ir.Constant(self.i64, 2))
         is_marked = builder.icmp_unsigned(">=", obj_gen, grace_mark)
         builder.cbranch(is_marked, marked_node, unmarked_node)
 

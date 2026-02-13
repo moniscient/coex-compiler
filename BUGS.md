@@ -82,4 +82,19 @@
 
 ---
 
-**Next valid BUG ID: BUG-127**
+### BUG-128: Module function calls don't auto-convert string to json parameter
+- **Discovered**: 2026-02-12, during Metal 3D smoke test compilation
+- **Category**: Codegen
+- **Severity**: Medium
+- **Reproduction**: Compile `examples/ui_demo.coex` (or any program calling a module function with `json` parameter and passing a string)
+- **Observed**: `TypeError: Type of #1 arg mismatch: %"struct.Json"* != %"struct.String"*`
+- **Expected**: Auto-conversion from string to json at call site per CLAUDE.md spec ("When a function parameter or return type is `json`, conversion happens automatically")
+- **Hypothesis**: Module function call codegen path doesn't check for json parameter type and insert conversion. The conversion logic exists for direct function calls but not for qualified module calls.
+- **Files**: codegen/expressions.py (module function call dispatch), codegen/functions.py (argument marshalling)
+- **Status**: Open (workaround: use direct extern calls or pass pre-converted json)
+
+---
+
+---
+
+**Next valid BUG ID: BUG-131**

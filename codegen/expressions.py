@@ -24,7 +24,8 @@ from ast_nodes import (
     SelfExpr, LlvmIrExpr, AsExpr,
     ListComprehension, SetComprehension, MapComprehension, JsonObjectExpr,
     IdentifierPattern, WildcardPattern, TuplePattern, FunctionKind,
-    AtomicType, PrimitiveType, ListType, ArrayType, MapType, SetType, FunctionDecl, KindFunctionDecl
+    AtomicType, PrimitiveType, ListType, ArrayType, MapType, SetType, FunctionDecl, KindFunctionDecl,
+    FunctionType as CoexFunctionType
 )
 
 if TYPE_CHECKING:
@@ -122,11 +123,10 @@ class ExpressionGenerator:
             return cg._generate_lambda(expr)
 
         elif isinstance(expr, SelfExpr):
-            # Return self pointer if available
-            # BUG-125 FIX: Re-derive from handle if self is handle-stored
+            # Return self handle (i64) — deref at point of use
             if "self" in cg.locals:
                 if "self" in getattr(cg, 'var_ptr_types', {}):
-                    return cg._load_var_ptr("self")
+                    return cg._load_var_handle("self")
                 return cg.builder.load(cg.locals["self"])
             return ir.Constant(ir.IntType(64), 0)
 
@@ -168,9 +168,9 @@ class ExpressionGenerator:
             return cg.builder.load(read_buf, name=name)
 
         if name in cg.locals:
-            # Handle-storing allocas: deref handle to get current pointer
+            # Handles-everywhere: return i64 handle for reference types
             if name in getattr(cg, 'var_ptr_types', {}):
-                return cg._load_var_ptr(name)
+                return cg._load_var_handle(name)
             raw_value = cg.builder.load(cg.locals[name], name=name)
             return raw_value
         elif name in cg.functions:
@@ -180,9 +180,10 @@ class ExpressionGenerator:
             if cg.current_type and "self" in cg.locals:
                 field_idx = cg._get_field_index(cg.current_type, name)
                 if field_idx is not None:
-                    # BUG-125 FIX: Re-derive self from handle
+                    # Deref self handle at point of use
                     if "self" in getattr(cg, 'var_ptr_types', {}):
-                        self_ptr = cg._load_var_ptr("self")
+                        self_handle = cg._load_var_handle("self")
+                        self_ptr = cg._deref_handle(self_handle, cg.current_type)
                     else:
                         self_ptr = cg.builder.load(cg.locals["self"])
                     field_ptr = cg.builder.gep(self_ptr, [
@@ -209,12 +210,13 @@ class ExpressionGenerator:
             return self.generate_short_circuit_or(expr)
 
         left = self.generate_expression(expr.left)
-        right = self.generate_expression(expr.right)
 
-        # Check for String operations
-        is_string = (isinstance(left.type, ir.PointerType) and
-                     hasattr(left.type.pointee, 'name') and
-                     left.type.pointee.name == "struct.String")
+        # Check for String operations BEFORE evaluating right
+        # With handles-everywhere, left is i64 handle (stable across GC), use Coex type info
+        is_string = (cg._resolve_expr_type_name(expr.left) == "String")
+
+        # Handles are stable across GC — no need to save/re-derive (BUG-129 fix removed)
+        right = self.generate_expression(expr.right)
 
         if is_string:
             if expr.op == BinaryOp.ADD:
@@ -285,13 +287,17 @@ class ExpressionGenerator:
                     has_value = cg.builder.extract_value(left, 0, name="has_value")
                     value = cg.builder.extract_value(left, 1, name="opt_value")
                     return cg.builder.select(has_value, value, right)
-            # Handle pointer types (nil = null pointer)
+            # Handle reference types (i64 handles) — null = 0
+            elif cg._resolve_expr_type_name(expr.left) in ("String", "List", "Map", "Set", "Array", "Json", "Result", "Channel"):
+                is_not_null = cg.builder.icmp_unsigned("!=", left, ir.Constant(ir.IntType(64), 0))
+                return cg.builder.select(is_not_null, left, right)
+            # Handle raw pointer types (function pointers, etc.)
             elif isinstance(left.type, ir.PointerType):
                 null_ptr = ir.Constant(left.type, None)
                 is_not_null = cg.builder.icmp_unsigned("!=", left, null_ptr)
                 return cg.builder.select(is_not_null, left, right)
             # Fallback: treat as boolean check
-            cond = cg._to_bool(left)
+            cond = cg._to_bool(left, expr.left)
             return cg.builder.select(cond, left, right)
 
         return ir.Constant(ir.IntType(64), 0)
@@ -305,14 +311,14 @@ class ExpressionGenerator:
         merge = func.append_basic_block("and_merge")
 
         left = self.generate_expression(expr.left)
-        left_bool = cg._to_bool(left)
+        left_bool = cg._to_bool(left, expr.left)
         left_block = cg.builder.block
 
         cg.builder.cbranch(left_bool, eval_right, merge)
 
         cg.builder.position_at_end(eval_right)
         right = self.generate_expression(expr.right)
-        right_bool = cg._to_bool(right)
+        right_bool = cg._to_bool(right, expr.right)
         right_block = cg.builder.block
         cg.builder.branch(merge)
 
@@ -332,14 +338,14 @@ class ExpressionGenerator:
         merge = func.append_basic_block("or_merge")
 
         left = self.generate_expression(expr.left)
-        left_bool = cg._to_bool(left)
+        left_bool = cg._to_bool(left, expr.left)
         left_block = cg.builder.block
 
         cg.builder.cbranch(left_bool, merge, eval_right)
 
         cg.builder.position_at_end(eval_right)
         right = self.generate_expression(expr.right)
-        right_bool = cg._to_bool(right)
+        right_bool = cg._to_bool(right, expr.right)
         right_block = cg.builder.block
         cg.builder.branch(merge)
 
@@ -369,7 +375,7 @@ class ExpressionGenerator:
                 return cg.builder.not_(operand)
             else:
                 # Compare to zero
-                cond = cg._to_bool(operand)
+                cond = cg._to_bool(operand, expr.operand)
                 return cg.builder.not_(cond)
         elif expr.op == UnaryOp.AWAIT:
             # In sequential mode, await just returns the value
@@ -394,7 +400,7 @@ class ExpressionGenerator:
         else_block = func.append_basic_block("tern_else")
 
         cond = self.generate_expression(expr.condition)
-        cond = cg._to_bool(cond)
+        cond = cg._to_bool(cond, expr.condition)
 
         cg.builder.cbranch(cond, then_block, else_block)
 
@@ -507,7 +513,7 @@ class ExpressionGenerator:
                 per_elem_is_ref = is_ref_type
                 if isinstance(elem_val, ir.Function) or (
                     isinstance(elem_val.type, ir.PointerType) and
-                    isinstance(elem_val.type.pointee, ir.FunctionType)):
+                    isinstance(getattr(elem_val.type, 'pointee', None), ir.FunctionType)):
                     per_elem_type_id = cg.gc.TV_TYPE_FUNC
                     per_elem_is_ref = False
                 elif i > 0:
@@ -533,7 +539,7 @@ class ExpressionGenerator:
         elif isinstance(elem_type, ir.DoubleType):
             size = 8
         elif isinstance(elem_type, ir.PointerType):
-            size = 8
+            size = 8  # Function pointers etc.
         elif isinstance(elem_type, ir.LiteralStructType):
             size = sum(
                 max(1, e.width // 8) if isinstance(e, ir.IntType) else 8
@@ -553,10 +559,9 @@ class ExpressionGenerator:
                 elem_val = self.generate_expression(elem_expr)
 
             if is_ref_type:
-                elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                # With handles-everywhere, elem_val is already an i64 handle
                 temp = cg.builder.alloca(i64, name=f"list_elem_{i}_handle")
-                cg.builder.store(elem_handle, temp)
+                cg.builder.store(elem_val, temp)
                 temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
             else:
                 temp = cg.builder.alloca(elem_type, name=f"list_elem_{i}")
@@ -570,16 +575,20 @@ class ExpressionGenerator:
     def _to_i64_value(self, val: ir.Value, is_ref: bool) -> ir.Value:
         """Convert a value to i64 for storage in TaggedValue.
 
-        For reference types, converts pointer to handle.
+        With handles-everywhere, reference type values are ALREADY i64 handles.
         For primitives, converts/casts to i64.
         """
         cg = self.cg
         i64 = ir.IntType(64)
 
         if is_ref:
-            # Reference type: convert pointer to handle
-            val_i8 = cg.builder.bitcast(val, ir.IntType(8).as_pointer())
-            return cg.builder.call(cg.gc.gc_ptr_to_handle, [val_i8])
+            # Reference type: already an i64 handle with handles-everywhere
+            if val.type == i64:
+                return val
+            # Fallback for function pointers that happen to be marked as ref
+            if isinstance(val.type, ir.PointerType):
+                return cg.builder.ptrtoint(val, i64)
+            return cg._cast_value(val, i64)
         elif val.type == i64:
             return val
         elif isinstance(val.type, ir.IntType):
@@ -590,13 +599,8 @@ class ExpressionGenerator:
         elif isinstance(val.type, ir.DoubleType):
             return cg.builder.bitcast(val, i64)
         elif isinstance(val.type, ir.PointerType):
-            # Check if this is a function pointer (code pointer, not heap object)
-            if isinstance(val.type.pointee, ir.FunctionType) or isinstance(val, ir.Function):
-                # Function pointers are NOT GC-allocated - use ptrtoint
-                return cg.builder.ptrtoint(val, i64)
-            # BUG-081 FIX: Heap object pointers use gc_ptr_to_handle, not ptrtoint
-            val_i8 = cg.builder.bitcast(val, ir.IntType(8).as_pointer())
-            return cg.builder.call(cg.gc.gc_ptr_to_handle, [val_i8])
+            # Only function pointers should remain as actual pointer types
+            return cg.builder.ptrtoint(val, i64)
         else:
             # Fallback: try direct bitcast if same size
             return cg.builder.bitcast(val, i64)
@@ -647,20 +651,17 @@ class ExpressionGenerator:
             value = self.generate_expression(value_expr)
             value_coex_type = cg._infer_type_from_expr(value_expr)
 
-            # Check if key is a string pointer
-            is_string_key = (isinstance(key.type, ir.PointerType) and
-                            hasattr(key.type.pointee, 'name') and
-                            key.type.pointee.name == "struct.String")
+            # Check if key is a string using Coex type info
+            key_coex_type = cg._infer_type_from_expr(key_expr)
+            is_string_key = (isinstance(key_coex_type, PrimitiveType) and key_coex_type.name == "string")
 
-            # Check if value is a reference type - if so, store handle instead of pointer
+            # Check if value is a reference type - with handles-everywhere, value is already i64 handle
             is_ref_value = value_coex_type is not None and cg._is_reference_type(value_coex_type)
 
             if is_string_key:
-                # Use string-aware map_set
+                # Use string-aware map_set — key and value are already i64 handles
                 if is_ref_value:
-                    value_i8 = cg.builder.bitcast(value, ir.IntType(8).as_pointer())
-                    value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
-                    map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value_handle])
+                    map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value])
                 else:
                     value_i64 = cg._cast_value(value, ir.IntType(64))
                     map_ptr = cg.builder.call(cg.map_set_string, [map_ptr, key, value_i64])
@@ -668,9 +669,8 @@ class ExpressionGenerator:
                 # Cast to i64 for map storage
                 key_i64 = cg._cast_value(key, ir.IntType(64))
                 if is_ref_value:
-                    value_i8 = cg.builder.bitcast(value, ir.IntType(8).as_pointer())
-                    value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
-                    map_ptr = cg.builder.call(cg.map_set, [map_ptr, key_i64, value_handle])
+                    # With handles-everywhere, value is already an i64 handle
+                    map_ptr = cg.builder.call(cg.map_set, [map_ptr, key_i64, value])
                 else:
                     value_i64 = cg._cast_value(value, ir.IntType(64))
                     # map_set returns a NEW map; update our reference
@@ -697,21 +697,18 @@ class ExpressionGenerator:
             elem = self.generate_expression(elem_expr)
             elem_coex_type = cg._infer_type_from_expr(elem_expr)
 
-            # Check if element is a string
-            is_string_elem = (isinstance(elem.type, ir.PointerType) and
-                            hasattr(elem.type.pointee, 'name') and
-                            elem.type.pointee.name == "struct.String")
+            # Check if element is a string using Coex type info
+            is_string_elem = (isinstance(elem_coex_type, PrimitiveType) and elem_coex_type.name == "string")
 
             if is_string_elem:
-                # Use string-aware set_add (strings stored as pointers for content comparison)
+                # Use string-aware set_add — elem is already an i64 handle
                 set_ptr = cg.builder.call(cg.set_add_string, [set_ptr, elem])
             else:
-                # Check if element is a reference type - if so, store handle instead of pointer
+                # Check if element is a reference type
                 is_ref_elem = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
                 if is_ref_elem:
-                    elem_i8 = cg.builder.bitcast(elem, ir.IntType(8).as_pointer())
-                    elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
-                    set_ptr = cg.builder.call(cg.set_add, [set_ptr, elem_handle])
+                    # With handles-everywhere, elem is already an i64 handle
+                    set_ptr = cg.builder.call(cg.set_add, [set_ptr, elem])
                 else:
                     # Cast to i64 for set storage
                     elem_i64 = cg._cast_value(elem, ir.IntType(64))
@@ -811,28 +808,28 @@ class ExpressionGenerator:
                             ])
                             return cg.builder.load(ptr)
 
-        # Try to determine the type from the pointer
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        # Try to determine the type from the expression's Coex type
+        type_name = cg._resolve_expr_type_name(expr.object)
 
         if type_name and type_name in cg.type_fields:
+            # Deref handle to get struct pointer for GEP
+            obj_ptr = cg._deref_handle(obj, type_name)
             field_idx = cg._get_field_index(type_name, expr.member)
             if field_idx is not None:
                 # GEP to get field pointer
-                field_ptr = cg.builder.gep(obj, [
+                field_ptr = cg.builder.gep(obj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), field_idx)
                 ], inbounds=True)
                 field_val = cg.builder.load(field_ptr)
 
-                # Phase 6: Reference type fields store i64 handles - convert to pointer
+                # Reference type fields store i64 handles — return as-is (handle)
                 field_info = cg.type_fields[type_name]
                 if field_idx < len(field_info):
                     _, field_type = field_info[field_idx]
                     if cg._is_reference_type(field_type):
-                        # Field contains a handle - dereference to get pointer
-                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [field_val])
-                        ptr_type = cg._get_llvm_type(field_type)
-                        return cg.builder.bitcast(ptr_i8, ptr_type)
+                        # Field contains a handle — with handles-everywhere, just return it
+                        return field_val
 
                 return field_val
 
@@ -865,12 +862,14 @@ class ExpressionGenerator:
         cg = self.cg
         obj = self.generate_expression(expr.object)
 
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        type_name = cg._resolve_expr_type_name(expr.object)
 
         if type_name and type_name in cg.type_fields:
+            # Deref handle to get struct pointer for GEP
+            obj_ptr = cg._deref_handle(obj, type_name)
             field_idx = cg._get_field_index(type_name, expr.member)
             if field_idx is not None:
-                return cg.builder.gep(obj, [
+                return cg.builder.gep(obj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), field_idx)
                 ], inbounds=True)
@@ -894,7 +893,7 @@ class ExpressionGenerator:
             return ir.Constant(ir.IntType(64), 0)
 
         # Check if this is a user-defined type with a get method
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        type_name = cg._resolve_expr_type_name(expr.object)
 
         # Special handling for Array multi-index BEFORE generic type_methods
         # This handles arr[i, j] syntax for 2D arrays
@@ -1053,11 +1052,15 @@ class ExpressionGenerator:
                         heap_phi.add_incoming(ptr_i8, heap_default_bb)
 
                         # Convert to final elem_llvm_type for outer merge
+                        # With handles-everywhere, elem_llvm_type for ref types is i64
+                        # so the heap path returns the handle (raw_value) directly
                         if isinstance(elem_llvm_type, ir.PointerType):
                             heap_result = cg.builder.bitcast(heap_phi, elem_llvm_type)
+                        elif elem_llvm_type == ir.IntType(64):
+                            # For i64 (handles or plain int), raw_value from tagged value IS the handle
+                            heap_result = raw_value
                         else:
                             # Compile-time thinks it's primitive but runtime says heap
-                            # Return ptr as i64 - caller must handle this case
                             heap_result = cg.builder.ptrtoint(heap_phi, ir.IntType(64))
                             heap_result = self._from_i64_value(heap_result, elem_llvm_type)
                         cg.builder.branch(merge_bb)
@@ -1077,17 +1080,20 @@ class ExpressionGenerator:
                         return phi
                     else:
                         # Legacy mode: element stored directly
-                        typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
-                        return cg.builder.load(typed_ptr)
+                        # For reference types (i64 handles), load handle from element storage
+                        if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                            handle_ptr = cg.builder.bitcast(result, ir.IntType(64).as_pointer())
+                            return cg.builder.load(handle_ptr)
+                        else:
+                            typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
+                            return cg.builder.load(typed_ptr)
 
                 return result
 
         index = self.generate_expression(expr.indices[0])
 
         # Check if this is an Array
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+        if type_name == "Array":
                 # Array indexing
                 # For N-D arrays:
                 # - arr[i] on 1D array: returns element
@@ -1116,15 +1122,12 @@ class ExpressionGenerator:
                                 elem_coex_type_2d = coex_type.element_type
                                 elem_llvm_type = cg._get_llvm_type(elem_coex_type_2d)
 
-                    # BUG-081 FIX: Arrays of reference types store handles, not raw pointers
+                    # Arrays of reference types store handles — with handles-everywhere, return handle directly
                     is_ref_elem_2d = elem_coex_type_2d is not None and cg._is_reference_type(elem_coex_type_2d)
                     if is_ref_elem_2d:
-                        # Load the handle (i64) from the array
+                        # Load the handle (i64) from the array — return as i64 handle
                         handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-                        elem_handle = cg.builder.load(handle_ptr)
-                        # Convert handle to pointer via gc_handle_deref
-                        elem_i8 = cg.builder.call(cg.gc.gc_handle_deref, [elem_handle])
-                        return cg.builder.bitcast(elem_i8, elem_llvm_type)
+                        return cg.builder.load(handle_ptr)
                     else:
                         typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                         return cg.builder.load(typed_ptr)
@@ -1148,24 +1151,18 @@ class ExpressionGenerator:
                             elem_coex_type = coex_type.element_type
                             elem_llvm_type = cg._get_llvm_type(elem_coex_type)
 
-                # BUG-081 FIX: Arrays of reference types store handles, not raw pointers
-                # We need to load the handle, then convert it to a pointer via gc_handle_deref
+                # Arrays of reference types store handles — return handle directly
                 is_ref_elem = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
                 if is_ref_elem:
-                    # Load the handle (i64) from the array
+                    # Load the handle (i64) from the array — return as i64 handle
                     handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-                    elem_handle = cg.builder.load(handle_ptr)
-                    # Convert handle to pointer via gc_handle_deref
-                    elem_i8 = cg.builder.call(cg.gc.gc_handle_deref, [elem_handle])
-                    return cg.builder.bitcast(elem_i8, elem_llvm_type)
+                    return cg.builder.load(handle_ptr)
                 else:
                     typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                     return cg.builder.load(typed_ptr)
 
         # Check if this is a List
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.List":
+        if type_name == "List":
                 # List indexing - call list_get and load the value
                 # Ensure index is i64
                 if index.type != ir.IntType(64):
@@ -1221,9 +1218,12 @@ class ExpressionGenerator:
                     # Heap path: raw_value is a handle, dereference it
                     cg.builder.position_at_end(heap_bb)
                     ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [raw_value])
-                    # For pointer types: bitcast; for primitives: ptrtoint (never executed but must be valid IR)
+                    # With handles-everywhere, elem_llvm_type for ref types is i64
                     if isinstance(elem_llvm_type, ir.PointerType):
                         heap_result = cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                    elif elem_llvm_type == ir.IntType(64):
+                        # For i64 (handles or plain int), raw_value from tagged value IS the handle
+                        heap_result = raw_value
                     else:
                         # This branch won't be taken for primitives, but IR must be valid
                         heap_result = cg.builder.ptrtoint(ptr_i8, elem_llvm_type)
@@ -1244,36 +1244,31 @@ class ExpressionGenerator:
                     return phi
                 else:
                     # Legacy mode: element is stored directly
-                    # Reference types are stored as handles in lists - load and dereference
+                    # With handles-everywhere, ref type elements are i64 handles — return directly
                     if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
-                        # Load the handle (i64)
+                        # Load the handle (i64) — return as handle
                         handle_ptr = cg.builder.bitcast(elem_ptr, ir.IntType(64).as_pointer())
-                        handle = cg.builder.load(handle_ptr)
-                        # Dereference handle to get pointer
-                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                        return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                        return cg.builder.load(handle_ptr)
                     else:
                         typed_ptr = cg.builder.bitcast(elem_ptr, elem_llvm_type.as_pointer())
                         return cg.builder.load(typed_ptr)
 
-            # JSON indexing: j["key"] or j[0]
-            if hasattr(pointee, 'name') and pointee.name == "struct.Json":
-                # Determine index type
-                index_coex_type = cg._infer_type_from_expr(expr.indices[0])
-                from ast_nodes import PrimitiveType
-                if isinstance(index_coex_type, PrimitiveType) and index_coex_type.name == "string":
-                    # String key: call json_get_field
-                    return cg.builder.call(cg.json_get_field, [obj, index])
-                else:
-                    # Integer index: call json_get_index
-                    if index.type != ir.IntType(64):
-                        index = cg._cast_value(index, ir.IntType(64))
-                    return cg.builder.call(cg.json_get_index, [obj, index])
+        # JSON indexing: j["key"] or j[0]
+        if type_name == "Json":
+            # Determine index type
+            index_coex_type = cg._infer_type_from_expr(expr.indices[0])
+            from ast_nodes import PrimitiveType as PT_local
+            if isinstance(index_coex_type, PT_local) and index_coex_type.name == "string":
+                # String key: call json_get_field
+                return cg.builder.call(cg.json_get_field, [obj, index])
+            else:
+                # Integer index: call json_get_index
+                if index.type != ir.IntType(64):
+                    index = cg._cast_value(index, ir.IntType(64))
+                return cg.builder.call(cg.json_get_index, [obj, index])
 
-            # String indexing
-            ptr = cg.builder.gep(obj, [index])
-            return cg.builder.load(ptr)
-
+        # String indexing (string is now i64 handle — unsupported direct indexing)
+        # Fallback
         return ir.Constant(ir.IntType(64), 0)
 
     def generate_relative_index(self, expr: RelativeIndexExpr) -> ir.Value:
@@ -1351,7 +1346,7 @@ class ExpressionGenerator:
         i64 = ir.IntType(64)
 
         # Get collection length for bounds normalization
-        length = self.get_collection_length(obj)
+        length = self.get_collection_length(obj, expr.object)
 
         # Normalize start
         if expr.start is None:
@@ -1370,7 +1365,7 @@ class ExpressionGenerator:
             end = self.normalize_slice_index(end, length)
 
         # Call getrange method
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        type_name = cg._resolve_expr_type_name(expr.object)
         if type_name and type_name in cg.type_methods:
             method_map = cg.type_methods[type_name]
             if "getrange" in method_map:
@@ -1378,13 +1373,11 @@ class ExpressionGenerator:
                 func = cg.functions[mangled]
                 return cg.builder.call(func, [obj, start, end])
 
-        # Fallback: check for direct list_getrange
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                return cg.builder.call(cg.list_getrange, [obj, start, end])
-            elif hasattr(pointee, 'name') and pointee.name == "struct.String":
-                return cg.builder.call(cg.string_getrange, [obj, start, end])
+        # Fallback: check for direct list_getrange / string_getrange
+        if type_name == "List":
+            return cg.builder.call(cg.list_getrange, [obj, start, end])
+        elif type_name == "String":
+            return cg.builder.call(cg.string_getrange, [obj, start, end])
 
         raise RuntimeError(f"Type '{type_name}' does not support slice access (no getrange method)")
 
@@ -1402,20 +1395,22 @@ class ExpressionGenerator:
 
         return cg.builder.select(is_negative, normalized, index)
 
-    def get_collection_length(self, obj: ir.Value) -> ir.Value:
+    def get_collection_length(self, obj: ir.Value, expr_obj=None) -> ir.Value:
         """Get the length of a collection for slice bounds normalization."""
         cg = self.cg
-        type_name = cg._get_type_name_from_ptr(obj.type)
 
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name'):
-                if pointee.name == "struct.List":
-                    return cg.builder.call(cg.list_len, [obj])
-                elif pointee.name == "struct.String":
-                    return cg.builder.call(cg.string_len, [obj])
-                elif pointee.name == "struct.Array":
-                    return cg.builder.call(cg.array_len, [obj])
+        # Try direct type name dispatch
+        if expr_obj is not None:
+            type_name = cg._resolve_expr_type_name(expr_obj)
+        else:
+            type_name = cg._get_type_name_from_ptr(obj.type) if isinstance(obj.type, ir.PointerType) else None
+
+        if type_name == "List":
+            return cg.builder.call(cg.list_len, [obj])
+        elif type_name == "String":
+            return cg.builder.call(cg.string_len, [obj])
+        elif type_name == "Array":
+            return cg.builder.call(cg.array_len, [obj])
 
         # Try type_methods lookup
         if type_name and type_name in cg.type_methods:
@@ -1544,7 +1539,54 @@ class ExpressionGenerator:
             if name == "sqrt":
                 if expr.args:
                     val = self.generate_expression(expr.args[0])
-                    return val
+                    val = cg._cast_value(val, ir.DoubleType())
+                    sqrt_fn = cg.module.declare_intrinsic("llvm.sqrt", [ir.DoubleType()])
+                    return cg.builder.call(sqrt_fn, [val])
+                return ir.Constant(ir.DoubleType(), 0.0)
+
+            if name == "sin":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    val = cg._cast_value(val, ir.DoubleType())
+                    sin_fn = cg.module.declare_intrinsic("llvm.sin", [ir.DoubleType()])
+                    return cg.builder.call(sin_fn, [val])
+                return ir.Constant(ir.DoubleType(), 0.0)
+
+            if name == "cos":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    val = cg._cast_value(val, ir.DoubleType())
+                    cos_fn = cg.module.declare_intrinsic("llvm.cos", [ir.DoubleType()])
+                    return cg.builder.call(cos_fn, [val])
+                return ir.Constant(ir.DoubleType(), 0.0)
+
+            if name == "atan2":
+                if len(expr.args) >= 2:
+                    y_val = self.generate_expression(expr.args[0])
+                    x_val = self.generate_expression(expr.args[1])
+                    y_val = cg._cast_value(y_val, ir.DoubleType())
+                    x_val = cg._cast_value(x_val, ir.DoubleType())
+                    atan2_fn = cg.module.globals.get("atan2")
+                    if atan2_fn is None:
+                        atan2_type = ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()])
+                        atan2_fn = ir.Function(cg.module, atan2_type, name="atan2")
+                    return cg.builder.call(atan2_fn, [y_val, x_val])
+                return ir.Constant(ir.DoubleType(), 0.0)
+
+            if name == "floor":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    val = cg._cast_value(val, ir.DoubleType())
+                    floor_fn = cg.module.declare_intrinsic("llvm.floor", [ir.DoubleType()])
+                    return cg.builder.call(floor_fn, [val])
+                return ir.Constant(ir.DoubleType(), 0.0)
+
+            if name == "ceil":
+                if expr.args:
+                    val = self.generate_expression(expr.args[0])
+                    val = cg._cast_value(val, ir.DoubleType())
+                    ceil_fn = cg.module.declare_intrinsic("llvm.ceil", [ir.DoubleType()])
+                    return cg.builder.call(ceil_fn, [val])
                 return ir.Constant(ir.DoubleType(), 0.0)
 
             if name == "gc":
@@ -1609,9 +1651,17 @@ class ExpressionGenerator:
 
             if name == "print":
                 if expr.args:
-                    value = self.generate_expression(expr.args[0])
+                    arg_expr = expr.args[0]
+                    value = self.generate_expression(arg_expr)
 
-                    if isinstance(value.type, ir.IntType):
+                    # With handles-everywhere, check Coex type FIRST for string detection
+                    arg_type_name = cg._resolve_expr_type_name(arg_expr)
+
+                    if arg_type_name == "String":
+                        # String (i64 handle) — call string_print
+                        cg.builder.call(cg.string_print, [value])
+
+                    elif isinstance(value.type, ir.IntType):
                         if value.type.width == 1:
                             # Boolean
                             true_block = cg.builder.append_basic_block("print_true")
@@ -1649,12 +1699,9 @@ class ExpressionGenerator:
                         cg.builder.call(cg.printf, [fmt_ptr, value64])
 
                     elif isinstance(value.type, ir.PointerType):
-                        pointee = value.type.pointee
-                        if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                            cg.builder.call(cg.string_print, [value])
-                        else:
-                            fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
-                            cg.builder.call(cg.printf, [fmt_ptr, value])
+                        # Remaining pointer types (function pointers, etc.)
+                        fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
+                        cg.builder.call(cg.printf, [fmt_ptr, value])
 
                     # Flush stdout
                     null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
@@ -1715,7 +1762,7 @@ class ExpressionGenerator:
                     arg_val = self.generate_expression(arg)
                     # Try implicit collection conversion if we have parameter type info
                     if func_decl:
-                        arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
+                        arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl, arg_expr=arg)
                     if i < len(func.args):
                         expected = func.args[i].type
                         arg_val = cg._cast_value(arg_val, expected)
@@ -1737,7 +1784,7 @@ class ExpressionGenerator:
                         arg_val = self.generate_expression(arg)
                         # Try implicit collection conversion if we have parameter type info
                         if func_decl:
-                            arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
+                            arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl, arg_expr=arg)
                         if i < len(func.args):
                             expected = func.args[i].type
                             arg_val = cg._cast_value(arg_val, expected)
@@ -1762,7 +1809,7 @@ class ExpressionGenerator:
                             arg_val = self.generate_expression(arg)
                             # Try implicit collection conversion if we have parameter type info
                             if func_decl:
-                                arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl)
+                                arg_val = self._convert_function_arg_if_needed(arg_val, i, func_decl, arg_expr=arg)
                             if i < len(func.args):
                                 expected = func.args[i].type
                                 arg_val = cg._cast_value(arg_val, expected)
@@ -1808,6 +1855,19 @@ class ExpressionGenerator:
                         args.append(arg_val)
                     return cg.builder.call(func_ptr, args)
 
+                # Function pointer stored as i64 (handles-everywhere)
+                if isinstance(func_ptr.type, ir.IntType) and func_ptr.type.width == 64:
+                    coex_type = cg.var_coex_types.get(name)
+                    if isinstance(coex_type, CoexFunctionType):
+                        # Reconstruct LLVM function type from Coex type
+                        param_llvm_types = [cg._get_llvm_type(pt) for pt in coex_type.param_types]
+                        ret_llvm_type = cg._get_llvm_type(coex_type.return_type) if coex_type.return_type else ir.IntType(64)
+                        llvm_func_type = ir.FunctionType(ret_llvm_type, param_llvm_types)
+                        # Convert i64 back to function pointer
+                        func_ptr_typed = cg.builder.inttoptr(func_ptr, llvm_func_type.as_pointer())
+                        args = [self.generate_expression(arg) for arg in expr.args]
+                        return cg.builder.call(func_ptr_typed, args)
+
         return ir.Constant(ir.IntType(64), 0)
 
     # ========================================================================
@@ -1815,7 +1875,7 @@ class ExpressionGenerator:
     # ========================================================================
 
     def _convert_function_arg_if_needed(self, arg_val: ir.Value, param_idx: int,
-                                        func_decl: FunctionDecl) -> ir.Value:
+                                        func_decl: FunctionDecl, arg_expr=None) -> ir.Value:
         """Try implicit collection conversion for a function argument.
 
         If the expected parameter type is a collection type (List, Array, Set)
@@ -1826,6 +1886,7 @@ class ExpressionGenerator:
             arg_val: The LLVM value of the argument
             param_idx: Index of the parameter in the function declaration
             func_decl: The AST function declaration containing parameter types
+            arg_expr: The AST expression for the argument (for type inference)
 
         Returns:
             The (possibly converted) argument value
@@ -1843,14 +1904,18 @@ class ExpressionGenerator:
         if not isinstance(expected_type, (ListType, ArrayType, SetType)):
             return arg_val
 
+        # Infer source type from argument expression
+        source_type = cg._infer_type_from_expr(arg_expr) if arg_expr else None
+
         # Try implicit collection conversion
         converted_value, was_converted = cg._try_implicit_collection_conversion(
-            arg_val, expected_type
+            arg_val, expected_type, value_type=source_type
         )
 
         if was_converted:
-            # Get source struct name for warning message
+            # Determine source and target struct names for warning message
             source_struct = "unknown"
+            # With handles-everywhere, infer from Coex type or use LLVM type fallback
             if isinstance(arg_val.type, ir.PointerType) and hasattr(arg_val.type.pointee, 'name'):
                 source_struct = arg_val.type.pointee.name
 
@@ -2060,6 +2125,11 @@ class ExpressionGenerator:
                     arg_val = self.generate_expression(expr.args[0])
                     arg_type = arg_val.type
 
+                    # Check Coex type first for json detection (i64 handle like everything else)
+                    arg_coex_type = cg._infer_type_from_expr(expr.args[0])
+                    if isinstance(arg_coex_type, PrimitiveType) and arg_coex_type.name == "json":
+                        return cg.builder.call(cg.json_to_string, [arg_val])
+
                     if isinstance(arg_type, ir.IntType):
                         if arg_type.width == 1:
                             return cg.builder.call(cg.string_from_bool, [arg_val])
@@ -2069,10 +2139,7 @@ class ExpressionGenerator:
                     elif isinstance(arg_type, ir.DoubleType):
                         return cg.builder.call(cg.string_from_float, [arg_val])
                     elif isinstance(arg_type, ir.PointerType):
-                        # Check if it's a json pointer - use json_to_string (returns raw value, no quotes)
-                        if hasattr(cg, 'json_struct') and arg_type.pointee == cg.json_struct:
-                            return cg.builder.call(cg.json_to_string, [arg_val])
-                        # Other pointer types - fallback to int
+                        # Function pointers etc. - fallback to int
                         arg_val = cg._cast_value(arg_val, ir.IntType(64))
                         return cg.builder.call(cg.string_from_int, [arg_val])
                     else:
@@ -2082,7 +2149,11 @@ class ExpressionGenerator:
                 # Special handling for String.from_bytes()
                 if type_name == "String" and expr.method == "from_bytes" and expr.args:
                     arg_val = self.generate_expression(expr.args[0])
-                    if isinstance(arg_val.type, ir.PointerType):
+                    # With handles-everywhere, list value is i64 handle. string_from_bytes takes i64 handle.
+                    arg_coex_type = cg._infer_type_from_expr(expr.args[0])
+                    if arg_coex_type is not None and cg._is_reference_type(arg_coex_type):
+                        return cg.builder.call(cg.string_from_bytes, [arg_val])
+                    elif isinstance(arg_val.type, ir.PointerType):
                         return cg.builder.call(cg.string_from_bytes, [arg_val])
                     return cg.builder.call(cg.string_from_literal, [cg._get_string_literal("")])
 
@@ -2119,10 +2190,11 @@ class ExpressionGenerator:
                     else:
                         elem_size = ir.Constant(ir.IntType(64), 8)  # default
 
-                    # Allocate the array
-                    array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
+                    # Allocate the array — returns i64 handle
+                    array_handle = cg.builder.call(cg.array_new, [size_val, elem_size])
 
-                    # Get data pointer: deref handle (field 0) + offset (field 4)
+                    # Deref handle to get struct pointer, then get data pointer
+                    array_ptr = cg._deref_handle(array_handle, "Array")
                     handle_ptr = cg.builder.gep(array_ptr, [
                         ir.Constant(ir.IntType(32), 0),
                         ir.Constant(ir.IntType(32), 0)
@@ -2176,7 +2248,7 @@ class ExpressionGenerator:
                     cg.builder.branch(cond_bb)
 
                     cg.builder.position_at_end(end_bb)
-                    return array_ptr
+                    return array_handle
 
                 # Legacy alias: Array.filled -> Array.fill
                 if type_name == "Array" and expr.method == "filled" and len(expr.args) == 2:
@@ -2184,9 +2256,10 @@ class ExpressionGenerator:
                     size_val = cg._cast_value(size_val, ir.IntType(64))
                     fill_val = self.generate_expression(expr.args[1])
                     elem_size = ir.Constant(ir.IntType(64), 8)
-                    array_ptr = cg.builder.call(cg.array_new, [size_val, elem_size])
+                    array_handle = cg.builder.call(cg.array_new, [size_val, elem_size])
 
-                    # Get data pointer (deref GC handle)
+                    # Deref handle to get struct pointer, then get data pointer
+                    array_ptr = cg._deref_handle(array_handle, "Array")
                     handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
                     handle = cg.builder.load(handle_ptr)
                     base_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
@@ -2230,7 +2303,7 @@ class ExpressionGenerator:
                     cg.builder.branch(cond_bb)
 
                     cg.builder.position_at_end(end_bb)
-                    return array_ptr
+                    return array_handle
 
                 # Special handling for Array.identity(n)
                 # Creates an n x n identity matrix (2D array with 1s on diagonal)
@@ -2239,10 +2312,11 @@ class ExpressionGenerator:
                     n_val = cg._cast_value(n_val, ir.IntType(64))
                     elem_size = ir.Constant(ir.IntType(64), 8)  # i64/f64 elements
 
-                    # Create 2D array
-                    array_ptr = cg.builder.call(cg.array_new_2d, [n_val, n_val, elem_size])
+                    # Create 2D array — returns i64 handle
+                    array_handle = cg.builder.call(cg.array_new_2d, [n_val, n_val, elem_size])
 
-                    # Get data pointer (deref GC handle)
+                    # Deref handle to get struct pointer, then get data pointer
+                    array_ptr = cg._deref_handle(array_handle, "Array")
                     handle_ptr = cg.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
                     handle = cg.builder.load(handle_ptr)
                     data_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
@@ -2278,7 +2352,7 @@ class ExpressionGenerator:
                     cg.builder.branch(cond_bb)
 
                     cg.builder.position_at_end(end_bb)
-                    return array_ptr
+                    return array_handle
 
                 # Special handling for Array.zeros_2d(rows, cols)
                 # Creates a 2D zero-initialized array
@@ -2301,18 +2375,9 @@ class ExpressionGenerator:
                         arg_val = self.generate_expression(arg)
                         if i < len(func.args):
                             expected = func.args[i].type
-                            # For Result.ok/err with reference type arguments,
-                            # convert pointer to GC handle instead of raw ptrtoint
-                            if (is_result_constructor and
-                                isinstance(arg_val.type, ir.PointerType) and
-                                isinstance(expected, ir.IntType) and
-                                cg.gc is not None):
-                                i8_ptr = ir.IntType(8).as_pointer()
-                                val_i8 = cg.builder.bitcast(arg_val, i8_ptr)
-                                val_promoted = cg.builder.call(cg.gc.gc_promote_to_heap, [val_i8])
-                                arg_val = cg.builder.call(cg.gc.gc_ptr_to_handle, [val_promoted])
-                            else:
-                                arg_val = cg._cast_value(arg_val, expected)
+                            # With handles-everywhere, arg_val for ref types is already i64 handle
+                            # cast_value handles i64->i64 identity correctly
+                            arg_val = cg._cast_value(arg_val, expected)
                         args.append(arg_val)
                     return cg.builder.call(func, args)
 
@@ -2396,20 +2461,19 @@ class ExpressionGenerator:
         obj = self.generate_expression(expr.object)
         method = expr.method
 
-        # Try to determine the type from the pointer
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        # Try to determine the type from the expression's Coex type
+        type_name = cg._resolve_expr_type_name(expr.object)
 
         # Special handling for Map with string keys
         if type_name == "Map" and method in ("get", "has", "set", "remove") and expr.args:
             key_arg = self.generate_expression(expr.args[0])
-            is_string_key = (isinstance(key_arg.type, ir.PointerType) and
-                            hasattr(key_arg.type.pointee, 'name') and
-                            key_arg.type.pointee.name == "struct.String")
+            key_coex_type = cg._infer_type_from_expr(expr.args[0])
+            is_string_key = (isinstance(key_coex_type, PrimitiveType) and key_coex_type.name == "string")
 
             if is_string_key:
                 if method == "get":
                     result = cg.builder.call(cg.map_get_string, [obj, key_arg])
-                    # Convert result to proper type if value is a reference type
+                    # With handles-everywhere, ref type values are i64 handles — return directly
                     if isinstance(expr.object, Identifier):
                         var_name = expr.object.name
                         if var_name in cg.var_coex_types:
@@ -2417,26 +2481,18 @@ class ExpressionGenerator:
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, MapType):
                                 value_coex_type = coex_type.value_type
-                                value_llvm_type = cg._get_llvm_type(value_coex_type)
-                                if isinstance(value_llvm_type, ir.PointerType):
-                                    # Reference types are stored as handles - dereference
-                                    if cg._is_reference_type(value_coex_type):
-                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
-                                        return cg.builder.bitcast(ptr_i8, value_llvm_type)
-                                    else:
-                                        return cg.builder.inttoptr(result, value_llvm_type)
+                                if cg._is_reference_type(value_coex_type):
+                                    # Result is already an i64 handle — return as-is
+                                    return result
                     return result
                 elif method == "has":
                     return cg.builder.call(cg.map_has_string, [obj, key_arg])
                 elif method == "set":
                     value_arg = self.generate_expression(expr.args[1])
-                    # Check if value is a reference type - if so, store handle instead of pointer
+                    # With handles-everywhere, value for ref types is already i64 handle
                     value_coex_type = cg._infer_type_from_expr(expr.args[1])
                     if value_coex_type is not None and cg._is_reference_type(value_coex_type):
-                        # Convert pointer to handle for storage
-                        value_i8 = cg.builder.bitcast(value_arg, ir.IntType(8).as_pointer())
-                        value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
-                        return cg.builder.call(cg.map_set_string, [obj, key_arg, value_handle])
+                        return cg.builder.call(cg.map_set_string, [obj, key_arg, value_arg])
                     else:
                         value_i64 = cg._cast_value(value_arg, ir.IntType(64))
                         return cg.builder.call(cg.map_set_string, [obj, key_arg, value_i64])
@@ -2446,9 +2502,8 @@ class ExpressionGenerator:
         # Special handling for Set with string elements
         if type_name == "Set" and method in ("has", "add") and expr.args:
             elem_arg = self.generate_expression(expr.args[0])
-            is_string_elem = (isinstance(elem_arg.type, ir.PointerType) and
-                            hasattr(elem_arg.type.pointee, 'name') and
-                            elem_arg.type.pointee.name == "struct.String")
+            elem_coex_type = cg._infer_type_from_expr(expr.args[0])
+            is_string_elem = (isinstance(elem_coex_type, PrimitiveType) and elem_coex_type.name == "string")
 
             if is_string_elem:
                 if method == "has":
@@ -2461,23 +2516,34 @@ class ExpressionGenerator:
             key_arg = self.generate_expression(expr.args[0])
             value_arg = self.generate_expression(expr.args[1])
             key_i64 = cg._cast_value(key_arg, ir.IntType(64))
-            # Check if value is a reference type - if so, store handle instead of pointer
+            # With handles-everywhere, ref type values are already i64 handles
             value_coex_type = cg._infer_type_from_expr(expr.args[1])
             if value_coex_type is not None and cg._is_reference_type(value_coex_type):
-                value_i8 = cg.builder.bitcast(value_arg, ir.IntType(8).as_pointer())
-                value_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [value_i8])
-                return cg.builder.call(cg.map_set, [obj, key_i64, value_handle])
+                return cg.builder.call(cg.map_set, [obj, key_i64, value_arg])
             else:
                 value_i64 = cg._cast_value(value_arg, ir.IntType(64))
                 return cg.builder.call(cg.map_set, [obj, key_i64, value_i64])
 
         # Special handling for Channel methods
-        if type_name == "Channel" and method in ("send", "receive"):
+        if type_name == "Channel" and method in ("send", "receive", "try_receive"):
             if method == "send" and expr.args:
                 value = self.generate_expression(expr.args[0])
                 return cg._channel.generate_channel_send(obj, value, cg.builder)
             elif method == "receive":
                 return cg._channel.generate_channel_receive(obj, cg.builder)
+            elif method == "try_receive":
+                return cg._channel.generate_channel_try_receive(obj, cg.builder)
+
+        # JSON .get() method — dispatch to json_get_field or json_get_index
+        if type_name == "Json" and method == "get" and expr.args:
+            key_arg = self.generate_expression(expr.args[0])
+            key_coex_type = cg._infer_type_from_expr(expr.args[0])
+            is_string_key = (isinstance(key_coex_type, PrimitiveType) and key_coex_type.name == "string")
+            if is_string_key:
+                return cg.builder.call(cg.json_get_field, [obj, key_arg])
+            else:
+                key_i64 = cg._cast_value(key_arg, ir.IntType(64))
+                return cg.builder.call(cg.json_get_index, [obj, key_i64])
 
         # BUG-074 FIX: Special handling for Json.set - dispatch based on key type
         # json.set(int_index, value) -> json_set_index
@@ -2486,16 +2552,14 @@ class ExpressionGenerator:
             key_arg = self.generate_expression(expr.args[0])
             value_arg = self.generate_expression(expr.args[1])
 
-            # Convert value to json if needed
-            if not (isinstance(value_arg.type, ir.PointerType) and
-                    hasattr(value_arg.type.pointee, 'name') and
-                    value_arg.type.pointee.name == "struct.Json"):
+            # Convert value to json if needed — use Coex type info
+            value_type_name = cg._resolve_expr_type_name(expr.args[1])
+            if value_type_name != "Json":
                 value_arg = cg._convert_to_json(value_arg, expr.args[1])
 
-            # Check if key is a string
-            is_string_key = (isinstance(key_arg.type, ir.PointerType) and
-                            hasattr(key_arg.type.pointee, 'name') and
-                            key_arg.type.pointee.name == "struct.String")
+            # Check if key is a string using Coex type info
+            key_coex_type = cg._infer_type_from_expr(expr.args[0])
+            is_string_key = (isinstance(key_coex_type, PrimitiveType) and key_coex_type.name == "string")
 
             if is_string_key:
                 # String key: call json_set_field(json*, string*, json*)
@@ -2516,12 +2580,11 @@ class ExpressionGenerator:
                     arg_val = self.generate_expression(arg)
                     if i + 1 < len(func.args):
                         expected = func.args[i + 1].type
-                        if type_name == "Json" and isinstance(expected, ir.PointerType):
-                            if hasattr(expected.pointee, 'name') and expected.pointee.name == "struct.Json":
-                                if not (isinstance(arg_val.type, ir.PointerType) and
-                                        hasattr(arg_val.type.pointee, 'name') and
-                                        arg_val.type.pointee.name == "struct.Json"):
-                                    arg_val = cg._convert_to_json(arg_val, arg)
+                        if type_name == "Json":
+                            # With handles-everywhere, check if this arg should be auto-converted to json
+                            arg_type_name = cg._resolve_expr_type_name(arg)
+                            if arg_type_name != "Json":
+                                arg_val = cg._convert_to_json(arg_val, arg)
                         else:
                             arg_val = cg._cast_value(arg_val, expected)
                     args.append(arg_val)
@@ -2539,6 +2602,14 @@ class ExpressionGenerator:
                             coex_type = cg.var_coex_types[var_name]
                             if isinstance(coex_type, ListType) or isinstance(coex_type, ArrayType):
                                 elem_coex_type = coex_type.element_type
+                                elem_llvm_type = cg._get_llvm_type(elem_coex_type)
+                    elif isinstance(expr.object, MemberExpr):
+                        # Handle chained access: obj.field.get(i)
+                        field_type = cg._statements._infer_member_type(expr.object)
+                        if field_type is not None:
+                            from ast_nodes import ListType, ArrayType
+                            if isinstance(field_type, (ListType, ArrayType)):
+                                elem_coex_type = field_type.element_type
                                 elem_llvm_type = cg._get_llvm_type(elem_coex_type)
 
                     # Check if TaggedValue mode is enabled (List only, not Array yet)
@@ -2624,11 +2695,13 @@ class ExpressionGenerator:
                         heap_phi.add_incoming(ptr_i8, heap_default_bb)
 
                         # Convert to final elem_llvm_type for outer merge
+                        # With handles-everywhere, elem_llvm_type for ref types is i64
                         if isinstance(elem_llvm_type, ir.PointerType):
                             heap_result = cg.builder.bitcast(heap_phi, elem_llvm_type)
+                        elif elem_llvm_type == ir.IntType(64):
+                            # For i64 (handles or plain int), raw_value IS the handle
+                            heap_result = raw_value
                         else:
-                            # Compile-time thinks it's primitive but runtime says heap
-                            # Return ptr as i64 - caller must handle this case
                             heap_result = cg.builder.ptrtoint(heap_phi, ir.IntType(64))
                             heap_result = self._from_i64_value(heap_result, elem_llvm_type)
                         cg.builder.branch(merge_bb)
@@ -2647,53 +2720,25 @@ class ExpressionGenerator:
                         phi.add_incoming(value_result, value_bb_final)
                         return phi
                     else:
-                        # Legacy mode: Reference types are stored as handles - load handle and dereference
+                        # Legacy mode: with handles-everywhere, ref type elements are i64 handles
                         if elem_coex_type is not None and cg._is_reference_type(elem_coex_type):
+                            # Load the handle (i64) — return as handle
                             handle_ptr = cg.builder.bitcast(result, ir.IntType(64).as_pointer())
-                            handle = cg.builder.load(handle_ptr)
-                            ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-                            return cg.builder.bitcast(ptr_i8, elem_llvm_type)
+                            return cg.builder.load(handle_ptr)
                         else:
                             # Non-reference types: load directly
                             typed_ptr = cg.builder.bitcast(result, elem_llvm_type.as_pointer())
                             return cg.builder.load(typed_ptr)
 
-                # Special handling for Map.get - returns i64 that may be a handle
+                # Special handling for Map.get - with handles-everywhere, result is i64 handle
                 if type_name == "Map" and method == "get":
-                    if isinstance(expr.object, Identifier):
-                        var_name = expr.object.name
-                        if var_name in cg.var_coex_types:
-                            from ast_nodes import MapType
-                            coex_type = cg.var_coex_types[var_name]
-                            if isinstance(coex_type, MapType):
-                                value_coex_type = coex_type.value_type
-                                value_llvm_type = cg._get_llvm_type(value_coex_type)
-                                # If value type is a pointer, the i64 result is a handle
-                                if isinstance(value_llvm_type, ir.PointerType):
-                                    # Reference types are stored as handles - dereference
-                                    if cg._is_reference_type(value_coex_type):
-                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
-                                        return cg.builder.bitcast(ptr_i8, value_llvm_type)
-                                    else:
-                                        return cg.builder.inttoptr(result, value_llvm_type)
+                    # With handles-everywhere, map_get returns i64 which is already a handle
+                    # for ref types — no need to deref
                     return result
 
                 # Special handling for Result.unwrap and Result.unwrap_or
                 if type_name == "Result" and method in ("unwrap", "unwrap_or"):
-                    if isinstance(expr.object, Identifier):
-                        var_name = expr.object.name
-                        if var_name in cg.var_coex_types:
-                            from ast_nodes import ResultType
-                            coex_type = cg.var_coex_types[var_name]
-                            if isinstance(coex_type, ResultType):
-                                ok_llvm_type = cg._get_llvm_type(coex_type.ok_type)
-                                # If ok_type is a pointer, convert i64 handle back to pointer
-                                if isinstance(ok_llvm_type, ir.PointerType):
-                                    if cg._is_reference_type(coex_type.ok_type):
-                                        ptr_i8 = cg.builder.call(cg.gc.gc_handle_deref, [result])
-                                        return cg.builder.bitcast(ptr_i8, ok_llvm_type)
-                                    else:
-                                        return cg.builder.inttoptr(result, ok_llvm_type)
+                    # With handles-everywhere, result is i64 handle — return as-is
                     return result
 
                 return result
@@ -2703,33 +2748,16 @@ class ExpressionGenerator:
             return ir.Constant(ir.IntType(8).as_pointer(), None)
 
         if method == "append":
-            if expr.args and isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+            if expr.args and type_name == "List":
+                    # With handles-everywhere, obj is an i64 handle — stable across GC
+                    # No BUG-130 save/re-derive needed
+
                     elem_val = self.generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
-                    # Check if element is a reference type - if so, store handle instead of pointer
+                    # Check if element is a reference type
                     elem_coex_type = cg._infer_type_from_expr(expr.args[0])
                     is_ref_type = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
-
-                    # Safety net: if type inference missed it but LLVM type is a pointer,
-                    # it's a reference type (e.g. String.from() returns String*)
-                    if not is_ref_type and isinstance(elem_type, ir.PointerType):
-                        is_ref_type = True
-                        # Try to infer coex type from LLVM pointer type
-                        if elem_coex_type is None or not cg._is_reference_type(elem_coex_type):
-                            if hasattr(elem_type.pointee, 'name'):
-                                if elem_type.pointee.name == "struct.String":
-                                    elem_coex_type = PrimitiveType("string")
-                                elif elem_type.pointee.name == "struct.List":
-                                    elem_coex_type = ListType(PrimitiveType("int"))
-                                elif elem_type.pointee.name == "struct.Map":
-                                    elem_coex_type = MapType(PrimitiveType("int"), PrimitiveType("int"))
-                                elif elem_type.pointee.name == "struct.Set":
-                                    elem_coex_type = SetType(PrimitiveType("int"))
-                                elif elem_type.pointee.name == "struct.Array":
-                                    elem_coex_type = ArrayType(PrimitiveType("int"))
 
                     # Check if TaggedValue mode is enabled
                     use_tagged = getattr(cg, 'USE_TAGGED_VALUES', False)
@@ -2769,12 +2797,10 @@ class ExpressionGenerator:
                         elem_size = ir.Constant(ir.IntType(64), size)
 
                         if is_ref_type:
-                            # Reference types: convert pointer to handle, store handle
-                            elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                            elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                            # With handles-everywhere, elem_val is already an i64 handle
                             with cg.builder.goto_entry_block():
                                 temp = cg.builder.alloca(ir.IntType(64), name="append_elem_handle")
-                            cg.builder.store(elem_handle, temp)
+                            cg.builder.store(elem_val, temp)
                             temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
                         else:
                             # Non-reference types: store value directly
@@ -2785,7 +2811,7 @@ class ExpressionGenerator:
 
                         return cg.builder.call(cg.list_append, [obj, temp_ptr, elem_size])
 
-                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+            if expr.args and type_name == "Array":
                     elem_val = self.generate_expression(expr.args[0])
                     elem_type = elem_val.type
 
@@ -2812,12 +2838,10 @@ class ExpressionGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     if is_ref_type:
-                        # Reference types: convert pointer to handle, store handle
-                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                        # With handles-everywhere, elem_val is already an i64 handle
                         with cg.builder.goto_entry_block():
                             temp = cg.builder.alloca(ir.IntType(64), name="array_append_elem_handle")
-                        cg.builder.store(elem_handle, temp)
+                        cg.builder.store(elem_val, temp)
                         temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
                         return cg.builder.call(cg.array_append_ref, [obj, temp_ptr, elem_size])
                     else:
@@ -2830,10 +2854,9 @@ class ExpressionGenerator:
             return ir.Constant(ir.IntType(64), 0)
 
         if method == "set" or method == "set_at":
-            if len(expr.args) >= 2 and isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
+            if len(expr.args) >= 2 and type_name in ("List", "Array"):
 
-                if hasattr(pointee, 'name') and pointee.name == "struct.List":
+                if type_name == "List":
                     index = self.generate_expression(expr.args[0])
                     elem_val = self.generate_expression(expr.args[1])
                     elem_type = elem_val.type
@@ -2884,12 +2907,10 @@ class ExpressionGenerator:
                         elem_size = ir.Constant(ir.IntType(64), size)
 
                         if is_ref_type:
-                            # Reference types: convert pointer to handle, store handle
-                            elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                            elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                            # With handles-everywhere, elem_val is already an i64 handle
                             with cg.builder.goto_entry_block():
                                 temp = cg.builder.alloca(ir.IntType(64), name="list_set_elem_handle")
-                            cg.builder.store(elem_handle, temp)
+                            cg.builder.store(elem_val, temp)
                             temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
                         else:
                             # Non-reference types: store value directly
@@ -2903,7 +2924,7 @@ class ExpressionGenerator:
 
                         return cg.builder.call(cg.list_set, [obj, index, temp_ptr, elem_size])
 
-                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
+                if type_name == "Array":
                     index = self.generate_expression(expr.args[0])
                     elem_val = self.generate_expression(expr.args[1])
                     elem_type = elem_val.type
@@ -2932,12 +2953,10 @@ class ExpressionGenerator:
                     elem_size = ir.Constant(ir.IntType(64), size)
 
                     if is_ref_type:
-                        # Reference types: convert pointer to handle, store handle
-                        elem_i8 = cg.builder.bitcast(elem_val, ir.IntType(8).as_pointer())
-                        elem_handle = cg.builder.call(cg.gc.gc_ptr_to_handle, [elem_i8])
+                        # With handles-everywhere, elem_val is already an i64 handle
                         with cg.builder.goto_entry_block():
                             temp = cg.builder.alloca(ir.IntType(64), name="array_set_elem_handle")
-                        cg.builder.store(elem_handle, temp)
+                        cg.builder.store(elem_val, temp)
                         temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
                     else:
                         # Non-reference types: store value directly
@@ -2971,38 +2990,32 @@ class ExpressionGenerator:
             return obj
 
         if method == "packed" or method == "toArray":
-            if isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                    # Check if List has reference type elements for proper GC tracing
-                    is_ref_type = False
-                    if isinstance(expr.object, Identifier):
-                        var_name = expr.object.name
-                        if var_name in cg.var_coex_types:
-                            from ast_nodes import ListType
-                            coex_type = cg.var_coex_types[var_name]
-                            if isinstance(coex_type, ListType):
-                                elem_coex_type = coex_type.element_type
-                                is_ref_type = cg._is_reference_type(elem_coex_type)
-                    return cg._list_to_array(obj, is_ref_type)
-                if hasattr(pointee, 'name') and pointee.name == "struct.Set":
-                    return cg._set_to_array(obj)
+            if type_name == "List":
+                # Check if List has reference type elements for proper GC tracing
+                is_ref_type = False
+                if isinstance(expr.object, Identifier):
+                    var_name = expr.object.name
+                    if var_name in cg.var_coex_types:
+                        from ast_nodes import ListType
+                        coex_type = cg.var_coex_types[var_name]
+                        if isinstance(coex_type, ListType):
+                            elem_coex_type = coex_type.element_type
+                            is_ref_type = cg._is_reference_type(elem_coex_type)
+                return cg._list_to_array(obj, is_ref_type)
+            if type_name == "Set":
+                return cg._set_to_array(obj)
             return ir.Constant(ir.IntType(64), 0)
 
         if method == "unpacked" or method == "toList":
-            if isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                    return cg._array_to_list(obj)
+            if type_name == "Array":
+                return cg._array_to_list(obj)
             return ir.Constant(ir.IntType(64), 0)
 
         if method == "toSet" or method == "to_set":
-            if isinstance(obj.type, ir.PointerType):
-                pointee = obj.type.pointee
-                if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                    return cg._array_to_set(obj)
-                if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                    return cg._list_to_set(obj)
+            if type_name == "Array":
+                return cg._array_to_set(obj)
+            if type_name == "List":
+                return cg._list_to_set(obj)
             return ir.Constant(ir.IntType(64), 0)
 
         # Type conversion methods: .int(), .float(), .int32(), .float32()
@@ -3043,10 +3056,8 @@ class ExpressionGenerator:
             return obj
 
         # Array element-wise operations and reductions
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.Array":
-                return self._generate_array_operation(obj, method, expr.args)
+        if type_name == "Array":
+            return self._generate_array_operation(obj, method, expr.args)
 
         # Generic method lookup failed
         if type_name:
@@ -3054,7 +3065,7 @@ class ExpressionGenerator:
         else:
             raise RuntimeError(f"Undefined method '{method}' on unknown type")
 
-    def _generate_array_operation(self, array_ptr: ir.Value, method: str, args: list) -> ir.Value:
+    def _generate_array_operation(self, array_handle: ir.Value, method: str, args: list) -> ir.Value:
         """Generate element-wise operations and reductions for Array<T>.
 
         Element-wise ops (return new Array):
@@ -3077,8 +3088,11 @@ class ExpressionGenerator:
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
 
-        # Get total element count
-        total_elements = builder.call(cg.array_total_size, [array_ptr])
+        # With handles-everywhere, array_handle is i64 — deref for struct access
+        array_ptr = cg._deref_handle(array_handle, "Array")
+
+        # Get total element count (takes handle)
+        total_elements = builder.call(cg.array_total_size, [array_handle])
 
         # Read elem_size from the array struct (field 5)
         elem_size_ptr = builder.gep(array_ptr, [
@@ -3086,8 +3100,8 @@ class ExpressionGenerator:
         ], inbounds=True)
         elem_size = builder.load(elem_size_ptr, name="elem_size")
 
-        # Get source data pointer
-        src_data = builder.call(cg.array_get, [array_ptr, zero])
+        # Get source data pointer (takes handle)
+        src_data = builder.call(cg.array_get, [array_handle, zero])
 
         if method == "scale":
             # scale(scalar) - multiply all elements by scalar
@@ -3364,9 +3378,9 @@ class ExpressionGenerator:
             # transpose() - swap rows and cols in 2D array
             i32 = ir.IntType(32)
 
-            # Get original shape
-            rows = builder.call(cg.array_shape, [array_ptr, zero])
-            cols = builder.call(cg.array_shape, [array_ptr, one])
+            # Get original shape (takes handle)
+            rows = builder.call(cg.array_shape, [array_handle, zero])
+            cols = builder.call(cg.array_shape, [array_handle, one])
 
             # Create new 2D array with swapped dimensions
             new_arr = builder.call(cg.array_new_2d, [cols, rows, elem_size])
@@ -3402,8 +3416,8 @@ class ExpressionGenerator:
             r = builder.load(row_ptr)
             c = builder.load(col_ptr)
 
-            # Get element at [r, c] in original
-            src_elem = builder.call(cg.array_get_2d, [array_ptr, r, c])
+            # Get element at [r, c] in original (takes handle)
+            src_elem = builder.call(cg.array_get_2d, [array_handle, r, c])
             src_elem_i64 = builder.bitcast(src_elem, i64.as_pointer())
             val = builder.load(src_elem_i64)
 

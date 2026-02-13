@@ -68,8 +68,8 @@ class InplaceOpsGenerator:
         set_remove_inplace_ty = ir.FunctionType(void, [set_ptr, i64])
         cg.set_remove_inplace = ir.Function(cg.module, set_remove_inplace_ty, name="coex_set_remove_inplace")
 
-        # set_add_string_inplace(set: Set*, key: String*) -> void
-        set_add_string_inplace_ty = ir.FunctionType(void, [set_ptr, string_ptr])
+        # set_add_string_inplace(set: Set*, key: i64 string handle) -> void
+        set_add_string_inplace_ty = ir.FunctionType(void, [set_ptr, i64])
         cg.set_add_string_inplace = ir.Function(cg.module, set_add_string_inplace_ty, name="coex_set_add_string_inplace")
 
     def _implement_set_add_inplace(self):
@@ -239,8 +239,8 @@ class InplaceOpsGenerator:
         map_remove_inplace_ty = ir.FunctionType(void, [map_ptr, i64])
         cg.map_remove_inplace = ir.Function(cg.module, map_remove_inplace_ty, name="coex_map_remove_inplace")
 
-        # map_put_string_inplace(map: Map*, key: String*, value: i64) -> void
-        map_put_string_inplace_ty = ir.FunctionType(void, [map_ptr, string_ptr, i64])
+        # map_put_string_inplace(map: Map*, key: i64 string handle, value: i64) -> void
+        map_put_string_inplace_ty = ir.FunctionType(void, [map_ptr, i64, i64])
         cg.map_put_string_inplace = ir.Function(cg.module, map_put_string_inplace_ty, name="coex_map_put_string_inplace")
 
     def _implement_map_put_inplace(self):

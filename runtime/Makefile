@@ -211,6 +211,22 @@ bgfx/bgfx_c_bridge.o: bgfx/bgfx_c_bridge.cpp bgfx/coex_bgfx.h
 bgfx/coex_bgfx_imgui.o: bgfx/coex_bgfx_imgui.cpp bgfx/coex_bgfx.h
 	clang++ $(BGFX_CXXFLAGS) -c -o $@ $<
 
+# Metal 3D Library (macOS only, requires UI shell)
+METAL3D_LIB = libcoex_metal3d.a
+
+ifeq ($(UNAME_S),Darwin)
+METAL3D_OBJ = metal3d/coex_metal3d.o
+
+metal3d: $(METAL3D_LIB)
+	@echo "Metal 3D library built: $(METAL3D_LIB)"
+
+$(METAL3D_LIB): $(METAL3D_OBJ)
+	$(AR) rcs $@ $^
+
+metal3d/coex_metal3d.o: metal3d/coex_metal3d.m metal3d/coex_metal3d.h coex_ui_shell.h
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+endif
+
 # Test targets
 test_task: test_coex_task.c coex_task.c coex_task.h
 	$(CC) $(CFLAGS) -o $@ test_coex_task.c coex_task.c -lpthread
@@ -229,5 +245,6 @@ clean:
 	rm -f $(FFI_OBJ) $(TASK_OBJ) $(SCHEDULER_OBJ) $(CHANNEL_OBJ) coex_metal.o coex_metal_stub.o $(BLAS_OBJ) $(LIBS) test_task test_metal
 	rm -f $(UI_OBJ) $(UI_LIB) coex_ui_metal.o
 	rm -f bgfx/coex_bgfx.o bgfx/bgfx_c_bridge.o bgfx/coex_bgfx_imgui.o $(BGFX_LIB)
+	rm -f metal3d/coex_metal3d.o $(METAL3D_LIB)
 
-.PHONY: all test clean test_metal ui bgfx
+.PHONY: all test clean test_metal ui bgfx metal3d

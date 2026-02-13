@@ -369,6 +369,14 @@ def compile_coex(source_path: str, output_path: str = None,
                         link_cmd.append(lunasvg_lib)
                     if os.path.exists(plutovg_lib):
                         link_cmd.append(plutovg_lib)
+                # Add Metal 3D graphics library (nested inside uses_ui since metal3d requires the shell)
+                if codegen.uses_metal3d():
+                    metal3d_runtime = os.path.join(runtime_dir, "libcoex_metal3d.a")
+                    if os.path.exists(metal3d_runtime):
+                        link_cmd.append(metal3d_runtime)
+                    else:
+                        print(f"Warning: Metal 3D runtime library not found at {metal3d_runtime}")
+                        print("Build it with: cd runtime && make metal3d")
                 # Add bgfx 3D graphics library (nested inside uses_ui since bgfx requires the shell)
                 if codegen.uses_bgfx():
                     bgfx_runtime = os.path.join(runtime_dir, "libcoex_bgfx.a")

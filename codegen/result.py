@@ -51,29 +51,30 @@ class ResultGenerator:
         # Both value fields may contain pointers
         cg.gc.register_type("Result", 24, [8, 16])
 
-        # result_ok(value: i64) -> Result*
+        # Handles-everywhere: all functions take/return i64 handles
+        # result_ok(value: i64) -> i64 handle
         self._create_result_ok(result_ptr, i64)
 
-        # result_err(error: i64) -> Result*
+        # result_err(error: i64) -> i64 handle
         self._create_result_err(result_ptr, i64)
 
-        # result_is_ok(r: Result*) -> bool
+        # result_is_ok(r: i64 handle) -> bool
         self._create_result_is_ok(result_ptr, i1)
 
-        # result_is_err(r: Result*) -> bool
+        # result_is_err(r: i64 handle) -> bool
         self._create_result_is_err(result_ptr, i1)
 
-        # result_unwrap(r: Result*) -> i64
+        # result_unwrap(r: i64 handle) -> i64
         self._create_result_unwrap(result_ptr, i64)
 
-        # result_unwrap_or(r: Result*, default: i64) -> i64
+        # result_unwrap_or(r: i64 handle, default: i64) -> i64
         self._create_result_unwrap_or(result_ptr, i64)
 
     def _create_result_ok(self, result_ptr: ir.Type, i64: ir.Type):
-        """Create Result.ok(value) constructor."""
+        """Create Result.ok(value) constructor. Returns i64 handle."""
         cg = self.cg
 
-        func_type = ir.FunctionType(result_ptr, [i64])
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_result_ok")
         cg.result_ok = func
         cg.functions["coex_result_ok"] = func
@@ -114,13 +115,15 @@ class ResultGenerator:
         ], inbounds=True)
         builder.store(ir.Constant(i64, 0), err_field)
 
-        builder.ret(result)
+        # Return handle
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [builder.bitcast(result, ir.IntType(8).as_pointer())])
+        builder.ret(handle)
 
     def _create_result_err(self, result_ptr: ir.Type, i64: ir.Type):
-        """Create Result.err(error) constructor."""
+        """Create Result.err(error) constructor. Returns i64 handle."""
         cg = self.cg
 
-        func_type = ir.FunctionType(result_ptr, [i64])
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_result_err")
         cg.result_err = func
         cg.functions["coex_result_err"] = func
@@ -161,24 +164,29 @@ class ResultGenerator:
         ], inbounds=True)
         builder.store(error, err_field)
 
-        builder.ret(result)
+        # Return handle
+        handle = builder.call(cg.gc.gc_ptr_to_handle, [builder.bitcast(result, ir.IntType(8).as_pointer())])
+        builder.ret(handle)
 
     def _create_result_is_ok(self, result_ptr: ir.Type, i1: ir.Type):
-        """Create result.is_ok() method."""
+        """Create result.is_ok() method. Takes i64 handle."""
         cg = self.cg
+        i64 = ir.IntType(64)
 
-        func_type = ir.FunctionType(i1, [result_ptr])
+        func_type = ir.FunctionType(i1, [i64])
         func = ir.Function(cg.module, func_type, name="coex_result_is_ok")
         cg.result_is_ok = func
         cg.functions["coex_result_is_ok"] = func
         cg.type_methods["Result"]["is_ok"] = "coex_result_is_ok"
 
-        func.args[0].name = "result"
+        func.args[0].name = "result_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        result = func.args[0]
+        # Deref handle to get struct pointer
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [func.args[0]])
+        result = builder.bitcast(raw_ptr, result_ptr)
 
         # Get tag
         tag_field = builder.gep(result, [
@@ -188,25 +196,28 @@ class ResultGenerator:
         tag = builder.load(tag_field)
 
         # Return tag == 0
-        is_ok = builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+        is_ok = builder.icmp_signed("==", tag, ir.Constant(i64, 0))
         builder.ret(is_ok)
 
     def _create_result_is_err(self, result_ptr: ir.Type, i1: ir.Type):
-        """Create result.is_err() method."""
+        """Create result.is_err() method. Takes i64 handle."""
         cg = self.cg
+        i64 = ir.IntType(64)
 
-        func_type = ir.FunctionType(i1, [result_ptr])
+        func_type = ir.FunctionType(i1, [i64])
         func = ir.Function(cg.module, func_type, name="coex_result_is_err")
         cg.result_is_err = func
         cg.functions["coex_result_is_err"] = func
         cg.type_methods["Result"]["is_err"] = "coex_result_is_err"
 
-        func.args[0].name = "result"
+        func.args[0].name = "result_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        result = func.args[0]
+        # Deref handle to get struct pointer
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [func.args[0]])
+        result = builder.bitcast(raw_ptr, result_ptr)
 
         # Get tag
         tag_field = builder.gep(result, [
@@ -216,25 +227,27 @@ class ResultGenerator:
         tag = builder.load(tag_field)
 
         # Return tag != 0 (i.e., tag == 1 means Err)
-        is_err = builder.icmp_signed("!=", tag, ir.Constant(ir.IntType(64), 0))
+        is_err = builder.icmp_signed("!=", tag, ir.Constant(i64, 0))
         builder.ret(is_err)
 
     def _create_result_unwrap(self, result_ptr: ir.Type, i64: ir.Type):
-        """Create result.unwrap() method. Returns ok_value (panics if Err in real impl)."""
+        """Create result.unwrap() method. Takes i64 handle, returns ok_value."""
         cg = self.cg
 
-        func_type = ir.FunctionType(i64, [result_ptr])
+        func_type = ir.FunctionType(i64, [i64])
         func = ir.Function(cg.module, func_type, name="coex_result_unwrap")
         cg.result_unwrap = func
         cg.functions["coex_result_unwrap"] = func
         cg.type_methods["Result"]["unwrap"] = "coex_result_unwrap"
 
-        func.args[0].name = "result"
+        func.args[0].name = "result_handle"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        result = func.args[0]
+        # Deref handle to get struct pointer
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [func.args[0]])
+        result = builder.bitcast(raw_ptr, result_ptr)
 
         # Get ok_value (field 1)
         ok_field = builder.gep(result, [
@@ -246,23 +259,26 @@ class ResultGenerator:
         builder.ret(ok_value)
 
     def _create_result_unwrap_or(self, result_ptr: ir.Type, i64: ir.Type):
-        """Create result.unwrap_or(default) method."""
+        """Create result.unwrap_or(default) method. Takes i64 handle."""
         cg = self.cg
 
-        func_type = ir.FunctionType(i64, [result_ptr, i64])
+        func_type = ir.FunctionType(i64, [i64, i64])
         func = ir.Function(cg.module, func_type, name="coex_result_unwrap_or")
         cg.result_unwrap_or = func
         cg.functions["coex_result_unwrap_or"] = func
         cg.type_methods["Result"]["unwrap_or"] = "coex_result_unwrap_or"
 
-        func.args[0].name = "result"
+        func.args[0].name = "result_handle"
         func.args[1].name = "default"
 
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        result = func.args[0]
         default = func.args[1]
+
+        # Deref handle to get struct pointer
+        raw_ptr = builder.call(cg.gc.gc_handle_deref, [func.args[0]])
+        result = builder.bitcast(raw_ptr, result_ptr)
 
         # Get tag
         tag_field = builder.gep(result, [
@@ -272,7 +288,7 @@ class ResultGenerator:
         tag = builder.load(tag_field)
 
         # Check if Ok (tag == 0)
-        is_ok = builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+        is_ok = builder.icmp_signed("==", tag, ir.Constant(i64, 0))
 
         # Get ok_value
         ok_field = builder.gep(result, [

@@ -15,6 +15,7 @@ from typing import List as PyList
 
 from ast_nodes import (
     Stmt, Expr, Type, ReturnStmt, IfStmt, WhileStmt, CycleStmt, MatchStmt,
+    SelectStmt, SelectCase, ChannelType, NamedType,
     VarDecl, Assignment, AssignOp, ForStmt, Identifier, NilLiteral,
     Pattern, WildcardPattern, LiteralPattern, IdentifierPattern, ConstructorPattern,
     PrimitiveType
@@ -106,7 +107,7 @@ class FlowControlGenerator:
 
         # Generate condition
         cond = cg._generate_expression(stmt.condition)
-        cond = self.to_bool(cond)
+        cond = self.to_bool(cond, stmt.condition)
 
         # Branch
         first_else = else_blocks[0] if else_blocks else else_block
@@ -127,7 +128,7 @@ class FlowControlGenerator:
         for i, (elif_cond, elif_body) in enumerate(stmt.else_if_clauses):
             cg.builder.position_at_end(else_blocks[i])
             cond = cg._generate_expression(elif_cond)
-            cond = self.to_bool(cond)
+            cond = self.to_bool(cond, elif_cond)
 
             elif_then = func.append_basic_block("elif_then")
             next_else = else_blocks[i + 1] if i + 1 < len(else_blocks) else else_block
@@ -158,12 +159,32 @@ class FlowControlGenerator:
 
         cg.builder.position_at_end(merge_block)
 
-    def to_bool(self, value: ir.Value) -> ir.Value:
-        """Convert value to boolean (i1)"""
+    def to_bool(self, value: ir.Value, expr: 'Expr' = None) -> ir.Value:
+        """Convert value to boolean (i1)
+
+        If expr is provided and the value is a Result type (either i64 handle or
+        pointer), deref/access the struct and check the tag field (Ok=0 -> true,
+        Err=1 -> false).
+        """
         cg = self.cg
         if value.type == ir.IntType(1):
             return value
         elif isinstance(value.type, ir.IntType):
+            # Check if this i64 is a Result handle - needs tag-based bool conversion
+            if value.type == ir.IntType(64) and expr is not None:
+                try:
+                    type_name = cg._resolve_expr_type_name(expr)
+                    if type_name == "Result":
+                        # Result<T, E> -> bool: true if Ok (tag == 0), false if Err (tag == 1)
+                        result_ptr = cg._deref_handle(value, "Result")
+                        tag_ptr = cg.builder.gep(result_ptr, [
+                            ir.Constant(ir.IntType(32), 0),
+                            ir.Constant(ir.IntType(32), 0)  # tag field
+                        ])
+                        tag = cg.builder.load(tag_ptr)
+                        return cg.builder.icmp_signed("==", tag, ir.Constant(ir.IntType(64), 0))
+                except Exception:
+                    pass
             return cg.builder.icmp_signed("!=", value, ir.Constant(value.type, 0))
         elif isinstance(value.type, ir.DoubleType):
             return cg.builder.fcmp_ordered("!=", value, ir.Constant(value.type, 0.0))
@@ -220,7 +241,7 @@ class FlowControlGenerator:
         # Generate condition check
         cg.builder.position_at_end(cond_block)
         cond_val = cg._generate_expression(stmt.condition)
-        cond_bool = self.to_bool(cond_val)
+        cond_bool = self.to_bool(cond_val, stmt.condition)
         cg.builder.cbranch(cond_bool, body_block, exit_block)
 
         # Generate loop body
@@ -307,7 +328,7 @@ class FlowControlGenerator:
 
         # Phase 4: Initial condition check (enter cycle only if condition true)
         init_cond = cg._generate_expression(stmt.condition)
-        init_cond_bool = self.to_bool(init_cond)
+        init_cond_bool = self.to_bool(init_cond, stmt.condition)
         cg.builder.cbranch(init_cond_bool, body_block, exit_block)
 
         # Phase 5: Push cycle context and generate body
@@ -343,7 +364,7 @@ class FlowControlGenerator:
         # Phase 7: Condition check (in outer scope, after swap)
         cg.builder.position_at_end(cond_block)
         cond_val = cg._generate_expression(stmt.condition)
-        cond_bool = self.to_bool(cond_val)
+        cond_bool = self.to_bool(cond_val, stmt.condition)
         cg.builder.cbranch(cond_bool, body_block, exit_block)
 
         # Phase 8: Exit and cleanup
@@ -445,7 +466,7 @@ class FlowControlGenerator:
                 cg.builder.cbranch(matched, guard_block, next_block)
                 cg.builder.position_at_end(guard_block)
                 guard = cg._generate_expression(arm.guard)
-                guard = self.to_bool(guard)
+                guard = self.to_bool(guard, arm.guard)
                 cg.builder.cbranch(guard, arm_block, next_block)
             else:
                 cg.builder.cbranch(matched, arm_block, next_block)
@@ -483,8 +504,14 @@ class FlowControlGenerator:
                 enum_name, variant_name = enum_info
                 tag, fields = cg.enum_variants[enum_name][variant_name]
 
+                # Deref handle if subject is i64
+                subj_ptr = subject
+                if isinstance(subject.type, ir.IntType) and subject.type.width == 64:
+                    raw = cg.builder.call(cg.gc.gc_handle_deref, [subject])
+                    subj_ptr = cg.builder.bitcast(raw, cg.type_registry[enum_name].as_pointer())
+
                 # Get tag from subject
-                tag_ptr = cg.builder.gep(subject, [
+                tag_ptr = cg.builder.gep(subj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), 0)
                 ], inbounds=True)
@@ -513,8 +540,14 @@ class FlowControlGenerator:
             enum_name, _ = enum_info
             tag, fields = cg.enum_variants[enum_name][variant_name]
 
+            # Deref handle if subject is i64
+            subj_ptr = subject
+            if isinstance(subject.type, ir.IntType) and subject.type.width == 64:
+                raw = cg.builder.call(cg.gc.gc_handle_deref, [subject])
+                subj_ptr = cg.builder.bitcast(raw, cg.type_registry[enum_name].as_pointer())
+
             # Get tag from subject
-            tag_ptr = cg.builder.gep(subject, [
+            tag_ptr = cg.builder.gep(subj_ptr, [
                 ir.Constant(ir.IntType(32), 0),
                 ir.Constant(ir.IntType(32), 0)
             ], inbounds=True)
@@ -531,7 +564,7 @@ class FlowControlGenerator:
                     field_name, field_type = fields[i]
 
                     # Get field pointer (index i+1, after tag)
-                    field_ptr = cg.builder.gep(subject, [
+                    field_ptr = cg.builder.gep(subj_ptr, [
                         ir.Constant(ir.IntType(32), 0),
                         ir.Constant(ir.IntType(32), i + 1)
                     ], inbounds=True)
@@ -540,10 +573,8 @@ class FlowControlGenerator:
                     # Convert back to proper type if needed
                     if isinstance(field_type, PrimitiveType) and field_type.name == "float":
                         field_val = cg.builder.bitcast(field_val, ir.DoubleType())
-                    # Phase 6: Reference type fields store i64 handles - convert to pointer
-                    elif cg._is_reference_type(field_type):
-                        ptr_type = cg._get_llvm_type(field_type)
-                        field_val = cg.builder.inttoptr(field_val, ptr_type)
+                    # Reference type fields store i64 handles - no conversion needed,
+                    # field_val is already an i64 handle
 
                     # If sub-pattern is an identifier, bind it
                     if isinstance(sub_pattern, IdentifierPattern):
@@ -557,3 +588,149 @@ class FlowControlGenerator:
 
         # Default: match
         return ir.Constant(ir.IntType(1), 1)
+
+    # ========================================================================
+    # Select Statement (Channel Multiplexing)
+    # ========================================================================
+
+    def generate_select(self, stmt: SelectStmt):
+        """Generate a select statement that polls multiple channels.
+
+        Strategy: DEFAULT polling loop.
+        - try_receive on each channel in order
+        - If any succeeds, bind the variable, execute the case body, exit
+        - If all empty, sched_yield and loop back
+        - GC safepoint at loop back-edge (like while loops)
+        """
+        cg = self.cg
+        func = cg.builder.function
+        i64 = ir.IntType(64)
+
+        num_cases = len(stmt.cases)
+        if num_cases == 0:
+            return
+
+        # Ensure channel functions are declared
+        cg._channel.declare_channel_functions()
+
+        # Create basic blocks
+        poll_block = func.append_basic_block("select_poll")
+        done_block = func.append_basic_block("select_done")
+
+        # Create try_receive + case body blocks for each case
+        try_blocks = []
+        body_blocks = []
+        for i, case in enumerate(stmt.cases):
+            try_blocks.append(func.append_basic_block(f"select_try_{i}"))
+            body_blocks.append(func.append_basic_block(f"select_case_{i}"))
+
+        # Yield block - all channels empty, yield and retry
+        yield_block = func.append_basic_block("select_yield")
+
+        # Jump to poll loop
+        cg.builder.branch(poll_block)
+
+        # Poll block just jumps to first try
+        cg.builder.position_at_end(poll_block)
+        cg.builder.branch(try_blocks[0])
+
+        # Generate try_receive for each case
+        for i, case in enumerate(stmt.cases):
+            cg.builder.position_at_end(try_blocks[i])
+
+            # Evaluate channel expression
+            channel_val = cg._generate_expression(case.channel)
+
+            # Ensure channel is the right pointer type
+            channel_ptr_type = cg._channel.get_channel_struct().as_pointer()
+            if channel_val.type != channel_ptr_type:
+                if isinstance(channel_val.type, ir.IntType):
+                    channel_val = cg.builder.inttoptr(channel_val, channel_ptr_type)
+                else:
+                    channel_val = cg.builder.bitcast(channel_val, channel_ptr_type)
+
+            # Alloca for try_receive output
+            out_alloca = cg.builder.alloca(i64, name=f"select_out_{i}")
+            cg.builder.store(ir.Constant(i64, 0), out_alloca)
+
+            # Call coex_channel_try_receive
+            status = cg.builder.call(
+                cg._channel._channel_try_receive_fn,
+                [channel_val, out_alloca],
+                name=f"select_status_{i}"
+            )
+
+            # Check success (0 = got value, -1 = empty)
+            is_ok = cg.builder.icmp_signed("==", status, ir.Constant(i64, 0),
+                                            name=f"select_ok_{i}")
+
+            # If success, go to case body; else try next channel or yield
+            next_block = try_blocks[i + 1] if i + 1 < num_cases else yield_block
+            cg.builder.cbranch(is_ok, body_blocks[i], next_block)
+
+            # Generate case body
+            cg.builder.position_at_end(body_blocks[i])
+            cg._enter_scope()
+
+            # Load received value
+            recv_val = cg.builder.load(out_alloca, name=f"select_val_{i}")
+
+            # Bind the case variable
+            # Determine channel element type for proper binding
+            ch_elem_type = self._get_channel_elem_type(case.channel)
+
+            if ch_elem_type is not None and cg._is_reference_type(ch_elem_type):
+                # Heap type: recv_val is a GC handle (i64)
+                # Store handle directly - generate_identifier will deref when needed
+                alloca = cg.builder.alloca(i64, name=case.var_name)
+                cg.locals[case.var_name] = alloca
+                cg.builder.store(recv_val, alloca)
+                cg.var_coex_types[case.var_name] = ch_elem_type
+                # Register struct pointer type for handle deref at point of use
+                struct_ptr_type = cg._get_struct_ptr_type(ch_elem_type)
+                cg.var_ptr_types[case.var_name] = struct_ptr_type
+            else:
+                # Primitive type: just store the i64 value
+                alloca = cg.builder.alloca(i64, name=case.var_name)
+                cg.locals[case.var_name] = alloca
+                cg.builder.store(recv_val, alloca)
+
+                if ch_elem_type is not None:
+                    cg.var_coex_types[case.var_name] = ch_elem_type
+
+            cg._register_var_in_scope(case.var_name)
+
+            # Execute case body statements
+            for s in case.body:
+                cg._generate_statement(s)
+                if cg.builder.block.is_terminated:
+                    break
+
+            cg._exit_scope()
+
+            if not cg.builder.block.is_terminated:
+                cg.builder.branch(done_block)
+
+        # Yield block: all channels empty, yield CPU, inject safepoint, retry
+        cg.builder.position_at_end(yield_block)
+        cg.builder.call(cg.gc.sched_yield, [])
+
+        # GC safepoint at back-edge (like while loops)
+        if cg._thread is not None:
+            cg._thread.inject_safepoint(cg.builder, done_block)
+        else:
+            cg.builder.call(cg.gc.gc_safepoint, [])
+
+        cg.builder.branch(poll_block)
+
+        # Continue after select
+        cg.builder.position_at_end(done_block)
+
+    def _get_channel_elem_type(self, channel_expr: Expr):
+        """Get the element type of a channel expression from var_coex_types."""
+        cg = self.cg
+        if isinstance(channel_expr, Identifier):
+            ch_type = cg.var_coex_types.get(channel_expr.name)
+            if isinstance(ch_type, ChannelType):
+                return ch_type.element_type
+        return None

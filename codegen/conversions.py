@@ -58,8 +58,11 @@ class ConversionGenerator:
         # Check if TaggedValue mode is enabled
         use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
 
+        # Deref list handle to get struct pointer for GEP
+        list_struct_ptr = self.cg._deref_handle(list_ptr, "List")
+
         # Get List elem_size (field 5 in PV structure)
-        elem_size_ptr = self.cg.builder.gep(list_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        elem_size_ptr = self.cg.builder.gep(list_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         list_elem_size = self.cg.builder.load(elem_size_ptr)
 
         # For Arrays, we store raw values (8 bytes), not TaggedValues
@@ -76,12 +79,15 @@ class ConversionGenerator:
         else:
             array_ptr = self.cg.builder.call(self.cg.array_new, [list_len, array_elem_size])
 
+        # Deref array handle to get struct pointer for GEP
+        array_struct_ptr = self.cg._deref_handle(array_ptr, "Array")
+
         # Array data: deref handle + offset
         # Field 0: handle (GC handle i64), Field 4: offset
-        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
         array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        array_offset_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
@@ -169,12 +175,15 @@ class ConversionGenerator:
         # Check if TaggedValue mode is enabled
         use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
 
+        # Deref array handle to get struct pointer for GEP
+        array_struct_ptr = self.cg._deref_handle(array_ptr, "Array")
+
         # Get array data pointer: deref handle + offset
         # Field 0: handle (GC handle i64), Field 4: offset
-        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
         array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        array_offset_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
@@ -259,16 +268,19 @@ class ConversionGenerator:
         # Check if TaggedValue mode is enabled
         use_tagged = getattr(self.cg, 'USE_TAGGED_VALUES', False)
 
+        # Deref array handle to get struct pointer for GEP
+        array_struct_ptr = self.cg._deref_handle(array_ptr, "Array")
+
         # Get Array elem_size (field 5 in N-D Array layout)
-        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        elem_size_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         array_elem_size = self.cg.builder.load(elem_size_ptr)
 
         # Get Array data: deref handle + offset
         # Field 0: handle (GC handle i64), Field 4: offset
-        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
         array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        array_offset_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
@@ -280,7 +292,7 @@ class ConversionGenerator:
         list_ptr = self.cg.builder.call(self.cg.list_new, [list_elem_size, ir.Constant(ir.IntType(64), 0)])
 
         # Store list_ptr in alloca since list_append returns new list
-        list_alloca = self.cg.builder.alloca(self.cg.list_struct.as_pointer(), name="arr_to_list")
+        list_alloca = self.cg.builder.alloca(ir.IntType(64), name="arr_to_list")
         self.cg.builder.store(list_ptr, list_alloca)
 
         # Loop through array elements and append to list
@@ -356,16 +368,19 @@ class ConversionGenerator:
         # Get Array length (shape[0] for 1D arrays)
         array_len = self.cg.builder.call(self.cg.array_len, [array_ptr])
 
+        # Deref array handle to get struct pointer for GEP
+        array_struct_ptr = self.cg._deref_handle(array_ptr, "Array")
+
         # Get Array elem_size (field 5 in N-D Array layout)
-        elem_size_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
+        elem_size_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 5)], inbounds=True)
         elem_size = self.cg.builder.load(elem_size_ptr)
 
         # Get Array data: deref handle + offset
         # Field 0: handle (GC handle i64), Field 4: offset
-        array_handle_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        array_handle_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
         array_handle = self.cg.builder.load(array_handle_ptr)
         array_base = self.cg.builder.call(self.cg.gc.gc_handle_deref, [array_handle])
-        array_offset_ptr = self.cg.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
+        array_offset_ptr = self.cg.builder.gep(array_struct_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 4)], inbounds=True)
         array_offset = self.cg.builder.load(array_offset_ptr)
         array_data = self.cg.builder.gep(array_base, [array_offset])
 
@@ -374,7 +389,7 @@ class ConversionGenerator:
         set_ptr = self.cg.builder.call(self.cg.set_new, [ir.Constant(i64, flags)])
 
         # Store set_ptr in alloca since set_add returns new set
-        set_alloca = self.cg.builder.alloca(self.cg.set_struct.as_pointer(), name="arr_to_set")
+        set_alloca = self.cg.builder.alloca(ir.IntType(64), name="arr_to_set")
         self.cg.builder.store(set_ptr, set_alloca)
 
         # Loop through array elements and add to set
@@ -438,7 +453,7 @@ class ConversionGenerator:
         set_ptr = self.cg.builder.call(self.cg.set_new, [ir.Constant(i64, flags)])
 
         # Store set_ptr in alloca since set_add returns new set
-        set_alloca = self.cg.builder.alloca(self.cg.set_struct.as_pointer(), name="list_to_set")
+        set_alloca = self.cg.builder.alloca(ir.IntType(64), name="list_to_set")
         self.cg.builder.store(set_ptr, set_alloca)
 
         # Loop through list elements and add to set
@@ -504,14 +519,19 @@ class ConversionGenerator:
         - Set<T> -> Array<T> (via .packed())
         - Array<T> -> Set<T> (via .toSet(), deduplicates)
         """
-        if not isinstance(value.type, ir.PointerType):
+        # Determine source collection type from Coex type info
+        # (with handles-everywhere, value.type is i64 for all collections)
+        if value_type is not None:
+            if isinstance(value_type, ListType):
+                source_struct = "struct.List"
+            elif isinstance(value_type, ArrayType):
+                source_struct = "struct.Array"
+            elif isinstance(value_type, SetType):
+                source_struct = "struct.Set"
+            else:
+                return value, False
+        else:
             return value, False
-
-        pointee = value.type.pointee
-        if not hasattr(pointee, 'name'):
-            return value, False
-
-        source_struct = pointee.name  # e.g., "struct.List"
 
         # Determine target collection type
         if isinstance(target_type, ListType):

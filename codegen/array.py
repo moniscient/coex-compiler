@@ -63,98 +63,85 @@ class ArrayGenerator:
         """
         cg = self.cg
 
-        array_ptr = cg.array_struct.as_pointer()
+        # Handles-everywhere: all Array params and returns use i64 handles
+        array_ptr = cg.array_struct.as_pointer()  # Keep for internal deref only
         i64 = ir.IntType(64)
         i8_ptr = ir.IntType(8).as_pointer()
 
-        # array_new(len: i64, elem_size: i64) -> Array*
-        # Creates a new 1D array with given length
-        array_new_ty = ir.FunctionType(array_ptr, [i64, i64])
+        # array_new(len: i64, elem_size: i64) -> i64 handle
+        array_new_ty = ir.FunctionType(i64, [i64, i64])
         cg.array_new = ir.Function(cg.module, array_new_ty, name="coex_array_new")
 
-        # array_get(arr: Array*, index: i64) -> i8*
-        array_get_ty = ir.FunctionType(i8_ptr, [array_ptr, i64])
+        # array_get(arr: i64 handle, index: i64) -> i8*
+        array_get_ty = ir.FunctionType(i8_ptr, [i64, i64])
         cg.array_get = ir.Function(cg.module, array_get_ty, name="coex_array_get")
 
-        # array_set(arr: Array*, index: i64, value: i8*, elem_size: i64) -> Array*
-        # Returns a NEW array with the element at index replaced
-        array_set_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i8_ptr, i64])
+        # array_set(arr: i64 handle, index: i64, value: i8*, elem_size: i64) -> i64 handle
+        array_set_ty = ir.FunctionType(i64, [i64, i64, i8_ptr, i64])
         cg.array_set = ir.Function(cg.module, array_set_ty, name="coex_array_set")
 
-        # array_append(arr: Array*, value: i8*, elem_size: i64) -> Array*
-        # Returns a NEW array with the element appended
-        array_append_ty = ir.FunctionType(array_ptr, [array_ptr, i8_ptr, i64])
+        # array_append(arr: i64 handle, value: i8*, elem_size: i64) -> i64 handle
+        array_append_ty = ir.FunctionType(i64, [i64, i8_ptr, i64])
         cg.array_append = ir.Function(cg.module, array_append_ty, name="coex_array_append")
 
-        # array_len(arr: Array*) -> i64
-        array_len_ty = ir.FunctionType(i64, [array_ptr])
+        # array_len(arr: i64 handle) -> i64
+        array_len_ty = ir.FunctionType(i64, [i64])
         cg.array_len = ir.Function(cg.module, array_len_ty, name="coex_array_len")
 
-        # array_size(arr: Array*) -> i64 (total memory footprint)
-        array_size_ty = ir.FunctionType(i64, [array_ptr])
+        # array_size(arr: i64 handle) -> i64
+        array_size_ty = ir.FunctionType(i64, [i64])
         cg.array_size = ir.Function(cg.module, array_size_ty, name="coex_array_size")
 
-        # array_copy(arr: Array*) -> Array* (structural sharing)
-        array_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
+        # array_copy(arr: i64 handle) -> i64 handle
+        array_copy_ty = ir.FunctionType(i64, [i64])
         cg.array_copy = ir.Function(cg.module, array_copy_ty, name="coex_array_copy")
 
-        # array_deep_copy(arr: Array*) -> Array* (creates independent copy with new buffer)
-        array_deep_copy_ty = ir.FunctionType(array_ptr, [array_ptr])
+        # array_deep_copy(arr: i64 handle) -> i64 handle
+        array_deep_copy_ty = ir.FunctionType(i64, [i64])
         cg.array_deep_copy = ir.Function(cg.module, array_deep_copy_ty, name="coex_array_deep_copy")
 
-        # array_getrange(arr: Array*, start: i64, end: i64) -> Array*
-        # Returns a VIEW (not a copy) of elements [start, end) - 1D only
-        array_getrange_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i64])
+        # array_getrange(arr: i64 handle, start: i64, end: i64) -> i64 handle
+        array_getrange_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.array_getrange = ir.Function(cg.module, array_getrange_ty, name="coex_array_getrange")
 
-        # array_filled(size: i64, elem_size: i64) -> Array*
-        # Creates a new 1D array with len=size (data initialized to zero by GC)
-        array_filled_ty = ir.FunctionType(array_ptr, [i64, i64])
+        # array_filled(size: i64, elem_size: i64) -> i64 handle
+        array_filled_ty = ir.FunctionType(i64, [i64, i64])
         cg.array_filled = ir.Function(cg.module, array_filled_ty, name="coex_array_filled")
 
-        # array_new_ref(len: i64, elem_size: i64) -> Array*
-        # Creates a new 1D array for reference type elements (data tracked by GC for handle tracing)
-        array_new_ref_ty = ir.FunctionType(array_ptr, [i64, i64])
+        # array_new_ref(len: i64, elem_size: i64) -> i64 handle
+        array_new_ref_ty = ir.FunctionType(i64, [i64, i64])
         cg.array_new_ref = ir.Function(cg.module, array_new_ref_ty, name="coex_array_new_ref")
 
-        # array_set_ref(arr: Array*, index: i64, value: i8*, elem_size: i64) -> Array*
-        # Like array_set but allocates data buffer with TYPE_ARRAY_DATA_REF
-        # so the GC traces element handles. Must be used for Array<string>, etc.
-        array_set_ref_ty = ir.FunctionType(array_ptr, [array_ptr, i64, i8_ptr, i64])
+        # array_set_ref(arr: i64 handle, index: i64, value: i8*, elem_size: i64) -> i64 handle
+        array_set_ref_ty = ir.FunctionType(i64, [i64, i64, i8_ptr, i64])
         cg.array_set_ref = ir.Function(cg.module, array_set_ref_ty, name="coex_array_set_ref")
 
-        # array_append_ref(arr: Array*, value: i8*, elem_size: i64) -> Array*
-        # Like array_append but for reference type elements.
-        array_append_ref_ty = ir.FunctionType(array_ptr, [array_ptr, i8_ptr, i64])
+        # array_append_ref(arr: i64 handle, value: i8*, elem_size: i64) -> i64 handle
+        array_append_ref_ty = ir.FunctionType(i64, [i64, i8_ptr, i64])
         cg.array_append_ref = ir.Function(cg.module, array_append_ref_ty, name="coex_array_append_ref")
 
-        # array_set_inplace(arr: Array*, index: i64, value: i8*, elem_size: i64) -> void
-        # Mutates the array in place (only safe when array is unique/unaliased)
-        array_set_inplace_ty = ir.FunctionType(ir.VoidType(), [array_ptr, i64, i8_ptr, i64])
+        # array_set_inplace(arr: i64 handle, index: i64, value: i8*, elem_size: i64) -> void
+        array_set_inplace_ty = ir.FunctionType(ir.VoidType(), [i64, i64, i8_ptr, i64])
         cg.array_set_inplace = ir.Function(cg.module, array_set_inplace_ty, name="coex_array_set_inplace")
 
-        # array_ndim(arr: Array*) -> i64
-        array_ndim_ty = ir.FunctionType(i64, [array_ptr])
+        # array_ndim(arr: i64 handle) -> i64
+        array_ndim_ty = ir.FunctionType(i64, [i64])
         cg.array_ndim = ir.Function(cg.module, array_ndim_ty, name="coex_array_ndim")
 
-        # array_shape(arr: Array*, dim: i64) -> i64
-        # Returns shape[dim] for the given dimension
-        array_shape_ty = ir.FunctionType(i64, [array_ptr, i64])
+        # array_shape(arr: i64 handle, dim: i64) -> i64
+        array_shape_ty = ir.FunctionType(i64, [i64, i64])
         cg.array_shape = ir.Function(cg.module, array_shape_ty, name="coex_array_shape")
 
-        # array_new_2d(rows: i64, cols: i64, elem_size: i64) -> Array*
-        # Creates a new 2D array with given dimensions
-        array_new_2d_ty = ir.FunctionType(array_ptr, [i64, i64, i64])
+        # array_new_2d(rows: i64, cols: i64, elem_size: i64) -> i64 handle
+        array_new_2d_ty = ir.FunctionType(i64, [i64, i64, i64])
         cg.array_new_2d = ir.Function(cg.module, array_new_2d_ty, name="coex_array_new_2d")
 
-        # array_get_2d(arr: Array*, row: i64, col: i64) -> i8*
-        # Get element at (row, col) in 2D array
-        array_get_2d_ty = ir.FunctionType(i8_ptr, [array_ptr, i64, i64])
+        # array_get_2d(arr: i64 handle, row: i64, col: i64) -> i8*
+        array_get_2d_ty = ir.FunctionType(i8_ptr, [i64, i64, i64])
         cg.array_get_2d = ir.Function(cg.module, array_get_2d_ty, name="coex_array_get_2d")
 
-        # array_total_size(arr: Array*) -> i64
-        # Returns total number of elements (product of all shape dimensions)
-        array_total_size_ty = ir.FunctionType(i64, [array_ptr])
+        # array_total_size(arr: i64 handle) -> i64
+        array_total_size_ty = ir.FunctionType(i64, [i64])
         cg.array_total_size = ir.Function(cg.module, array_total_size_ty, name="coex_array_total_size")
 
         # Implement all functions
@@ -318,7 +305,10 @@ class ArrayGenerator:
         # Initialize all fields for 1D array
         self._init_1d_array_fields(builder, array_ptr, length, elem_size, data_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_filled(self):
         """Implement array_filled: allocate a new 1D array with given size.
@@ -357,7 +347,10 @@ class ArrayGenerator:
         # Initialize all fields for 1D array
         self._init_1d_array_fields(builder, array_ptr, size, elem_size, data_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_new_ref(self):
         """Implement array_new_ref: allocate a new 1D array for reference type elements.
@@ -397,7 +390,10 @@ class ArrayGenerator:
         # Initialize all fields for 1D array
         self._init_1d_array_fields(builder, array_ptr, length, elem_size, data_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_set_inplace(self):
         """Implement array_set_inplace: mutate element at index IN PLACE.
@@ -416,10 +412,14 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         index = func.args[1]
         value_ptr = func.args[2]
         elem_size = func.args[3]
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
 
         # Get data pointer
         data = self._get_array_data_ptr(builder, array_ptr)
@@ -444,8 +444,12 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         index = func.args[1]
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
 
         # Get elem_size
         elem_size = self._get_array_elem_size(builder, array_ptr)
@@ -475,20 +479,32 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_arr = func.args[0]
+        old_arr_handle = func.args[0]  # i64 handle
         index = func.args[1]
         value_ptr = func.args[2]
         elem_size = func.args[3]
         i64 = ir.IntType(64)
 
+        # Deref handle to get Array*
+        old_arr_raw = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr = builder.bitcast(old_arr_raw, cg.array_struct.as_pointer())
+
         # Get old array's length (shape[0])
         old_len = self._get_array_len(builder, old_arr)
 
-        # Create new array with same length
-        new_arr = builder.call(cg.array_new, [old_len, elem_size])
+        # Create new array with same length (returns i64 handle now)
+        new_arr_handle = builder.call(cg.array_new, [old_len, elem_size])
+
+        # Re-derive old_arr after allocation (may have moved)
+        old_arr_raw2 = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr2 = builder.bitcast(old_arr_raw2, cg.array_struct.as_pointer())
+
+        # Deref new handle to get Array*
+        new_arr_raw = builder.call(cg.gc.gc_handle_deref, [new_arr_handle])
+        new_arr = builder.bitcast(new_arr_raw, cg.array_struct.as_pointer())
 
         # Copy all data from old to new
-        old_data = self._get_array_data_ptr(builder, old_arr)
+        old_data = self._get_array_data_ptr(builder, old_arr2)
         new_data = self._get_array_data_ptr(builder, new_arr)
         copy_size = builder.mul(old_len, elem_size)
         builder.call(cg.memcpy, [new_data, old_data, copy_size])
@@ -498,7 +514,8 @@ class ArrayGenerator:
         dest = builder.gep(new_data, [elem_offset])
         builder.call(cg.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        # Return i64 handle
+        builder.ret(new_arr_handle)
 
     def _implement_array_set_ref(self):
         """Like array_set but uses array_new_ref for the data buffer.
@@ -517,15 +534,29 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_arr = func.args[0]
+        old_arr_handle = func.args[0]  # i64 handle
         index = func.args[1]
         value_ptr = func.args[2]
         elem_size = func.args[3]
 
-        old_len = self._get_array_len(builder, old_arr)
-        new_arr = builder.call(cg.array_new_ref, [old_len, elem_size])
+        # Deref handle to get Array*
+        old_arr_raw = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr = builder.bitcast(old_arr_raw, cg.array_struct.as_pointer())
 
-        old_data = self._get_array_data_ptr(builder, old_arr)
+        old_len = self._get_array_len(builder, old_arr)
+
+        # array_new_ref now returns i64 handle
+        new_arr_handle = builder.call(cg.array_new_ref, [old_len, elem_size])
+
+        # Re-derive old_arr after allocation (may have moved)
+        old_arr_raw2 = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr2 = builder.bitcast(old_arr_raw2, cg.array_struct.as_pointer())
+
+        # Deref new handle to get Array*
+        new_arr_raw = builder.call(cg.gc.gc_handle_deref, [new_arr_handle])
+        new_arr = builder.bitcast(new_arr_raw, cg.array_struct.as_pointer())
+
+        old_data = self._get_array_data_ptr(builder, old_arr2)
         new_data = self._get_array_data_ptr(builder, new_arr)
         copy_size = builder.mul(old_len, elem_size)
         builder.call(cg.memcpy, [new_data, old_data, copy_size])
@@ -534,7 +565,8 @@ class ArrayGenerator:
         dest = builder.gep(new_data, [elem_offset])
         builder.call(cg.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        # Return i64 handle
+        builder.ret(new_arr_handle)
 
     def _implement_array_append(self):
         """Implement array_append: return a NEW 1D array with element appended.
@@ -551,10 +583,14 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_arr = func.args[0]
+        old_arr_handle = func.args[0]  # i64 handle
         value_ptr = func.args[1]
         elem_size = func.args[2]
         i64 = ir.IntType(64)
+
+        # Deref handle to get Array*
+        old_arr_raw = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr = builder.bitcast(old_arr_raw, cg.array_struct.as_pointer())
 
         # Get old array's length
         old_len = self._get_array_len(builder, old_arr)
@@ -562,11 +598,19 @@ class ArrayGenerator:
         # New length = old_len + 1
         new_len = builder.add(old_len, ir.Constant(i64, 1))
 
-        # Create new array
-        new_arr = builder.call(cg.array_new, [new_len, elem_size])
+        # Create new array (returns i64 handle now)
+        new_arr_handle = builder.call(cg.array_new, [new_len, elem_size])
+
+        # Re-derive old_arr after allocation (may have moved)
+        old_arr_raw2 = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr2 = builder.bitcast(old_arr_raw2, cg.array_struct.as_pointer())
+
+        # Deref new handle to get Array*
+        new_arr_raw = builder.call(cg.gc.gc_handle_deref, [new_arr_handle])
+        new_arr = builder.bitcast(new_arr_raw, cg.array_struct.as_pointer())
 
         # Copy old data
-        old_data = self._get_array_data_ptr(builder, old_arr)
+        old_data = self._get_array_data_ptr(builder, old_arr2)
         new_data = self._get_array_data_ptr(builder, new_arr)
         copy_size = builder.mul(old_len, elem_size)
         builder.call(cg.memcpy, [new_data, old_data, copy_size])
@@ -576,7 +620,8 @@ class ArrayGenerator:
         dest = builder.gep(new_data, [elem_offset])
         builder.call(cg.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        # Return i64 handle
+        builder.ret(new_arr_handle)
 
     def _implement_array_append_ref(self):
         """Like array_append but uses array_new_ref for the data buffer.
@@ -593,16 +638,30 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        old_arr = func.args[0]
+        old_arr_handle = func.args[0]  # i64 handle
         value_ptr = func.args[1]
         elem_size = func.args[2]
         i64 = ir.IntType(64)
 
+        # Deref handle to get Array*
+        old_arr_raw = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr = builder.bitcast(old_arr_raw, cg.array_struct.as_pointer())
+
         old_len = self._get_array_len(builder, old_arr)
         new_len = builder.add(old_len, ir.Constant(i64, 1))
-        new_arr = builder.call(cg.array_new_ref, [new_len, elem_size])
 
-        old_data = self._get_array_data_ptr(builder, old_arr)
+        # array_new_ref now returns i64 handle
+        new_arr_handle = builder.call(cg.array_new_ref, [new_len, elem_size])
+
+        # Re-derive old_arr after allocation (may have moved)
+        old_arr_raw2 = builder.call(cg.gc.gc_handle_deref, [old_arr_handle])
+        old_arr2 = builder.bitcast(old_arr_raw2, cg.array_struct.as_pointer())
+
+        # Deref new handle to get Array*
+        new_arr_raw = builder.call(cg.gc.gc_handle_deref, [new_arr_handle])
+        new_arr = builder.bitcast(new_arr_raw, cg.array_struct.as_pointer())
+
+        old_data = self._get_array_data_ptr(builder, old_arr2)
         new_data = self._get_array_data_ptr(builder, new_arr)
         copy_size = builder.mul(old_len, elem_size)
         builder.call(cg.memcpy, [new_data, old_data, copy_size])
@@ -611,7 +670,8 @@ class ArrayGenerator:
         dest = builder.gep(new_data, [elem_offset])
         builder.call(cg.memcpy, [dest, value_ptr, elem_size])
 
-        builder.ret(new_arr)
+        # Return i64 handle
+        builder.ret(new_arr_handle)
 
     def _implement_array_len(self):
         """Implement array_len: return shape[0] (1D length)."""
@@ -623,7 +683,12 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
+
         length = self._get_array_len(builder, array_ptr)
         builder.ret(length)
 
@@ -642,12 +707,17 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get total elements and elem_size
-        total_elements = builder.call(cg.array_total_size, [array_ptr])
+        # array_total_size also takes i64 handle now
+        total_elements = builder.call(cg.array_total_size, [arr_handle])
+
+        # Deref handle to get Array* for elem_size access
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
+
         elem_size = self._get_array_elem_size(builder, array_ptr)
 
         # Size = 104 (header) + total_elements * elem_size
@@ -657,9 +727,9 @@ class ArrayGenerator:
         builder.ret(total_size)
 
     def _implement_array_copy(self):
-        """Implement array_copy: return same pointer for structural sharing.
+        """Implement array_copy: return same handle for structural sharing.
 
-        With GC-managed memory, copying is just pointer sharing.
+        With GC-managed memory, copying is just handle sharing.
         GC keeps shared arrays alive; mutation creates new arrays.
         """
         cg = self.cg
@@ -670,8 +740,9 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        src = func.args[0]
-        builder.ret(src)
+        src_handle = func.args[0]  # i64 handle
+        # Just return the same handle (structural sharing)
+        builder.ret(src_handle)
 
     def _implement_array_deep_copy(self):
         """Create an independent copy of an array with its own data buffer.
@@ -686,12 +757,16 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        src = func.args[0]
+        src_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # Get total elements count
-        total_elements = builder.call(cg.array_total_size, [src])
+        # array_total_size takes i64 handle now
+        total_elements = builder.call(cg.array_total_size, [src_handle])
+
+        # Deref handle to get Array* for field access
+        src_raw = builder.call(cg.gc.gc_handle_deref, [src_handle])
+        src = builder.bitcast(src_raw, cg.array_struct.as_pointer())
 
         # Get elem_size
         elem_size = self._get_array_elem_size(builder, src)
@@ -702,41 +777,50 @@ class ArrayGenerator:
         # Allocate new data buffer
         type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY_DATA)
         new_data = cg.gc.alloc_arena_or_gc(builder, data_size, type_id)
-        # Save handle for re-derivation (arena objects have forward=0, no handle)
+        # Save handle for re-derivation
         new_data_handle = builder.call(cg.gc.gc_ptr_to_handle, [new_data])
 
-        # Copy data from source
-        src_data = self._get_array_data_ptr(builder, src)
+        # Re-derive src after allocation (may have moved)
+        src_raw2 = builder.call(cg.gc.gc_handle_deref, [src_handle])
+        src2 = builder.bitcast(src_raw2, cg.array_struct.as_pointer())
+
+        # Copy data from source (re-derive new_data too since we'll allocate again)
+        src_data = self._get_array_data_ptr(builder, src2)
+        # new_data is still valid here (no allocation between new_data alloc and now, just deref)
         builder.call(cg.memcpy, [new_data, src_data, data_size])
 
-        # Allocate new Array descriptor (104 bytes)
+        # Allocate new Array descriptor (104 bytes) - this allocation invalidates new_data raw ptr
         struct_size = ir.Constant(i64, ARRAY_STRUCT_SIZE)
         array_type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, array_type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
+        # Re-derive src again after second allocation
+        src_raw3 = builder.call(cg.gc.gc_handle_deref, [src_handle])
+        src3 = builder.bitcast(src_raw3, cg.array_struct.as_pointer())
+
         # Copy all fields from source, but with new data buffer and offset=0
 
-        # Field 0: handle = new_data GC handle (re-derived via handle, stable across compaction)
+        # Field 0: handle = new_data GC handle (stable across compaction)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
         builder.store(new_data_handle, handle_ptr)
 
         # Field 1: ndim (copy from source)
-        src_ndim_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
+        src_ndim_ptr = builder.gep(src3, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
         ndim = builder.load(src_ndim_ptr)
         dst_ndim_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
         builder.store(ndim, dst_ndim_ptr)
 
         # Field 2: shape (copy from source)
         for i in range(4):
-            src_shape_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_SHAPE), ir.Constant(i32, i)], inbounds=True)
+            src_shape_ptr = builder.gep(src3, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_SHAPE), ir.Constant(i32, i)], inbounds=True)
             shape_val = builder.load(src_shape_ptr)
             dst_shape_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_SHAPE), ir.Constant(i32, i)], inbounds=True)
             builder.store(shape_val, dst_shape_ptr)
 
         # Field 3: strides (copy from source)
         for i in range(4):
-            src_stride_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_STRIDES), ir.Constant(i32, i)], inbounds=True)
+            src_stride_ptr = builder.gep(src3, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_STRIDES), ir.Constant(i32, i)], inbounds=True)
             stride_val = builder.load(src_stride_ptr)
             dst_stride_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_STRIDES), ir.Constant(i32, i)], inbounds=True)
             builder.store(stride_val, dst_stride_ptr)
@@ -750,12 +834,15 @@ class ArrayGenerator:
         builder.store(elem_size, dst_elem_size_ptr)
 
         # Field 6: type_id (copy from source)
-        src_type_id_ptr = builder.gep(src, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
+        src_type_id_ptr = builder.gep(src3, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
         type_id_val = builder.load(src_type_id_ptr)
         dst_type_id_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
         builder.store(type_id_val, dst_type_id_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_getrange(self):
         """Create a slice VIEW of a 1D array (zero-copy).
@@ -773,22 +860,30 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        arr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         start = func.args[1]
         end = func.args[2]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         zero = ir.Constant(i64, 0)
 
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        arr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
+
         # Load source fields
         src_handle_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        src_handle = builder.load(src_handle_ptr)
+        src_data_handle = builder.load(src_handle_ptr)
 
         src_offset_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_OFFSET)], inbounds=True)
         src_offset = builder.load(src_offset_ptr)
 
         src_len = self._get_array_len(builder, arr)
         elem_size = self._get_array_elem_size(builder, arr)
+
+        # Also read type_id before allocation (source may move)
+        src_type_id_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
+        type_id_val = builder.load(src_type_id_ptr)
 
         # Clamp start to [0, len]
         start_neg = builder.icmp_signed("<", start, zero)
@@ -809,13 +904,13 @@ class ArrayGenerator:
 
         # Allocate new Array descriptor (104 bytes) - NO data copy!
         struct_size = ir.Constant(i64, ARRAY_STRUCT_SIZE)
-        type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
-        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, type_id)
+        alloc_type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
+        raw_ptr = cg.gc.alloc_arena_or_gc(builder, struct_size, alloc_type_id)
         array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
 
-        # Field 0: handle (shared with source)
+        # Field 0: handle (shared with source - this is the data buffer handle)
         new_handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        builder.store(src_handle, new_handle_ptr)
+        builder.store(src_data_handle, new_handle_ptr)
 
         # Field 1: ndim = 1
         ndim_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
@@ -849,13 +944,14 @@ class ArrayGenerator:
         elem_size_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_ELEM_SIZE)], inbounds=True)
         builder.store(elem_size, elem_size_ptr)
 
-        # Field 6: type_id (copy from source)
-        src_type_id_ptr = builder.gep(arr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
-        type_id_val = builder.load(src_type_id_ptr)
+        # Field 6: type_id (loaded from source before allocation)
         dst_type_id_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
         builder.store(type_id_val, dst_type_id_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_ndim(self):
         """Implement array_ndim: return number of dimensions."""
@@ -867,8 +963,12 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
 
         ndim_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
         ndim = builder.load(ndim_ptr)
@@ -885,10 +985,14 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         dim = func.args[1]
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
 
         # Clamp dim to [0, 3]
         dim_clamped = builder.select(
@@ -933,7 +1037,8 @@ class ArrayGenerator:
         array_size_const = ir.Constant(i64, ARRAY_STRUCT_SIZE)
         type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY)
         raw_ptr = cg.gc.alloc_arena_or_gc(builder, array_size_const, type_id)
-        array_ptr = builder.bitcast(raw_ptr, cg.array_struct.as_pointer())
+        # Save handle for re-derivation after second allocation
+        array_handle = builder.call(cg.gc.gc_ptr_to_handle, [raw_ptr])
 
         # Allocate data buffer: rows * cols * elem_size
         total_elements = builder.mul(rows, cols)
@@ -941,10 +1046,14 @@ class ArrayGenerator:
         array_data_type_id = ir.Constant(i32, cg.gc.TYPE_ARRAY_DATA)
         data_ptr = cg.gc.alloc_arena_or_gc(builder, data_size, array_data_type_id)
 
-        # Field 0: handle (GC handle i64)
+        # Re-derive array_ptr via handle (may have moved during data buffer allocation)
+        array_raw2 = builder.call(cg.gc.gc_handle_deref, [array_handle])
+        array_ptr = builder.bitcast(array_raw2, cg.array_struct.as_pointer())
+
+        # Field 0: handle (GC handle i64 for data buffer)
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        handle = builder.call(cg.gc.gc_ptr_to_handle, [data_ptr])
-        builder.store(handle, handle_ptr)
+        data_handle = builder.call(cg.gc.gc_ptr_to_handle, [data_ptr])
+        builder.store(data_handle, handle_ptr)
 
         # Field 1: ndim = 2
         ndim_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)
@@ -985,7 +1094,10 @@ class ArrayGenerator:
         type_id_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_TYPE_ID)], inbounds=True)
         builder.store(zero, type_id_ptr)
 
-        builder.ret(array_ptr)
+        # Return i64 handle (not Array*)
+        array_i8 = builder.bitcast(array_ptr, ir.IntType(8).as_pointer())
+        ret_handle = builder.call(cg.gc.gc_ptr_to_handle, [array_i8])
+        builder.ret(ret_handle)
 
     def _implement_array_get_2d(self):
         """Implement array_get_2d: return pointer to element at (row, col) in 2D array."""
@@ -999,15 +1111,19 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         row = func.args[1]
         col = func.args[2]
         i32 = ir.IntType(32)
 
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
+
         # Get data base pointer via GC handle deref
         handle_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_HANDLE)], inbounds=True)
-        handle = builder.load(handle_ptr)
-        data_base = builder.call(cg.gc.gc_handle_deref, [handle])
+        data_buf_handle = builder.load(handle_ptr)
+        data_base = builder.call(cg.gc.gc_handle_deref, [data_buf_handle])
 
         # Get offset
         offset_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_OFFSET)], inbounds=True)
@@ -1038,9 +1154,13 @@ class ArrayGenerator:
         entry = func.append_basic_block("entry")
         builder = ir.IRBuilder(entry)
 
-        array_ptr = func.args[0]
+        arr_handle = func.args[0]  # i64 handle
         i32 = ir.IntType(32)
         i64 = ir.IntType(64)
+
+        # Deref handle to get Array*
+        arr_raw = builder.call(cg.gc.gc_handle_deref, [arr_handle])
+        array_ptr = builder.bitcast(arr_raw, cg.array_struct.as_pointer())
 
         # Get ndim
         ndim_ptr = builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, ARRAY_FIELD_NDIM)], inbounds=True)

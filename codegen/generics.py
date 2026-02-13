@@ -15,10 +15,11 @@ from typing import List as PyList
 from ast_nodes import (
     Type, TypeDecl, TypeParam, FunctionDecl, FunctionKind, Expr,
     PrimitiveType, NamedType, ListType, OptionalType, ResultType,
-    TupleType, FunctionType, MapType, SetType, ArrayType,
+    TupleType, FunctionType, MapType, SetType, ArrayType, ChannelType,
     IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, Identifier,
     ListExpr, MapExpr, SetExpr, JsonObjectExpr, CallExpr, MemberExpr, IndexExpr,
-    MethodCallExpr, BinaryExpr, BinaryOp, UnaryExpr, UnaryOp, TernaryExpr
+    MethodCallExpr, BinaryExpr, BinaryOp, UnaryExpr, UnaryOp, TernaryExpr,
+    SelfExpr, ListComprehension, SetComprehension, MapComprehension
 )
 
 if TYPE_CHECKING:
@@ -271,12 +272,23 @@ class GenericsHandler:
             return PrimitiveType("bool")
         elif isinstance(expr, StringLiteral):
             return PrimitiveType("string")
+        elif isinstance(expr, SelfExpr):
+            # Self in UDT method context — return the current type
+            if hasattr(cg, 'current_type') and cg.current_type:
+                return NamedType(cg.current_type)
+            return PrimitiveType("int")
         elif isinstance(expr, Identifier):
             # Look up variable type
             name = expr.name
             # First check var_coex_types which tracks Coex types directly
             if hasattr(cg, 'var_coex_types') and name in cg.var_coex_types:
                 return cg.var_coex_types[name]
+            # Check if this is a function name (for function-as-value references)
+            if name in cg.func_decls:
+                func_decl = cg.func_decls[name]
+                param_types = [p.type_annotation for p in func_decl.params] if func_decl.params else []
+                kind = getattr(func_decl, 'kind', FunctionKind.FUNC)
+                return FunctionType(kind, param_types, func_decl.return_type)
             # Fall back to LLVM type lookup
             if name in cg.locals:
                 llvm_type = cg._get_var_original_type(name)
@@ -299,6 +311,16 @@ class GenericsHandler:
                 elem_type = self.infer_type_from_expr(expr.elements[0])
                 return SetType(elem_type)
             return SetType(PrimitiveType("int"))
+        elif isinstance(expr, ListComprehension):
+            elem_type = self.infer_type_from_expr(expr.value)
+            return ListType(elem_type)
+        elif isinstance(expr, SetComprehension):
+            elem_type = self.infer_type_from_expr(expr.value)
+            return SetType(elem_type)
+        elif isinstance(expr, MapComprehension):
+            key_type = self.infer_type_from_expr(expr.key)
+            val_type = self.infer_type_from_expr(expr.value)
+            return MapType(key_type, val_type)
         elif isinstance(expr, CallExpr):
             # Check for method calls via MemberExpr callee (e.g., j.get(), json.parse())
             if isinstance(expr.callee, MemberExpr):
@@ -311,9 +333,9 @@ class GenericsHandler:
                         if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
                             # JSON method calls
                             method = expr.callee.member
-                            if method in ("get", "set", "remove"):
+                            if method in ("get", "set", "remove", "append"):
                                 return PrimitiveType("json")
-                            elif method == "stringify":
+                            elif method in ("stringify", "pretty"):
                                 return PrimitiveType("string")
                             elif method in ("as_int", "len"):
                                 return PrimitiveType("int")
@@ -324,9 +346,201 @@ class GenericsHandler:
                                 return PrimitiveType("bool")
                             elif method == "as_string":
                                 return PrimitiveType("string")
-                    # Check for json.parse()
+                            elif method == "keys":
+                                return ListType(PrimitiveType("string"))
+                            elif method == "values":
+                                return ListType(PrimitiveType("json"))
+                        # Result method return types
+                        if isinstance(obj_type, ResultType):
+                            method = expr.callee.member
+                            if method in ("unwrap", "unwrap_or"):
+                                return obj_type.ok_type
+                            elif method in ("is_ok", "is_err"):
+                                return PrimitiveType("bool")
+                        # Collection conversion method return types
+                        if isinstance(obj_type, (ListType, SetType)):
+                            method = expr.callee.member
+                            if method in ("toArray", "packed"):
+                                return ArrayType(obj_type.element_type)
+                        if isinstance(obj_type, (ArrayType, SetType)):
+                            method = expr.callee.member
+                            if method in ("toList", "unpacked"):
+                                return ListType(obj_type.element_type)
+                        if isinstance(obj_type, (ListType, ArrayType)):
+                            method = expr.callee.member
+                            if method == "toSet":
+                                return SetType(obj_type.element_type)
+                        # List methods
+                        if isinstance(obj_type, ListType):
+                            method = expr.callee.member
+                            if method in ("append", "set", "setrange", "getrange", "copy"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.element_type
+                            elif method in ("len", "size"):
+                                return PrimitiveType("int")
+                        # Array methods
+                        if isinstance(obj_type, ArrayType):
+                            method = expr.callee.member
+                            if method in ("append", "set", "deep_copy", "scale", "add", "sub", "mul", "div", "getrange"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.element_type
+                            elif method in ("len", "total_size"):
+                                return PrimitiveType("int")
+                            elif method in ("sum", "min", "max"):
+                                return obj_type.element_type
+                        # Map methods
+                        if isinstance(obj_type, MapType):
+                            method = expr.callee.member
+                            if method in ("set", "remove"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.value_type
+                            elif method == "has":
+                                return PrimitiveType("bool")
+                            elif method == "len":
+                                return PrimitiveType("int")
+                            elif method == "keys":
+                                return ListType(obj_type.key_type)
+                            elif method == "values":
+                                return ListType(obj_type.value_type)
+                        # Set methods
+                        if isinstance(obj_type, SetType):
+                            method = expr.callee.member
+                            if method in ("add", "remove"):
+                                return obj_type
+                            elif method == "has":
+                                return PrimitiveType("bool")
+                            elif method == "len":
+                                return PrimitiveType("int")
+                        # String methods
+                        if isinstance(obj_type, PrimitiveType) and obj_type.name == "string":
+                            method = expr.callee.member
+                            if method in ("upper", "lower", "trim", "replace", "getrange",
+                                          "repeat", "reverse", "substr", "concat", "split_at"):
+                                return PrimitiveType("string")
+                            elif method in ("len", "index_of", "find"):
+                                return PrimitiveType("int")
+                            elif method in ("bytes", "cstring"):
+                                return ListType(PrimitiveType("byte"))
+                            elif method in ("contains", "starts_with", "ends_with", "eq"):
+                                return PrimitiveType("bool")
+                            elif method == "split":
+                                return ListType(PrimitiveType("string"))
+                        # Channel methods
+                        if isinstance(obj_type, ChannelType):
+                            method = expr.callee.member
+                            if method == "receive":
+                                return obj_type.element_type
+                            elif method in ("send", "try_receive"):
+                                return PrimitiveType("int")
+                        # UDT methods
+                        if isinstance(obj_type, NamedType):
+                            type_name = obj_type.name
+                            if type_name in cg.type_methods and expr.callee.member in cg.type_methods[type_name]:
+                                mangled = cg.type_methods[type_name][expr.callee.member]
+                                if mangled in cg.func_decls:
+                                    ret_type = cg.func_decls[mangled].return_type
+                                    if ret_type:
+                                        return ret_type
+                    # Check for static type method calls (e.g., String.from(), Array.zeros())
+                    if obj_name == "String":
+                        # String.from(), String.from_bytes(), String.from_hex() all return string
+                        if expr.callee.member in ("from", "from_bytes", "from_hex"):
+                            return PrimitiveType("string")
                     elif obj_name == "json" and expr.callee.member == "parse":
                         return PrimitiveType("json")
+                    elif obj_name == "Array":
+                        if expr.callee.member in ("zeros", "fill", "filled", "identity", "zeros_2d"):
+                            return ArrayType(PrimitiveType("int"))
+                    elif obj_name == "Result":
+                        if expr.callee.member == "ok":
+                            return ResultType(PrimitiveType("int"), PrimitiveType("string"))
+                        elif expr.callee.member == "err":
+                            return ResultType(PrimitiveType("int"), PrimitiveType("string"))
+                    elif obj_name in cg.type_registry:
+                        # Check type_methods for registered types
+                        if obj_name in cg.type_methods and expr.callee.member in cg.type_methods[obj_name]:
+                            mangled = cg.type_methods[obj_name][expr.callee.member]
+                            if mangled in cg.func_decls:
+                                ret_type = cg.func_decls[mangled].return_type
+                                if ret_type:
+                                    return ret_type
+                else:
+                    # Non-Identifier object (e.g., chained calls: j.get("name").as_string())
+                    # Recursively infer the object's type and dispatch on method name
+                    obj_type = self.infer_type_from_expr(expr.callee.object)
+                    method = expr.callee.member
+                    if obj_type is not None:
+                        if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
+                            if method in ("get", "set", "remove", "append"):
+                                return PrimitiveType("json")
+                            elif method in ("stringify", "as_string", "pretty"):
+                                return PrimitiveType("string")
+                            elif method in ("as_int", "len"):
+                                return PrimitiveType("int")
+                            elif method == "as_float":
+                                return PrimitiveType("float")
+                            elif method in ("as_bool", "is_null", "is_bool", "is_int", "is_float",
+                                            "is_string", "is_array", "is_object", "has"):
+                                return PrimitiveType("bool")
+                            elif method == "keys":
+                                return ListType(PrimitiveType("string"))
+                            elif method == "values":
+                                return ListType(PrimitiveType("json"))
+                        elif isinstance(obj_type, PrimitiveType) and obj_type.name == "string":
+                            if method in ("upper", "lower", "trim", "replace", "getrange",
+                                          "repeat", "reverse", "substr", "concat", "split_at"):
+                                return PrimitiveType("string")
+                            elif method in ("len", "index_of", "find"):
+                                return PrimitiveType("int")
+                            elif method in ("bytes", "cstring"):
+                                return ListType(PrimitiveType("byte"))
+                            elif method in ("contains", "starts_with", "ends_with", "eq"):
+                                return PrimitiveType("bool")
+                            elif method == "split":
+                                return ListType(PrimitiveType("string"))
+                        elif isinstance(obj_type, ListType):
+                            if method in ("append", "set", "setrange", "getrange", "copy"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.element_type
+                            elif method in ("len", "size"):
+                                return PrimitiveType("int")
+                        elif isinstance(obj_type, ArrayType):
+                            if method in ("append", "set", "deep_copy", "scale", "add", "sub", "mul", "div", "getrange"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.element_type
+                            elif method in ("len", "total_size"):
+                                return PrimitiveType("int")
+                        elif isinstance(obj_type, MapType):
+                            if method in ("set", "remove"):
+                                return obj_type
+                            elif method == "get":
+                                return obj_type.value_type
+                            elif method == "has":
+                                return PrimitiveType("bool")
+                            elif method == "len":
+                                return PrimitiveType("int")
+                        elif isinstance(obj_type, SetType):
+                            if method in ("add", "remove"):
+                                return obj_type
+                            elif method == "has":
+                                return PrimitiveType("bool")
+                            elif method == "len":
+                                return PrimitiveType("int")
+                        elif isinstance(obj_type, ResultType):
+                            if method in ("unwrap", "unwrap_or"):
+                                return obj_type.ok_type
+                            elif method in ("is_ok", "is_err"):
+                                return PrimitiveType("bool")
+                        elif isinstance(obj_type, ChannelType):
+                            if method == "receive":
+                                return obj_type.element_type
+                            elif method in ("send", "try_receive"):
+                                return PrimitiveType("int")
             # Check if this is a type constructor call (e.g., Point(10, 20))
             func_name = expr.callee.name if isinstance(expr.callee, Identifier) else None
             if func_name and func_name in cg.type_fields:
@@ -399,7 +613,7 @@ class GenericsHandler:
             obj_type = self.infer_type_from_expr(expr.object)
             if isinstance(obj_type, PrimitiveType) and obj_type.name == "json":
                 # JSON methods that return JSON
-                if expr.method in ("get", "set", "remove"):
+                if expr.method in ("get", "set", "remove", "append"):
                     return PrimitiveType("json")
                 # JSON methods that return primitives
                 elif expr.method == "stringify":
@@ -417,21 +631,84 @@ class GenericsHandler:
                     return ListType(PrimitiveType("string"))
                 elif expr.method == "values":
                     return ListType(PrimitiveType("json"))
-            # List/Array methods
+            # List methods
             if isinstance(obj_type, ListType):
-                if expr.method == "append":
+                if expr.method in ("append", "set", "setrange", "getrange", "copy"):
                     return obj_type  # Returns same list type
                 elif expr.method == "get":
                     return obj_type.element_type
-                elif expr.method == "len":
+                elif expr.method in ("len", "size"):
                     return PrimitiveType("int")
+            # Array methods
             if isinstance(obj_type, ArrayType):
-                if expr.method == "append":
+                if expr.method in ("append", "set", "deep_copy", "scale", "add", "sub", "mul", "div", "getrange"):
                     return obj_type
                 elif expr.method == "get":
                     return obj_type.element_type
+                elif expr.method in ("len", "total_size"):
+                    return PrimitiveType("int")
+                elif expr.method in ("sum", "min", "max"):
+                    return obj_type.element_type
+            # Map methods
+            if isinstance(obj_type, MapType):
+                if expr.method in ("set", "remove"):
+                    return obj_type
+                elif expr.method == "get":
+                    return obj_type.value_type
+                elif expr.method == "has":
+                    return PrimitiveType("bool")
                 elif expr.method == "len":
                     return PrimitiveType("int")
+                elif expr.method == "keys":
+                    return ListType(obj_type.key_type)
+                elif expr.method == "values":
+                    return ListType(obj_type.value_type)
+            # Set methods
+            if isinstance(obj_type, SetType):
+                if expr.method in ("add", "remove"):
+                    return obj_type
+                elif expr.method == "has":
+                    return PrimitiveType("bool")
+                elif expr.method == "len":
+                    return PrimitiveType("int")
+            # String methods
+            if isinstance(obj_type, PrimitiveType) and obj_type.name == "string":
+                if expr.method in ("upper", "lower", "trim", "replace", "getrange",
+                                    "repeat", "reverse", "substr", "concat", "split_at"):
+                    return PrimitiveType("string")
+                elif expr.method in ("len", "index_of", "find"):
+                    return PrimitiveType("int")
+                elif expr.method in ("bytes", "cstring"):
+                    return ListType(PrimitiveType("byte"))
+                elif expr.method in ("contains", "starts_with", "ends_with", "eq"):
+                    return PrimitiveType("bool")
+                elif expr.method == "split":
+                    return ListType(PrimitiveType("string"))
+            # Result methods
+            if isinstance(obj_type, ResultType):
+                if expr.method == "unwrap":
+                    return obj_type.ok_type
+                elif expr.method == "unwrap_or":
+                    return obj_type.ok_type
+                elif expr.method in ("is_ok", "is_err"):
+                    return PrimitiveType("bool")
+                elif expr.method == "unwrap_err":
+                    return obj_type.err_type
+            # Channel methods
+            if isinstance(obj_type, ChannelType):
+                if expr.method == "receive":
+                    return obj_type.element_type
+                elif expr.method in ("send", "try_receive"):
+                    return PrimitiveType("int")
+            # Check if this is a UDT method call
+            if isinstance(obj_type, NamedType):
+                type_name = obj_type.name
+                if type_name in cg.type_methods and expr.method in cg.type_methods[type_name]:
+                    mangled = cg.type_methods[type_name][expr.method]
+                    if mangled in cg.func_decls:
+                        ret_type = cg.func_decls[mangled].return_type
+                        if ret_type:
+                            return ret_type
 
         # Default
         return PrimitiveType("int")

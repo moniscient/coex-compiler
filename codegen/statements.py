@@ -18,10 +18,10 @@ from ast_nodes import (
     Stmt, VarDecl, Assignment, SliceAssignment, ReturnStmt, PrintStmt, DebugStmt,
     IfStmt, WhileStmt, CycleStmt, ForStmt, ForAssignStmt, BreakStmt, ContinueStmt,
     FirstAssignStmt, MostAssignStmt,
-    MatchStmt, ExprStmt, LlvmIrStmt, TupleDestructureStmt, TupleExpr,
-    Identifier, MemberExpr, IndexExpr, CallExpr, MethodCallExpr,
+    MatchStmt, SelectStmt, ExprStmt, LlvmIrStmt, TupleDestructureStmt, TupleExpr,
+    Identifier, MemberExpr, IndexExpr, SliceExpr, CallExpr, MethodCallExpr,
     MapExpr, ListExpr, SetExpr, StringLiteral, NilLiteral, JsonObjectExpr,
-    AssignOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
+    AssignOp, BinaryExpr, BinaryOp, FunctionKind, ListType, SetType, MapType, ArrayType, TupleType,
     OptionalType, PrimitiveType, NamedType, AtomicType, KindFunctionDecl, FunctionDecl,
     FunctionType, ChannelType
 )
@@ -62,18 +62,6 @@ class StatementGenerator:
         elif isinstance(source_type, FunctionType):
             needs_warning = True
             type_name = "function"
-        # Check LLVM IR type for function pointers and sets
-        elif isinstance(init_value, ir.Function):
-            needs_warning = True
-            type_name = "function"
-        elif isinstance(init_value.type, ir.PointerType):
-            if isinstance(init_value.type.pointee, ir.FunctionType):
-                needs_warning = True
-                type_name = "function"
-            elif hasattr(init_value.type.pointee, 'name'):
-                if init_value.type.pointee.name == "struct.Set":
-                    needs_warning = True
-                    type_name = "Set"
 
         if needs_warning:
             cg._emit_warning(
@@ -221,17 +209,36 @@ class StatementGenerator:
         """Generate the actual in-place function call."""
         cg = self.cg
 
-        # Load the wrapper pointer - handle-storing allocas need deref
-        if var_name in getattr(cg, 'var_ptr_types', {}) and cg.gc is not None:
-            handle = cg._load_var_handle(var_name)
-            raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
-            wrapper_ptr = cg.builder.bitcast(raw_ptr, cg.var_ptr_types[var_name])
+        # Load handle and check if inplace function expects struct pointer or i64 handle
+        expected_first_arg_type = inplace_func.args[0].type
+        expects_handle = isinstance(expected_first_arg_type, ir.IntType) and expected_first_arg_type.width == 64
+
+        if expects_handle:
+            # Function takes i64 handle directly (e.g., array_set_inplace)
+            if var_name in getattr(cg, 'var_ptr_types', {}) and cg.gc is not None:
+                wrapper_val = cg._load_var_handle(var_name)
+            else:
+                alloca = cg.locals[var_name]
+                wrapper_val = cg.builder.load(alloca)
         else:
-            alloca = cg.locals[var_name]
-            wrapper_ptr = cg.builder.load(alloca)
+            # Function takes struct pointer — deref handle first
+            if var_name in getattr(cg, 'var_ptr_types', {}) and cg.gc is not None:
+                handle = cg._load_var_handle(var_name)
+                raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [handle])
+                wrapper_val = cg.builder.bitcast(raw_ptr, cg.var_ptr_types[var_name])
+            else:
+                alloca = cg.locals[var_name]
+                wrapper_val = cg.builder.load(alloca)
+                # With handles-everywhere, alloca stores i64 handle — deref for struct ptr ops
+                if isinstance(wrapper_val.type, ir.IntType) and wrapper_val.type.width == 64:
+                    if coex_type is not None and cg._is_reference_type(coex_type):
+                        struct_ptr_type = cg._get_struct_ptr_type(coex_type)
+                        if struct_ptr_type is not None:
+                            raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [wrapper_val])
+                            wrapper_val = cg.builder.bitcast(raw_ptr, struct_ptr_type)
 
         # Generate arguments - Array.set needs special handling
-        llvm_args = [wrapper_ptr]
+        llvm_args = [wrapper_val]
 
         if isinstance(coex_type, ArrayType) and method_name == "set":
             # Array.set(index, value) -> array_set_inplace(arr, index, value_ptr, elem_size)
@@ -260,7 +267,7 @@ class StatementGenerator:
             if index.type != ir.IntType(64):
                 index = cg.builder.sext(index, ir.IntType(64))
 
-            llvm_args = [wrapper_ptr, index, temp_ptr, elem_size]
+            llvm_args = [wrapper_val, index, temp_ptr, elem_size]
         else:
             # Standard argument generation for Set/Map
             for arg in args:
@@ -317,6 +324,8 @@ class StatementGenerator:
             cg._generate_continue()
         elif isinstance(stmt, MatchStmt):
             cg._generate_match(stmt)
+        elif isinstance(stmt, SelectStmt):
+            cg._generate_select(stmt)
         elif isinstance(stmt, LlvmIrStmt):
             cg._generate_llvm_ir_block(stmt)
         elif isinstance(stmt, ExprStmt):
@@ -524,15 +533,24 @@ class StatementGenerator:
                 else:
                     alloca = cg.builder.alloca(llvm_type, name=stmt.name)
 
-            # Record original pointer type for handle-storing allocas
-            if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
-                cg.var_ptr_types[stmt.name] = llvm_type
-
             # Value semantics: deep copy collections
             inferred_coex_type = self._infer_coex_type_from_initializer(stmt)
 
+            # Record pointer type for handle-storing allocas based on Coex type
+            if use_handle_alloca:
+                # Determine the struct pointer type from Coex type
+                resolved_coex_type = inferred_coex_type
+                if resolved_coex_type is None and hasattr(stmt, 'type_annotation') and stmt.type_annotation:
+                    resolved_coex_type = stmt.type_annotation
+                if resolved_coex_type is not None and cg._is_reference_type(resolved_coex_type):
+                    struct_ptr_type = cg._get_struct_ptr_type(resolved_coex_type)
+                    if struct_ptr_type is not None:
+                        cg.var_ptr_types[stmt.name] = struct_ptr_type
+                elif isinstance(llvm_type, ir.PointerType):
+                    # Legacy fallback for any remaining pointer types
+                    cg.var_ptr_types[stmt.name] = llvm_type
+
             # Handle i64 values that are actually handles to heap types
-            # This happens with Channel.receive() which returns handles (i64).
             if isinstance(init_value.type, ir.IntType) and init_value.type.width == 64:
                 target_struct = self._resolve_heap_target_struct(inferred_coex_type, stmt)
 
@@ -542,13 +560,6 @@ class StatementGenerator:
                         # Record the pointer type for later deref
                         cg.var_ptr_types[stmt.name] = target_struct.as_pointer()
                         # init_value stays as i64 handle
-                    else:
-                        # Convert handle (i64) to typed pointer via gc_handle_deref
-                        raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [init_value])
-                        init_value = cg.builder.bitcast(raw_ptr, target_struct.as_pointer())
-                        # Re-allocate local with correct pointer type
-                        alloca = cg.builder.alloca(init_value.type, name=stmt.name)
-                        cg.locals[stmt.name] = alloca
 
             # Track aliasing for in-place optimization safety:
             # When copying a collection from another variable (e.g., s2 = s1),
@@ -556,6 +567,10 @@ class StatementGenerator:
             source_var_name = None
             if isinstance(stmt.initializer, Identifier) and not stmt.is_copy:
                 source_var_name = stmt.initializer.name
+
+            # Always track inferred type for this variable
+            if inferred_coex_type:
+                cg.var_coex_types[stmt.name] = inferred_coex_type
 
             if inferred_coex_type and cg._is_collection_coex_type(inferred_coex_type):
                 if stmt.is_copy:
@@ -572,47 +587,42 @@ class StatementGenerator:
                     if source_var_name and not is_unique_target and not is_unique_source:
                         cg.aliased_vars.add(source_var_name)
                         cg.aliased_vars.add(stmt.name)  # Target is also aliased
-                cg.var_coex_types[stmt.name] = inferred_coex_type
-            elif isinstance(init_value.type, ir.PointerType):
-                # Fallback for struct types without Coex type info
-                # := (is_copy=True) creates deep copy, = (is_copy=False) shares pointer
-                pointee = init_value.type.pointee
+            else:
+                # Fallback for reference types without Coex collection type info
+                # Use expression type resolution to determine copy semantics
+                init_type_name = cg._resolve_expr_type_name(stmt.initializer)
                 # Check for unique bindings - they are never aliased
                 is_unique_target = stmt.name in cg.unique_bindings
                 is_unique_source = source_var_name and source_var_name in cg.unique_bindings
                 should_mark_aliased = source_var_name and not is_unique_target and not is_unique_source
-                if hasattr(pointee, 'name'):
-                    if pointee.name == "struct.List":
-                        if stmt.is_copy:
-                            init_value = cg.builder.call(cg.list_copy, [init_value])  # shallow for now
-                        elif should_mark_aliased:
-                            # = operator: share pointer, mark aliased (unless unique)
-                            cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)
-                    elif pointee.name == "struct.Set":
-                        if stmt.is_copy:
-                            init_value = cg.builder.call(cg.set_copy, [init_value])
-                        elif should_mark_aliased:
-                            cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)
-                    elif pointee.name == "struct.Map":
-                        if stmt.is_copy:
-                            init_value = cg.builder.call(cg.map_copy, [init_value])
-                        elif should_mark_aliased:
-                            cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)
-                    elif pointee.name == "struct.String":
-                        if stmt.is_copy:
-                            init_value = cg.builder.call(cg.string_deep_copy, [init_value])
-                        # Note: Strings are immutable, so aliasing doesn't affect in-place ops
-                    elif pointee.name == "struct.Array":
-                        if stmt.is_copy:
-                            # := operator: create truly independent deep copy
-                            init_value = cg.builder.call(cg.array_deep_copy, [init_value])
-                        elif should_mark_aliased:
-                            # = operator: share pointer (aliased unless unique)
-                            cg.aliased_vars.add(source_var_name)
-                            cg.aliased_vars.add(stmt.name)
+                if init_type_name == "List":
+                    if stmt.is_copy:
+                        init_value = cg.builder.call(cg.list_copy, [init_value])
+                    elif should_mark_aliased:
+                        cg.aliased_vars.add(source_var_name)
+                        cg.aliased_vars.add(stmt.name)
+                elif init_type_name == "Set":
+                    if stmt.is_copy:
+                        init_value = cg.builder.call(cg.set_copy, [init_value])
+                    elif should_mark_aliased:
+                        cg.aliased_vars.add(source_var_name)
+                        cg.aliased_vars.add(stmt.name)
+                elif init_type_name == "Map":
+                    if stmt.is_copy:
+                        init_value = cg.builder.call(cg.map_copy, [init_value])
+                    elif should_mark_aliased:
+                        cg.aliased_vars.add(source_var_name)
+                        cg.aliased_vars.add(stmt.name)
+                elif init_type_name == "String":
+                    if stmt.is_copy:
+                        init_value = cg.builder.call(cg.string_deep_copy, [init_value])
+                    # Note: Strings are immutable, so aliasing doesn't affect in-place ops
+                elif init_type_name == "Array":
+                    if stmt.is_copy:
+                        init_value = cg.builder.call(cg.array_deep_copy, [init_value])
+                    elif should_mark_aliased:
+                        cg.aliased_vars.add(source_var_name)
+                        cg.aliased_vars.add(stmt.name)
 
             # Store value and update shadow stack
             cg._store_var_handle(stmt.name, init_value, alloca)
@@ -670,7 +680,12 @@ class StatementGenerator:
                 alloca = cg.builder.alloca(llvm_type, name=stmt.name)
 
         # Record original pointer type for handle-storing allocas
-        if use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+        if use_handle_alloca and stmt.type_annotation is not None and cg._is_reference_type(stmt.type_annotation):
+            struct_ptr_type = cg._get_struct_ptr_type(stmt.type_annotation)
+            if struct_ptr_type is not None:
+                cg.var_ptr_types[stmt.name] = struct_ptr_type
+        elif use_handle_alloca and isinstance(llvm_type, ir.PointerType):
+            # Legacy fallback for any remaining pointer types
             cg.var_ptr_types[stmt.name] = llvm_type
 
         # Generate initializer with special cases
@@ -745,11 +760,12 @@ class StatementGenerator:
 
         # Try implicit collection conversion
         if isinstance(stmt.type_annotation, (ListType, ArrayType, SetType)):
+            source_coex_type = cg._infer_type_from_expr(stmt.initializer)
             converted_value, was_converted = cg._try_implicit_collection_conversion(
-                init_value, stmt.type_annotation
+                init_value, stmt.type_annotation, value_type=source_coex_type
             )
             if was_converted:
-                source_struct = init_value.type.pointee.name if isinstance(init_value.type, ir.PointerType) else "unknown"
+                source_struct = "struct." + (cg._resolve_expr_type_name(stmt.initializer) or "unknown")
                 warning_msg = cg._get_conversion_warning_message(source_struct,
                     "struct.List" if isinstance(stmt.type_annotation, ListType) else
                     "struct.Array" if isinstance(stmt.type_annotation, ArrayType) else "struct.Set")
@@ -811,19 +827,18 @@ class StatementGenerator:
                 if typed_should_mark_aliased:
                     cg.aliased_vars.add(typed_source_var_name)
                     cg.aliased_vars.add(stmt.name)  # Target is also aliased
-        elif isinstance(init_value.type, ir.PointerType):
-            if isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in cg.type_fields:
-                if stmt.is_copy:
-                    # := operator: create truly independent deep copy
-                    init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
-                    # No aliasing since we have independent copy
-                else:
-                    # = operator: share pointer
-                    init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
-                    # User-defined types with fields: mark both as aliased (unless unique)
-                    if typed_should_mark_aliased:
-                        cg.aliased_vars.add(typed_source_var_name)
-                        cg.aliased_vars.add(stmt.name)  # Target is also aliased
+        elif isinstance(stmt.type_annotation, NamedType) and stmt.type_annotation.name in cg.type_fields:
+            if stmt.is_copy:
+                # := operator: create truly independent deep copy
+                init_value = cg._generate_deep_copy(init_value, stmt.type_annotation)
+                # No aliasing since we have independent copy
+            else:
+                # = operator: share pointer
+                init_value = cg._generate_move_or_eager_copy(init_value, stmt.type_annotation)
+                # User-defined types with fields: mark both as aliased (unless unique)
+                if typed_should_mark_aliased:
+                    cg.aliased_vars.add(typed_source_var_name)
+                    cg.aliased_vars.add(stmt.name)  # Target is also aliased
 
         # Store value and update shadow stack
         cg._store_var_handle(stmt.name, init_value, alloca)
@@ -836,6 +851,37 @@ class StatementGenerator:
 
         if move_source_name:
             cg.moved_vars.add(move_source_name)
+
+    def _infer_member_type(self, member_expr: MemberExpr):
+        """Infer the Coex type of a MemberExpr (e.g., root.children -> [Tree]).
+
+        Walks the member chain to resolve the type of the field being accessed.
+        """
+        cg = self.cg
+        if isinstance(member_expr.object, Identifier):
+            obj_name = member_expr.object.name
+            if obj_name in cg.var_coex_types:
+                obj_type = cg.var_coex_types[obj_name]
+                # Look up the field type in the UDT's type_fields
+                type_name = None
+                if isinstance(obj_type, NamedType):
+                    type_name = obj_type.name
+                elif hasattr(obj_type, 'name'):
+                    type_name = obj_type.name
+                if type_name and type_name in cg.type_fields:
+                    for field_name, field_type in cg.type_fields[type_name]:
+                        if field_name == member_expr.member:
+                            return field_type
+        elif isinstance(member_expr.object, MemberExpr):
+            # Recursive case: obj.field1.field2
+            parent_type = self._infer_member_type(member_expr.object)
+            if parent_type and isinstance(parent_type, NamedType):
+                type_name = parent_type.name
+                if type_name in cg.type_fields:
+                    for field_name, field_type in cg.type_fields[type_name]:
+                        if field_name == member_expr.member:
+                            return field_type
+        return None
 
     def _resolve_heap_target_struct(self, inferred_coex_type, stmt):
         """Resolve LLVM struct type for a heap object handle.
@@ -863,6 +909,10 @@ class StatementGenerator:
             return cg.array_struct
         elif isinstance(coex_type, PrimitiveType) and coex_type.name == "string":
             return cg.string_struct
+        elif isinstance(coex_type, NamedType):
+            type_name = coex_type.name
+            if type_name in cg.type_registry:
+                return cg.type_registry[type_name]
         return None
 
     def _infer_coex_type_from_initializer(self, stmt: VarDecl):
@@ -875,14 +925,28 @@ class StatementGenerator:
             if var_name in cg.var_coex_types:
                 inferred_coex_type = cg.var_coex_types[var_name]
         elif isinstance(stmt.initializer, IndexExpr):
-            # Handle list indexing: v = vals[0] where vals: [json] -> v: json
+            # Handle collection indexing/slicing
             index_obj = stmt.initializer.object
+            # Check if the index is a range (slice) — arr[1:4] returns same collection type
+            first_index = stmt.initializer.indices[0] if stmt.initializer.indices else None
+            is_range_index = (isinstance(first_index, BinaryExpr) and
+                              first_index.op == BinaryOp.RANGE)
             if isinstance(index_obj, Identifier):
                 obj_name = index_obj.name
                 if obj_name in cg.var_coex_types:
                     obj_type = cg.var_coex_types[obj_name]
-                    if isinstance(obj_type, ListType):
+                    if is_range_index:
+                        # Slicing returns the same collection type
+                        inferred_coex_type = obj_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif isinstance(obj_type, ListType):
                         inferred_coex_type = obj_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif isinstance(obj_type, ArrayType):
+                        inferred_coex_type = obj_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif isinstance(obj_type, MapType):
+                        inferred_coex_type = obj_type.value_type
                         cg.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(index_obj, MemberExpr):
                 # Handle field access like call.param_values[0]
@@ -897,6 +961,14 @@ class StatementGenerator:
                                         inferred_coex_type = field_type.element_type
                                         cg.var_coex_types[stmt.name] = inferred_coex_type
                                     break
+        elif isinstance(stmt.initializer, SliceExpr):
+            # Slicing returns the same collection type: arr[1:4] -> Array, list[0:2] -> List
+            slice_obj = stmt.initializer.object
+            if isinstance(slice_obj, Identifier):
+                obj_name = slice_obj.name
+                if obj_name in cg.var_coex_types:
+                    inferred_coex_type = cg.var_coex_types[obj_name]
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
         elif isinstance(stmt.initializer, MemberExpr):
             # Handle field access: vals = call.param_values where call: KindCall
             member_obj = stmt.initializer.object
@@ -916,24 +988,53 @@ class StatementGenerator:
         elif isinstance(stmt.initializer, StringLiteral):
             cg.var_coex_types[stmt.name] = PrimitiveType("string")
         elif isinstance(stmt.initializer, MethodCallExpr):
+            receiver_type = None
             if isinstance(stmt.initializer.object, Identifier):
                 receiver_name = stmt.initializer.object.name
                 if receiver_name in cg.var_coex_types:
                     receiver_type = cg.var_coex_types[receiver_name]
-                    if stmt.initializer.method in ("set", "append", "remove", "pop", "insert"):
-                        inferred_coex_type = receiver_type
-                        cg.var_coex_types[stmt.name] = inferred_coex_type
-                    elif stmt.initializer.method == "get" and isinstance(receiver_type, (ListType, ArrayType)):
-                        # .get() on List/Array returns the element type
-                        inferred_coex_type = receiver_type.element_type
-                        cg.var_coex_types[stmt.name] = inferred_coex_type
-                    elif stmt.initializer.method == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
-                        inferred_coex_type = ListType(PrimitiveType("string"))
-                        cg.var_coex_types[stmt.name] = inferred_coex_type
-                    elif stmt.initializer.method == "receive" and isinstance(receiver_type, ChannelType):
-                        # Channel.receive() returns the channel's element type
-                        inferred_coex_type = receiver_type.element_type
-                        cg.var_coex_types[stmt.name] = inferred_coex_type
+            elif isinstance(stmt.initializer.object, MemberExpr):
+                # Handle chained member access: obj.field.method()
+                receiver_type = self._infer_member_type(stmt.initializer.object)
+            # Fallback: infer type from expression (handles literals, etc.)
+            if receiver_type is None:
+                receiver_type = cg._infer_type_from_expr(stmt.initializer.object)
+            if receiver_type is not None:
+                if stmt.initializer.method in ("set", "append", "remove", "pop", "insert"):
+                    inferred_coex_type = receiver_type
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method == "get" and isinstance(receiver_type, (ListType, ArrayType)):
+                    # .get() on List/Array returns the element type
+                    inferred_coex_type = receiver_type.element_type
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
+                    inferred_coex_type = ListType(PrimitiveType("string"))
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method == "receive" and isinstance(receiver_type, ChannelType):
+                    # Channel.receive() returns the channel's element type
+                    inferred_coex_type = receiver_type.element_type
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method == "try_receive" and isinstance(receiver_type, ChannelType):
+                    # Channel.try_receive() returns the channel's element type (or nil)
+                    inferred_coex_type = receiver_type.element_type
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method in ("toArray", "packed") and isinstance(receiver_type, (ListType, SetType)):
+                    elem = receiver_type.element_type
+                    inferred_coex_type = ArrayType(elem)
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method in ("toList", "unpacked") and isinstance(receiver_type, (ArrayType, SetType)):
+                    elem = receiver_type.element_type
+                    inferred_coex_type = ListType(elem)
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+                elif stmt.initializer.method == "toSet" and isinstance(receiver_type, (ListType, ArrayType)):
+                    elem = receiver_type.element_type
+                    inferred_coex_type = SetType(elem)
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+            # Fallback: use general type inference for unhandled methods (e.g., UDT methods)
+            if inferred_coex_type is None:
+                inferred_coex_type = cg._infer_type_from_expr(stmt.initializer)
+                if inferred_coex_type is not None:
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
         elif isinstance(stmt.initializer, CallExpr):
             if isinstance(stmt.initializer.callee, Identifier):
                 callee_name = stmt.initializer.callee.name
@@ -941,13 +1042,40 @@ class StatementGenerator:
                 if callee_name in cg.type_registry:
                     inferred_coex_type = NamedType(callee_name)
                     cg.var_coex_types[stmt.name] = inferred_coex_type
+                # BUG-130: Infer type from function return type declaration.
+                # Without this, variables assigned from function calls (e.g.
+                # octants = make_octants(b)) don't track their collection
+                # element types, causing .get() to miss handle deref.
+                elif callee_name in cg.func_decls:
+                    func_decl = cg.func_decls[callee_name]
+                    if func_decl.return_type is not None:
+                        inferred_coex_type = func_decl.return_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
             elif isinstance(stmt.initializer.callee, MemberExpr):
                 callee_member = stmt.initializer.callee
                 method_name = callee_member.member
+                # Try to resolve receiver type from direct var or member chain
                 receiver_type = cg._get_receiver_type(callee_member.object)
+                # For chained member access (obj.field.method()), also try
+                # resolving through UDT field types
+                if receiver_type is None and isinstance(callee_member.object, MemberExpr):
+                    receiver_type = self._infer_member_type(callee_member.object)
+                elif receiver_type is not None and isinstance(callee_member.object, MemberExpr):
+                    # get_receiver_type for MemberExpr returns the root variable type,
+                    # not the field type. Override with field type.
+                    field_type = self._infer_member_type(callee_member.object)
+                    if field_type is not None:
+                        receiver_type = field_type
+                # Fallback: infer type from expression (handles literals, etc.)
+                if receiver_type is None:
+                    receiver_type = cg._infer_type_from_expr(callee_member.object)
                 if receiver_type:
                     if method_name in ("set", "append", "remove", "pop", "insert"):
                         inferred_coex_type = receiver_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name == "get" and isinstance(receiver_type, (ListType, ArrayType)):
+                        # .get() on List/Array returns the element type
+                        inferred_coex_type = receiver_type.element_type
                         cg.var_coex_types[stmt.name] = inferred_coex_type
                     elif method_name == "split" and isinstance(receiver_type, PrimitiveType) and receiver_type.name == "string":
                         inferred_coex_type = ListType(PrimitiveType("string"))
@@ -956,6 +1084,37 @@ class StatementGenerator:
                         # Channel.receive() returns the channel's element type
                         inferred_coex_type = receiver_type.element_type
                         cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name == "try_receive" and isinstance(receiver_type, ChannelType):
+                        inferred_coex_type = receiver_type.element_type
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name in ("toArray", "packed") and isinstance(receiver_type, (ListType, SetType)):
+                        elem = receiver_type.element_type
+                        inferred_coex_type = ArrayType(elem)
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name in ("toList", "unpacked") and isinstance(receiver_type, (ArrayType, SetType)):
+                        elem = receiver_type.element_type
+                        inferred_coex_type = ListType(elem)
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+                    elif method_name == "toSet" and isinstance(receiver_type, (ListType, ArrayType)):
+                        elem = receiver_type.element_type
+                        inferred_coex_type = SetType(elem)
+                        cg.var_coex_types[stmt.name] = inferred_coex_type
+        elif isinstance(stmt.initializer, BinaryExpr):
+            # String concatenation: if either side is a string, result is string
+            if stmt.initializer.op == BinaryOp.ADD:
+                left_type = cg._infer_type_from_expr(stmt.initializer.left)
+                right_type = cg._infer_type_from_expr(stmt.initializer.right)
+                if ((isinstance(left_type, PrimitiveType) and left_type.name == "string") or
+                        (isinstance(right_type, PrimitiveType) and right_type.name == "string")):
+                    inferred_coex_type = PrimitiveType("string")
+                    cg.var_coex_types[stmt.name] = inferred_coex_type
+
+        # General fallback: try _infer_type_from_expr for any unhandled expression
+        if inferred_coex_type is None:
+            fallback = cg._infer_type_from_expr(stmt.initializer)
+            if fallback is not None:
+                inferred_coex_type = fallback
+                cg.var_coex_types[stmt.name] = inferred_coex_type
 
         return inferred_coex_type
 
@@ -1017,6 +1176,12 @@ class StatementGenerator:
         reassign_should_mark_aliased = reassign_source_var_name and not reassign_is_unique_target and not reassign_is_unique_source
 
         coex_type = cg.var_coex_types.get(stmt.name)
+        # If no type recorded yet, infer from initializer
+        if coex_type is None:
+            inferred = self._infer_coex_type_from_initializer(stmt)
+            if inferred:
+                coex_type = inferred
+                cg.var_coex_types[stmt.name] = coex_type
         if coex_type and cg._is_collection_coex_type(coex_type):
             if stmt.is_copy:
                 # := operator: create truly independent deep copy
@@ -1029,41 +1194,38 @@ class StatementGenerator:
                 if reassign_should_mark_aliased:
                     cg.aliased_vars.add(reassign_source_var_name)
                     cg.aliased_vars.add(stmt.name)  # Target is also aliased
-        elif isinstance(value.type, ir.PointerType):
-            # Fallback for struct types without Coex type info
-            # := (is_copy=True) creates deep copy, = (is_copy=False) shares pointer
-            pointee = value.type.pointee
-            if hasattr(pointee, 'name'):
-                if pointee.name == "struct.List":
-                    if stmt.is_copy:
-                        value = cg.builder.call(cg.list_copy, [value])  # shallow for now
-                    elif reassign_should_mark_aliased:
-                        # = operator: share pointer, mark aliased (unless unique)
-                        cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)
-                elif pointee.name == "struct.Set":
-                    if stmt.is_copy:
-                        value = cg.builder.call(cg.set_copy, [value])
-                    elif reassign_should_mark_aliased:
-                        cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)
-                elif pointee.name == "struct.Map":
-                    if stmt.is_copy:
-                        value = cg.builder.call(cg.map_copy, [value])
-                    elif reassign_should_mark_aliased:
-                        cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)
-                elif pointee.name == "struct.String":
-                    if stmt.is_copy:
-                        value = cg.builder.call(cg.string_deep_copy, [value])
-                    # = operator: share pointer (strings are immutable)
-                elif pointee.name == "struct.Array":
-                    if stmt.is_copy:
-                        value = cg.builder.call(cg.array_deep_copy, [value])
-                    elif reassign_should_mark_aliased:
-                        # = operator: share pointer, mark aliased (unless unique)
-                        cg.aliased_vars.add(reassign_source_var_name)
-                        cg.aliased_vars.add(stmt.name)
+        else:
+            # Fallback for reference types without Coex collection type info
+            # Use expression type resolution to determine copy semantics
+            value_type_name = cg._resolve_expr_type_name(stmt.initializer)
+            if value_type_name == "List":
+                if stmt.is_copy:
+                    value = cg.builder.call(cg.list_copy, [value])
+                elif reassign_should_mark_aliased:
+                    cg.aliased_vars.add(reassign_source_var_name)
+                    cg.aliased_vars.add(stmt.name)
+            elif value_type_name == "Set":
+                if stmt.is_copy:
+                    value = cg.builder.call(cg.set_copy, [value])
+                elif reassign_should_mark_aliased:
+                    cg.aliased_vars.add(reassign_source_var_name)
+                    cg.aliased_vars.add(stmt.name)
+            elif value_type_name == "Map":
+                if stmt.is_copy:
+                    value = cg.builder.call(cg.map_copy, [value])
+                elif reassign_should_mark_aliased:
+                    cg.aliased_vars.add(reassign_source_var_name)
+                    cg.aliased_vars.add(stmt.name)
+            elif value_type_name == "String":
+                if stmt.is_copy:
+                    value = cg.builder.call(cg.string_deep_copy, [value])
+                # = operator: share pointer (strings are immutable)
+            elif value_type_name == "Array":
+                if stmt.is_copy:
+                    value = cg.builder.call(cg.array_deep_copy, [value])
+                elif reassign_should_mark_aliased:
+                    cg.aliased_vars.add(reassign_source_var_name)
+                    cg.aliased_vars.add(stmt.name)
 
         # Store value and update shadow stack
         cg._store_var_handle(stmt.name, value, alloca)
@@ -1096,11 +1258,22 @@ class StatementGenerator:
                         if orig_type != elem_type:
                             elem_val = cg._cast_value(elem_val, orig_type)
                     else:
+                        # Determine if this tuple element is a reference type
+                        elem_coex_type = None
+                        tuple_coex_type = cg._infer_type_from_expr(stmt.value)
+                        if isinstance(tuple_coex_type, TupleType) and i < len(tuple_coex_type.elements):
+                            elem_coex_type = tuple_coex_type.elements[i]
+                        is_ref_elem = elem_coex_type is not None and cg._is_reference_type(elem_coex_type)
                         use_handle = (name in cg.gc_root_indices and cg.gc is not None
-                                      and isinstance(elem_type, ir.PointerType))
+                                      and (isinstance(elem_type, ir.PointerType) or is_ref_elem))
                         if use_handle:
                             alloca = cg.builder.alloca(ir.IntType(64), name=name)
-                            cg.var_ptr_types[name] = elem_type
+                            if isinstance(elem_type, ir.PointerType):
+                                cg.var_ptr_types[name] = elem_type
+                            elif is_ref_elem:
+                                struct_ptr_type = cg._get_struct_ptr_type(elem_coex_type)
+                                if struct_ptr_type is not None:
+                                    cg.var_ptr_types[name] = struct_ptr_type
                         else:
                             alloca = cg.builder.alloca(elem_type, name=name)
                         cg.locals[name] = alloca
@@ -1178,9 +1351,9 @@ class StatementGenerator:
                 alloca = cg.locals[name]
 
                 if stmt.op != AssignOp.ASSIGN and stmt.op != AssignOp.COPY_ASSIGN:
-                    # Compound assignment: load current value (deref handle if needed)
+                    # Compound assignment: load current value (handle for ref types)
                     if name in getattr(cg, 'var_ptr_types', {}):
-                        old_val = cg._load_var_ptr(name)
+                        old_val = cg._load_var_handle(name)
                     else:
                         old_val = cg.builder.load(alloca)
                     value = self._apply_compound_op(stmt.op, old_val, value)
@@ -1195,19 +1368,19 @@ class StatementGenerator:
                         value = cg._generate_move_or_eager_copy(value, coex_type)
                     else:
                         value = cg._generate_deep_copy(value, coex_type)
-                elif isinstance(value.type, ir.PointerType):
-                    pointee = value.type.pointee
-                    if hasattr(pointee, 'name'):
-                        if pointee.name == "struct.List" and stmt.op != AssignOp.COPY_ASSIGN:
-                            value = cg.builder.call(cg.list_copy, [value])
-                        elif pointee.name == "struct.Set" and stmt.op != AssignOp.COPY_ASSIGN:
-                            value = cg.builder.call(cg.set_copy, [value])
-                        elif pointee.name == "struct.Map" and stmt.op != AssignOp.COPY_ASSIGN:
-                            value = cg.builder.call(cg.map_copy, [value])
-                        elif pointee.name == "struct.String" and stmt.op != AssignOp.COPY_ASSIGN:
-                            value = cg.builder.call(cg.string_copy, [value])
-                        elif pointee.name == "struct.Array" and stmt.op != AssignOp.COPY_ASSIGN:
-                            value = cg.builder.call(cg.array_copy, [value])
+                else:
+                    # Fallback for reference types without Coex collection type info
+                    value_type_name = cg._resolve_expr_type_name(stmt.value)
+                    if value_type_name == "List" and stmt.op != AssignOp.COPY_ASSIGN:
+                        value = cg.builder.call(cg.list_copy, [value])
+                    elif value_type_name == "Set" and stmt.op != AssignOp.COPY_ASSIGN:
+                        value = cg.builder.call(cg.set_copy, [value])
+                    elif value_type_name == "Map" and stmt.op != AssignOp.COPY_ASSIGN:
+                        value = cg.builder.call(cg.map_copy, [value])
+                    elif value_type_name == "String" and stmt.op != AssignOp.COPY_ASSIGN:
+                        value = cg.builder.call(cg.string_copy, [value])
+                    elif value_type_name == "Array" and stmt.op != AssignOp.COPY_ASSIGN:
+                        value = cg.builder.call(cg.array_copy, [value])
 
                 # Store value and update shadow stack
                 cg._store_var_handle(name, value, alloca)
@@ -1272,70 +1445,67 @@ class StatementGenerator:
         index = cg._generate_expression(target.indices[0])
         value = cg._generate_expression(stmt.value)
 
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        obj_type_name = cg._resolve_expr_type_name(target.object)
 
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name'):
-                if pointee.name == "struct.List":
-                    # Call list_set which returns NEW list
-                    elem_type = value.type
-                    if isinstance(elem_type, ir.IntType):
-                        size = max(1, elem_type.width // 8)
-                    elif isinstance(elem_type, ir.DoubleType):
-                        size = 8
-                    elif isinstance(elem_type, ir.PointerType):
-                        size = 8
-                    else:
-                        size = 8
+        if obj_type_name == "List":
+            # Call list_set which returns NEW list
+            elem_type = value.type
+            if isinstance(elem_type, ir.IntType):
+                size = max(1, elem_type.width // 8)
+            elif isinstance(elem_type, ir.DoubleType):
+                size = 8
+            elif isinstance(elem_type, ir.PointerType):
+                size = 8
+            else:
+                size = 8
 
-                    elem_size = ir.Constant(ir.IntType(64), size)
+            elem_size = ir.Constant(ir.IntType(64), size)
 
-                    with cg.builder.goto_entry_block():
-                        temp = cg.builder.alloca(elem_type, name="idx_set_elem")
-                    cg.builder.store(value, temp)
-                    temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+            with cg.builder.goto_entry_block():
+                temp = cg.builder.alloca(elem_type, name="idx_set_elem")
+            cg.builder.store(value, temp)
+            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
-                    if index.type != ir.IntType(64):
-                        index = cg.builder.sext(index, ir.IntType(64))
+            if index.type != ir.IntType(64):
+                index = cg.builder.sext(index, ir.IntType(64))
 
-                    new_list = cg.builder.call(cg.list_set, [obj, index, temp_ptr, elem_size])
+            new_list = cg.builder.call(cg.list_set, [obj, index, temp_ptr, elem_size])
 
-                    # Update variable with new list
-                    if isinstance(target.object, Identifier):
-                        var_name = target.object.name
-                        if var_name in cg.locals:
-                            cg._store_var_handle(var_name, new_list, cg.locals[var_name])
-                    return
+            # Update variable with new list
+            if isinstance(target.object, Identifier):
+                var_name = target.object.name
+                if var_name in cg.locals:
+                    cg._store_var_handle(var_name, new_list, cg.locals[var_name])
+            return
 
-                if pointee.name == "struct.Array":
-                    elem_type = value.type
-                    if isinstance(elem_type, ir.IntType):
-                        size = max(1, elem_type.width // 8)
-                    elif isinstance(elem_type, ir.DoubleType):
-                        size = 8
-                    elif isinstance(elem_type, ir.PointerType):
-                        size = 8
-                    else:
-                        size = 8
+        if obj_type_name == "Array":
+            elem_type = value.type
+            if isinstance(elem_type, ir.IntType):
+                size = max(1, elem_type.width // 8)
+            elif isinstance(elem_type, ir.DoubleType):
+                size = 8
+            elif isinstance(elem_type, ir.PointerType):
+                size = 8
+            else:
+                size = 8
 
-                    elem_size = ir.Constant(ir.IntType(64), size)
+            elem_size = ir.Constant(ir.IntType(64), size)
 
-                    with cg.builder.goto_entry_block():
-                        temp = cg.builder.alloca(elem_type, name="array_set_elem")
-                    cg.builder.store(value, temp)
-                    temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
+            with cg.builder.goto_entry_block():
+                temp = cg.builder.alloca(elem_type, name="array_set_elem")
+            cg.builder.store(value, temp)
+            temp_ptr = cg.builder.bitcast(temp, ir.IntType(8).as_pointer())
 
-                    if index.type != ir.IntType(64):
-                        index = cg.builder.sext(index, ir.IntType(64))
+            if index.type != ir.IntType(64):
+                index = cg.builder.sext(index, ir.IntType(64))
 
-                    new_array = cg.builder.call(cg.array_set, [obj, index, temp_ptr, elem_size])
+            new_array = cg.builder.call(cg.array_set, [obj, index, temp_ptr, elem_size])
 
-                    if isinstance(target.object, Identifier):
-                        var_name = target.object.name
-                        if var_name in cg.locals:
-                            cg._store_var_handle(var_name, new_array, cg.locals[var_name])
-                    return
+            if isinstance(target.object, Identifier):
+                var_name = target.object.name
+                if var_name in cg.locals:
+                    cg._store_var_handle(var_name, new_array, cg.locals[var_name])
+            return
 
     def generate_slice_assignment(self, stmt: SliceAssignment):
         """Generate slice assignment: obj[start:end] = value"""
@@ -1344,7 +1514,7 @@ class StatementGenerator:
         value = cg._generate_expression(stmt.value)
         i64 = ir.IntType(64)
 
-        length = cg._expressions.get_collection_length(obj)
+        length = cg._expressions.get_collection_length(obj, stmt.target)
 
         if stmt.start is None:
             start = ir.Constant(i64, 0)
@@ -1360,7 +1530,7 @@ class StatementGenerator:
             end = cg._cast_value(end, i64)
             end = cg._expressions.normalize_slice_index(end, length)
 
-        type_name = cg._get_type_name_from_ptr(obj.type)
+        type_name = cg._resolve_expr_type_name(stmt.target)
         if type_name and type_name in cg.type_methods:
             method_map = cg.type_methods[type_name]
             if "setrange" in method_map:
@@ -1374,14 +1544,13 @@ class StatementGenerator:
                         cg._store_var_handle(var_name, new_obj, cg.locals[var_name])
                 return
 
-        if isinstance(obj.type, ir.PointerType):
-            pointee = obj.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.List":
-                new_list = cg.builder.call(cg.list_setrange, [obj, start, end, value])
-                if isinstance(stmt.target, Identifier):
-                    var_name = stmt.target.name
-                    if var_name in cg.locals:
-                        cg._store_var_handle(var_name, new_list, cg.locals[var_name])
+        obj_type_name = type_name or cg._resolve_expr_type_name(stmt.target)
+        if obj_type_name == "List":
+            new_list = cg.builder.call(cg.list_setrange, [obj, start, end, value])
+            if isinstance(stmt.target, Identifier):
+                var_name = stmt.target.name
+                if var_name in cg.locals:
+                    cg._store_var_handle(var_name, new_list, cg.locals[var_name])
 
     def generate_return(self, stmt: ReturnStmt):
         """Generate return statement"""
@@ -1392,15 +1561,12 @@ class StatementGenerator:
             func = cg.builder.function
             ret_type = func.function_type.return_type
 
-            # Handle i64 values that are actually handles to heap types
-            # This happens with Channel.receive() which returns handles (i64).
+            # With handles-everywhere, return values for reference types are i64 handles
+            # and ret_type is also i64, so no conversion needed.
+            # Legacy fallback: if ret_type is still a pointer (shouldn't happen), convert
             if (isinstance(ret_val.type, ir.IntType) and ret_val.type.width == 64 and
                 isinstance(ret_type, ir.PointerType)):
-                pointee = ret_type.pointee
-                if hasattr(pointee, 'name') and pointee.name in (
-                    "struct.List", "struct.Map", "struct.Set",
-                    "struct.Array", "struct.String", "struct.Json"):
-                    # Convert handle (i64) to typed pointer via gc_handle_deref
+                if cg.gc is not None:
                     raw_ptr = cg.builder.call(cg.gc.gc_handle_deref, [ret_val])
                     ret_val = cg.builder.bitcast(raw_ptr, ret_type)
 
@@ -1446,7 +1612,11 @@ class StatementGenerator:
 
         value = cg._generate_expression(stmt.value)
 
-        if isinstance(value.type, ir.IntType):
+        # Check if value is a string handle (i64) before generic int handling
+        value_type_name = cg._resolve_expr_type_name(stmt.value)
+        if value_type_name == "String":
+            cg.builder.call(cg.string_print, [value])
+        elif isinstance(value.type, ir.IntType):
             if value.type.width == 1:
                 true_block = cg.builder.append_basic_block("print_true")
                 false_block = cg.builder.append_basic_block("print_false")
@@ -1482,12 +1652,9 @@ class StatementGenerator:
             cg.builder.call(cg.printf, [fmt_ptr, value64])
 
         elif isinstance(value.type, ir.PointerType):
-            pointee = value.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                cg.builder.call(cg.string_print, [value])
-            else:
-                fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
-                cg.builder.call(cg.printf, [fmt_ptr, value])
+            # Legacy fallback for any remaining pointer types
+            fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
+            cg.builder.call(cg.printf, [fmt_ptr, value])
 
         null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
         cg.builder.call(cg.fflush, [null_ptr])
@@ -1502,7 +1669,11 @@ class StatementGenerator:
         value = cg._generate_expression(stmt.value)
         stderr_fd = ir.Constant(ir.IntType(32), 2)
 
-        if isinstance(value.type, ir.IntType):
+        # Check if value is a string handle (i64) before generic int handling
+        value_type_name = cg._resolve_expr_type_name(stmt.value)
+        if value_type_name == "String":
+            cg.builder.call(cg.string_debug, [value])
+        elif isinstance(value.type, ir.IntType):
             if value.type.width == 1:
                 true_block = cg.builder.append_basic_block("debug_true")
                 false_block = cg.builder.append_basic_block("debug_false")
@@ -1538,12 +1709,9 @@ class StatementGenerator:
             cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value64])
 
         elif isinstance(value.type, ir.PointerType):
-            pointee = value.type.pointee
-            if hasattr(pointee, 'name') and pointee.name == "struct.String":
-                cg.builder.call(cg.string_debug, [value])
-            else:
-                fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
-                cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value])
+            # Legacy fallback for any remaining pointer types
+            fmt_ptr = cg.builder.bitcast(cg._str_fmt, ir.IntType(8).as_pointer())
+            cg.builder.call(cg.dprintf, [stderr_fd, fmt_ptr, value])
 
         null_ptr = ir.Constant(ir.IntType(8).as_pointer(), None)
         cg.builder.call(cg.fflush, [null_ptr])

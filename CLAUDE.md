@@ -2,6 +2,37 @@
 
 A compiler for **Coex**, a concurrent programming language with explicit function kinds, cellular automata support, and static polymorphism via traits.
 
+
+# CRITICAL INVARIANTS — NEVER VIOLATE
+
+## Garbage Collector Architecture
+
+The GC uses a **handle-based** design where all heap references are i64 indices into a global handle table, rather than raw pointers. This enables concurrent collection without stop-the-world pointer fixup.
+
+### Handle Storage Invariant
+**CRITICAL INVARIANT**: All stored references to GC-managed objects must be **handles** (i64 indices into the handle table), never raw pointers. This applies to:
+
+ALL complex types are managed as HANDLES, not pointers.
+Dereference a handle to a pointer ONLY at the moment the value
+is needed. NEVER store a dereferenced pointer across any call
+that could allocate or trigger GC. If you are writing code that
+holds a raw pointer, you are writing a bug.
+
+** If you find code using a pointer, write a BUG report to investigate
+
+- Collection element storage (List, Array elements that are reference types)
+- UDT Struct fields containing reference types
+- Map keys and values that are reference types
+- Any value persisted in heap-allocated structures
+- JSON values
+- Function return values
+
+**Why this matters:**
+- Handles are stable across GC cycles; pointers may become invalid after collection
+- The handle table is the single source of truth for object locations
+- Without compaction, raw pointers may "work" temporarily but will fail under GC pressure
+- Concurrent GC and compaction requires handle indirection for safe pointer fixup
+
 ## Quick Start
 
 ```bash
@@ -87,9 +118,6 @@ source.coex â†’ ANTLR4 Parser â†’ Parse Tree â†’ AST Builder â�
 | `coexc.py` | CLI entry point |
 | `tests/conftest.py` | Test fixtures (`compile_coex`, `expect_output`) |
 
-## Garbage Collector Architecture
-
-The GC uses a **handle-based** design where all heap references are i64 indices into a global handle table, rather than raw pointers. This enables concurrent collection without stop-the-world pointer fixup.
 
 ### Core Concepts
 
@@ -123,20 +151,6 @@ The GC uses a **handle-based** design where all heap references are i64 indices 
 - `gc_push_frame/gc_pop_frame`: Shadow stack management
 - `gc_set_root`: Store handle in shadow stack slot
 
-### Handle Storage Invariant
-
-**CRITICAL INVARIANT**: All stored references to GC-managed objects must be **handles** (i64 indices into the handle table), never raw pointers. This applies to:
-
-- Collection element storage (List, Array elements that are reference types)
-- Struct fields containing reference types
-- Map keys and values that are reference types
-- Any value persisted in heap-allocated structures
-
-**Why this matters:**
-- Handles are stable across GC cycles; pointers may become invalid after collection
-- The handle table is the single source of truth for object locations
-- Without compaction, raw pointers may "work" temporarily but will fail under GC pressure
-- Concurrent GC requires handle indirection for safe pointer fixup
 
 **Pattern for reference type storage:**
 ```
