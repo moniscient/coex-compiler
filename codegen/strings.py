@@ -703,6 +703,14 @@ class StringGenerator:
         i32 = ir.IntType(32)
         i8_ptr = ir.IntType(8).as_pointer()
 
+        # BUG-131: Root input handles to protect during internal allocations.
+        # Without this, unrooted caller handles can be swept by GC during
+        # the two gc_alloc calls below (string struct + data buffer).
+        start_slot = builder.call(cg.gc.gc_segment_push, [ir.Constant(i64, 2)])
+        builder.call(cg.gc.gc_segment_set_root, [start_slot, a_handle])
+        b_slot = builder.add(start_slot, ir.Constant(i64, 1))
+        builder.call(cg.gc.gc_segment_set_root, [b_slot, b_handle])
+
         # Deref handles to get String*
         a_raw = builder.call(cg.gc.gc_handle_deref, [a_handle])
         a = builder.bitcast(a_raw, cg.string_struct.as_pointer())
@@ -773,6 +781,8 @@ class StringGenerator:
         size_ptr = builder.gep(string_ptr2, [ir.Constant(i32, 0), ir.Constant(i32, 3)], inbounds=True)
         builder.store(total_size, size_ptr)
 
+        # BUG-131: Pop GC frame before return
+        builder.call(cg.gc.gc_segment_pop, [start_slot])
         builder.ret(string_handle)
 
     def _implement_string_join_list(self):

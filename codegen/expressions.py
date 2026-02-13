@@ -212,23 +212,36 @@ class ExpressionGenerator:
         left = self.generate_expression(expr.left)
 
         # Check for String operations BEFORE evaluating right
-        # With handles-everywhere, left is i64 handle (stable across GC), use Coex type info
         is_string = (cg._resolve_expr_type_name(expr.left) == "String")
 
-        # Handles are stable across GC — no need to save/re-derive (BUG-129 fix removed)
+        # BUG-131: Root left operand in temporary GC frame to protect during
+        # right operand evaluation. Without this, function call return values
+        # used as left operands (e.g. "[" + func_call() + "]") can be swept
+        # by GC during right evaluation, causing use-after-free.
+        temp_frame = None
+        if is_string and cg.gc is not None:
+            temp_frame = cg.gc.push_frame(cg.builder, 1)
+            cg.gc.set_root_handle(cg.builder, temp_frame, 0, left)
+
         right = self.generate_expression(expr.right)
 
         if is_string:
+            result = None
             if expr.op == BinaryOp.ADD:
-                # String concatenation: a + b -> string_concat(a, b)
-                return cg.builder.call(cg.string_concat, [left, right])
+                result = cg.builder.call(cg.string_concat, [left, right])
             elif expr.op == BinaryOp.EQ:
-                # String equality: a == b -> string_eq(a, b)
-                return cg.builder.call(cg.string_eq, [left, right])
+                result = cg.builder.call(cg.string_eq, [left, right])
             elif expr.op == BinaryOp.NE:
-                # String inequality: a != b -> !string_eq(a, b)
                 eq_result = cg.builder.call(cg.string_eq, [left, right])
-                return cg.builder.not_(eq_result)
+                result = cg.builder.not_(eq_result)
+            if result is not None:
+                if temp_frame is not None:
+                    cg.gc.pop_frame(cg.builder, temp_frame)
+                return result
+
+        # Pop temp frame if we fall through (shouldn't happen for valid string ops)
+        if temp_frame is not None:
+            cg.gc.pop_frame(cg.builder, temp_frame)
 
         # Promote types if needed
         if left.type != right.type:

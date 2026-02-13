@@ -2175,3 +2175,18 @@ func main() -> int
 - **Tests**: `tests/test_dead_thread_tlab_leak.py` — 8 tests covering dead thread sweep (3), TLAB reclamation (2), stress (1), and registry integrity (2)
 - **Files**: `coex_gc.py` (`_implement_gc_unregister_thread`, `_implement_gc_sweep_thread_lists`, `_implement_gc_collect`)
 - **Status**: Fixed (2026-02-11)
+
+---
+
+### BUG-131: Unrooted temporary handles in binary expression chains cause use-after-free
+- **Discovered**: 2026-02-13, during brep_torus crash investigation
+- **Category**: Codegen/GC
+- **Severity**: Critical
+- **Reproduction**: `cubes_data = "[" + collect_cubes_str(octree) + "]"` — function call return value used directly as operand in string concat chain. Crashes at scale (3000+ string concats in recursive function).
+- **Observed**: SIGSEGV during generation 4-5 of octree subdivision with ~3100-19800 cubes. Splitting into `tmp = collect_cubes_str(octree); cubes_data = "[" + tmp + "]"` eliminates crash.
+- **Expected**: Expression chains should work regardless of whether intermediate results are stored in variables.
+- **Root cause**: Two vulnerability windows: (1) In `generate_binary`, left operand evaluated and returned as i64 in LLVM register — not rooted in shadow stack. Right operand evaluation (function calls, allocations) can trigger GC that sweeps left's object. (2) Inside `string_concat`, both input handles are unrooted during two internal `gc_alloc` calls (string struct + data buffer). Birth-marking grace period insufficient for objects allocated many GC cycles ago.
+- **Fix**: Two-pronged: (1) `generate_binary` pushes temporary GC frame and roots left operand before evaluating right. (2) `string_concat` pushes GC frame and roots both input handles before internal allocations.
+- **Tests**: `tests/test_bug131_unrooted_temp_handles.py` — 5 tests covering basic concat chains, GC pressure, nested function returns, recursive builders, and stress loops
+- **Files**: codegen/expressions.py (generate_binary), codegen/strings.py (_implement_string_concat)
+- **Status**: Fixed (2026-02-13)
