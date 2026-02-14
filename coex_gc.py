@@ -1101,10 +1101,18 @@ class GarbageCollector:
 
         # Linked list of dead TLABs to munmap after compaction
         # Each node is {i8* tlab_ptr, i64 tlab_size, i8* next}
+        # Two-generation deferral: current cycle's dead TLABs go to _list,
+        # previous cycle's go to _list_prev. Only _list_prev is munmap'd,
+        # giving one extra cycle for in-flight gc_handle_deref to complete.
         self.gc_compact_dead_tlab_list = ir.GlobalVariable(
             self.module, self.i8_ptr, name="gc_compact_dead_tlab_list")
         self.gc_compact_dead_tlab_list.initializer = ir.Constant(self.i8_ptr, None)
         self.gc_compact_dead_tlab_list.linkage = 'internal'
+
+        self.gc_compact_dead_tlab_list_prev = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_compact_dead_tlab_list_prev")
+        self.gc_compact_dead_tlab_list_prev.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_compact_dead_tlab_list_prev.linkage = 'internal'
 
         # Previous compaction buffer (to be freed at next cleanup)
         self.gc_compact_prev_buffer = ir.GlobalVariable(
@@ -1118,9 +1126,20 @@ class GarbageCollector:
         self.gc_compact_prev_buffer_size.initializer = ir.Constant(self.i64, 0)
         self.gc_compact_prev_buffer_size.linkage = 'internal'
 
-        # NOTE: Two-generation buffer (prev_prev_buffer) REMOVED.
-        # With HAMT handle conversion, all HAMT internal references are handles
-        # (stable across compaction), so no extra-cycle buffer retention is needed.
+        # Two-generation buffer: prev_prev_buffer keeps the compaction buffer
+        # from 2 cycles ago alive. This prevents SIGBUS when a mutator holds a
+        # raw pointer (from gc_handle_deref) into prev_buffer while gc_compact_impl
+        # is updating handle table entries. Without this, the GC thread can munmap
+        # prev_buffer before in-flight mutator dereferences complete.
+        self.gc_compact_prev_prev_buffer = ir.GlobalVariable(
+            self.module, self.i8_ptr, name="gc_compact_prev_prev_buffer")
+        self.gc_compact_prev_prev_buffer.initializer = ir.Constant(self.i8_ptr, None)
+        self.gc_compact_prev_prev_buffer.linkage = 'internal'
+
+        self.gc_compact_prev_prev_buffer_size = ir.GlobalVariable(
+            self.module, self.i64, name="gc_compact_prev_prev_buffer_size")
+        self.gc_compact_prev_prev_buffer_size.initializer = ir.Constant(self.i64, 0)
+        self.gc_compact_prev_prev_buffer_size.linkage = 'internal'
 
     def _declare_functions(self):
         """Declare GC runtime functions"""
@@ -6829,8 +6848,14 @@ class GarbageCollector:
         # Dereference handle to get data pointer
         data_ptr = builder.call(self.gc_handle_deref, [obj_handle])
 
-        # Get header by subtracting HEADER_SIZE from data pointer
+        # Defense-in-depth: skip if deref returns NULL (should not happen for
+        # valid handles, but protects against races with handle retirement)
         data_int = builder.ptrtoint(data_ptr, self.i64)
+        is_null_data = builder.icmp_unsigned("==", data_int, ir.Constant(self.i64, 0))
+        sweep_data_ok = func.append_basic_block("sweep_data_ok")
+        builder.cbranch(is_null_data, next_node, sweep_data_ok)
+
+        builder.position_at_end(sweep_data_ok)
         header_int = builder.sub(data_int, ir.Constant(self.i64, self.HEADER_SIZE))
         header_ptr = builder.inttoptr(header_int, self.i8_ptr)
         header = builder.bitcast(header_ptr, self.header_type.as_pointer())
@@ -9941,14 +9966,13 @@ class GarbageCollector:
     def _implement_gc_compact_deferred_cleanup(self):
         """Free old memory from previous compaction.
 
-        Called at the start of gc_collect() after watermarks, when all mutators
-        are at safepoints and have discarded any raw pointers from before
-        compaction. Two lists are processed:
+        Called during gc_collect() after mark phase, before sweep.
+        Uses two-generation deferral for TLABs:
+        - gc_compact_dead_tlab_list_prev: TLABs from 2 cycles ago → munmap now
+        - gc_compact_dead_tlab_list: TLABs from 1 cycle ago → rotate to _prev
+        This gives an extra cycle for in-flight gc_handle_deref to complete.
 
-        1. gc_compact_deferred_free_list: linked list of {i8* old_ptr, i8* next}
-           nodes where old_ptr is a malloc'd object header to free.
-        2. gc_compact_dead_tlab_list: linked list of {i8* tlab_ptr, i64 tlab_size, i8* next}
-           nodes where tlab_ptr is a dead TLAB to munmap.
+        Also processes gc_compact_deferred_free_list (malloc'd objects) immediately.
         """
         func = self.gc_compact_deferred_cleanup
 
@@ -10004,21 +10028,25 @@ class GarbageCollector:
         builder.store(next_free, curr_free_alloca)
         builder.branch(free_loop)
 
-        # --- TLAB list loop: munmap each dead TLAB ---
+        # --- TLAB list: two-generation rotation ---
+        # Process _list_prev (TLABs from 2 cycles ago), then rotate _list → _list_prev
         builder.position_at_end(tlab_loop)
-        tlab_head = builder.load(self.gc_compact_dead_tlab_list)
+
+        # Load the PREVIOUS cycle's dead TLAB list (safe to munmap now)
+        tlab_head = builder.load(self.gc_compact_dead_tlab_list_prev)
         builder.store(tlab_head, curr_tlab_alloca)
         tlab_head_int = builder.ptrtoint(tlab_head, self.i64)
         has_tlab = builder.icmp_unsigned('!=', tlab_head_int, ir.Constant(self.i64, 0))
 
         tlab_check = func.append_basic_block("tlab_check")
-        builder.cbranch(has_tlab, tlab_check, done)
+        rotate_lists = func.append_basic_block("rotate_lists")
+        builder.cbranch(has_tlab, tlab_check, rotate_lists)
 
         builder.position_at_end(tlab_check)
         curr_tlab = builder.load(curr_tlab_alloca)
         curr_tlab_int = builder.ptrtoint(curr_tlab, self.i64)
         is_null_tlab = builder.icmp_unsigned('==', curr_tlab_int, ir.Constant(self.i64, 0))
-        builder.cbranch(is_null_tlab, done, tlab_body)
+        builder.cbranch(is_null_tlab, rotate_lists, tlab_body)
 
         builder.position_at_end(tlab_body)
         # Node layout: { i8* tlab_ptr, i64 tlab_size, i8* next }
@@ -10074,10 +10102,16 @@ class GarbageCollector:
         builder.store(next_tlab, curr_tlab_alloca)
         builder.branch(tlab_check)
 
-        # --- Done: clear both lists ---
+        # --- Rotate: _list → _list_prev (demote current to previous) ---
+        builder.position_at_end(rotate_lists)
+        current_dead_list = builder.load(self.gc_compact_dead_tlab_list)
+        builder.store(current_dead_list, self.gc_compact_dead_tlab_list_prev)
+        builder.store(ir.Constant(self.i8_ptr, None), self.gc_compact_dead_tlab_list)
+        builder.branch(done)
+
+        # --- Done: clear free list ---
         builder.position_at_end(done)
         builder.store(ir.Constant(self.i8_ptr, None), self.gc_compact_deferred_free_list)
-        builder.store(ir.Constant(self.i8_ptr, None), self.gc_compact_dead_tlab_list)
         # Note: gc_compact_prev_buffer is NOT freed here because it may still
         # contain live objects. It is freed in gc_compact_impl AFTER objects
         # are copied out of it.
@@ -10180,20 +10214,12 @@ class GarbageCollector:
 
         builder.position_at_end(size_process_thread)
 
-        # Skip dead entries (watermark_active == 0xDEAD)
-        size_skip_dead = func.append_basic_block("size_skip_dead")
-        size_live_thread = func.append_basic_block("size_live_thread")
-        wm_size_ptr = builder.gep(curr_thread, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        wm_size_val = builder.load(wm_size_ptr)
-        is_dead_size = builder.icmp_unsigned('==', wm_size_val, ir.Constant(self.i64, 0xDEAD))
-        builder.cbranch(is_dead_size, size_skip_dead, size_live_thread)
-
-        builder.position_at_end(size_skip_dead)
-        builder.branch(size_next_thread)
-
-        builder.position_at_end(size_live_thread)
+        # BUG-137 FIX: Do NOT skip dead entries during compaction.
+        # Dead threads' objects may reside in previous compaction buffers
+        # that get munmap'd by buffer rotation. If we skip them, their
+        # handles become dangling pointers into freed memory → SIGSEGV.
+        # Dead threads' alloc_lists are stable (no mutator adding nodes)
+        # and contain only survivors from sweep (which ran before compact).
         # Load alloc_list head (field 9)
         alloc_list_ptr = builder.gep(curr_thread, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
@@ -10392,20 +10418,8 @@ class GarbageCollector:
 
         builder.position_at_end(copy_process_thread)
 
-        # Skip dead entries
-        copy_skip_dead = func.append_basic_block("copy_skip_dead")
-        copy_live_thread = func.append_basic_block("copy_live_thread")
-        wm_copy_ptr = builder.gep(curr_thread2, [
-            ir.Constant(self.i32, 0), ir.Constant(self.i32, 3)
-        ], inbounds=True)
-        wm_copy_val = builder.load(wm_copy_ptr)
-        is_dead_copy = builder.icmp_unsigned('==', wm_copy_val, ir.Constant(self.i64, 0xDEAD))
-        builder.cbranch(is_dead_copy, copy_skip_dead, copy_live_thread)
-
-        builder.position_at_end(copy_skip_dead)
-        builder.branch(copy_next_thread)
-
-        builder.position_at_end(copy_live_thread)
+        # BUG-137 FIX: Do NOT skip dead entries during compaction.
+        # See size estimation phase comment for rationale.
         alloc_list_ptr2 = builder.gep(curr_thread2, [
             ir.Constant(self.i32, 0), ir.Constant(self.i32, 9)
         ], inbounds=True)
@@ -10748,26 +10762,36 @@ class GarbageCollector:
         final_bytes = builder.load(bytes_moved_alloca)
         builder.store(final_bytes, bytes_ptr)
 
-        # Free prev_buffer (from previous cycle). With HAMT handle conversion,
-        # no two-generation buffer is needed — all HAMT internal references are
-        # now handles, stable across compaction.
-        # Chain: free(prev) → prev = new_buffer
-        prev_buf_to_free = builder.load(self.gc_compact_prev_buffer)
-        prev_buf_to_free_int = builder.ptrtoint(prev_buf_to_free, self.i64)
-        has_prev = builder.icmp_unsigned('!=', prev_buf_to_free_int, ir.Constant(self.i64, 0))
+        # Two-generation buffer rotation: prev_prev → munmap, prev → prev_prev, new → prev.
+        # This keeps prev_buffer alive for one extra GC cycle to prevent SIGBUS when
+        # a mutator holds a raw pointer (from gc_handle_deref) into prev_buffer while
+        # gc_compact_impl is updating handle table entries. The GC thread can reach
+        # this point and munmap prev_buffer before in-flight mutator dereferences
+        # complete. Keeping one extra generation avoids that race.
 
-        free_prev = func.append_basic_block("free_prev_buf")
-        after_free_prev = func.append_basic_block("after_free_prev")
-        builder.cbranch(has_prev, free_prev, after_free_prev)
+        # Step 1: munmap prev_prev_buffer (from 2 cycles ago — safe to free now)
+        prev_prev_to_free = builder.load(self.gc_compact_prev_prev_buffer)
+        prev_prev_to_free_int = builder.ptrtoint(prev_prev_to_free, self.i64)
+        has_prev_prev = builder.icmp_unsigned('!=', prev_prev_to_free_int, ir.Constant(self.i64, 0))
 
-        builder.position_at_end(free_prev)
-        prev_size_to_free = builder.load(self.gc_compact_prev_buffer_size)
-        builder.call(self.munmap, [prev_buf_to_free, prev_size_to_free])
-        builder.branch(after_free_prev)
+        free_prev_prev = func.append_basic_block("free_prev_prev_buf")
+        after_free_prev_prev = func.append_basic_block("after_free_prev_prev")
+        builder.cbranch(has_prev_prev, free_prev_prev, after_free_prev_prev)
 
-        builder.position_at_end(after_free_prev)
+        builder.position_at_end(free_prev_prev)
+        prev_prev_size = builder.load(self.gc_compact_prev_prev_buffer_size)
+        builder.call(self.munmap, [prev_prev_to_free, prev_prev_size])
+        builder.branch(after_free_prev_prev)
 
-        # Save the NEW compact buffer as prev
+        builder.position_at_end(after_free_prev_prev)
+
+        # Step 2: Demote prev_buffer to prev_prev_buffer (keeps it alive one more cycle)
+        prev_buf_to_demote = builder.load(self.gc_compact_prev_buffer)
+        prev_size_to_demote = builder.load(self.gc_compact_prev_buffer_size)
+        builder.store(prev_buf_to_demote, self.gc_compact_prev_prev_buffer)
+        builder.store(prev_size_to_demote, self.gc_compact_prev_prev_buffer_size)
+
+        # Step 3: Save the NEW compact buffer as prev
         compact_buffer = builder.load(buffer_base_alloca)
         builder.store(compact_buffer, self.gc_compact_prev_buffer)
         compact_size = builder.load(buffer_limit_alloca)

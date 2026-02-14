@@ -4,6 +4,43 @@ This file contains bugs that have been fixed or resolved. They are moved here fr
 
 ---
 
+### BUG-137: Compaction skips dead threads → objects in old compact buffers get munmap'd → SIGSEGV
+- **Discovered**: 2026-02-13, during brep_torus_concurrent Gen 5 crash investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run `examples/brep_torus_concurrent.coex` — crashes at Gen 5 Subdividing (SIGSEGV in gc_sweep_thread_lists)
+- **Observed**: gc_handle_deref returns pointer into munmap'd compaction buffer. Crash at `ldur x9, [x0, #-0x8]` reading generation field from freed memory.
+- **Expected**: Dead thread objects compacted to new buffer before old buffer freed
+- **Root cause**: Both size estimation and copy phases of gc_compact_impl checked `watermark_active == 0xDEAD` and skipped dead threads entirely. Dead threads' objects that had been compacted in previous cycles stayed in old compact buffers. Buffer rotation (prev → prev_prev → munmap) freed those buffers while handle table still pointed there.
+- **Fix**: Removed dead-thread skip from both compaction phases. Dead threads' alloc_lists contain valid survivors from sweep and must be compacted like live threads' objects. Also added null-data check in sweep's gc_handle_deref path (defense in depth).
+- **Files**: coex_gc.py (gc_compact_impl)
+- **Status**: Fixed (2026-02-13)
+
+---
+
+### BUG-134: Task step function GC roots incomplete — heap-typed frame fields unrooted
+- **Discovered**: 2026-02-13, during brep_torus_concurrent Gen 3 crash investigation
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Compile and run `examples/brep_torus_concurrent.coex` — crashes at Gen 3 evaporation with `FATAL: gc_handle_deref: handle 4633513578020021108 >= table_size 1048576` (handle value is actually a double ~32.44, a torus coordinate)
+- **Observed**: Task step functions only root 1 GC slot (the first parameter), even though frame fields contain multiple heap-typed handles (lists, UDTs, task results). Under GC pressure, unrooted handles are swept and their memory reused for other objects (Vec3 with doubles). Reading what was a handle slot now yields a double → fatal crash.
+- **Root cause**: Four interrelated bugs:
+  1. `find_all_locals` overwrites typed entries with None when same variable rebound in inner scope (e.g., `new_children: [OctreeNode] = []` overwritten by `new_children = new_children.append(x)`)
+  2. `compute_hoisted_locals` uses inner stmt_index instead of top-level index, resulting in empty hoisted_locals
+  3. Suspension point target variables not included in heap_fields (type is None in all_locals)
+  4. GC roots not refreshed before SPAWN returns — roots from entry become stale after frame field updates
+- **Fix**: Four changes in task_analysis.py and task_transform.py:
+  1. `find_all_locals`: Don't overwrite existing typed entries with None — preserve original type annotation from first declaration
+  2. `_generate_step_function`: Add suspension point target variables to heap_fields using callee return type from `cg.func_decls`
+  3. `_generate_step_function`: Add AST-based type inference for untyped locals (via `_infer_local_type_from_ast`) to detect heap types from `.get()` calls on collections and function return types
+  4. `_store_task_result_spawn`: Re-root all heap-typed frame fields via `_reroot_heap_fields` before every SPAWN return to reflect current frame state
+- **Files**: task_transform.py, task_analysis.py
+- **Tests**: tests/test_task_gc_rooting.py (4 tests: tree building, UDT nesting, suspension var rooting, multi-gen subdivide+evaporate)
+- **Impact**: Standalone test with 37K+ octree nodes at Gen 5 now passes. Full brep_torus_concurrent progresses from Gen 3 crash to Gen 5 (remaining Gen 5 crash is separate Metal rendering issue).
+- **Status**: Fixed (2026-02-13)
+
+---
+
 ### BUG-129: Unrooted intermediate string concat results crash under GC compaction
 - **Discovered**: 2026-02-12, during BREP torus octree demo
 - **Category**: Codegen
@@ -2189,4 +2226,20 @@ func main() -> int
 - **Fix**: Two-pronged: (1) `generate_binary` pushes temporary GC frame and roots left operand before evaluating right. (2) `string_concat` pushes GC frame and roots both input handles before internal allocations.
 - **Tests**: `tests/test_bug131_unrooted_temp_handles.py` — 5 tests covering basic concat chains, GC pressure, nested function returns, recursive builders, and stress loops
 - **Files**: codegen/expressions.py (generate_binary), codegen/strings.py (_implement_string_concat)
+- **Status**: Fixed (2026-02-13)
+
+---
+
+### BUG-136: Compaction prev_buffer munmap races with in-flight gc_handle_deref
+- **Discovered**: 2026-02-13, during Gen 5 concurrent octree stress test
+- **Category**: GC
+- **Severity**: Critical
+- **Reproduction**: Run octree subdivide+evaporate for 5 generations with concurrent GC pressure thread (gc() every 50-100K allocations). Crashes non-deterministically with SIGBUS/SIGSEGV.
+- **Observed**: SIGBUS (exit 138) or SIGSEGV (exit 139) during Gen 4-5 processing. Only under concurrent GC pressure. Without pressure, same workload passes.
+- **Expected**: No crash — all memory accesses should be to mapped pages.
+- **Root cause**: `gc_compact_impl` immediately munmaps `prev_buffer` (compaction buffer from previous cycle) at line 10765. But a mutator thread can hold a raw pointer from `gc_handle_deref` into prev_buffer — obtained before the current compaction updated that handle's table entry. The race: mutator derefs handle → gets old pointer into prev_buffer → GC finishes updating handles → munmaps prev_buffer → mutator uses old pointer → SIGBUS.
+- **Fix**: Two-generation deferral for both compaction buffers AND dead TLABs:
+  1. Compaction buffer: Re-introduced `gc_compact_prev_prev_buffer`. Instead of immediately munmapping prev_buffer, it's demoted to prev_prev_buffer and kept alive for one additional GC cycle. The buffer from 2 cycles ago (prev_prev_buffer) is then munmap'd.
+  2. Dead TLABs: Added `gc_compact_dead_tlab_list_prev`. The deferred cleanup now processes TLABs from 2 cycles ago (_list_prev) and rotates the current list to _list_prev. This eliminates the SIGSEGV in gc_sweep_thread_lists where gc_handle_deref pointed to a munmap'd TLAB.
+- **Files**: coex_gc.py (gc_compact_impl buffer rotation, gc_compact_deferred_cleanup TLAB rotation, globals)
 - **Status**: Fixed (2026-02-13)

@@ -97,4 +97,71 @@
 
 ---
 
-**Next valid BUG ID: BUG-132**
+### BUG-132: Task calling task with `=` operator in loops produces wrong output (0 instead of correct value)
+- **Discovered**: 2026-02-13, during concurrent brep_torus demo development
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**:
+```coex
+task double(x: int) -> int
+    return x * 2
+~
+task sum_doubled(n: int) -> int
+    total = 0
+    i = 0
+    while i < n
+        d = double(i)
+        total = total + d
+        i = i + 1
+    ~
+    return total
+~
+func main() -> int
+    result := sum_doubled(5)
+    print(result)
+    return 0
+~
+```
+- **Observed**: Output is `0` instead of expected `20` (0+2+4+6+8=20)
+- **Expected**: Output `20`
+- **Hypothesis**: The state machine transform for `task` calls corrupts the loop accumulator when a task calls another task using `=` (non-move) assignment. The `=` operator compiles but the resumed value is lost. Using `:=` works correctly.
+- **Workaround**: Always use `:=` for task-to-task calls
+- **Files**: codegen/thread.py (state machine transform), codegen/statements.py
+- **Status**: Open
+
+---
+
+### BUG-133: No function kind supports both mutable bindings and direct calls from thread context
+- **Discovered**: 2026-02-13, during concurrent brep_torus demo development
+- **Category**: Semantic
+- **Severity**: Medium
+- **Reproduction**: Any program requiring a helper function with loops (mutable bindings) that is called from a `thread` context without `:=` overhead.
+- **Observed**:
+  - `formula`: supports direct calls from thread, but requires `const` bindings (no loops, no mutable state)
+  - `task`: supports mutable bindings, but ALL call sites require `:=` (move/flatten operator)
+  - `func`: supports mutable bindings and direct calls, but CANNOT be called from `thread` context
+- **Expected**: There should be a function kind (or relaxation of existing rules) that allows mutable bindings AND can be called directly (with `=`) from `thread` context.
+- **Hypothesis**: The kind hierarchy was designed with strict rules where `thread` can only call `{formula, task, thread}`. Adding `func` to thread's callable set OR allowing `formula` to have mutable bindings (with purity checking relaxed) would resolve the gap.
+- **Workaround**: Use `task` for all loop-heavy helpers called from threads, always use `:=` at call sites
+- **Files**: codegen/functions.py (kind checking), codegen/thread.py
+- **Status**: Open
+
+---
+
+---
+
+### BUG-135: Channel() constructor returns invalid handle-like value
+- **Discovered**: 2026-02-13, during concurrent test development
+- **Category**: Codegen
+- **Severity**: High
+- **Reproduction**: Use `Channel()` constructor syntax (instead of `Channel.new()`) and pass result to channel operations
+- **Observed**: `Channel()` returns value 65 (0x41), causing SIGSEGV when used as channel pointer in `coex_channel_receive`
+- **Expected**: `Channel()` and `Channel.new()` should produce equivalent valid channel pointers
+- **Hypothesis**: Channel() constructor path returns a handle or tag value instead of the raw malloc'd channel pointer
+- **Files**: codegen/expressions.py or codegen/core.py (Channel constructor)
+- **Workaround**: Use `Channel.new()` static method instead
+- **Status**: Open
+
+---
+
+**Next valid BUG ID: BUG-138**
